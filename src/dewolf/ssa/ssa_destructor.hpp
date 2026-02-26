@@ -1,22 +1,18 @@
 #pragma once
 #include "../structures/cfg.hpp"
 #include "../../common/arena.hpp"
+#include "../pipeline/pipeline.hpp"
 #include "liveness/liveness.hpp"
 
 namespace dewolf {
 
-class SsaDestructor {
+class SsaDestructor : public PipelineStage {
 public:
-    explicit SsaDestructor(DecompilerArena& arena, ControlFlowGraph& cfg)
-        : arena_(arena), cfg_(cfg) {}
-
-    void run();
+    const char* name() const override { return "SsaDestructor"; }
+    void execute(DecompilerTask& task) override;
 
 private:
-    DecompilerArena& arena_;
-    ControlFlowGraph& cfg_;
-
-    void eliminate_phi_nodes(const LivenessAnalysis& liveness);
+    void eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph& cfg, const LivenessAnalysis& liveness);
 };
 
 } // namespace dewolf

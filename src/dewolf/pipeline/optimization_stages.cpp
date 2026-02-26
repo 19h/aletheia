@@ -73,7 +73,13 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
                 }
 
                 if (auto* v = dynamic_cast<Variable*>(target)) {
+                    // Update definition locally but DO NOT inline away side-effectful or multi-use variables completely
+                    // DeWolf's GraphExpressionFolding does this strictly over SSA chains
                     local_defs[v->name()] = source;
+                    // We must still emit the SSA assignment for visibility!
+                    Operation* new_op = task.arena().create<Operation>(OperationType::assign, 
+                        std::vector<Expression*>{target, source}, op->size_bytes);
+                    new_instructions.push_back(task.arena().create<Instruction>(inst->address(), new_op));
                     continue; 
                 } else {
                     Operation* new_op = task.arena().create<Operation>(OperationType::assign, 
@@ -120,6 +126,17 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
                         new_instructions.pop_back();
                         new_instructions.push_back(task.arena().create<Instruction>(inst->address(), cond_op));
                         continue;
+                    } else if (last_inst->operation()->type() == OperationType::assign && last_inst->operation()->operands().size() == 2) {
+                        // Sometimes CMP is folded into an assign if mapped incorrectly, let's look for a sub inside the assign
+                        if (auto* rhs_sub = dynamic_cast<Operation*>(last_inst->operation()->operands()[1])) {
+                            if (rhs_sub->type() == OperationType::sub && rhs_sub->operands().size() == 2) {
+                                std::vector<Expression*> cmp_ops = rhs_sub->operands();
+                                Operation* cond_op = task.arena().create<Operation>(op->type(), std::move(cmp_ops), 0);
+                                new_instructions.pop_back();
+                                new_instructions.push_back(task.arena().create<Instruction>(inst->address(), cond_op));
+                                continue;
+                            }
+                        }
                     }
                 }
                 
@@ -138,13 +155,6 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
             }
         }
         
-        for (const auto& [vname, expr] : local_defs) {
-            Variable* v = task.arena().create<Variable>(vname, expr->size_bytes);
-            Operation* new_op = task.arena().create<Operation>(OperationType::assign, 
-                std::vector<Expression*>{v, expr}, expr->size_bytes);
-            new_instructions.push_back(task.arena().create<Instruction>(0, new_op));
-        }
-
         block->set_instructions(std::move(new_instructions));
     }
 }
@@ -152,8 +162,6 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
 void TypePropagationStage::execute(DecompilerTask& task) {}
 void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {}
 void DeadPathEliminationStage::execute(DecompilerTask& task) {}
-void DeadCodeEliminationStage::execute(DecompilerTask& task) {}
-void DeadLoopEliminationStage::execute(DecompilerTask& task) {}
 void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {}
 
 } // namespace dewolf

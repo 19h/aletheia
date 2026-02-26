@@ -3,6 +3,7 @@
 #include "../structures/cfg.hpp"
 #include "../structures/dataflow.hpp"
 #include "../../common/arena.hpp"
+#include "../pipeline/pipeline.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -10,26 +11,19 @@
 
 namespace dewolf {
 
-class SsaConstructor {
+class SsaConstructor : public PipelineStage {
 public:
-    explicit SsaConstructor(DecompilerArena& arena, ControlFlowGraph& cfg)
-        : arena_(arena), cfg_(cfg), dom_tree_(cfg) {}
-
-    void run();
+    const char* name() const override { return "SsaConstructor"; }
+    void execute(DecompilerTask& task) override;
 
 private:
-    void insert_phi_nodes();
-    void rename_variables();
+    void insert_phi_nodes(DecompilerArena& arena, ControlFlowGraph& cfg, const DominatorTree& dom_tree);
+    void rename_variables(DecompilerArena& arena, ControlFlowGraph& cfg, const DominatorTree& dom_tree);
 
-    DecompilerArena& arena_;
-    ControlFlowGraph& cfg_;
-    DominatorTree dom_tree_;
-
-    // Variables per block definition tracking
     std::unordered_map<std::string, std::vector<BasicBlock*>> var_defs_;
     std::unordered_map<BasicBlock*, std::vector<Instruction*>> phi_nodes_;
     
-    void gather_definitions();
+    void gather_definitions(ControlFlowGraph& cfg);
 };
 
 } // namespace dewolf

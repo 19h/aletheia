@@ -60,9 +60,14 @@ public:
     }
 
     const std::string& name() const { return name_; }
+    
+    // SSA fields
+    std::size_t ssa_version() const { return ssa_version_; }
+    void set_ssa_version(std::size_t version) { ssa_version_ = version; }
 
 private:
     std::string name_;
+    std::size_t ssa_version_ = 0;
 };
 
 enum class OperationType {
@@ -123,6 +128,7 @@ public:
 
     OperationType type() const { return type_; }
     const std::vector<Expression*>& operands() const { return operands_; }
+    std::vector<Expression*>& mutable_operands() { return operands_; }
 
 private:
     OperationType type_;

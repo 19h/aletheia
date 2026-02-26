@@ -18,7 +18,12 @@ void CExpressionGenerator::visit(Constant* c) {
 }
 
 void CExpressionGenerator::visit(Variable* v) {
-    result_ = ida::lines::tag_remove(v->name());
+    std::string base_name = ida::lines::tag_remove(v->name());
+    if (v->ssa_version() > 0) {
+        result_ = base_name + "_" + std::to_string(v->ssa_version());
+    } else {
+        result_ = base_name;
+    }
 }
 
 void CExpressionGenerator::visit(Operation* o) {

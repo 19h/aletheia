@@ -31,24 +31,31 @@ z3::expr Z3Converter::convert_operation(dewolf::Operation* o) {
     if (o->operands().empty()) return ctx_.bool_val(false);
 
     auto& ops = o->operands();
+
+    auto ensure_bv = [&](z3::expr e, unsigned size) {
+        if (e.is_bool()) {
+            return z3::ite(e, ctx_.bv_val(1, size), ctx_.bv_val(0, size));
+        }
+        return e;
+    };
     
     if (o->type() == dewolf::OperationType::eq && ops.size() == 2) {
-        return convert(ops[0]) == convert(ops[1]);
+        return ensure_bv(convert(ops[0]), 64) == ensure_bv(convert(ops[1]), 64);
     }
     if (o->type() == dewolf::OperationType::neq && ops.size() == 2) {
-        return convert(ops[0]) != convert(ops[1]);
+        return ensure_bv(convert(ops[0]), 64) != ensure_bv(convert(ops[1]), 64);
     }
     if (o->type() == dewolf::OperationType::lt && ops.size() == 2) {
-        return z3::slt(convert(ops[0]), convert(ops[1]));
+        return z3::slt(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
     }
     if (o->type() == dewolf::OperationType::le && ops.size() == 2) {
-        return z3::sle(convert(ops[0]), convert(ops[1]));
+        return z3::sle(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
     }
     if (o->type() == dewolf::OperationType::gt && ops.size() == 2) {
-        return z3::sgt(convert(ops[0]), convert(ops[1]));
+        return z3::sgt(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
     }
     if (o->type() == dewolf::OperationType::ge && ops.size() == 2) {
-        return z3::sge(convert(ops[0]), convert(ops[1]));
+        return z3::sge(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
     }
 
     if (o->type() == dewolf::OperationType::logical_and && ops.size() == 2) {

@@ -8,7 +8,11 @@
 #include "../src/dewolf/dewolf.hpp"
 #include "../src/dewolf/pipeline/pipeline.hpp"
 #include "../src/dewolf/pipeline/optimization_stages.hpp"
+#include "../src/dewolf/pipeline/expressions/graph_expression_folding.hpp"
+#include "../src/dewolf/pipeline/dataflow_analysis/dead_code_elimination.hpp"
 #include "../src/dewolf/lifter.hpp"
+#include "../src/dewolf/ssa/ssa_constructor.hpp"
+#include "../src/dewolf/ssa/ssa_destructor.hpp"
 #include "../src/dewolf/structuring/structuring_stage.hpp"
 #include "../src/dewolf/codegen/codegen.hpp"
 
@@ -47,7 +51,11 @@ void test_function(const std::string& func_name) {
 
     // Run pipeline stages
     DecompilerPipeline pipeline;
+    pipeline.add_stage(std::make_unique<SsaConstructor>());
     pipeline.add_stage(std::make_unique<ExpressionPropagationStage>());
+    pipeline.add_stage(std::make_unique<GraphExpressionFoldingStage>());
+    pipeline.add_stage(std::make_unique<DeadCodeEliminationStage>());
+    pipeline.add_stage(std::make_unique<SsaDestructor>());
     pipeline.add_stage(std::make_unique<PatternIndependentRestructuringStage>());
     
     pipeline.run(task);

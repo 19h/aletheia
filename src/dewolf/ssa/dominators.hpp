@@ -13,6 +13,7 @@ public:
 
     BasicBlock* idom(BasicBlock* node) const;
     const std::vector<BasicBlock*>& dominance_frontier(BasicBlock* node) const;
+    const std::vector<BasicBlock*>& children(BasicBlock* node) const;
     
     bool strictly_dominates(BasicBlock* a, BasicBlock* b) const;
     bool dominates(BasicBlock* a, BasicBlock* b) const;
@@ -24,6 +25,7 @@ private:
 
     std::unordered_map<BasicBlock*, BasicBlock*> idoms_;
     std::unordered_map<BasicBlock*, std::vector<BasicBlock*>> frontiers_;
+    std::unordered_map<BasicBlock*, std::vector<BasicBlock*>> children_;
 };
 
 } // namespace dewolf

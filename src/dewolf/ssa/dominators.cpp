@@ -144,6 +144,20 @@ void DominatorTree::compute_dominators(const ControlFlowGraph& cfg, bool post_do
     }
 
     idoms_[start_node] = nullptr;
+
+    // Populate children_
+    for (const auto& [node, idom_node] : idoms_) {
+        if (idom_node) {
+            children_[idom_node].push_back(node);
+        }
+    }
+}
+
+const std::vector<BasicBlock*>& DominatorTree::children(BasicBlock* node) const {
+    static const std::vector<BasicBlock*> empty;
+    auto it = children_.find(node);
+    if (it != children_.end()) return it->second;
+    return empty;
 }
 
 void DominatorTree::compute_dominance_frontiers(const ControlFlowGraph& cfg, bool post_dominators) {

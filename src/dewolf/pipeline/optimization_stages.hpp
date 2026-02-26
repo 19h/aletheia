@@ -27,18 +27,6 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
-class DeadCodeEliminationStage : public PipelineStage {
-public:
-    const char* name() const override { return "DeadCodeElimination"; }
-    void execute(DecompilerTask& task) override;
-};
-
-class DeadLoopEliminationStage : public PipelineStage {
-public:
-    const char* name() const override { return "DeadLoopElimination"; }
-    void execute(DecompilerTask& task) override;
-};
-
 class CommonSubexpressionEliminationStage : public PipelineStage {
 public:
     const char* name() const override { return "CommonSubexpressionElimination"; }

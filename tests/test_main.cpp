@@ -7,6 +7,8 @@
 #include "../src/dewolf/ssa/dominators.hpp"
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
 
+#include "../src/dewolf/pipeline/pipeline.hpp"
+
 #define ASSERT_TRUE(cond) if (!(cond)) { \
     std::cerr << "FAIL: " << #cond << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
     std::exit(1); \
@@ -81,18 +83,22 @@ void test_ssa_phi_insertion() {
     DecompilerArena arena;
     ControlFlowGraph cfg;
 
-    auto* A = arena.create<BasicBlock>(1);
-    auto* B = arena.create<BasicBlock>(2);
-    auto* C = arena.create<BasicBlock>(3);
-    auto* D = arena.create<BasicBlock>(4);
+    DecompilerTask task(0);
+    task.set_cfg(std::make_unique<ControlFlowGraph>());
+    ControlFlowGraph* tcfg = task.cfg();
 
-    cfg.set_entry_block(A);
-    cfg.add_block(A); cfg.add_block(B); cfg.add_block(C); cfg.add_block(D);
+    auto* A = task.arena().create<BasicBlock>(1);
+    auto* B = task.arena().create<BasicBlock>(2);
+    auto* C = task.arena().create<BasicBlock>(3);
+    auto* D = task.arena().create<BasicBlock>(4);
 
-    auto* e1 = arena.create<Edge>(A, B, EdgeType::Unconditional);
-    auto* e2 = arena.create<Edge>(A, C, EdgeType::Unconditional);
-    auto* e3 = arena.create<Edge>(B, D, EdgeType::Unconditional);
-    auto* e4 = arena.create<Edge>(C, D, EdgeType::Unconditional);
+    tcfg->set_entry_block(A);
+    tcfg->add_block(A); tcfg->add_block(B); tcfg->add_block(C); tcfg->add_block(D);
+
+    auto* e1 = task.arena().create<Edge>(A, B, EdgeType::Unconditional);
+    auto* e2 = task.arena().create<Edge>(A, C, EdgeType::Unconditional);
+    auto* e3 = task.arena().create<Edge>(B, D, EdgeType::Unconditional);
+    auto* e4 = task.arena().create<Edge>(C, D, EdgeType::Unconditional);
 
     A->add_successor(e1); B->add_predecessor(e1);
     A->add_successor(e2); C->add_predecessor(e2);
@@ -100,17 +106,17 @@ void test_ssa_phi_insertion() {
     C->add_successor(e4); D->add_predecessor(e4);
 
     // Insert definitions of variable "x" in B and C
-    auto* varX = arena.create<Variable>("x", 4);
+    auto* varX = task.arena().create<Variable>("x", 4);
     std::vector<Expression*> ops = { varX };
     
-    auto* assignB = arena.create<Operation>(OperationType::assign, ops, 4);
-    B->add_instruction(arena.create<Instruction>(0x10, assignB));
+    auto* assignB = task.arena().create<Operation>(OperationType::assign, ops, 4);
+    B->add_instruction(task.arena().create<Instruction>(0x10, assignB));
 
-    auto* assignC = arena.create<Operation>(OperationType::assign, ops, 4);
-    C->add_instruction(arena.create<Instruction>(0x20, assignC));
+    auto* assignC = task.arena().create<Operation>(OperationType::assign, ops, 4);
+    C->add_instruction(task.arena().create<Instruction>(0x20, assignC));
 
-    SsaConstructor ssa(arena, cfg);
-    ssa.run();
+    SsaConstructor ssa;
+    ssa.execute(task);
 
     // With definition in B and C, dominance frontier is D. 
     // We should expect a PHI node inserted in D.
