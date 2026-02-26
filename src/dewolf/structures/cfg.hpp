@@ -69,6 +69,7 @@ public:
     }
 
     const std::vector<Instruction*>& instructions() const { return instructions_; }
+    void set_instructions(std::vector<Instruction*> insts) { instructions_ = std::move(insts); }
 
     void add_predecessor(Edge* edge) { predecessors_.push_back(edge); }
     void add_successor(Edge* edge) { successors_.push_back(edge); }
