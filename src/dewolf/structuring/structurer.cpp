@@ -13,43 +13,169 @@ namespace dewolf {
 
 void CyclicRegionFinder::process(TransitionCFG& cfg) {
     if (!cfg.entry()) return;
-    
+
+    // Step 1: Detect all back edges via DFS
     std::unordered_set<TransitionBlock*> visited;
-    std::unordered_set<TransitionBlock*> path;
+    std::unordered_set<TransitionBlock*> on_path;
+    // back_edges: (tail, header) where tail->header is a back edge
     std::vector<std::pair<TransitionBlock*, TransitionBlock*>> back_edges;
 
     auto dfs = [&](TransitionBlock* node, auto& dfs_ref) -> void {
         if (!node) return;
         visited.insert(node);
-        path.insert(node);
+        on_path.insert(node);
 
         for (auto* succ : node->successors()) {
-            if (path.contains(succ)) {
+            if (on_path.contains(succ)) {
                 back_edges.push_back({node, succ});
             } else if (!visited.contains(succ)) {
                 dfs_ref(succ, dfs_ref);
             }
         }
-        path.erase(node);
+        on_path.erase(node);
     };
 
     dfs(cfg.entry(), dfs);
 
-    for (auto& edge : back_edges) {
-        TransitionBlock* tail = edge.first;
-        TransitionBlock* header = edge.second;
+    // Process each back edge: compute the natural loop region, synthesize
+    // break/continue, restructure the loop body, and wrap in a loop AST node.
+    for (auto& [tail, header] : back_edges) {
+        // --- Step 2: Compute the natural loop region ---
+        // The natural loop is the set of all nodes from which the header
+        // can be reached by traversing only backwards edges. We use the
+        // standard algorithm: start with {header, tail}, then for each
+        // node in the worklist that is not the header, add its predecessors.
+        std::unordered_set<TransitionBlock*> loop_region;
+        loop_region.insert(header);
 
-        SeqNode* body = arena_.create<SeqNode>();
-        body->add_node(header->ast_node());
+        std::vector<TransitionBlock*> worklist;
         if (tail != header) {
-            body->add_node(tail->ast_node());
+            loop_region.insert(tail);
+            worklist.push_back(tail);
         }
 
-        WhileLoopNode* loop = arena_.create<WhileLoopNode>(body);
+        while (!worklist.empty()) {
+            TransitionBlock* n = worklist.back();
+            worklist.pop_back();
+            for (auto* pred : n->predecessors()) {
+                if (!loop_region.contains(pred)) {
+                    loop_region.insert(pred);
+                    worklist.push_back(pred);
+                }
+            }
+        }
 
-        // Refine the endless loop into the correct loop type
-        AstNode* refined = LoopStructurer::refine_loop(arena_, loop);
+        // --- Step 3: Compute loop successors (exit targets) ---
+        std::unordered_set<TransitionBlock*> loop_successors;
+        for (auto* node : loop_region) {
+            for (auto* succ : node->successors()) {
+                if (!loop_region.contains(succ)) {
+                    loop_successors.insert(succ);
+                }
+            }
+        }
+
+        // --- Step 4: Build a sub-TransitionCFG for the loop region ---
+        // This allows us to run the acyclic restructurer on it.
+        auto* loop_cfg = arena_.create<TransitionCFG>();
+
+        // Create break/continue synthesis blocks and copy region blocks
+        // into the loop sub-CFG, with back edges and exit edges replaced.
+        std::unordered_map<TransitionBlock*, TransitionBlock*> block_map;
+        for (auto* node : loop_region) {
+            auto* clone = arena_.create<TransitionBlock>(node->ast_node());
+            block_map[node] = clone;
+            loop_cfg->add_block(clone);
+        }
+        loop_cfg->set_entry(block_map[header]);
+
+        // For each edge in the original region, wire up the clone graph.
+        // Replace back edges (->header) with Continue nodes.
+        // Replace exit edges (->successor outside region) with Break nodes.
+        for (auto* node : loop_region) {
+            auto* clone_src = block_map[node];
+            for (auto* succ : node->successors()) {
+                if (succ == header && node != header) {
+                    // Back edge -> insert Continue node
+                    auto* cont_block = arena_.create<BasicBlock>(9999);
+                    cont_block->add_instruction(arena_.create<ContinueInstr>());
+                    auto* cont_code = arena_.create<CodeNode>(cont_block);
+                    auto* cont_trans = arena_.create<TransitionBlock>(cont_code);
+                    loop_cfg->add_block(cont_trans);
+                    clone_src->add_successor(cont_trans);
+                    cont_trans->add_predecessor(clone_src);
+                } else if (loop_successors.contains(succ)) {
+                    // Exit edge -> insert Break node
+                    auto* brk_block = arena_.create<BasicBlock>(9998);
+                    brk_block->add_instruction(arena_.create<BreakInstr>());
+                    auto* brk_code = arena_.create<CodeNode>(brk_block);
+                    auto* brk_trans = arena_.create<TransitionBlock>(brk_code);
+                    loop_cfg->add_block(brk_trans);
+                    clone_src->add_successor(brk_trans);
+                    brk_trans->add_predecessor(clone_src);
+                } else if (block_map.contains(succ)) {
+                    // Internal edge within the region
+                    auto* clone_dst = block_map[succ];
+                    clone_src->add_successor(clone_dst);
+                    clone_dst->add_predecessor(clone_src);
+                }
+            }
+        }
+
+        // --- Step 5: Restructure the loop body as acyclic ---
+        // The loop sub-CFG is now a DAG (no back edges or exit edges).
+        AcyclicRegionRestructurer acyclic(arena_);
+        acyclic.process(*loop_cfg);
+
+        // The acyclic restructurer collapses everything into the entry
+        // block's AST node.
+        AstNode* loop_body_ast = loop_cfg->entry()->ast_node();
+
+        // --- Step 6: Wrap in WhileLoopNode and refine ---
+        auto* endless_loop = arena_.create<WhileLoopNode>(loop_body_ast);
+        AstNode* refined = LoopStructurer::refine_loop(arena_, endless_loop);
+
+        // Replace the header's AST node with the refined loop
         header->set_ast_node(refined);
+
+        // --- Step 7: Remove other region nodes from the main CFG ---
+        // Redirect edges: all predecessors of the header from outside the
+        // region already point to header. All exit edges from region nodes
+        // should now point from header to the successor.
+        for (auto* succ : loop_successors) {
+            // Remove edges from region nodes to this successor
+            for (auto* node : loop_region) {
+                if (node != header) {
+                    node->remove_successor(succ);
+                    succ->remove_predecessor(node);
+                }
+            }
+            // Add edge from header to successor (if not already present)
+            bool already_linked = false;
+            for (auto* s : header->successors()) {
+                if (s == succ) { already_linked = true; break; }
+            }
+            if (!already_linked) {
+                header->add_successor(succ);
+                succ->add_predecessor(header);
+            }
+        }
+
+        // Remove all non-header region nodes from the main CFG
+        for (auto* node : loop_region) {
+            if (node == header) continue;
+            // Remove all edges involving this node
+            for (auto* s : node->successors()) {
+                s->remove_predecessor(node);
+            }
+            for (auto* p : node->predecessors()) {
+                p->remove_successor(node);
+            }
+            cfg.remove_block(node);
+        }
+
+        // Remove the header's back-edge successors that were back edges
+        header->remove_successor(header); // self-loop if it existed
     }
 }
 
