@@ -27,6 +27,10 @@ private:
     // Operand lifting helpers
     std::vector<Expression*> lift_operands(const ida::instruction::Instruction& insn);
     Expression* lift_operand(const ida::instruction::Operand& op, ida::Address insn_addr);
+
+    // IR construction helpers
+    Assignment* make_binary_assign(OperationType op_type, std::vector<Expression*>& operands, ida::Address addr);
+    Assignment* make_unary_assign(OperationType op_type, std::vector<Expression*>& operands, ida::Address addr);
 };
 
 } // namespace dewolf

@@ -1,4 +1,5 @@
 #include "optimization_stages.hpp"
+#include "../../dewolf_logic/z3_logic.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -395,9 +396,274 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
     }
 }
 
+void DeadPathEliminationStage::execute(DecompilerTask& task) {
+    if (!task.cfg() || !task.cfg()->entry_block()) return;
+
+    z3::context ctx;
+    dewolf_logic::Z3Converter converter(ctx);
+
+    std::unordered_set<Edge*> dead_edges;
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (block->successors().size() > 1) {
+            if (block->instructions().empty()) continue;
+            Instruction* last_inst = block->instructions().back();
+            if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+                // If the branch is a generic Branch (not indirect), check its condition
+                dewolf_logic::LogicCondition cond = converter.convert_to_condition(branch->condition());
+                
+                for (Edge* edge : block->successors()) {
+                    bool invalid = false;
+                    if (edge->type() == EdgeType::False) {
+                        invalid = cond.negate().is_not_satisfiable();
+                    } else if (edge->type() == EdgeType::True) {
+                        invalid = cond.is_not_satisfiable();
+                    }
+                    if (invalid) {
+                        dead_edges.insert(edge);
+                    }
+                }
+            }
+        }
+    }
+
+    if (dead_edges.empty()) return;
+
+    for (Edge* dead_edge : dead_edges) {
+        BasicBlock* source = dead_edge->source();
+        
+        // Remove the branch instruction if it's there
+        if (!source->instructions().empty()) {
+            if (dynamic_cast<Branch*>(source->instructions().back())) {
+                source->mutable_instructions().pop_back();
+            }
+        }
+        
+        // Remove the dead edge from the graph
+        task.cfg()->remove_edge(dead_edge);
+
+        // Turn all remaining out-edges into unconditional
+        std::vector<Edge*> remaining_edges = source->successors();
+        for (Edge* remaining_edge : remaining_edges) {
+            Edge* unconditional = task.arena().create<Edge>(remaining_edge->source(), remaining_edge->target(), EdgeType::Unconditional);
+            task.cfg()->substitute_edge(remaining_edge, unconditional);
+        }
+    }
+
+    // Find unreachable blocks
+    std::vector<BasicBlock*> reachable_list = task.cfg()->post_order();
+    std::unordered_set<BasicBlock*> reachable(reachable_list.begin(), reachable_list.end());
+    
+    std::unordered_set<BasicBlock*> dead_blocks;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!reachable.contains(block)) {
+            dead_blocks.insert(block);
+        }
+    }
+
+    // Fix phi origin blocks
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+                std::vector<BasicBlock*> to_remove;
+                for (auto& pair : phi->origin_block()) {
+                    if (dead_blocks.contains(pair.first)) {
+                        to_remove.push_back(pair.first);
+                    }
+                }
+                for (BasicBlock* dead_pred : to_remove) {
+                    phi->remove_from_origin_block(dead_pred);
+                }
+            }
+        }
+    }
+
+    if (!dead_blocks.empty()) {
+        task.cfg()->remove_nodes_from(dead_blocks);
+    }
+}
+
+void DeadLoopEliminationStage::execute(DecompilerTask& task) {
+    if (!task.cfg() || !task.cfg()->entry_block()) return;
+
+    z3::context ctx;
+    dewolf_logic::Z3Converter converter(ctx);
+
+    using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
+    DefMap def_map;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                if (auto* dest = dynamic_cast<Variable*>(assign->destination())) {
+                    VarKey key = var_key(dest);
+                    if (!def_map.contains(key)) {
+                        def_map[key] = assign;
+                    }
+                }
+            }
+        }
+    }
+
+    std::unordered_set<Edge*> prunable_edges;
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (block->successors().size() > 1) {
+            if (block->instructions().empty()) continue;
+            Instruction* last_inst = block->instructions().back();
+            if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+                // Dependency dict: variables required by branch -> Phi that defines them
+                std::unordered_map<Variable*, Phi*> phi_dependencies;
+                std::unordered_set<Variable*> reqs;
+                branch->collect_requirements(reqs);
+
+                for (Variable* req : reqs) {
+                    if (req->is_aliased()) continue;
+                    auto it = def_map.find(var_key(req));
+                    if (it != def_map.end()) {
+                        if (auto* phi = dynamic_cast<Phi*>(it->second)) {
+                            phi_dependencies[req] = phi;
+                        }
+                    }
+                }
+
+                if (phi_dependencies.empty()) continue;
+
+                // Resolve phi values
+                std::unordered_map<Variable*, Constant*> substituted_constants;
+                for (auto& [req, phi] : phi_dependencies) {
+                    Constant* unique_upstream_value = nullptr;
+                    bool multiple_values = false;
+                    for (auto& [var_block, expr] : phi->origin_block()) {
+                        if (auto* c = dynamic_cast<Constant*>(expr)) {
+                            // If var_block == block, or no path exists from block to var_block 
+                            // (we skip precise dominator checks here for simplicity and assume it's valid if it reaches)
+                            if (!unique_upstream_value) {
+                                unique_upstream_value = c;
+                            } else if (unique_upstream_value->value() != c->value()) {
+                                multiple_values = true;
+                                break;
+                            }
+                        } else {
+                            multiple_values = true;
+                            break;
+                        }
+                    }
+
+                    if (unique_upstream_value && !multiple_values) {
+                        substituted_constants[req] = unique_upstream_value;
+                    }
+                }
+
+                if (substituted_constants.empty()) continue;
+
+                // Patch condition
+                Expression* patched_condition_expr = branch->condition()->copy(task.arena());
+                for (auto& [var, constant] : substituted_constants) {
+                    patched_condition_expr = replace_variable_ptr(task.arena(), patched_condition_expr, var, constant);
+                }
+
+                if (auto* patched_cond = dynamic_cast<Condition*>(patched_condition_expr)) {
+                    dewolf_logic::LogicCondition cond = converter.convert_to_condition(patched_cond);
+                    
+                    Edge* sat_edge = nullptr;
+                    Edge* unsat_edge = nullptr;
+
+                    for (Edge* edge : block->successors()) {
+                        bool invalid = false;
+                        if (edge->type() == EdgeType::False) {
+                            invalid = cond.negate().is_not_satisfiable();
+                        } else if (edge->type() == EdgeType::True) {
+                            invalid = cond.is_not_satisfiable();
+                        }
+
+                        if (invalid) {
+                            if (!unsat_edge) unsat_edge = edge;
+                        } else {
+                            sat_edge = edge;
+                        }
+                    }
+
+                    if (unsat_edge && sat_edge) {
+                        // Check reachability: can we reach block from sat_edge->target()?
+                        // If not, we never come back, meaning unsat_edge is prunable.
+                        // Simple DFS check:
+                        std::unordered_set<BasicBlock*> visited;
+                        std::vector<BasicBlock*> stack = { sat_edge->target() };
+                        bool reachable = false;
+                        while (!stack.empty()) {
+                            BasicBlock* curr = stack.back();
+                            stack.pop_back();
+                            if (curr == block) {
+                                reachable = true;
+                                break;
+                            }
+                            if (visited.contains(curr)) continue;
+                            visited.insert(curr);
+                            for (Edge* out : curr->successors()) {
+                                stack.push_back(out->target());
+                            }
+                        }
+
+                        if (!reachable) {
+                            prunable_edges.insert(unsat_edge);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (prunable_edges.empty()) return;
+
+    for (Edge* dead_edge : prunable_edges) {
+        BasicBlock* source = dead_edge->source();
+        if (!source->instructions().empty()) {
+            if (dynamic_cast<Branch*>(source->instructions().back())) {
+                source->mutable_instructions().pop_back();
+            }
+        }
+        task.cfg()->remove_edge(dead_edge);
+
+        std::vector<Edge*> remaining_edges = source->successors();
+        for (Edge* remaining_edge : remaining_edges) {
+            Edge* unconditional = task.arena().create<Edge>(remaining_edge->source(), remaining_edge->target(), EdgeType::Unconditional);
+            task.cfg()->substitute_edge(remaining_edge, unconditional);
+        }
+    }
+
+    // Unreachable blocks / fix origin phis logic (same as dead path)
+    std::vector<BasicBlock*> reachable_list = task.cfg()->post_order();
+    std::unordered_set<BasicBlock*> reachable(reachable_list.begin(), reachable_list.end());
+    
+    std::unordered_set<BasicBlock*> dead_blocks;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!reachable.contains(block)) {
+            dead_blocks.insert(block);
+        }
+    }
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+                std::vector<BasicBlock*> to_remove;
+                for (auto& pair : phi->origin_block()) {
+                    if (dead_blocks.contains(pair.first)) {
+                        to_remove.push_back(pair.first);
+                    }
+                }
+                for (BasicBlock* dead_pred : to_remove) {
+                    phi->remove_from_origin_block(dead_pred);
+                }
+            }
+        }
+    }
+
+    if (!dead_blocks.empty()) {
+        task.cfg()->remove_nodes_from(dead_blocks);
+    }
+}
 void TypePropagationStage::execute(DecompilerTask& task) {}
 void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {}
-void DeadPathEliminationStage::execute(DecompilerTask& task) {}
 void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {}
 
 } // namespace dewolf

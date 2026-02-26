@@ -47,6 +47,20 @@ public:
         return solver.check() == z3::unsat;
     }
 
+    bool is_satisfiable() const {
+        z3::solver solver(expr_.ctx());
+        solver.add(expr_);
+        return solver.check() == z3::sat;
+    }
+
+    bool is_not_satisfiable() const {
+        return !is_satisfiable();
+    }
+
+    LogicCondition negate() const {
+        return LogicCondition(!expr_);
+    }
+
 private:
     z3::expr expr_;
 };

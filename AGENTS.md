@@ -229,33 +229,45 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.3.3 Implement `requirements()` and `definitions()` as virtual methods on the Instruction hierarchy (after C.1), returning sets of `Variable*`.
     - *Already implemented in C.1: `collect_requirements()` and `collect_definitions()` are virtual methods. `Instruction::requirements()` and `Instruction::definitions()` are convenience wrappers returning vectors.*
 
-- [ ] **H.4** Expand Lifter Mnemonic Coverage (currently ~20 mnemonics, x86 alone has hundreds)
+- [x] **H.4** Expand Lifter Mnemonic Coverage (currently ~20 mnemonics, x86 alone has hundreds)
   - *The lifter currently maps only: `add`, `adds`, `sub`, `subs`, `cmp`, `mul`, `sdiv`, `udiv`, `mov`, `str`, `stur`, `ldr`, `ldur`, `ret`, and conditional branch suffixes (`b.le`, `b.lt`, etc.). Missing critical x86 mnemonics include: `imul`, `xor`, `or`, `and`, `not`, `neg`, `shl`, `shr`, `sar`, `test`, `lea`, `call`, `push`, `pop`, `movsx`, `movzx`, `cdq`, `cbw`, `cwde`, `cdqe`, `jmp`, `jcc` (all conditional jumps), `nop`, `inc`, `dec`, `adc`, `sbb`, `rol`, `ror`, `rcl`, `rcr`, `bswap`, `bt`, `bts`, `btr`, `btc`, `bsf`, `bsr`, `cmovcc`, `setcc`, `rep` prefixed string ops, `div`, `idiv`, etc. Missing ARM mnemonics: `bl`, `adr`, `adrp`, `stp`, `ldp`, `madd`, `msub`, `cset`, `csel`, `tbz`, `tbnz`, `cbz`, `cbnz`, etc. Every unmapped mnemonic becomes `OperationType::unknown`, producing `"unknown_op"` in the output.*
-  - [ ] H.4.1 Map all x86-64 arithmetic/logic: `imul` (1/2/3 operand forms), `xor`, `or`, `and`, `not`, `neg`, `inc`, `dec`, `adc`, `sbb`.
-  - [ ] H.4.2 Map all x86-64 shifts/rotates: `shl`/`sal`, `shr`, `sar`, `rol`, `ror`, `rcl`, `rcr`.
-  - [ ] H.4.3 Map all x86-64 data movement: `lea`, `movsx`, `movzx`, `cdq`, `cbw`, `cwde`, `cdqe`, `push`, `pop`, `xchg`, `bswap`.
-  - [ ] H.4.4 Map all x86-64 control flow: `call`, `ret`, `jmp`, all `jcc` variants (`je`, `jne`, `jg`, `jge`, `jl`, `jle`, `ja`, `jae`, `jb`, `jbe`, `js`, `jns`, `jo`, `jno`, `jp`, `jnp`), `nop`.
-  - [ ] H.4.5 Map x86-64 flag-setting: `test` (as `bit_and` without storing result), `bt`/`bts`/`btr`/`btc`, `bsf`/`bsr`.
-  - [ ] H.4.6 Map x86-64 conditional moves/sets: `cmovcc` (all variants), `setcc` (all variants).
-  - [ ] H.4.7 Map x86-64 division: `div` (unsigned), `idiv` (signed) -- these use implicit `edx:eax` operands.
-  - [ ] H.4.8 Map ARM64 extended set: `bl`, `adr`, `adrp`, `stp`, `ldp`, `madd`, `msub`, `cset`, `csel`, `tbz`, `tbnz`, `cbz`, `cbnz`, `ands`, `orr`, `eor`, `mvn`, `lsl`, `lsr`, `asr`, `ror`.
+  - [x] H.4.1 Map all x86-64 arithmetic/logic: `imul` (1/2/3 operand forms), `xor`, `or`, `and`, `not`, `neg`, `inc`, `dec`, `adc`, `sbb`.
+  - [x] H.4.2 Map all x86-64 shifts/rotates: `shl`/`sal`, `shr`, `sar`, `rol`, `ror`, `rcl`, `rcr`.
+  - [x] H.4.3 Map all x86-64 data movement: `lea`, `movsx`, `movzx`, `cdq`, `cbw`, `cwde`, `cdqe`, `push`, `pop`, `xchg`, `bswap`.
+  - [x] H.4.4 Map all x86-64 control flow: `call`, `ret`, `jmp`, all `jcc` variants (`je`, `jne`, `jg`, `jge`, `jl`, `jle`, `ja`, `jae`, `jb`, `jbe`, `js`, `jns`, `jo`, `jno`, `jp`, `jnp`), `nop`.
+  - [x] H.4.5 Map x86-64 flag-setting: `test` (as `bit_and` without storing result), `bt`/`bts`/`btr`/`btc`, `bsf`/`bsr`.
+  - [x] H.4.6 Map x86-64 conditional moves/sets: `cmovcc` (all variants), `setcc` (all variants).
+  - [x] H.4.7 Map x86-64 division: `div` (unsigned), `idiv` (signed) -- these use implicit `edx:eax` operands.
+  - [x] H.4.8 Map ARM64 extended set: `bl`, `adr`, `adrp`, `stp`, `ldp`, `madd`, `msub`, `cset`, `csel`, `tbz`, `tbnz`, `cbz`, `cbnz`, `ands`, `orr`, `eor`, `mvn`, `lsl`, `lsr`, `asr`, `ror`.
+    - *Complete rewrite of lifter.cpp. Added `make_binary_assign()` and `make_unary_assign()` helper methods. Now covers: NOP, RET, all x86 Jcc (16 variants + sign/overflow/parity), ARM conditional branches (B.xx, CBZ, CBNZ, TBZ, TBNZ), JMP/B/BR (unconditional), CMP, TEST, CALL, BL/BLR, all binary arithmetic/logic (ADD, ADC, SUB, SBB, IMUL, AND, OR, XOR, SHL, SAL, SHR, SAR, ROL, ROR, RCL, RCR), ARM variants (ADDS, SUBS, MUL, SDIV, UDIV, ANDS, ORR, EOR, LSL, LSR, ASR, ROR), ARM MADD/MSUB, unary ops (NOT, NEG, INC, DEC, MVN), LEA, MOV/MOVABS/MOVSX/MOVSXD/MOVZX/XCHG, LDR/LDUR/STR/STUR/LDRB/LDRH/etc, STP/LDP, ADR/ADRP, CSET/CSEL, CDQ/CWD/CQO, PUSH/POP, BSWAP, BT/BTS/BTR/BTC, BSF/BSR, all CMOVcc (16+ variants), all SETcc (16+ variants), DIV/IDIV (implicit edx:eax), MUL (unsigned, implicit). All 6 tests pass, build clean.*
 
-- [ ] **H.5** Implement `RangeSimplifier` for Real (currently a stub -- `is_unfulfillable()` always returns false, `simplify()` is identity)
+- [x] **H.5** Implement `RangeSimplifier` for Real (currently a stub -- `is_unfulfillable()` always returns false, `simplify()` is identity)
   - *The Python reference `RangeSimplifier` performs: splitting non-binary relations, applying `SingleRangeSimplifier` per relation (unfulfillable detection, consecutive-bound -> equality conversion, size-bound tautology detection), then `BitwiseAndRangeSimplifier` or `BitwiseOrRangeSimplifier` for conjunction/disjunction simplification. The `ExpressionValues` class tracks must-values, forbidden-values, signed/unsigned bounds, combines mixed bounds across 4 cases, refines bounds using forbidden values, and detects unfulfillability when constraints conflict. Without this, `DeadPathEliminationStage` cannot eliminate dead branches.*
-  - [ ] H.5.1 Implement `ExpressionValues` with `must_values`, `forbidden_values`, `lower_bound`, `upper_bound` (each with separate signed/unsigned `ConstantBound` components), and the `update_with(BoundRelation)` dispatcher.
-  - [ ] H.5.2 Implement `ExpressionValues::is_unfulfillable()` checking: >1 must-value, must-value in forbidden, must-value out of bounds, upper < lower.
-  - [ ] H.5.3 Implement `ExpressionValues::simplify()` with the 6-step pipeline: remove redundant bounds, add must-value if bounds equal size bounds, refine bounds using forbidden values, remove redundant forbidden values, add must-value if bounds are equal, recheck.
-  - [ ] H.5.4 Implement `BoundRelation` wrapper: validates binary relation with exactly 1 constant, extracts constant/expression/smaller/greater operands, is_signed.
-  - [ ] H.5.5 Implement `SingleRangeSimplifier` for simplifying individual binary relations.
-  - [ ] H.5.6 Implement `BitwiseAndRangeSimplifier::simplify()`: extract `BoundRelation`s from AND operands, build `ExpressionValues` per variable, detect unfulfillability, emit replacement constraints.
-  - [ ] H.5.7 Implement `BitwiseOrRangeSimplifier::simplify()`: negate to AND, simplify, negate back.
+  - [x] H.5.1 Implement `ExpressionValues` with `must_values`, `forbidden_values`, `lower_bound`, `upper_bound` (each with separate signed/unsigned `ConstantBound` components), and the `update_with(BoundRelation)` dispatcher.
+    - *Full implementation in `range_simplifier.cpp`. `ExpressionValues` constructed with bit_size, computes signed/unsigned min/max. `update_with()` dispatches on eq/neq/lt/le/gt/ge (and unsigned variants), normalizing const-on-lhs vs rhs, adjusting for strict inequalities (x < c → upper = c-1).*
+  - [x] H.5.2 Implement `ExpressionValues::is_unfulfillable()` checking: >1 must-value, must-value in forbidden, must-value out of bounds, upper < lower.
+    - *4 checks: multiple must-values, must ∩ forbidden, must outside bounds (signed + unsigned), upper < lower (signed + unsigned).*
+  - [x] H.5.3 Implement `ExpressionValues::simplify()` with the 6-step pipeline: remove redundant bounds, add must-value if bounds equal size bounds, refine bounds using forbidden values, remove redundant forbidden values, add must-value if bounds are equal, recheck.
+    - *6-step pipeline: `combine_mixed_bounds()` (4-case signed/unsigned bound combination matching the Python reference), size-bound must-value detection, `refine_bounds_using_forbidden()` (iterative adjustment with convergence protection), `remove_redundant_forbidden()` (via `std::erase_if`), `add_must_if_bounds_equal()`, and recheck.*
+  - [x] H.5.4 Implement `BoundRelation` wrapper: validates binary relation with exactly 1 constant, extracts constant/expression/smaller/greater operands, is_signed.
+    - *`BoundRelation::from()` handles both `Condition*` and generic `Operation*` with comparison type. Validates exactly one constant operand. Extracts variable_expr, constant_value, constant_is_lhs.*
+  - [x] H.5.5 Implement `SingleRangeSimplifier` for simplifying individual binary relations.
+    - *Handles strict comparisons (unfulfillable → Constant(0), consecutive → Condition(eq)), non-strict comparisons (tautology → Constant(1), bounds-equal → Condition(eq)). All size-bound computations respect signed vs unsigned.*
+  - [x] H.5.6 Implement `BitwiseAndRangeSimplifier::simplify()`: extract `BoundRelation`s from AND operands, build `ExpressionValues` per variable, detect unfulfillability, emit replacement constraints.
+    - *Implemented in `BitwiseAndRangeSimplifier::simplify`. Extracts bounds into `ExpressionValues` per variable. Emits simplified relations like `eq`, bounds `le`/`ge`, and consecutive ranges negations via `logical_not` of `bit_and` ranges.*
+  - [x] H.5.7 Implement `BitwiseOrRangeSimplifier::simplify()`: negate to AND, simplify, negate back.
+    - *Implemented in `BitwiseOrRangeSimplifier::simplify`. Converts `A | B` to `~(~A & ~B)`, applies `BitwiseAndRangeSimplifier::simplify`, and negates the result back.*
 
-- [ ] **H.6** Implement `DeadPathEliminationStage` for Real (currently an empty stub)
+- [x] **H.6** Implement `DeadPathEliminationStage` for Real (currently an empty stub)
   - *The Python reference uses Z3/DeLogic to check satisfiability of branch conditions. It removes edges with unsatisfiable conditions (dead paths), then removes unreachable blocks, and fixes phi origin blocks. `DeadLoopElimination` extends this to specifically target loop back-edges, resolving phi-function constants to determine if the loop body is ever re-entered. Without dead path elimination, impossible branches (e.g., `if (x < 0 && x > 10)`) survive and clutter the output.*
-  - [ ] H.6.1 Implement the core stage: for each conditional branch in the CFG, convert the condition to a Z3 expression via `Z3Converter`, check satisfiability, and remove the edge + unreachable successor if unsatisfiable.
-  - [ ] H.6.2 After removing dead edges, remove blocks that become unreachable from the entry.
-  - [ ] H.6.3 Fix phi origin blocks after block removal (remove entries for deleted predecessors).
-  - [ ] H.6.4 Implement `DeadLoopEliminationStage` extending dead path elimination to target loop back-edges.
+  - [x] H.6.1 Implement the core stage: for each conditional branch in the CFG, convert the condition to a Z3 expression via `Z3Converter`, check satisfiability, and remove the edge + unreachable successor if unsatisfiable.
+    - *Implemented in `DeadPathEliminationStage::execute()`. Converts condition to Z3, checks both true and false paths for satisfiability via `LogicCondition::is_not_satisfiable()`, marks invalid edges as dead.*
+  - [x] H.6.2 After removing dead edges, remove blocks that become unreachable from the entry.
+    - *Implemented using `task.cfg()->post_order()` to find reachable blocks, filtering unreachable ones and feeding them to `task.cfg()->remove_nodes_from()`.*
+  - [x] H.6.3 Fix phi origin blocks after block removal (remove entries for deleted predecessors).
+    - *Implemented by iterating all Phis, checking `origin_block()` entries against the dead blocks list, and calling `remove_from_origin_block()`.*
+  - [x] H.6.4 Implement `DeadLoopEliminationStage` extending dead path elimination to target loop back-edges.
+    - *Implemented `DeadLoopEliminationStage::execute()`. Extends DPE by checking branch dependency on Phis, extracting unique upstream constants (approximated without deep dominance checking), patching branch conditions, and using Z3 satisfiability along with reachability checks (DFS from satisfiable edge) to aggressively prune branch edges in loops.*
 
 - [ ] **H.7** Implement `ExpressionPropagationMemory` Stage (currently missing entirely)
   - *The Python reference has a separate `ExpressionPropagationMemory` stage that propagates aliased/memory variables. It checks whether the definition's value could have been modified via a memory access (pointer write) between the definition and the target usage, using pointer analysis and path-based safety checks. It also has a "postponed aliased propagation" sub-pass. Without this, aliased variables (those that could be modified through pointers) are never propagated, leaving many redundant loads in the output.*

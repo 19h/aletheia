@@ -11,6 +11,9 @@
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
 
 #include "../src/dewolf/pipeline/pipeline.hpp"
+#include "../src/dewolf_logic/range_simplifier.hpp"
+
+
 
 #define ASSERT_TRUE(cond) if (!(cond)) { \
     std::cerr << "FAIL: " << #cond << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
@@ -427,6 +430,132 @@ void test_type_system() {
     std::cout << "[+] test_type_system passed.\n";
 }
 
+void test_range_simplifier() {
+    using namespace dewolf_logic;
+    DecompilerArena arena;
+
+    // --- Test 1: Contradictory must-values are unfulfillable ---
+    {
+        ExpressionValues ev(32);
+        ev.update_with(OperationType::eq, 5, false);  // x == 5
+        ev.update_with(OperationType::eq, 10, false); // x == 10
+        ASSERT_TRUE(ev.is_unfulfillable());
+    }
+
+    // --- Test 2: Must-value in forbidden set is unfulfillable ---
+    {
+        ExpressionValues ev(32);
+        ev.update_with(OperationType::eq, 5, false);  // x == 5
+        ev.update_with(OperationType::neq, 5, false); // x != 5
+        ASSERT_TRUE(ev.is_unfulfillable());
+    }
+
+    // --- Test 3: Upper < lower is unfulfillable ---
+    {
+        ExpressionValues ev(32);
+        // x <= 3 AND x >= 10  => unfulfillable
+        ev.update_with(OperationType::le, 3, false);   // x <= 3
+        ev.update_with(OperationType::ge, 10, false);  // x >= 10
+        ASSERT_TRUE(ev.is_unfulfillable());
+    }
+
+    // --- Test 4: Compatible constraints are NOT unfulfillable ---
+    {
+        ExpressionValues ev(32);
+        ev.update_with(OperationType::le, 100, false);  // x <= 100
+        ev.update_with(OperationType::ge, 0, false);    // x >= 0
+        ASSERT_TRUE(!ev.is_unfulfillable());
+    }
+
+    // --- Test 5: Simplify adds must-value when lower == upper ---
+    {
+        ExpressionValues ev(32);
+        ev.update_with(OperationType::le, 5, false);  // x <= 5
+        ev.update_with(OperationType::ge, 5, false);  // x >= 5
+        ev.simplify();
+        ASSERT_TRUE(!ev.must_values().empty());
+        ASSERT_TRUE(ev.must_values().count(5));
+    }
+
+    // --- Test 6: BoundRelation::from() extracts from a Condition ---
+    {
+        auto* var = arena.create<Variable>("eax", 4);
+        auto* c10 = arena.create<Constant>(10, 4);
+        auto* cond = arena.create<Condition>(OperationType::lt, var, c10, 1);
+        auto br = BoundRelation::from(cond);
+        ASSERT_TRUE(br.has_value());
+        ASSERT_EQ(br->op, OperationType::lt);
+        ASSERT_EQ(br->constant_value, 10);
+        ASSERT_TRUE(!br->constant_is_lhs);
+        ASSERT_EQ(br->variable_expr, var);
+    }
+
+    // --- Test 7: BoundRelation::from() rejects two-variable expressions ---
+    {
+        auto* v1 = arena.create<Variable>("eax", 4);
+        auto* v2 = arena.create<Variable>("ebx", 4);
+        auto* cond = arena.create<Condition>(OperationType::lt, v1, v2, 1);
+        auto br = BoundRelation::from(cond);
+        ASSERT_TRUE(!br.has_value());
+    }
+
+    // --- Test 8: SingleRangeSimplifier detects tautology ---
+    {
+        auto* var = arena.create<Variable>("eax", 4);
+        // x <= 2147483647 (INT32_MAX) for signed 32-bit => always true
+        auto* max_c = arena.create<Constant>(2147483647ULL, 4);
+        auto* cond = arena.create<Condition>(OperationType::le, var, max_c, 1);
+        auto* result = SingleRangeSimplifier::simplify(cond, arena);
+        ASSERT_TRUE(result != nullptr);
+        auto* c = dynamic_cast<Constant*>(result);
+        ASSERT_TRUE(c != nullptr);
+        ASSERT_EQ(c->value(), 1ULL); // true
+    }
+
+    // --- Test 9: SingleRangeSimplifier detects unfulfillable strict ---
+    {
+        auto* var = arena.create<Variable>("eax", 4);
+        // INT32_MAX < x for signed 32-bit => false (nothing > MAX)
+        auto* max_c = arena.create<Constant>(2147483647ULL, 4);
+        auto* cond = arena.create<Condition>(OperationType::lt, max_c, var, 1);
+        auto* result = SingleRangeSimplifier::simplify(cond, arena);
+        ASSERT_TRUE(result != nullptr);
+        auto* c = dynamic_cast<Constant*>(result);
+        ASSERT_TRUE(c != nullptr);
+        ASSERT_EQ(c->value(), 0ULL); // false
+    }
+
+    // --- Test 10: RangeSimplifier::is_unfulfillable on AND of contradicting ---
+    {
+        auto* var = arena.create<Variable>("eax", 4);
+        auto* c3 = arena.create<Constant>(3, 4);
+        auto* c10 = arena.create<Constant>(10, 4);
+        auto* le3 = arena.create<Condition>(OperationType::le, var, c3, 1);
+        auto* ge10 = arena.create<Condition>(OperationType::ge, var, c10, 1);
+        auto* and_op = arena.create<Operation>(OperationType::logical_and,
+            std::vector<Expression*>{le3, ge10}, 1);
+
+        RangeSimplifier rs;
+        ASSERT_TRUE(rs.is_unfulfillable(and_op));
+    }
+
+    // --- Test 11: RangeSimplifier::is_unfulfillable returns false for satisfiable ---
+    {
+        auto* var = arena.create<Variable>("eax", 4);
+        auto* c3 = arena.create<Constant>(3, 4);
+        auto* c10 = arena.create<Constant>(10, 4);
+        auto* ge3 = arena.create<Condition>(OperationType::ge, var, c3, 1);
+        auto* le10 = arena.create<Condition>(OperationType::le, var, c10, 1);
+        auto* and_op = arena.create<Operation>(OperationType::logical_and,
+            std::vector<Expression*>{ge3, le10}, 1);
+
+        RangeSimplifier rs;
+        ASSERT_TRUE(!rs.is_unfulfillable(and_op));
+    }
+
+    std::cout << "[+] test_range_simplifier passed.\n";
+}
+
 int main() {
     std::cout << "Running DeWolf tests...\n";
     test_arena();
@@ -435,6 +564,7 @@ int main() {
     test_instruction_hierarchy();
     test_type_system();
     test_loop_structurer();
+    test_range_simplifier();
     std::cout << "All tests passed successfully.\n";
     return 0;
 }

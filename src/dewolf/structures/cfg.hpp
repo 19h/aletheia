@@ -70,6 +70,23 @@ public:
     void add_predecessor(Edge* edge) { predecessors_.push_back(edge); }
     void add_successor(Edge* edge) { successors_.push_back(edge); }
 
+    void remove_predecessor(Edge* edge) {
+        std::erase(predecessors_, edge);
+    }
+
+    void remove_successor(Edge* edge) {
+        std::erase(successors_, edge);
+    }
+
+    void substitute_successor(Edge* old_edge, Edge* new_edge) {
+        for (auto& edge : successors_) {
+            if (edge == old_edge) {
+                edge = new_edge;
+                break;
+            }
+        }
+    }
+
     const std::vector<Edge*>& predecessors() const { return predecessors_; }
     const std::vector<Edge*>& successors() const { return successors_; }
 
@@ -89,6 +106,11 @@ public:
 
     void add_block(BasicBlock* block) { blocks_.push_back(block); }
     const std::vector<BasicBlock*>& blocks() const { return blocks_; }
+    std::vector<BasicBlock*>& mutable_blocks() { return blocks_; }
+
+    void remove_edge(Edge* edge);
+    void substitute_edge(Edge* old_edge, Edge* new_edge);
+    void remove_nodes_from(const std::unordered_set<BasicBlock*>& dead_blocks);
 
     // Traversals
     std::vector<BasicBlock*> post_order() const;
