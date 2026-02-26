@@ -269,38 +269,110 @@ static void remove_redundant_phis(ControlFlowGraph* cfg, DecompilerArena& arena)
 }
 
 // =============================================================================
-// ExpressionPropagationStage -- Inter-block iterative fixed-point
+// Dangerous Memory Check Helpers
 // =============================================================================
 
-void ExpressionPropagationStage::execute(DecompilerTask& task) {
+static bool is_dangerous_memory_instruction(Instruction* inst) {
+    if (dynamic_cast<Relation*>(inst)) return true;
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        if (contains_dereference(assign->destination())) return true;
+        if (auto* op = dynamic_cast<Operation*>(assign->value())) {
+            if (op->type() == OperationType::call) return true;
+        }
+        if (dynamic_cast<Call*>(assign->value())) return true;
+    }
+    return false;
+}
+
+struct InstLocation {
+    BasicBlock* block;
+    std::size_t index;
+};
+
+// =============================================================================
+// ExpressionPropagation Common Logic
+// =============================================================================
+
+static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
     if (!task.cfg()) return;
+
+    // Cache reachability matrix if memory mode
+    std::unordered_map<BasicBlock*, std::unordered_set<BasicBlock*>> reachability;
+    if (is_memory) {
+        for (BasicBlock* b : task.cfg()->blocks()) {
+            std::vector<BasicBlock*> stack = {b};
+            while (!stack.empty()) {
+                BasicBlock* curr = stack.back();
+                stack.pop_back();
+                for (Edge* e : curr->successors()) {
+                    if (reachability[b].insert(e->target()).second) {
+                        stack.push_back(e->target());
+                    }
+                }
+            }
+        }
+    }
+
+    auto has_path = [&](BasicBlock* source, BasicBlock* sink) {
+        if (source == sink) return true;
+        return reachability[source].contains(sink);
+    };
 
     // Fixed-point outer loop
     for (int iteration = 0; iteration < 100; ++iteration) {
         // Step 1: Remove redundant phis before each iteration
         remove_redundant_phis(task.cfg(), task.arena());
 
+        std::unordered_map<Instruction*, InstLocation> loc_map;
+        std::vector<Instruction*> dangerous_uses;
+
         // Step 2: Build DefMap globally (Variable -> Assignment*)
-        // In SSA form, each variable has exactly one definition.
         using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
         DefMap def_map;
 
         for (BasicBlock* block : task.cfg()->blocks()) {
-            for (Instruction* inst : block->instructions()) {
+            for (std::size_t i = 0; i < block->instructions().size(); ++i) {
+                Instruction* inst = block->instructions()[i];
+                loc_map[inst] = {block, i};
+                if (is_memory && is_dangerous_memory_instruction(inst)) {
+                    dangerous_uses.push_back(inst);
+                }
+
                 auto* assign = dynamic_cast<Assignment*>(inst);
                 if (!assign) continue;
-                // Phi is a subclass of Assignment, so this handles both
                 if (auto* dest = dynamic_cast<Variable*>(assign->destination())) {
                     VarKey key = var_key(dest);
-                    // In valid SSA, each variable is defined once.
-                    // If we see a duplicate, keep the first (the later one may be
-                    // from a previous propagation round creating a new assignment).
                     if (!def_map.contains(key)) {
                         def_map[key] = assign;
                     }
                 }
             }
         }
+
+        auto has_any_dangerous_use = [&](Instruction* def, Instruction* target) {
+            auto def_loc = loc_map[def];
+            auto target_loc = loc_map[target];
+            
+            for (Instruction* use : dangerous_uses) {
+                auto use_loc = loc_map[use];
+                if (def_loc.block == target_loc.block) {
+                    if (use_loc.block == def_loc.block && use_loc.index > def_loc.index && use_loc.index < target_loc.index) {
+                        return true;
+                    }
+                } else {
+                    if (use_loc.block == target_loc.block) {
+                        if (use_loc.index < target_loc.index && has_path(def_loc.block, use_loc.block)) return true;
+                    } else if (use_loc.block == def_loc.block) {
+                        if (use_loc.index > def_loc.index && has_path(use_loc.block, target_loc.block)) return true;
+                    } else {
+                        if (has_path(def_loc.block, use_loc.block) && has_path(use_loc.block, target_loc.block)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        };
 
         // Step 3: Iterate blocks in RPO and propagate definitions
         bool any_change = false;
@@ -326,7 +398,33 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
                     if (static_cast<Instruction*>(def) == inst) continue;
 
                     // Apply rule checks
-                    if (!definition_can_be_propagated(def, inst)) continue;
+                    bool allowed = true;
+                    if (dynamic_cast<Phi*>(def)) allowed = false;
+                    else if (auto* val = dynamic_cast<Operation*>(def->value())) {
+                        if (val->type() == OperationType::call) allowed = false;
+                    } else if (dynamic_cast<Call*>(def->value())) {
+                        allowed = false;
+                    }
+                    if (allowed && is_address_of(def->value())) allowed = false;
+                    if (allowed && dynamic_cast<Phi*>(inst) && dynamic_cast<Operation*>(def->value())) allowed = false;
+
+                    if (!allowed) continue;
+
+                    if (!is_memory) {
+                        if (contains_aliased_variable(def->destination()) ||
+                            contains_aliased_variable(def->value())) continue;
+                        if (contains_dereference(def->value())) continue;
+                    } else {
+                        // Memory mode specific rules:
+                        // We ONLY want to path-check if it actually contains an aliased var or deref
+                        // Actually, if it DOESN'T contain aliased/deref, we don't need the dangerous use check
+                        if (contains_aliased_variable(def->destination()) ||
+                            contains_aliased_variable(def->value()) ||
+                            contains_dereference(def->value())) {
+                            
+                            if (has_any_dangerous_use(def, inst)) continue;
+                        }
+                    }
 
                     Expression* replacement = def->value();
                     if (!replacement) continue;
@@ -394,6 +492,18 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
         // Fixed-point: stop if no changes occurred in this iteration
         if (!any_change) break;
     }
+}
+
+// =============================================================================
+// ExpressionPropagationStage
+// =============================================================================
+
+void ExpressionPropagationStage::execute(DecompilerTask& task) {
+    expression_propagation_impl(task, false);
+}
+
+void ExpressionPropagationMemoryStage::execute(DecompilerTask& task) {
+    expression_propagation_impl(task, true);
 }
 
 void DeadPathEliminationStage::execute(DecompilerTask& task) {
@@ -662,6 +772,163 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
         task.cfg()->remove_nodes_from(dead_blocks);
     }
 }
+void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+
+    // Fixed-point loop for function call propagation
+    bool changed = true;
+    while (changed) {
+        changed = false;
+
+        using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
+        DefMap def_map;
+        
+        using UseSet = std::unordered_set<Instruction*>;
+        std::unordered_map<VarKey, UseSet, VarKeyHash> use_map;
+
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            for (Instruction* inst : block->instructions()) {
+                if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                    if (auto* dest = dynamic_cast<Variable*>(assign->destination())) {
+                        VarKey key = var_key(dest);
+                        if (!def_map.contains(key)) def_map[key] = assign;
+                    }
+                }
+                std::unordered_set<Variable*> reqs;
+                inst->collect_requirements(reqs);
+                for (Variable* req : reqs) {
+                    use_map[var_key(req)].insert(inst);
+                }
+            }
+        }
+
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            auto& instrs = block->mutable_instructions();
+            for (std::size_t i = 0; i < instrs.size(); ++i) {
+                Instruction* inst = instrs[i];
+                std::unordered_set<Variable*> reqs;
+                inst->collect_requirements(reqs);
+                
+                for (Variable* req_var : reqs) {
+                    VarKey key = var_key(req_var);
+                    auto it_def = def_map.find(key);
+                    if (it_def == def_map.end()) continue;
+                    Assignment* def = it_def->second;
+
+                    // We only propagate call assignments
+                    bool is_call = false;
+                    if (auto* op = dynamic_cast<Operation*>(def->value())) {
+                        if (op->type() == OperationType::call) is_call = true;
+                    } else if (dynamic_cast<Call*>(def->value())) {
+                        is_call = true;
+                    }
+
+                    if (!is_call) continue;
+
+                    // It must be used exactly once
+                    if (use_map[key].size() != 1) continue;
+
+                    // Path-based memory safety (conservative):
+                    // A call modifies/reads memory, so no dangerous memory instruction
+                    // between the call and its single use.
+                    // To keep it simple in this pass, we just verify it's the exact same block
+                    // and no dangerous uses between them.
+                    bool safe = true;
+                    BasicBlock* use_block = nullptr;
+                    std::size_t use_idx = 0;
+                    for (BasicBlock* ub : task.cfg()->blocks()) {
+                        for (std::size_t ui = 0; ui < ub->instructions().size(); ++ui) {
+                            if (ub->instructions()[ui] == inst) {
+                                use_block = ub;
+                                use_idx = ui;
+                                break;
+                            }
+                        }
+                    }
+
+                    BasicBlock* def_block = nullptr;
+                    std::size_t def_idx = 0;
+                    for (BasicBlock* db : task.cfg()->blocks()) {
+                        for (std::size_t di = 0; db->instructions().size() > di; ++di) {
+                            if (db->instructions()[di] == def) {
+                                def_block = db;
+                                def_idx = di;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Strict safety: same block, def_idx < use_idx, and no dangerous calls/relations in between
+                    if (def_block != use_block || def_idx >= use_idx) {
+                        // Complex cross-block tracking skipped for now; assume unsafe
+                        safe = false;
+                    } else {
+                        for (std::size_t idx = def_idx + 1; idx < use_idx; ++idx) {
+                            if (is_dangerous_memory_instruction(use_block->instructions()[idx])) {
+                                safe = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!safe) continue;
+
+                    // Perform substitution
+                    Expression* replacement = def->value();
+                    bool sub_changed = false;
+
+                    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                        Expression* new_val = replace_variable_ptr(task.arena(), assign->value(), req_var, replacement);
+                        if (new_val != assign->value()) {
+                            assign->set_value(new_val);
+                            sub_changed = true;
+                        }
+                        if (!dynamic_cast<Variable*>(assign->destination())) {
+                            Expression* new_dest = replace_variable_ptr(task.arena(), assign->destination(), req_var, replacement);
+                            if (new_dest != assign->destination()) {
+                                assign->set_destination(new_dest);
+                                sub_changed = true;
+                            }
+                        }
+                    } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                        Condition* cond = branch->condition();
+                        Expression* new_lhs = replace_variable_ptr(task.arena(), cond->lhs(), req_var, replacement);
+                        Expression* new_rhs = replace_variable_ptr(task.arena(), cond->rhs(), req_var, replacement);
+                        if (new_lhs != cond->lhs() || new_rhs != cond->rhs()) {
+                            auto* new_cond = task.arena().create<Condition>(cond->type(), new_lhs, new_rhs, cond->size_bytes);
+                            branch->set_condition(new_cond);
+                            sub_changed = true;
+                        }
+                    } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+                        std::vector<Expression*> new_vals;
+                        for (auto* val : ret->values()) {
+                            Expression* new_val = replace_variable_ptr(task.arena(), val, req_var, replacement);
+                            if (new_val != val) sub_changed = true;
+                            new_vals.push_back(new_val);
+                        }
+                        if (sub_changed) {
+                            auto* new_ret = task.arena().create<Return>(std::move(new_vals));
+                            new_ret->set_address(ret->address());
+                            instrs[i] = new_ret;
+                            inst = new_ret;
+                        }
+                    }
+
+                    if (sub_changed) {
+                        // Replace the original call assignment with var = 0 (Constant 0)
+                        // It will be cleaned up by DeadCodeElimination if not used.
+                        def->set_value(task.arena().create<Constant>(0, def->value()->size_bytes));
+                        changed = true;
+                        break; // restart iteration since we modified instructions list and maps
+                    }
+                }
+                if (changed) break;
+            }
+            if (changed) break;
+        }
+    }
+}
+
 void TypePropagationStage::execute(DecompilerTask& task) {}
 void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {}
 void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {}

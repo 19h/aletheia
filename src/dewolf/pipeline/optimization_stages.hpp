@@ -9,6 +9,18 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class ExpressionPropagationMemoryStage : public PipelineStage {
+public:
+    const char* name() const override { return "ExpressionPropagationMemory"; }
+    void execute(DecompilerTask& task) override;
+};
+
+class ExpressionPropagationFunctionCallStage : public PipelineStage {
+public:
+    const char* name() const override { return "ExpressionPropagationFunctionCall"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class TypePropagationStage : public PipelineStage {
 public:
     const char* name() const override { return "TypePropagation"; }

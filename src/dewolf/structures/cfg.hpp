@@ -19,6 +19,15 @@ enum class EdgeType {
     Fallthrough
 };
 
+enum class EdgeProperty {
+    Tree,
+    Back,
+    Forward,
+    Cross,
+    Retreating,
+    NonLoop
+};
+
 class Edge : public ArenaAllocated {
 public:
     Edge(BasicBlock* source, BasicBlock* target, EdgeType type)
@@ -112,6 +121,11 @@ public:
     void substitute_edge(Edge* old_edge, Edge* new_edge);
     void remove_nodes_from(const std::unordered_set<BasicBlock*>& dead_blocks);
 
+    void classify_edges(class DominatorTree& dom_tree);
+    const std::unordered_map<Edge*, EdgeProperty>& edge_properties() const { return edge_properties_; }
+    std::unordered_map<BasicBlock*, std::unordered_set<Edge*>> back_edges() const;
+    std::unordered_set<Edge*> retreating_edges() const;
+
     // Traversals
     std::vector<BasicBlock*> post_order() const;
     std::vector<BasicBlock*> reverse_post_order() const;
@@ -120,6 +134,7 @@ public:
 private:
     BasicBlock* entry_block_ = nullptr;
     std::vector<BasicBlock*> blocks_;
+    std::unordered_map<Edge*, EdgeProperty> edge_properties_;
 };
 
 // =============================================================================

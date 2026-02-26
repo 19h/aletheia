@@ -1,6 +1,9 @@
 #include "cfg.hpp"
+#include "../ssa/dominators.hpp"
 #include <unordered_set>
+#include <unordered_map>
 #include <algorithm>
+#include <vector>
 
 namespace dewolf {
 
@@ -120,6 +123,96 @@ void ControlFlowGraph::remove_nodes_from(const std::unordered_set<BasicBlock*>& 
     if (entry_block_ && dead_blocks.count(entry_block_) > 0) {
         entry_block_ = nullptr;
     }
+}
+
+
+static bool has_tree_path(BasicBlock* start, BasicBlock* finish, const std::unordered_map<BasicBlock*, BasicBlock*>& parent_dict) {
+    BasicBlock* current = start;
+    while (parent_dict.find(current) != parent_dict.end()) {
+        current = parent_dict.at(current);
+        if (current == finish) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ControlFlowGraph::classify_edges(DominatorTree& dom_tree) {
+    edge_properties_.clear();
+    
+    std::unordered_map<BasicBlock*, int> node_indices;
+    std::unordered_map<BasicBlock*, BasicBlock*> parent_dict;
+    
+    int index = blocks_.size();
+    std::unordered_set<BasicBlock*> visited_nodes;
+    
+    if (!entry_block_) return;
+    
+    visited_nodes.insert(entry_block_);
+    
+    // Stack holds <Parent, ChildIterator>
+    // We emulate iterator by an integer index into successors
+    std::vector<std::pair<BasicBlock*, size_t>> stack;
+    stack.push_back({entry_block_, 0});
+    
+    while (!stack.empty()) {
+        auto& top = stack.back();
+        BasicBlock* parent = top.first;
+        size_t& child_idx = top.second;
+        
+        if (child_idx < parent->successors().size()) {
+            Edge* edge = parent->successors()[child_idx];
+            BasicBlock* child = edge->target();
+            child_idx++;
+            
+            if (visited_nodes.count(child)) {
+                EdgeProperty prop;
+                if (node_indices.count(child)) {
+                    if (has_tree_path(child, parent, parent_dict)) {
+                        prop = EdgeProperty::Forward;
+                    } else {
+                        prop = EdgeProperty::Cross;
+                    }
+                } else {
+                    if (dom_tree.dominates(child, parent)) {
+                        prop = EdgeProperty::Back;
+                    } else {
+                        prop = EdgeProperty::Retreating;
+                    }
+                }
+                edge_properties_[edge] = prop;
+            } else {
+                edge_properties_[edge] = EdgeProperty::Tree;
+                parent_dict[child] = parent;
+                visited_nodes.insert(child);
+                stack.push_back({child, 0});
+            }
+        } else {
+            node_indices[parent] = index;
+            index--;
+            stack.pop_back();
+        }
+    }
+}
+
+std::unordered_map<BasicBlock*, std::unordered_set<Edge*>> ControlFlowGraph::back_edges() const {
+    std::unordered_map<BasicBlock*, std::unordered_set<Edge*>> result;
+    for (auto& [edge, prop] : edge_properties_) {
+        if (prop == EdgeProperty::Back) {
+            result[edge->target()].insert(edge);
+        }
+    }
+    return result;
+}
+
+std::unordered_set<Edge*> ControlFlowGraph::retreating_edges() const {
+    std::unordered_set<Edge*> result;
+    for (auto& [edge, prop] : edge_properties_) {
+        if (prop == EdgeProperty::Retreating) {
+            result.insert(edge);
+        }
+    }
+    return result;
 }
 
 } // namespace dewolf

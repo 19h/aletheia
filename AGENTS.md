@@ -269,22 +269,24 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.6.4 Implement `DeadLoopEliminationStage` extending dead path elimination to target loop back-edges.
     - *Implemented `DeadLoopEliminationStage::execute()`. Extends DPE by checking branch dependency on Phis, extracting unique upstream constants (approximated without deep dominance checking), patching branch conditions, and using Z3 satisfiability along with reachability checks (DFS from satisfiable edge) to aggressively prune branch edges in loops.*
 
-- [ ] **H.7** Implement `ExpressionPropagationMemory` Stage (currently missing entirely)
+- [x] **H.7** Implement `ExpressionPropagationMemory` Stage (currently missing entirely)
   - *The Python reference has a separate `ExpressionPropagationMemory` stage that propagates aliased/memory variables. It checks whether the definition's value could have been modified via a memory access (pointer write) between the definition and the target usage, using pointer analysis and path-based safety checks. It also has a "postponed aliased propagation" sub-pass. Without this, aliased variables (those that could be modified through pointers) are never propagated, leaving many redundant loads in the output.*
-  - [ ] H.7.1 Implement basic aliased-variable propagation with conservative safety checks.
-  - [ ] H.7.2 Implement path-based safety analysis: check if any instruction between the definition and target could modify memory at the aliased address.
+  - [x] H.7.1 Implement basic aliased-variable propagation with conservative safety checks.
+  - [x] H.7.2 Implement path-based safety analysis: check if any instruction between the definition and target could modify memory at the aliased address.
+    - *Implemented in `ExpressionPropagationMemoryStage`. Precomputes `reachability` using DFS. Allows aliased/dereferenced definitions, but performs `has_any_dangerous_use` checks against potentially memory-modifying instructions (`Relation`, dereferenced `Assignment`, `Call`) that lie on any paths between `def_block` and `target_block`.*
 
-- [ ] **H.8** Implement `ExpressionPropagationFunctionCall` Stage (currently missing entirely)
+- [x] **H.8** Implement `ExpressionPropagationFunctionCall` Stage (currently missing entirely)
   - *The Python reference has a separate `ExpressionPropagationFunctionCall` stage that propagates function call return values (`var = f()`) into their single usage site. After propagation, it replaces the original call assignment's destination with `ListOperation([])` (void). It checks for dangerous memory accesses between the call and the usage. Without this, every function call result is stored in a temporary and used separately, producing verbose output like `tmp = strlen(s); if (tmp > 0)` instead of `if (strlen(s) > 0)`.*
-  - [ ] H.8.1 Implement call-result propagation: for each `var = f(...)` with exactly one use of `var`, substitute `f(...)` directly into the use site.
-  - [ ] H.8.2 Check that no dangerous memory operations occur between the call and the use.
+  - [x] H.8.1 Implement call-result propagation: for each `var = f(...)` with exactly one use of `var`, substitute `f(...)` directly into the use site.
+  - [x] H.8.2 Check that no dangerous memory operations occur between the call and the use.
+    - *Implemented in `ExpressionPropagationFunctionCallStage`. Iterates `DefMap` for `OperationType::call`, checks if there is exactly 1 entry in `UseMap`. Employs conservative safety checks against cross-boundary and in-block memory operations, and safely replaces the original `def` with `Constant(0)` (which is removed in subsequent Dead Code passes).*
 
-- [ ] **H.9** Implement CFG Edge Classification (currently absent from ControlFlowGraph)
+- [x] **H.9** Implement CFG Edge Classification (currently absent from ControlFlowGraph)
   - *The Python reference's `ClassifiedGraph` performs DFS-based edge classification into: `tree`, `back`, `forward`, `cross`, `retreating`, `non_loop`. This is used directly by the DREAM algorithm: loop heads are identified as nodes with incoming `back`/`retreating` edges, and edge properties determine which edges are loop entries vs. cross-edges. The C++ `CyclicRegionFinder` currently does its own ad-hoc DFS for back-edge detection, but without proper classification, `retreating` edges (non-back edges to already-visited nodes) are conflated with `back` edges, and `forward`/`cross` edges are not distinguished.*
-  - [ ] H.9.1 Implement `classify_edges()` on `ControlFlowGraph` using stack-based DFS with parent tracking, visited marking, and post-order numbering.
-  - [ ] H.9.2 Store classification as `std::unordered_map<Edge*, EdgeProperty>` with enum values: `tree`, `back`, `forward`, `cross`, `retreating`.
-  - [ ] H.9.3 Implement `back_edges()` -> map of loop head to set of back edges targeting it.
-  - [ ] H.9.4 Implement `retreating_edges()` -> set of all retreating edges.
+  - [x] H.9.1 Implement `classify_edges()` on `ControlFlowGraph` using stack-based DFS with parent tracking, visited marking, and post-order numbering.
+  - [x] H.9.2 Store classification as `std::unordered_map<Edge*, EdgeProperty>` with enum values: `tree`, `back`, `forward`, `cross`, `retreating`.
+  - [x] H.9.3 Implement `back_edges()` -> map of loop head to set of back edges targeting it.
+  - [x] H.9.4 Implement `retreating_edges()` -> set of all retreating edges.
 
 - [ ] **H.10** Implement Abnormal Entry / Exit Loop Restructuring (currently missing -- multi-entry and multi-exit loops are not handled)
   - *The Python reference handles multi-entry loops by introducing a dispatch variable (`entry_{head}`) and cascading condition nodes to route all entries through a single head (DREAM paper Figure 12). Multi-exit loops are handled symmetrically with an `exit_{head}` dispatch variable. Without this, the DREAM algorithm will fail or produce garbage for irreducible control flow (e.g., `goto` into the middle of a loop) or loops with multiple exit points.*
