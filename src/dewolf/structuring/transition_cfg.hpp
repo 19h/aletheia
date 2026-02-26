@@ -2,6 +2,7 @@
 #include "../../common/arena_allocated.hpp"
 #include "ast.hpp"
 #include <vector>
+#include <algorithm>
 
 namespace dewolf {
 
@@ -14,6 +15,14 @@ public:
 
     void add_predecessor(TransitionBlock* b) { predecessors_.push_back(b); }
     void add_successor(TransitionBlock* b) { successors_.push_back(b); }
+
+    void remove_predecessor(TransitionBlock* b) {
+        predecessors_.erase(std::remove(predecessors_.begin(), predecessors_.end(), b), predecessors_.end());
+    }
+
+    void remove_successor(TransitionBlock* b) {
+        successors_.erase(std::remove(successors_.begin(), successors_.end(), b), successors_.end());
+    }
 
     const std::vector<TransitionBlock*>& predecessors() const { return predecessors_; }
     const std::vector<TransitionBlock*>& successors() const { return successors_; }
@@ -32,6 +41,12 @@ public:
     TransitionBlock* entry() const { return entry_; }
 
     void add_block(TransitionBlock* block) { blocks_.push_back(block); }
+    
+    void remove_block(TransitionBlock* block) {
+        blocks_.erase(std::remove(blocks_.begin(), blocks_.end(), block), blocks_.end());
+        if (entry_ == block) entry_ = nullptr;
+    }
+
     const std::vector<TransitionBlock*>& blocks() const { return blocks_; }
 
 private:

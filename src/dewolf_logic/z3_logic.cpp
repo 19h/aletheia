@@ -36,8 +36,19 @@ z3::expr Z3Converter::convert_operation(dewolf::Operation* o) {
         if (e.is_bool()) {
             return z3::ite(e, ctx_.bv_val(1, size), ctx_.bv_val(0, size));
         }
+        if (e.is_bv()) {
+            unsigned curr_sz = e.get_sort().bv_size();
+            if (curr_sz < size) return z3::zext(e, size - curr_sz);
+            if (curr_sz > size) return e.extract(size - 1, 0);
+        }
         return e;
     };
+
+    if (o->type() == dewolf::OperationType::deref && ops.size() == 1) {
+        std::string name = "deref_";
+        if (auto* v = dynamic_cast<dewolf::Variable*>(ops[0])) name += v->name();
+        return ctx_.bv_const(name.c_str(), (o->size_bytes > 0 ? o->size_bytes : 8) * 8);
+    }
     
     if (o->type() == dewolf::OperationType::eq && ops.size() == 2) {
         return ensure_bv(convert(ops[0]), 64) == ensure_bv(convert(ops[1]), 64);

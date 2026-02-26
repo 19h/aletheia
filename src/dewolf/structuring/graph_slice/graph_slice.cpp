@@ -89,12 +89,46 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
     dfs(source, dfs);
 
     // Now reconstruct edges within the slice
+    // We must return the blocks in topological order so that CBR processes them correctly sequentially.
+    std::vector<TransitionBlock*> topo_order;
+    std::unordered_map<TransitionBlock*, int> in_degree;
+
     for (TransitionBlock* node : slice_nodes) {
+        in_degree[node] = 0;
+    }
+
+    for (TransitionBlock* node : slice_nodes) {
+        for (TransitionBlock* succ : node->successors()) {
+            if (slice_nodes.contains(succ)) {
+                in_degree[succ]++;
+            }
+        }
+    }
+
+    std::vector<TransitionBlock*> q;
+    for (TransitionBlock* node : slice_nodes) {
+        if (in_degree[node] == 0) {
+            q.push_back(node);
+        }
+    }
+
+    size_t head = 0;
+    while (head < q.size()) {
+        TransitionBlock* u = q[head++];
+        topo_order.push_back(u);
+
+        for (TransitionBlock* v : u->successors()) {
+            if (slice_nodes.contains(v)) {
+                in_degree[v]--;
+                if (in_degree[v] == 0) {
+                    q.push_back(v);
+                }
+            }
+        }
+    }
+
+    for (TransitionBlock* node : topo_order) {
         slice->add_block(node);
-        // Note: For a true deep copy slice, we'd clone blocks. 
-        // We'll keep references to the original TransitionBlocks but logically they belong to the slice.
-        // For the structurer to work recursively, we might need a richer graph class that tracks its own edges,
-        // rather than storing edges natively in TransitionBlock. But we emulate it for now.
     }
 
     return slice;
