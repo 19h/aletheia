@@ -1,6 +1,7 @@
 #pragma once
 #include "../../common/arena_allocated.hpp"
 #include "../../common/types.hpp"
+#include "types.hpp"
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -82,6 +83,13 @@ public:
 
     /// Size of the object in bytes (register width, constant width, etc.)
     std::size_t size_bytes = 0;
+
+    /// The type of this IR node (may be null if not yet resolved).
+    TypePtr ir_type() const { return type_; }
+    void set_ir_type(TypePtr t) { type_ = std::move(t); }
+
+private:
+    TypePtr type_;
 };
 
 // =============================================================================

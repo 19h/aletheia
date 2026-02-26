@@ -4,6 +4,7 @@
 #include "../src/common/arena.hpp"
 #include "../src/dewolf/structures/cfg.hpp"
 #include "../src/dewolf/structures/dataflow.hpp"
+#include "../src/dewolf/structures/types.hpp"
 #include "../src/dewolf/ssa/dominators.hpp"
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
 
@@ -197,12 +198,107 @@ void test_instruction_hierarchy() {
     std::cout << "[+] test_instruction_hierarchy passed.\n";
 }
 
+void test_type_system() {
+    // Basic integer types
+    auto i32 = Integer::int32_t();
+    ASSERT_EQ(i32->to_string(), "int");
+    ASSERT_EQ(i32->size(), 32);
+    ASSERT_EQ(i32->size_bytes(), 4);
+    
+    auto u64 = Integer::uint64_t();
+    ASSERT_EQ(u64->to_string(), "unsigned long");
+    ASSERT_EQ(u64->size(), 64);
+    
+    // Signedness
+    auto* i32_raw = dynamic_cast<const Integer*>(i32.get());
+    ASSERT_TRUE(i32_raw != nullptr);
+    ASSERT_TRUE(i32_raw->is_signed());
+    
+    auto* u64_raw = dynamic_cast<const Integer*>(u64.get());
+    ASSERT_TRUE(u64_raw != nullptr);
+    ASSERT_TRUE(!u64_raw->is_signed());
+    
+    // Float types
+    auto f32 = Float::float32();
+    ASSERT_EQ(f32->to_string(), "float");
+    auto f64 = Float::float64();
+    ASSERT_EQ(f64->to_string(), "double");
+    
+    // CustomType
+    auto void_t = CustomType::void_type();
+    ASSERT_EQ(void_t->to_string(), "void");
+    ASSERT_EQ(void_t->size(), 0);
+    
+    auto bool_t = CustomType::bool_type();
+    ASSERT_EQ(bool_t->to_string(), "bool");
+    ASSERT_TRUE(bool_t->is_boolean());
+    
+    // Pointer types
+    auto ptr_int = std::make_shared<const Pointer>(i32, 64);
+    ASSERT_EQ(ptr_int->to_string(), "int *");
+    ASSERT_EQ(ptr_int->size(), 64);
+    
+    // Nested pointer
+    auto ptr_ptr = std::make_shared<const Pointer>(ptr_int, 64);
+    ASSERT_EQ(ptr_ptr->to_string(), "int **");
+    
+    // Array type
+    auto arr = std::make_shared<const ArrayType>(i32, 10);
+    ASSERT_EQ(arr->to_string(), "int [10]");
+    ASSERT_EQ(arr->size(), 320);
+    ASSERT_EQ(arr->count(), 10);
+    
+    // FunctionTypeDef
+    auto func_t = std::make_shared<const FunctionTypeDef>(
+        i32, std::vector<TypePtr>{i32, ptr_int});
+    ASSERT_EQ(func_t->to_string(), "int(int, int *)");
+    
+    // Equality
+    auto i32_2 = Integer::int32_t();
+    ASSERT_TRUE(*i32 == *i32_2);     // same factory -> same instance, but also value-equal
+    ASSERT_TRUE(!(*i32 == *u64));    // different types
+    ASSERT_TRUE(!(*i32 == *f32));    // cross-type inequality
+    
+    // UnknownType
+    auto unk = UnknownType::instance();
+    ASSERT_EQ(unk->to_string(), "unknown type");
+    
+    // TypeParser
+    TypeParser parser(64);
+    auto parsed_int = parser.parse("int");
+    ASSERT_EQ(parsed_int->to_string(), "int");
+    
+    auto parsed_ptr = parser.parse("char *");
+    ASSERT_EQ(parsed_ptr->to_string(), "char *");
+    
+    auto parsed_unsigned = parser.parse("unsigned int");
+    ASSERT_EQ(parsed_unsigned->to_string(), "unsigned int");
+    
+    auto parsed_void = parser.parse("void");
+    ASSERT_EQ(parsed_void->to_string(), "void");
+    
+    // Verify IR nodes can hold types
+    DecompilerArena arena;
+    auto* var = arena.create<Variable>("eax", 4);
+    ASSERT_TRUE(var->ir_type() == nullptr);  // default: no type
+    var->set_ir_type(i32);
+    ASSERT_TRUE(var->ir_type() != nullptr);
+    ASSERT_EQ(var->ir_type()->to_string(), "int");
+    
+    auto* con = arena.create<Constant>(42, 4);
+    con->set_ir_type(u64);
+    ASSERT_EQ(con->ir_type()->to_string(), "unsigned long");
+    
+    std::cout << "[+] test_type_system passed.\n";
+}
+
 int main() {
     std::cout << "Running DeWolf tests...\n";
     test_arena();
     test_dominators();
     test_ssa_phi_insertion();
     test_instruction_hierarchy();
+    test_type_system();
     std::cout << "All tests passed successfully.\n";
     return 0;
 }
