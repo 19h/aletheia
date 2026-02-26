@@ -24,7 +24,8 @@ std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> ReachingCondi
     }
 
     for (TransitionBlock* node : graph_slice->blocks()) {
-        for (TransitionBlock* succ : node->successors()) {
+        for (TransitionEdge* edge : node->successors()) {
+            TransitionBlock* succ = edge->sink();
             if (in_degree.contains(succ)) {
                 in_degree[succ]++;
             }
@@ -41,7 +42,8 @@ std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> ReachingCondi
         q.pop();
         topo_order.push_back(u);
 
-        for (TransitionBlock* v : u->successors()) {
+        for (TransitionEdge* edge : u->successors()) {
+            TransitionBlock* v = edge->sink();
             if (in_degree.contains(v)) {
                 in_degree[v]--;
                 if (in_degree[v] == 0) {
@@ -58,37 +60,11 @@ std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> ReachingCondi
         z3::expr node_cond = ctx.bool_val(false);
         bool has_preds = false;
 
-        for (TransitionBlock* pred : node->predecessors()) {
+        for (TransitionEdge* edge : node->predecessors()) {
+            TransitionBlock* pred = edge->source();
             if (reaching_conditions.contains(pred)) {
-                z3::expr edge_cond = ctx.bool_val(true);
-
-                BasicBlock* orig_pred = pred->ast_node()->get_original_block();
-                BasicBlock* orig_node = node->ast_node()->get_original_block();
-
-                if (orig_pred && orig_node) {
-                    for (Edge* e : orig_pred->successors()) {
-                        if (e->target() == orig_node) {
-                            if (e->type() == EdgeType::True || e->type() == EdgeType::False) {
-                                // Extract the condition from the predecessor's last instruction
-                                if (!orig_pred->instructions().empty()) {
-                                    Instruction* last_inst = orig_pred->instructions().back();
-                                    
-                                    // Use the new Branch type to extract the condition
-                                    if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
-                                        dewolf_logic::Z3Converter z3_conv(ctx);
-                                        dewolf_logic::LogicCondition c = z3_conv.convert_to_condition(branch->condition());
-                                        if (e->type() == EdgeType::True) {
-                                            edge_cond = c.expression();
-                                        } else {
-                                            edge_cond = (!c.expression());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
+                // The edge tag holds the condition!
+                z3::expr edge_cond = edge->tag().expression();
                 node_cond = node_cond || (reaching_conditions.at(pred).expression() && edge_cond);
                 has_preds = true;
             }

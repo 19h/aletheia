@@ -25,7 +25,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         visited.insert(node);
         on_path.insert(node);
 
-        for (auto* succ : node->successors()) {
+        for (auto* succ : node->successors_blocks()) {
             if (on_path.contains(succ)) {
                 back_edges.push_back({node, succ});
             } else if (!visited.contains(succ)) {
@@ -57,7 +57,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         while (!worklist.empty()) {
             TransitionBlock* n = worklist.back();
             worklist.pop_back();
-            for (auto* pred : n->predecessors()) {
+            for (auto* pred : n->predecessors_blocks()) {
                 if (!loop_region.contains(pred)) {
                     loop_region.insert(pred);
                     worklist.push_back(pred);
@@ -68,7 +68,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         // --- Step 3: Compute loop successors (exit targets) ---
         std::unordered_set<TransitionBlock*> loop_successors;
         for (auto* node : loop_region) {
-            for (auto* succ : node->successors()) {
+            for (auto* succ : node->successors_blocks()) {
                 if (!loop_region.contains(succ)) {
                     loop_successors.insert(succ);
                 }
@@ -77,7 +77,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
 
         // --- Step 4: Build a sub-TransitionCFG for the loop region ---
         // This allows us to run the acyclic restructurer on it.
-        auto* loop_cfg = arena_.create<TransitionCFG>();
+        auto* loop_cfg = arena_.create<TransitionCFG>(arena_);
 
         // Create break/continue synthesis blocks and copy region blocks
         // into the loop sub-CFG, with back edges and exit edges replaced.
@@ -94,7 +94,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         // Replace exit edges (->successor outside region) with Break nodes.
         for (auto* node : loop_region) {
             auto* clone_src = block_map[node];
-            for (auto* succ : node->successors()) {
+            for (auto* succ : node->successors_blocks()) {
                 if (succ == header && node != header) {
                     // Back edge -> insert Continue node
                     auto* cont_block = arena_.create<BasicBlock>(9999);
@@ -102,8 +102,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                     auto* cont_code = arena_.create<CodeNode>(cont_block);
                     auto* cont_trans = arena_.create<TransitionBlock>(cont_code);
                     loop_cfg->add_block(cont_trans);
-                    clone_src->add_successor(cont_trans);
-                    cont_trans->add_predecessor(clone_src);
+                    loop_cfg->add_edge(clone_src, cont_trans, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)));
                 } else if (loop_successors.contains(succ)) {
                     // Exit edge -> insert Break node
                     auto* brk_block = arena_.create<BasicBlock>(9998);
@@ -111,20 +110,18 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                     auto* brk_code = arena_.create<CodeNode>(brk_block);
                     auto* brk_trans = arena_.create<TransitionBlock>(brk_code);
                     loop_cfg->add_block(brk_trans);
-                    clone_src->add_successor(brk_trans);
-                    brk_trans->add_predecessor(clone_src);
+                    loop_cfg->add_edge(clone_src, brk_trans, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)));
                 } else if (block_map.contains(succ)) {
                     // Internal edge within the region
                     auto* clone_dst = block_map[succ];
-                    clone_src->add_successor(clone_dst);
-                    clone_dst->add_predecessor(clone_src);
+                    loop_cfg->add_edge(clone_src, clone_dst, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)));
                 }
             }
         }
 
         // --- Step 5: Restructure the loop body as acyclic ---
         // The loop sub-CFG is now a DAG (no back edges or exit edges).
-        AcyclicRegionRestructurer acyclic(arena_);
+        AcyclicRegionRestructurer acyclic(task_);
         acyclic.process(*loop_cfg);
 
         // The acyclic restructurer collapses everything into the entry
@@ -146,18 +143,16 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             // Remove edges from region nodes to this successor
             for (auto* node : loop_region) {
                 if (node != header) {
-                    node->remove_successor(succ);
-                    succ->remove_predecessor(node);
+                    cfg.remove_edge_between(node, succ);
                 }
             }
             // Add edge from header to successor (if not already present)
             bool already_linked = false;
-            for (auto* s : header->successors()) {
+            for (auto* s : header->successors_blocks()) {
                 if (s == succ) { already_linked = true; break; }
             }
             if (!already_linked) {
-                header->add_successor(succ);
-                succ->add_predecessor(header);
+                cfg.add_edge(header, succ, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)));
             }
         }
 
@@ -165,17 +160,17 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         for (auto* node : loop_region) {
             if (node == header) continue;
             // Remove all edges involving this node
-            for (auto* s : node->successors()) {
-                s->remove_predecessor(node);
+            for (auto* s : node->successors_blocks()) {
+                cfg.remove_edge_between(node, s);
             }
-            for (auto* p : node->predecessors()) {
-                p->remove_successor(node);
+            for (auto* p : node->predecessors_blocks()) {
+                cfg.remove_edge_between(p, node);
             }
             cfg.remove_block(node);
         }
 
         // Remove the header's back-edge successors that were back edges
-        header->remove_successor(header); // self-loop if it existed
+        cfg.remove_edge_between(header, header);
     }
 }
 
@@ -204,7 +199,7 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
                 
                 bool all_preds_in = true;
                 if (curr != header) {
-                    for (auto* p : curr->predecessors()) {
+                    for (auto* p : curr->predecessors_blocks()) {
                         if (!region.contains(p)) {
                             all_preds_in = false;
                             break;
@@ -214,7 +209,7 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
                 
                 if (all_preds_in) {
                     region.insert(curr);
-                    for (auto* s : curr->successors()) {
+                    for (auto* s : curr->successors_blocks()) {
                         stack.push_back(s);
                     }
                 }
@@ -224,7 +219,7 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
 
             std::unordered_set<TransitionBlock*> exits;
             for (auto* node : region) {
-                for (auto* s : node->successors()) {
+                for (auto* s : node->successors_blocks()) {
                     if (!region.contains(s)) {
                         exits.insert(s);
                     }
@@ -246,22 +241,19 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
             TransitionBlock* collapsed_block = arena_.create<TransitionBlock>(best_header->ast_node());
             
             std::vector<TransitionBlock*> incoming_preds;
-            for (auto* p : best_header->predecessors()) {
+            for (auto* p : best_header->predecessors_blocks()) {
                 if (!best_region.contains(p)) incoming_preds.push_back(p);
             }
             for (auto* p : incoming_preds) {
-                p->remove_successor(best_header);
-                p->add_successor(collapsed_block);
-                collapsed_block->add_predecessor(p);
+                cfg.remove_edge_between(p, best_header);
+                cfg.add_edge(p, collapsed_block, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)));
             }
             
             if (best_exit) {
-                collapsed_block->add_successor(best_exit);
-                best_exit->add_predecessor(collapsed_block);
+                cfg.add_edge(collapsed_block, best_exit, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)));
                 
                 for (auto* node : best_region) {
-                    node->remove_successor(best_exit);
-                    best_exit->remove_predecessor(node);
+                    cfg.remove_edge_between(node, best_exit);
                 }
             }
             
@@ -293,7 +285,7 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
 void AcyclicRegionRestructurer::restructure_region(TransitionCFG* t_cfg, TransitionBlock* header, const std::unordered_set<TransitionBlock*>& region) {
     TransitionCFG* slice = GraphSlice::compute_graph_slice_for_region(arena_, t_cfg, header, region, false);
 
-    z3::context ctx;
+    z3::context& ctx = task_.z3_ctx();
     auto reaching_conditions = ReachingConditions::compute(ctx, slice, header, t_cfg);
 
     SeqNode* seq = arena_.create<SeqNode>();

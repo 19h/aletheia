@@ -293,12 +293,13 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [ ] H.10.1 Implement `AbnormalEntryRestructurer`: detect region nodes with predecessors outside the region, introduce dispatch variable, create cascading conditions, redirect entries.
   - [ ] H.10.2 Implement `AbnormalExitRestructurer`: detect multiple loop successors, introduce dispatch variable, create cascading conditions after the loop, redirect exits.
 
-- [ ] **H.11** Add `LogicCondition` Tags to `TransitionEdge` (currently TransitionBlock only has predecessor/successor pointer lists with no edge metadata)
+- [x] **H.11** Add `LogicCondition` Tags to `TransitionEdge` (currently TransitionBlock only has predecessor/successor pointer lists with no edge metadata)
   - *The Python reference's `TransitionEdge` carries a `tag: LogicCondition` (the symbolic boolean condition for traversing that edge) and a `property: EdgeProperty` (back/retreating/non_loop). The C++ `TransitionBlock` uses raw predecessor/successor pointer lists with no per-edge data. This forces the reaching conditions computation to re-derive edge conditions from the original CFG's basic block instructions every time, which is fragile and loses information about switch-case edge tags (which are disjunctions of case symbols).*
-  - [ ] H.11.1 Define `TransitionEdge` class with `source`, `sink`, `LogicCondition tag`, `EdgeProperty property`.
-  - [ ] H.11.2 Replace raw `vector<TransitionBlock*>` predecessor/successor lists in `TransitionBlock` with `vector<TransitionEdge*>`.
-  - [ ] H.11.3 During `TransitionCFG::generate()`, compute and assign edge tags (True condition, negated condition, True for unconditional, disjunction of case symbols for switch).
-  - [ ] H.11.4 Update `ReachingConditions::compute()` to read edge tags directly from `TransitionEdge` instead of re-deriving from original basic block instructions.
+  - [x] H.11.1 Define `TransitionEdge` class with `source`, `sink`, `LogicCondition tag`, `EdgeProperty property`.
+  - [x] H.11.2 Replace raw `vector<TransitionBlock*>` predecessor/successor lists in `TransitionBlock` with `vector<TransitionEdge*>`.
+  - [x] H.11.3 During `TransitionCFG::generate()`, compute and assign edge tags (True condition, negated condition, True for unconditional, disjunction of case symbols for switch).
+  - [x] H.11.4 Update `ReachingConditions::compute()`
+    - *Added `TransitionEdge` class storing source, sink, `LogicCondition` tag, and `EdgeProperty`. Replaced `TransitionBlock` predecessor/successor vectors with edge pointers. Updated `ReachingConditions` to read tags directly. Added shared `z3::context` to `DecompilerTask`.* to read edge tags directly from `TransitionEdge` instead of re-deriving from original basic block instructions.
 
 - [ ] **H.12** Implement Function Signature Generation in Code Output (currently absent -- no return type, function name, or parameters in output)
   - *The Python reference's `CodeGenerator` uses `string.Template` to emit: `$return_type $name($parameters) { $local_declarations $function_body }`. Without function signatures, the output is a bare block of statements with no function header -- not valid C code.*

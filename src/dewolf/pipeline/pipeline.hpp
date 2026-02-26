@@ -4,6 +4,7 @@
 #include "../structuring/ast.hpp"
 #include <memory>
 #include <ida/idax.hpp>
+#include <z3++.h>
 
 namespace dewolf {
 
@@ -14,6 +15,7 @@ public:
 
     ida::Address function_address() const { return function_address_; }
     DecompilerArena& arena() { return arena_; }
+    z3::context& z3_ctx() { return z3_ctx_; }
     
     ControlFlowGraph* cfg() const { return cfg_.get(); }
     void set_cfg(std::unique_ptr<ControlFlowGraph> cfg) { cfg_ = std::move(cfg); }
@@ -24,6 +26,7 @@ public:
 private:
     ida::Address function_address_;
     DecompilerArena arena_;
+    z3::context z3_ctx_;
     std::unique_ptr<ControlFlowGraph> cfg_;
     std::unique_ptr<AbstractSyntaxForest> ast_;
 };

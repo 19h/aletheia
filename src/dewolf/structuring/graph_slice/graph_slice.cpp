@@ -6,11 +6,11 @@ namespace dewolf {
 std::vector<TransitionBlock*> GraphSlice::get_sink_nodes(TransitionCFG* t_cfg, const std::unordered_set<TransitionBlock*>& region) {
     std::vector<TransitionBlock*> sinks;
     for (TransitionBlock* node : region) {
-        if (node->successors().empty()) {
+        if (node->successors_blocks().empty()) {
             sinks.push_back(node);
             continue;
         }
-        for (TransitionBlock* succ : node->successors()) {
+        for (TransitionBlock* succ : node->successors_blocks()) {
             if (region.find(succ) == region.end()) {
                 sinks.push_back(node);
                 break;
@@ -42,7 +42,7 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
     // A slice is a directed acyclic subgraph where N is the set of all vertices on simple paths
     // from source to any of the sink_nodes.
 
-    TransitionCFG* slice = arena.create<TransitionCFG>();
+    TransitionCFG* slice = arena.create<TransitionCFG>(arena);
     slice->set_entry(source);
 
     // Simple implementation: DFS from source. If path reaches a sink, all nodes in path are in the slice.
@@ -60,7 +60,7 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
         if (std::find(sink_nodes.begin(), sink_nodes.end(), node) != sink_nodes.end()) {
             reaches_sink = true;
         } else {
-            for (TransitionBlock* succ : node->successors()) {
+            for (TransitionBlock* succ : node->successors_blocks()) {
                 if (path.contains(succ)) {
                     // Back-edge
                     if (back_edges) reaches_sink = true; // Loosely keeping back edges
@@ -98,7 +98,7 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
     }
 
     for (TransitionBlock* node : slice_nodes) {
-        for (TransitionBlock* succ : node->successors()) {
+        for (TransitionBlock* succ : node->successors_blocks()) {
             if (slice_nodes.contains(succ)) {
                 in_degree[succ]++;
             }
@@ -117,7 +117,7 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
         TransitionBlock* u = q[head++];
         topo_order.push_back(u);
 
-        for (TransitionBlock* v : u->successors()) {
+        for (TransitionBlock* v : u->successors_blocks()) {
             if (slice_nodes.contains(v)) {
                 in_degree[v]--;
                 if (in_degree[v] == 0) {

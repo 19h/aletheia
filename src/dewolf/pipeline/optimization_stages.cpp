@@ -509,7 +509,7 @@ void ExpressionPropagationMemoryStage::execute(DecompilerTask& task) {
 void DeadPathEliminationStage::execute(DecompilerTask& task) {
     if (!task.cfg() || !task.cfg()->entry_block()) return;
 
-    z3::context ctx;
+    z3::context& ctx = task.z3_ctx();
     dewolf_logic::Z3Converter converter(ctx);
 
     std::unordered_set<Edge*> dead_edges;
@@ -596,7 +596,7 @@ void DeadPathEliminationStage::execute(DecompilerTask& task) {
 void DeadLoopEliminationStage::execute(DecompilerTask& task) {
     if (!task.cfg() || !task.cfg()->entry_block()) return;
 
-    z3::context ctx;
+    z3::context& ctx = task.z3_ctx();
     dewolf_logic::Z3Converter converter(ctx);
 
     using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
