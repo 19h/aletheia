@@ -31,6 +31,10 @@ class IfNode : public AstNode {
 public:
     IfNode(AstNode* cond, AstNode* true_branch, AstNode* false_branch = nullptr)
         : cond_(cond), true_branch_(true_branch), false_branch_(false_branch) {}
+    
+    AstNode* cond() const { return cond_; }
+    AstNode* true_branch() const { return true_branch_; }
+    AstNode* false_branch() const { return false_branch_; }
 private:
     AstNode* cond_;
     AstNode* true_branch_;
@@ -40,6 +44,7 @@ private:
 class LoopNode : public AstNode {
 public:
     explicit LoopNode(AstNode* body) : body_(body) {}
+    AstNode* body() const { return body_; }
 private:
     AstNode* body_;
 };

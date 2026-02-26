@@ -32,4 +32,33 @@ ida_add_plugin(dewolf_ida
     SOURCES src/plugin/plugin.cpp
     LIBRARIES dewolf dewolf_logic dewolf_idioms idax::idax
 )
+
+# Rigorous Headless Tests
+add_executable(dewolf_tests tests/test_main.cpp)
+target_link_libraries(dewolf_tests dewolf dewolf_logic dewolf_idioms)
+if(APPLE)
+    set_target_properties(dewolf_tests PROPERTIES LINK_FLAGS "-Wl,-undefined,dynamic_lookup")
+endif()
+
+# Real Binary End-to-End Test via idalib
+set(IDA_INSTALL_DIR "/Applications/IDA Professional 9.3.app/Contents/MacOS")
+add_executable(dewolf_idalib_test tests/test_idalib.cpp)
+target_link_libraries(dewolf_idalib_test
+    PRIVATE
+        dewolf
+        dewolf_logic
+        dewolf_idioms
+        idax::idax
+        "${IDA_INSTALL_DIR}/libidalib.dylib"
+        "${IDA_INSTALL_DIR}/libida.dylib"
+)
+target_compile_definitions(dewolf_idalib_test PRIVATE __EA64__ IDALIB_IMPL)
+target_include_directories(dewolf_idalib_test PRIVATE "${IDASDK}/include")
+set_target_properties(dewolf_idalib_test PROPERTIES
+    BUILD_RPATH "${IDA_INSTALL_DIR}"
+    INSTALL_RPATH "${IDA_INSTALL_DIR}"
+)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+

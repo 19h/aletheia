@@ -10,6 +10,7 @@ public:
     explicit TransitionBlock(AstNode* ast_node) : ast_node_(ast_node) {}
 
     AstNode* ast_node() const { return ast_node_; }
+    void set_ast_node(AstNode* node) { ast_node_ = node; }
 
     void add_predecessor(TransitionBlock* b) { predecessors_.push_back(b); }
     void add_successor(TransitionBlock* b) { successors_.push_back(b); }
