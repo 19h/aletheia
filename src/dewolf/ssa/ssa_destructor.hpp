@@ -1,6 +1,7 @@
 #pragma once
 #include "../structures/cfg.hpp"
 #include "../../common/arena.hpp"
+#include "liveness/liveness.hpp"
 
 namespace dewolf {
 
@@ -15,7 +16,7 @@ private:
     DecompilerArena& arena_;
     ControlFlowGraph& cfg_;
 
-    void eliminate_phi_nodes();
+    void eliminate_phi_nodes(const LivenessAnalysis& liveness);
 };
 
 } // namespace dewolf
