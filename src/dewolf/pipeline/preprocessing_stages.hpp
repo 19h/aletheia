@@ -1,0 +1,36 @@
+#pragma once
+#include "pipeline.hpp"
+
+namespace dewolf {
+
+class CompilerIdiomHandlingStage : public PipelineStage {
+public:
+    const char* name() const override { return "CompilerIdiomHandling"; }
+    void execute(DecompilerTask& task) override;
+};
+
+class RegisterPairHandlingStage : public PipelineStage {
+public:
+    const char* name() const override { return "RegisterPairHandling"; }
+    void execute(DecompilerTask& task) override;
+};
+
+class SwitchVariableDetectionStage : public PipelineStage {
+public:
+    const char* name() const override { return "SwitchVariableDetection"; }
+    void execute(DecompilerTask& task) override;
+};
+
+class RemoveGoPrologueStage : public PipelineStage {
+public:
+    const char* name() const override { return "RemoveGoPrologue"; }
+    void execute(DecompilerTask& task) override;
+};
+
+class RemoveStackCanaryStage : public PipelineStage {
+public:
+    const char* name() const override { return "RemoveStackCanary"; }
+    void execute(DecompilerTask& task) override;
+};
+
+} // namespace dewolf
