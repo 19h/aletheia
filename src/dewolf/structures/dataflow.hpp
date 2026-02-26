@@ -1,5 +1,6 @@
 #pragma once
 #include "../../common/arena_allocated.hpp"
+#include "../../common/arena.hpp"
 #include "../../common/types.hpp"
 #include "types.hpp"
 #include <cstdint>
@@ -11,9 +12,11 @@
 namespace dewolf {
 
 // Forward declarations -- Expressions
+class Expression;
 class Constant;
 class Variable;
 class Operation;
+class Call;
 class ListOperation;
 class Condition;
 
@@ -51,6 +54,7 @@ public:
 
     // Extended expression visitors (default to visit(Operation*) for
     // backward compatibility during incremental migration)
+    virtual void visit(Call* o);
     virtual void visit(ListOperation* o);
     virtual void visit(Condition* o);
 
@@ -81,6 +85,14 @@ public:
         (void)out;
     }
 
+    /// Recursively substitute all occurrences of `replacee` with `replacement`
+    /// in this object's children. For leaf nodes (Constant, Variable), this is
+    /// a no-op. For composite nodes (Operation, Instructions), this replaces
+    /// direct children that match `replacee` and delegates recursively.
+    virtual void substitute(Expression* replacee, Expression* replacement) {
+        (void)replacee; (void)replacement;
+    }
+
     /// Size of the object in bytes (register width, constant width, etc.)
     std::size_t size_bytes = 0;
 
@@ -102,6 +114,9 @@ private:
 class Expression : public DataflowObject {
 public:
     virtual ~Expression() = default;
+
+    /// Deep-clone this expression into the given arena.
+    virtual Expression* copy(DecompilerArena& arena) const = 0;
 };
 
 // =============================================================================
@@ -117,6 +132,14 @@ public:
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit(this);
     }
+
+    Expression* copy(DecompilerArena& arena) const override {
+        auto* c = arena.create<Constant>(value_, size_bytes);
+        c->set_ir_type(ir_type());
+        return c;
+    }
+
+    // Constant is a leaf: substitute() is a no-op (inherited default).
 
     std::uint64_t value() const { return value_; }
 
@@ -144,6 +167,16 @@ public:
         out.insert(const_cast<Variable*>(this));
     }
 
+    Expression* copy(DecompilerArena& arena) const override {
+        auto* v = arena.create<Variable>(name_, size_bytes);
+        v->set_ssa_version(ssa_version_);
+        v->set_aliased(is_aliased_);
+        v->set_ir_type(ir_type());
+        return v;
+    }
+
+    // Variable is a leaf: substitute() is a no-op (inherited default).
+
     const std::string& name() const { return name_; }
 
     // SSA fields
@@ -170,42 +203,84 @@ private:
 
 enum class OperationType {
     // Arithmetic (signed)
-    add,
-    sub,
-    mul,
-    div,
-    mod,
+    add,                    // a + b
+    add_with_carry,         // a + b + carry
+    sub,                    // a - b
+    sub_with_carry,         // a - b - borrow
+    mul,                    // a * b  (signed)
+    mul_us,                 // a * b  (unsigned)
+    div,                    // a / b  (signed)
+    div_us,                 // a / b  (unsigned)
+    mod,                    // a % b  (signed)
+    mod_us,                 // a % b  (unsigned)
+    negate,                 // -a     (unary arithmetic negation)
+    power,                  // a ** b (exponentiation, idiom recovery)
+
+    // Floating point arithmetic
+    add_float,              // a + b  (float)
+    sub_float,              // a - b  (float)
+    mul_float,              // a * b  (float)
+    div_float,              // a / b  (float)
 
     // Bitwise
-    bit_and,
-    bit_or,
-    bit_xor,
-    bit_not,
+    bit_and,                // a & b
+    bit_or,                 // a | b
+    bit_xor,                // a ^ b
+    bit_not,                // ~a
 
     // Shifts
-    shl,
-    shr,
-    sar,
+    shl,                    // a << b  (logical left shift)
+    shr,                    // a >> b  (arithmetic right shift, signed)
+    shr_us,                 // a >> b  (logical right shift, unsigned)
+    sar,                    // a >> b  (alias: arithmetic shift right, same as shr)
+
+    // Rotates
+    left_rotate,            // rotate left
+    right_rotate,           // rotate right
+    left_rotate_carry,      // rotate left through carry
+    right_rotate_carry,     // rotate right through carry
 
     // Logical
-    logical_and,
-    logical_or,
-    logical_not,
+    logical_and,            // a && b
+    logical_or,             // a || b
+    logical_not,            // !a
 
     // Comparison (signed)
-    eq,
-    neq,
-    lt,
-    le,
-    gt,
-    ge,
+    eq,                     // a == b
+    neq,                    // a != b
+    lt,                     // a <  b  (signed)
+    le,                     // a <= b  (signed)
+    gt,                     // a >  b  (signed)
+    ge,                     // a >= b  (signed)
 
-    // Memory
-    deref,
-    address_of,
+    // Comparison (unsigned)
+    lt_us,                  // a <  b  (unsigned)
+    le_us,                  // a <= b  (unsigned)
+    gt_us,                  // a >  b  (unsigned)
+    ge_us,                  // a >= b  (unsigned)
+
+    // Memory / addressing
+    deref,                  // *a      (dereference / memory load)
+    address_of,             // &a      (address-of)
+    member_access,          // a.b or a->b (struct/union member access)
+
+    // Type / cast operations
+    cast,                   // (type)a (explicit type cast)
+    pointer,                // pointer type wrapper (used in type annotations)
+    low,                    // low bits extraction (e.g., low byte of a register)
+    field,                  // field access (struct/union field by offset)
+
+    // Ternary
+    ternary,                // a ? b : c
 
     // Function calls (expression-level: the call itself produces a value)
     call,
+
+    // List (multiple values, used for function args / return lists)
+    list_op,
+
+    // Carry-based addition (used for multi-precision arithmetic)
+    adc,                    // add-with-carry (x86 ADC instruction)
 
     // Unknown / unmapped
     unknown
@@ -229,6 +304,28 @@ public:
     void collect_requirements(std::unordered_set<Variable*>& out) const override {
         for (auto* op : operands_) {
             if (op) op->collect_requirements(out);
+        }
+    }
+
+    Expression* copy(DecompilerArena& arena) const override {
+        std::vector<Expression*> new_ops;
+        new_ops.reserve(operands_.size());
+        for (auto* op : operands_) {
+            new_ops.push_back(op ? op->copy(arena) : nullptr);
+        }
+        auto* o = arena.create<Operation>(type_, std::move(new_ops), size_bytes);
+        o->set_ir_type(ir_type());
+        return o;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        // First, recursively substitute in children
+        for (auto* op : operands_) {
+            if (op) op->substitute(replacee, replacement);
+        }
+        // Then, replace direct children that match
+        for (auto& op : operands_) {
+            if (op == replacee) op = replacement;
         }
     }
 
@@ -263,6 +360,26 @@ public:
         }
     }
 
+    Expression* copy(DecompilerArena& arena) const override {
+        std::vector<Expression*> new_ops;
+        new_ops.reserve(operands_.size());
+        for (auto* op : operands_) {
+            new_ops.push_back(op ? op->copy(arena) : nullptr);
+        }
+        auto* lo = arena.create<ListOperation>(std::move(new_ops), size_bytes);
+        lo->set_ir_type(ir_type());
+        return lo;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        for (auto* op : operands_) {
+            if (op) op->substitute(replacee, replacement);
+        }
+        for (auto& op : operands_) {
+            if (op == replacee) op = replacement;
+        }
+    }
+
     const std::vector<Expression*>& operands() const { return operands_; }
     std::vector<Expression*>& mutable_operands() { return operands_; }
     bool empty() const { return operands_.empty(); }
@@ -289,18 +406,31 @@ public:
         visitor.visit(this);
     }
 
+    Expression* copy(DecompilerArena& arena) const override {
+        auto* c = arena.create<Condition>(type(),
+            lhs()->copy(arena), rhs()->copy(arena), size_bytes);
+        c->set_ir_type(ir_type());
+        return c;
+    }
+
+    // substitute() inherited from Operation is correct for Condition.
+
     Expression* lhs() const { return operands()[0]; }
     Expression* rhs() const { return operands()[1]; }
 
     /// Return the negated comparison type (e.g., eq -> neq, lt -> ge).
     static OperationType negate_comparison(OperationType op) {
         switch (op) {
-            case OperationType::eq:  return OperationType::neq;
-            case OperationType::neq: return OperationType::eq;
-            case OperationType::lt:  return OperationType::ge;
-            case OperationType::ge:  return OperationType::lt;
-            case OperationType::le:  return OperationType::gt;
-            case OperationType::gt:  return OperationType::le;
+            case OperationType::eq:    return OperationType::neq;
+            case OperationType::neq:   return OperationType::eq;
+            case OperationType::lt:    return OperationType::ge;
+            case OperationType::ge:    return OperationType::lt;
+            case OperationType::le:    return OperationType::gt;
+            case OperationType::gt:    return OperationType::le;
+            case OperationType::lt_us: return OperationType::ge_us;
+            case OperationType::ge_us: return OperationType::lt_us;
+            case OperationType::le_us: return OperationType::gt_us;
+            case OperationType::gt_us: return OperationType::le_us;
             default: return op;
         }
     }
@@ -310,6 +440,52 @@ public:
         return type() == OperationType::eq &&
                (dynamic_cast<Constant*>(operands()[0]) ||
                 dynamic_cast<Constant*>(operands()[1]));
+    }
+};
+
+// =============================================================================
+// Call -- Function call expression (subclass of Operation)
+// =============================================================================
+// A Call has operands[0] = function target, operands[1..N] = arguments.
+// It dispatches to visit_call() instead of the generic visit(Operation*).
+
+class Call : public Operation {
+public:
+    Call(Expression* target, std::vector<Expression*> args, std::size_t size)
+        : Operation(OperationType::call, build_operands_(target, std::move(args)), size) {}
+
+    void accept(DataflowObjectVisitorInterface& visitor) override {
+        visitor.visit(this);
+    }
+
+    Expression* copy(DecompilerArena& arena) const override {
+        Expression* new_target = target()->copy(arena);
+        std::vector<Expression*> new_args;
+        new_args.reserve(arg_count());
+        for (std::size_t i = 0; i < arg_count(); ++i) {
+            new_args.push_back(arg(i)->copy(arena));
+        }
+        auto* c = arena.create<Call>(new_target, std::move(new_args), size_bytes);
+        c->set_ir_type(ir_type());
+        return c;
+    }
+
+    // substitute() inherited from Operation is correct for Call.
+
+    /// The function target expression (typically a Constant with the address or a Variable).
+    Expression* target() const { return operands()[0]; }
+
+    /// The argument expressions (operands[1..N]).
+    std::size_t arg_count() const { return operands().size() > 0 ? operands().size() - 1 : 0; }
+    Expression* arg(std::size_t i) const { return operands()[i + 1]; }
+
+private:
+    static std::vector<Expression*> build_operands_(Expression* target, std::vector<Expression*> args) {
+        std::vector<Expression*> ops;
+        ops.reserve(1 + args.size());
+        ops.push_back(target);
+        for (auto* a : args) ops.push_back(a);
+        return ops;
     }
 };
 
@@ -340,6 +516,9 @@ public:
     /// 0 if synthetic (e.g., phi nodes, inserted copies).
     Address address() const { return address_; }
     void set_address(Address addr) { address_ = addr; }
+
+    /// Deep-clone this instruction into the given arena.
+    virtual Instruction* copy(DecompilerArena& arena) const = 0;
 
     /// Variables defined (written) by this instruction.
     /// Default: empty (branches, break, continue, comments define nothing).
@@ -401,6 +580,24 @@ public:
         }
     }
 
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* a = arena.create<Assignment>(
+            destination_ ? destination_->copy(arena) : nullptr,
+            value_ ? value_->copy(arena) : nullptr);
+        a->set_address(address());
+        a->set_ir_type(ir_type());
+        return a;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        // Recursively substitute in children first
+        if (value_) value_->substitute(replacee, replacement);
+        if (destination_) destination_->substitute(replacee, replacement);
+        // Then replace direct children
+        if (value_ == replacee) value_ = replacement;
+        if (destination_ == replacee) destination_ = replacement;
+    }
+
     Expression* destination() const { return destination_; }
     Expression* value() const { return value_; }
 
@@ -443,6 +640,24 @@ public:
         if (destination_) out.insert(destination_);
     }
 
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* r = arena.create<Relation>(
+            destination_ ? static_cast<Variable*>(destination_->copy(arena)) : nullptr,
+            value_ ? static_cast<Variable*>(value_->copy(arena)) : nullptr);
+        r->set_address(address());
+        r->set_ir_type(ir_type());
+        return r;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        if (value_ == replacee) {
+            if (auto* v = dynamic_cast<Variable*>(replacement)) value_ = v;
+        }
+        if (destination_ == replacee) {
+            if (auto* v = dynamic_cast<Variable*>(replacement)) destination_ = v;
+        }
+    }
+
     Variable* destination() const { return destination_; }
     Variable* value() const { return value_; }
 
@@ -465,6 +680,21 @@ public:
 
     void collect_requirements(std::unordered_set<Variable*>& out) const override {
         if (condition_) condition_->collect_requirements(out);
+    }
+
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* b = arena.create<Branch>(
+            condition_ ? static_cast<Condition*>(condition_->copy(arena)) : nullptr);
+        b->set_address(address());
+        b->set_ir_type(ir_type());
+        return b;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        if (condition_) condition_->substitute(replacee, replacement);
+        if (condition_ == replacee) {
+            if (auto* c = dynamic_cast<Condition*>(replacement)) condition_ = c;
+        }
     }
 
     Condition* condition() const { return condition_; }
@@ -490,6 +720,19 @@ public:
         if (expression_) expression_->collect_requirements(out);
     }
 
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* ib = arena.create<IndirectBranch>(
+            expression_ ? expression_->copy(arena) : nullptr);
+        ib->set_address(address());
+        ib->set_ir_type(ir_type());
+        return ib;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        if (expression_) expression_->substitute(replacee, replacement);
+        if (expression_ == replacee) expression_ = replacement;
+    }
+
     Expression* expression() const { return expression_; }
 
 private:
@@ -512,6 +755,27 @@ public:
     void collect_requirements(std::unordered_set<Variable*>& out) const override {
         for (auto* val : values_) {
             if (val) val->collect_requirements(out);
+        }
+    }
+
+    Instruction* copy(DecompilerArena& arena) const override {
+        std::vector<Expression*> new_vals;
+        new_vals.reserve(values_.size());
+        for (auto* v : values_) {
+            new_vals.push_back(v ? v->copy(arena) : nullptr);
+        }
+        auto* r = arena.create<Return>(std::move(new_vals));
+        r->set_address(address());
+        r->set_ir_type(ir_type());
+        return r;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        for (auto* v : values_) {
+            if (v) v->substitute(replacee, replacement);
+        }
+        for (auto& v : values_) {
+            if (v == replacee) v = replacement;
         }
     }
 
@@ -540,6 +804,20 @@ public:
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_phi(this);
     }
+
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* new_dest = destination_ ? static_cast<Variable*>(destination_->copy(arena)) : nullptr;
+        auto* new_ops = value_ ? static_cast<ListOperation*>(value_->copy(arena)) : nullptr;
+        auto* p = arena.create<Phi>(new_dest, new_ops);
+        p->set_address(address());
+        p->set_ir_type(ir_type());
+        // Note: origin_block_ is NOT deep-copied -- it maps BasicBlock* -> Expression*
+        // and the BasicBlock pointers are shared references, not owned.
+        // The caller must update origin_block after copying if needed.
+        return p;
+    }
+
+    // substitute() inherited from Assignment handles destination_ and value_.
 
     /// The phi destination variable.
     Variable* dest_var() const {
@@ -594,6 +872,12 @@ public:
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_break(this);
     }
+
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* b = arena.create<BreakInstr>();
+        b->set_address(address());
+        return b;
+    }
 };
 
 // =============================================================================
@@ -606,6 +890,12 @@ public:
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_continue(this);
+    }
+
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* c = arena.create<ContinueInstr>();
+        c->set_address(address());
+        return c;
     }
 };
 
@@ -621,6 +911,12 @@ public:
         visitor.visit_comment(this);
     }
 
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* c = arena.create<Comment>(message_);
+        c->set_address(address());
+        return c;
+    }
+
     const std::string& message() const { return message_; }
 
 private:
@@ -633,6 +929,11 @@ private:
 // These are defined inline here so that existing visitor subclasses that only
 // override the original 3 methods (Constant, Variable, Operation) continue to
 // compile without changes.
+
+inline void DataflowObjectVisitorInterface::visit(Call* o) {
+    // Fall back to generic Operation visitor since Call IS-A Operation.
+    visit(static_cast<Operation*>(o));
+}
 
 inline void DataflowObjectVisitorInterface::visit(ListOperation* o) {
     // ListOperation is not an Operation, so we can't delegate.

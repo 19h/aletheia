@@ -68,6 +68,19 @@ z3::expr Z3Converter::convert_operation(dewolf::Operation* o) {
     if (o->type() == dewolf::OperationType::ge && ops.size() == 2) {
         return z3::sge(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
     }
+    // Unsigned comparisons
+    if (o->type() == dewolf::OperationType::lt_us && ops.size() == 2) {
+        return z3::ult(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
+    }
+    if (o->type() == dewolf::OperationType::le_us && ops.size() == 2) {
+        return z3::ule(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
+    }
+    if (o->type() == dewolf::OperationType::gt_us && ops.size() == 2) {
+        return z3::ugt(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
+    }
+    if (o->type() == dewolf::OperationType::ge_us && ops.size() == 2) {
+        return z3::uge(ensure_bv(convert(ops[0]), 64), ensure_bv(convert(ops[1]), 64));
+    }
 
     if (o->type() == dewolf::OperationType::logical_and && ops.size() == 2) {
         return convert(ops[0]) && convert(ops[1]);

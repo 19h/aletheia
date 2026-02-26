@@ -27,41 +27,188 @@ void CExpressionGenerator::visit(Variable* v) {
 }
 
 void CExpressionGenerator::visit(Operation* o) {
-    if (o->type() == OperationType::add && o->operands().size() == 2) {
-        result_ = generate(o->operands()[0]) + " + " + generate(o->operands()[1]);
-    } else if (o->type() == OperationType::sub && o->operands().size() == 2) {
-        result_ = generate(o->operands()[0]) + " - " + generate(o->operands()[1]);
-    } else if (o->type() == OperationType::mul && o->operands().size() == 2) {
-        result_ = generate(o->operands()[0]) + " * " + generate(o->operands()[1]);
-    } else if (o->type() == OperationType::div && o->operands().size() == 2) {
-        result_ = generate(o->operands()[0]) + " / " + generate(o->operands()[1]);
-    } else if (o->type() == OperationType::deref && !o->operands().empty()) {
-        result_ = "*(" + generate(o->operands()[0]) + ")";
-    } else if (o->type() == OperationType::call && !o->operands().empty()) {
-        std::string func = generate(o->operands()[0]);
+    auto type = o->type();
+    auto& ops = o->operands();
+
+    // --- Binary infix operators ---
+    if (ops.size() == 2) {
+        const char* infix = nullptr;
+        switch (type) {
+            // Arithmetic (signed)
+            case OperationType::add:
+            case OperationType::add_with_carry:
+            case OperationType::add_float:      infix = " + "; break;
+            case OperationType::sub:
+            case OperationType::sub_with_carry:
+            case OperationType::sub_float:      infix = " - "; break;
+            case OperationType::mul:
+            case OperationType::mul_us:
+            case OperationType::mul_float:      infix = " * "; break;
+            case OperationType::div:
+            case OperationType::div_us:
+            case OperationType::div_float:      infix = " / "; break;
+            case OperationType::mod:
+            case OperationType::mod_us:         infix = " % "; break;
+            case OperationType::power:          infix = " ** "; break;
+            // Bitwise
+            case OperationType::bit_and:        infix = " & "; break;
+            case OperationType::bit_or:         infix = " | "; break;
+            case OperationType::bit_xor:        infix = " ^ "; break;
+            // Shifts
+            case OperationType::shl:            infix = " << "; break;
+            case OperationType::shr:
+            case OperationType::shr_us:
+            case OperationType::sar:            infix = " >> "; break;
+            // Logical
+            case OperationType::logical_and:    infix = " && "; break;
+            case OperationType::logical_or:     infix = " || "; break;
+            // Comparison (signed)
+            case OperationType::eq:             infix = " == "; break;
+            case OperationType::neq:            infix = " != "; break;
+            case OperationType::lt:
+            case OperationType::lt_us:          infix = " < "; break;
+            case OperationType::le:
+            case OperationType::le_us:          infix = " <= "; break;
+            case OperationType::gt:
+            case OperationType::gt_us:          infix = " > "; break;
+            case OperationType::ge:
+            case OperationType::ge_us:          infix = " >= "; break;
+            // Carry addition
+            case OperationType::adc:            infix = " + "; break;
+            default: break;
+        }
+        if (infix) {
+            result_ = generate(ops[0]) + infix + generate(ops[1]);
+            return;
+        }
+    }
+
+    // --- Unary prefix operators ---
+    if (ops.size() == 1) {
+        switch (type) {
+            case OperationType::negate:
+                result_ = "-(" + generate(ops[0]) + ")";
+                return;
+            case OperationType::bit_not:
+                result_ = "~(" + generate(ops[0]) + ")";
+                return;
+            case OperationType::logical_not:
+                result_ = "!(" + generate(ops[0]) + ")";
+                return;
+            case OperationType::deref:
+                result_ = "*(" + generate(ops[0]) + ")";
+                return;
+            case OperationType::address_of:
+                result_ = "&(" + generate(ops[0]) + ")";
+                return;
+            case OperationType::low:
+                result_ = "(uint8_t)(" + generate(ops[0]) + ")";
+                return;
+            case OperationType::cast:
+                // cast with 1 operand: type info should come from the Operation's ir_type
+                if (o->ir_type()) {
+                    result_ = "(" + o->ir_type()->to_string() + ")" + generate(ops[0]);
+                } else {
+                    result_ = "(cast)" + generate(ops[0]);
+                }
+                return;
+            case OperationType::pointer:
+                result_ = "&" + generate(ops[0]);
+                return;
+            default: break;
+        }
+    }
+
+    // --- Ternary: a ? b : c ---
+    if (type == OperationType::ternary && ops.size() == 3) {
+        result_ = "(" + generate(ops[0]) + " ? " + generate(ops[1]) + " : " + generate(ops[2]) + ")";
+        return;
+    }
+
+    // --- Member access: a.b or a->b ---
+    if (type == OperationType::member_access && ops.size() == 2) {
+        result_ = generate(ops[0]) + "." + generate(ops[1]);
+        return;
+    }
+
+    // --- Field access by offset ---
+    if (type == OperationType::field && ops.size() == 2) {
+        result_ = generate(ops[0]) + "." + generate(ops[1]);
+        return;
+    }
+
+    // --- Rotates: emit as function-style ---
+    if (ops.size() == 2) {
+        const char* rot_name = nullptr;
+        switch (type) {
+            case OperationType::left_rotate:        rot_name = "__ROL__"; break;
+            case OperationType::right_rotate:       rot_name = "__ROR__"; break;
+            case OperationType::left_rotate_carry:  rot_name = "__RCL__"; break;
+            case OperationType::right_rotate_carry: rot_name = "__RCR__"; break;
+            default: break;
+        }
+        if (rot_name) {
+            result_ = std::string(rot_name) + "(" + generate(ops[0]) + ", " + generate(ops[1]) + ")";
+            return;
+        }
+    }
+
+    // --- Function call (legacy: plain Operation with call type, not a Call object) ---
+    if (type == OperationType::call && !ops.empty()) {
+        std::string func = generate(ops[0]);
         result_ = func + "(";
-        for (size_t i = 1; i < o->operands().size(); ++i) {
+        for (size_t i = 1; i < ops.size(); ++i) {
             if (i > 1) result_ += ", ";
-            result_ += generate(o->operands()[i]);
+            result_ += generate(ops[i]);
         }
         result_ += ")";
-    } else if (o->type() == OperationType::unknown && !o->operands().empty()) {
-        std::string func = generate(o->operands()[0]);
-        result_ = func + "()";
-    } else {
-        result_ = "unknown_op";
+        return;
     }
+
+    // --- List operation ---
+    if (type == OperationType::list_op) {
+        result_.clear();
+        for (size_t i = 0; i < ops.size(); ++i) {
+            if (i > 0) result_ += ", ";
+            result_ += generate(ops[i]);
+        }
+        return;
+    }
+
+    // --- Unknown with operands (likely a function call from lifter) ---
+    if (type == OperationType::unknown && !ops.empty()) {
+        std::string func = generate(ops[0]);
+        result_ = func + "()";
+        return;
+    }
+
+    // --- Fallback ---
+    result_ = "unknown_op";
+}
+
+void CExpressionGenerator::visit(Call* c) {
+    std::string func = generate(c->target());
+    result_ = func + "(";
+    for (size_t i = 0; i < c->arg_count(); ++i) {
+        if (i > 0) result_ += ", ";
+        result_ += generate(c->arg(i));
+    }
+    result_ += ")";
 }
 
 void CExpressionGenerator::visit(Condition* c) {
     std::string op_str = " == ";
     switch (c->type()) {
-        case OperationType::eq:  op_str = " == "; break;
-        case OperationType::neq: op_str = " != "; break;
-        case OperationType::lt:  op_str = " < "; break;
-        case OperationType::le:  op_str = " <= "; break;
-        case OperationType::gt:  op_str = " > "; break;
-        case OperationType::ge:  op_str = " >= "; break;
+        case OperationType::eq:    op_str = " == "; break;
+        case OperationType::neq:   op_str = " != "; break;
+        case OperationType::lt:
+        case OperationType::lt_us: op_str = " < "; break;
+        case OperationType::le:
+        case OperationType::le_us: op_str = " <= "; break;
+        case OperationType::gt:
+        case OperationType::gt_us: op_str = " > "; break;
+        case OperationType::ge:
+        case OperationType::ge_us: op_str = " >= "; break;
         default: op_str = " ?? "; break;
     }
     result_ = generate(c->lhs()) + op_str + generate(c->rhs());

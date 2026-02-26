@@ -149,7 +149,8 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     if (lmnem == "add" || lmnem == "adds") arith_type = OperationType::add;
     else if (lmnem == "sub" || lmnem == "subs") arith_type = OperationType::sub;
     else if (lmnem == "mul") arith_type = OperationType::mul;
-    else if (lmnem == "sdiv" || lmnem == "udiv") arith_type = OperationType::div;
+    else if (lmnem == "sdiv") arith_type = OperationType::div;
+    else if (lmnem == "udiv") arith_type = OperationType::div_us;
 
     if (arith_type != OperationType::unknown) {
         if (lmnem == "cmp" && operands.size() == 2) {
