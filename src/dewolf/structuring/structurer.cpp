@@ -1,4 +1,5 @@
 #include "structurer.hpp"
+#include "loop_structurer.hpp"
 #include "../ssa/dominators.hpp"
 #include "../../dewolf_logic/z3_logic.hpp"
 #include "graph_slice/graph_slice.hpp"
@@ -44,8 +45,11 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             body->add_node(tail->ast_node());
         }
 
-        LoopNode* loop = arena_.create<LoopNode>(body);
-        header->set_ast_node(loop);
+        WhileLoopNode* loop = arena_.create<WhileLoopNode>(body);
+
+        // Refine the endless loop into the correct loop type
+        AstNode* refined = LoopStructurer::refine_loop(arena_, loop);
+        header->set_ast_node(refined);
     }
 }
 

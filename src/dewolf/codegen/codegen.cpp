@@ -181,12 +181,52 @@ void CodeVisitor::visit_node(AstNode* node) {
         current_line_ += "}";
         lines_.push_back(current_line_);
         current_line_.clear();
-    } else if (LoopNode* lnode = dynamic_cast<LoopNode*>(node)) {
+    } else if (auto* dowhile = dynamic_cast<DoWhileLoopNode*>(node)) {
         indent();
-        current_line_ += "while (true) {";
+        current_line_ += "do {";
         lines_.push_back(current_line_);
         current_line_.clear();
-        
+
+        indent_level_++;
+        visit_node(dowhile->body());
+        indent_level_--;
+
+        indent();
+        if (dowhile->condition()) {
+            current_line_ += "} while (" + expr_gen_.generate(dowhile->condition()) + ");";
+        } else {
+            current_line_ += "} while (true);";
+        }
+        lines_.push_back(current_line_);
+        current_line_.clear();
+    } else if (auto* forloop = dynamic_cast<ForLoopNode*>(node)) {
+        indent();
+        std::string decl_str = forloop->declaration() ? expr_gen_.generate(forloop->declaration()) : "";
+        std::string cond_str = forloop->condition() ? expr_gen_.generate(forloop->condition()) : "";
+        std::string mod_str = forloop->modification() ? expr_gen_.generate(forloop->modification()) : "";
+        current_line_ += "for (" + decl_str + "; " + cond_str + "; " + mod_str + ") {";
+        lines_.push_back(current_line_);
+        current_line_.clear();
+
+        indent_level_++;
+        visit_node(forloop->body());
+        indent_level_--;
+
+        indent();
+        current_line_ += "}";
+        lines_.push_back(current_line_);
+        current_line_.clear();
+    } else if (LoopNode* lnode = dynamic_cast<LoopNode*>(node)) {
+        // WhileLoopNode or any other LoopNode subclass
+        indent();
+        if (lnode->condition()) {
+            current_line_ += "while (" + expr_gen_.generate(lnode->condition()) + ") {";
+        } else {
+            current_line_ += "while (true) {";
+        }
+        lines_.push_back(current_line_);
+        current_line_.clear();
+
         indent_level_++;
         visit_node(lnode->body());
         indent_level_--;

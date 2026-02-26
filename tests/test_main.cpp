@@ -5,6 +5,8 @@
 #include "../src/dewolf/structures/cfg.hpp"
 #include "../src/dewolf/structures/dataflow.hpp"
 #include "../src/dewolf/structures/types.hpp"
+#include "../src/dewolf/structuring/ast.hpp"
+#include "../src/dewolf/structuring/loop_structurer.hpp"
 #include "../src/dewolf/ssa/dominators.hpp"
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
 
@@ -198,6 +200,139 @@ void test_instruction_hierarchy() {
     std::cout << "[+] test_instruction_hierarchy passed.\n";
 }
 
+void test_loop_structurer() {
+    DecompilerArena arena;
+    
+    // -- Test WhileLoopRule --
+    // Build: while(true) { if (x > 0) break; y = 1; }
+    // Expected: while (x <= 0) { y = 1; }
+    {
+        auto* blk_break = arena.create<BasicBlock>(100);
+        blk_break->add_instruction(arena.create<BreakInstr>());
+        auto* break_code = arena.create<CodeNode>(blk_break);
+        
+        auto* x = arena.create<Variable>("x", 4);
+        auto* zero = arena.create<Constant>(0, 4);
+        auto* cond = arena.create<Condition>(OperationType::gt, x, zero);
+        auto* cond_ast = arena.create<ExprAstNode>(cond);
+        auto* if_break = arena.create<IfNode>(cond_ast, break_code, nullptr);
+        
+        auto* blk_body = arena.create<BasicBlock>(101);
+        auto* y = arena.create<Variable>("y", 4);
+        auto* one = arena.create<Constant>(1, 4);
+        blk_body->add_instruction(arena.create<Assignment>(y, one));
+        auto* body_code = arena.create<CodeNode>(blk_body);
+        
+        auto* seq = arena.create<SeqNode>();
+        seq->add_node(if_break);
+        seq->add_node(body_code);
+        
+        auto* loop = arena.create<WhileLoopNode>(seq);
+        ASSERT_TRUE(loop->is_endless());
+        
+        AstNode* result = LoopStructurer::refine_loop(arena, loop);
+        auto* refined = dynamic_cast<WhileLoopNode*>(result);
+        ASSERT_TRUE(refined != nullptr);
+        ASSERT_TRUE(!refined->is_endless());
+        ASSERT_TRUE(refined->condition() != nullptr);
+        // Condition should be negated: gt -> le
+        auto* new_cond = dynamic_cast<Condition*>(refined->condition());
+        ASSERT_TRUE(new_cond != nullptr);
+        ASSERT_EQ(new_cond->type(), OperationType::le);
+    }
+    
+    // -- Test DoWhileLoopRule --
+    // Build: while(true) { y = 1; if (x > 0) break; }
+    // Expected: do { y = 1; } while (x <= 0)
+    {
+        auto* blk_body = arena.create<BasicBlock>(200);
+        auto* y = arena.create<Variable>("y", 4);
+        auto* one = arena.create<Constant>(1, 4);
+        blk_body->add_instruction(arena.create<Assignment>(y, one));
+        auto* body_code = arena.create<CodeNode>(blk_body);
+        
+        auto* blk_break = arena.create<BasicBlock>(201);
+        blk_break->add_instruction(arena.create<BreakInstr>());
+        auto* break_code = arena.create<CodeNode>(blk_break);
+        
+        auto* x = arena.create<Variable>("x", 4);
+        auto* zero = arena.create<Constant>(0, 4);
+        auto* cond = arena.create<Condition>(OperationType::gt, x, zero);
+        auto* cond_ast = arena.create<ExprAstNode>(cond);
+        auto* if_break = arena.create<IfNode>(cond_ast, break_code, nullptr);
+        
+        auto* seq = arena.create<SeqNode>();
+        seq->add_node(body_code);
+        seq->add_node(if_break);
+        
+        auto* loop = arena.create<WhileLoopNode>(seq);
+        AstNode* result = LoopStructurer::refine_loop(arena, loop);
+        auto* dowhile = dynamic_cast<DoWhileLoopNode*>(result);
+        ASSERT_TRUE(dowhile != nullptr);
+        ASSERT_TRUE(dowhile->condition() != nullptr);
+        auto* new_cond = dynamic_cast<Condition*>(dowhile->condition());
+        ASSERT_TRUE(new_cond != nullptr);
+        ASSERT_EQ(new_cond->type(), OperationType::le);
+    }
+    
+    // -- Test SequenceRule --
+    // Build: while(true) { y = 1; break; }
+    // Expected: { y = 1; } (no loop)
+    {
+        auto* blk = arena.create<BasicBlock>(300);
+        auto* y = arena.create<Variable>("y", 4);
+        auto* one = arena.create<Constant>(1, 4);
+        blk->add_instruction(arena.create<Assignment>(y, one));
+        blk->add_instruction(arena.create<BreakInstr>());
+        auto* code = arena.create<CodeNode>(blk);
+        
+        auto* seq = arena.create<SeqNode>();
+        seq->add_node(code);
+        
+        auto* loop = arena.create<WhileLoopNode>(seq);
+        AstNode* result = LoopStructurer::refine_loop(arena, loop);
+        // Should NOT be a loop anymore
+        ASSERT_TRUE(dynamic_cast<LoopNode*>(result) == nullptr);
+    }
+    
+    // -- Test ConditionToSequenceRule --
+    // Build: while(true) { if(cond) { A } else { B; break; } }
+    // Expected: while(cond) { A }; B
+    {
+        auto* blk_a = arena.create<BasicBlock>(400);
+        auto* a_var = arena.create<Variable>("a", 4);
+        auto* a_val = arena.create<Constant>(1, 4);
+        blk_a->add_instruction(arena.create<Assignment>(a_var, a_val));
+        auto* code_a = arena.create<CodeNode>(blk_a);
+        
+        auto* blk_b = arena.create<BasicBlock>(401);
+        auto* b_var = arena.create<Variable>("b", 4);
+        auto* b_val = arena.create<Constant>(2, 4);
+        blk_b->add_instruction(arena.create<Assignment>(b_var, b_val));
+        blk_b->add_instruction(arena.create<BreakInstr>());
+        auto* code_b = arena.create<CodeNode>(blk_b);
+        
+        auto* x = arena.create<Variable>("x", 4);
+        auto* zero = arena.create<Constant>(0, 4);
+        auto* cond = arena.create<Condition>(OperationType::gt, x, zero);
+        auto* cond_ast = arena.create<ExprAstNode>(cond);
+        auto* if_node = arena.create<IfNode>(cond_ast, code_a, code_b);
+        
+        auto* loop = arena.create<WhileLoopNode>(static_cast<AstNode*>(if_node));
+        AstNode* result = LoopStructurer::refine_loop(arena, loop);
+        
+        // Result should be a SeqNode: [WhileLoopNode, code_b]
+        auto* result_seq = dynamic_cast<SeqNode*>(result);
+        ASSERT_TRUE(result_seq != nullptr);
+        ASSERT_TRUE(result_seq->size() >= 1);
+        auto* new_while = dynamic_cast<WhileLoopNode*>(result_seq->first());
+        ASSERT_TRUE(new_while != nullptr);
+        ASSERT_TRUE(!new_while->is_endless());
+    }
+    
+    std::cout << "[+] test_loop_structurer passed.\n";
+}
+
 void test_type_system() {
     // Basic integer types
     auto i32 = Integer::int32_t();
@@ -299,6 +434,7 @@ int main() {
     test_ssa_phi_insertion();
     test_instruction_hierarchy();
     test_type_system();
+    test_loop_structurer();
     std::cout << "All tests passed successfully.\n";
     return 0;
 }
