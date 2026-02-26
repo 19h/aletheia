@@ -24,7 +24,7 @@ private:
     std::vector<TransitionBlock*> successors_;
 };
 
-class TransitionCFG {
+class TransitionCFG : public ArenaAllocated {
 public:
     TransitionCFG() = default;
 
@@ -32,6 +32,7 @@ public:
     TransitionBlock* entry() const { return entry_; }
 
     void add_block(TransitionBlock* block) { blocks_.push_back(block); }
+    const std::vector<TransitionBlock*>& blocks() const { return blocks_; }
 
 private:
     TransitionBlock* entry_ = nullptr;

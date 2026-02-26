@@ -1,6 +1,7 @@
 #pragma once
 #include "transition_cfg.hpp"
 #include "../../common/arena.hpp"
+#include <unordered_set>
 
 namespace dewolf {
 
@@ -28,6 +29,9 @@ public:
 
 private:
     DecompilerArena& arena_;
+
+    // Internal restructuring matching python dewolf
+    void restructure_region(TransitionCFG* t_cfg, TransitionBlock* header, const std::unordered_set<TransitionBlock*>& region);
 };
 
 } // namespace dewolf

@@ -1,0 +1,103 @@
+#include "graph_slice.hpp"
+#include <algorithm>
+
+namespace dewolf {
+
+std::vector<TransitionBlock*> GraphSlice::get_sink_nodes(TransitionCFG* t_cfg, const std::unordered_set<TransitionBlock*>& region) {
+    std::vector<TransitionBlock*> sinks;
+    for (TransitionBlock* node : region) {
+        if (node->successors().empty()) {
+            sinks.push_back(node);
+            continue;
+        }
+        for (TransitionBlock* succ : node->successors()) {
+            if (region.find(succ) == region.end()) {
+                sinks.push_back(node);
+                break;
+            }
+        }
+    }
+    return sinks;
+}
+
+TransitionCFG* GraphSlice::compute_graph_slice_for_region(
+    DecompilerArena& arena,
+    TransitionCFG* t_cfg,
+    TransitionBlock* source,
+    const std::unordered_set<TransitionBlock*>& region,
+    bool back_edges
+) {
+    auto sink_nodes = get_sink_nodes(t_cfg, region);
+    return compute_graph_slice_for_sink_nodes(arena, t_cfg, source, sink_nodes, back_edges);
+}
+
+TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
+    DecompilerArena& arena,
+    TransitionCFG* t_cfg,
+    TransitionBlock* source,
+    const std::vector<TransitionBlock*>& sink_nodes,
+    bool back_edges
+) {
+    // Port of GraphSlice logic:
+    // A slice is a directed acyclic subgraph where N is the set of all vertices on simple paths
+    // from source to any of the sink_nodes.
+
+    TransitionCFG* slice = arena.create<TransitionCFG>();
+    slice->set_entry(source);
+
+    // Simple implementation: DFS from source. If path reaches a sink, all nodes in path are in the slice.
+    std::unordered_set<TransitionBlock*> slice_nodes;
+    std::unordered_set<TransitionBlock*> path;
+    std::unordered_set<TransitionBlock*> visited;
+
+    auto dfs = [&](TransitionBlock* node, auto& dfs_ref) -> bool {
+        if (!node) return false;
+        
+        path.insert(node);
+        visited.insert(node);
+
+        bool reaches_sink = false;
+        if (std::find(sink_nodes.begin(), sink_nodes.end(), node) != sink_nodes.end()) {
+            reaches_sink = true;
+        } else {
+            for (TransitionBlock* succ : node->successors()) {
+                if (path.contains(succ)) {
+                    // Back-edge
+                    if (back_edges) reaches_sink = true; // Loosely keeping back edges
+                    continue;
+                }
+                
+                // If it was already processed and known to be in slice, it reaches sink
+                if (slice_nodes.contains(succ)) {
+                    reaches_sink = true;
+                } else if (!visited.contains(succ)) {
+                    if (dfs_ref(succ, dfs_ref)) {
+                        reaches_sink = true;
+                    }
+                }
+            }
+        }
+
+        path.erase(node);
+        
+        if (reaches_sink) {
+            slice_nodes.insert(node);
+        }
+        return reaches_sink;
+    };
+
+    dfs(source, dfs);
+
+    // Now reconstruct edges within the slice
+    for (TransitionBlock* node : slice_nodes) {
+        slice->add_block(node);
+        // Note: For a true deep copy slice, we'd clone blocks. 
+        // We'll keep references to the original TransitionBlocks but logically they belong to the slice.
+        // For the structurer to work recursively, we might need a richer graph class that tracks its own edges,
+        // rather than storing edges natively in TransitionBlock. But we emulate it for now.
+    }
+
+    return slice;
+}
+
+} // namespace dewolf
