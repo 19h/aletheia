@@ -18,6 +18,17 @@ static void substitute_uses(Expression* expr, const std::unordered_map<Variable*
                 substitute_uses(op->operands()[i], subs);
             }
         }
+    } else if (ListOperation* list = dynamic_cast<ListOperation*>(expr)) {
+        for (size_t i = 0; i < list->operands().size(); ++i) {
+            if (Variable* v = dynamic_cast<Variable*>(list->operands()[i])) {
+                auto it = subs.find(v);
+                if (it != subs.end()) {
+                    list->mutable_operands()[i] = it->second;
+                }
+            } else {
+                substitute_uses(list->operands()[i], subs);
+            }
+        }
     }
 }
 
@@ -29,13 +40,15 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
     std::unordered_map<Variable*, Expression*> substitutions;
     std::unordered_set<Instruction*> dead_instructions;
 
-    // Pass 1: Build identity groups from Assignments
+    // Pass 1: Build identity groups from Assignments (not Phis)
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            Operation* op = inst->operation();
-            if (op->type() == OperationType::assign && op->operands().size() == 2) {
-                if (Variable* target = dynamic_cast<Variable*>(op->operands()[0])) {
-                    Expression* value = op->operands()[1];
+            // Skip phi nodes
+            if (dynamic_cast<Phi*>(inst)) continue;
+
+            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                if (Variable* target = dynamic_cast<Variable*>(assign->destination())) {
+                    Expression* value = assign->value();
                     
                     // If assigning to a Constant or another Variable without side effects
                     if (dynamic_cast<Constant*>(value) || dynamic_cast<Variable*>(value)) {
@@ -69,21 +82,31 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
                 continue;
             }
 
-            Operation* op = inst->operation();
-            
-            // For assignments, we only substitute the RHS (operands[1])
-            if (op->type() == OperationType::assign && op->operands().size() == 2) {
-                if (Variable* v = dynamic_cast<Variable*>(op->operands()[1])) {
+            // Skip phi nodes (don't substitute naively into phis)
+            if (dynamic_cast<Phi*>(inst)) {
+                new_insts.push_back(inst);
+                continue;
+            }
+
+            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                // Substitute in the value (RHS) only
+                Expression* value = assign->value();
+                if (Variable* v = dynamic_cast<Variable*>(value)) {
                     auto it = substitutions.find(v);
                     if (it != substitutions.end()) {
-                        op->mutable_operands()[1] = it->second;
+                        assign->set_value(it->second);
                     }
                 } else {
-                    substitute_uses(op->operands()[1], substitutions);
+                    substitute_uses(value, substitutions);
                 }
-            } else if (op->type() != OperationType::phi) {
-                // Do not substitute phi targets/arguments naively without proper SSA tracking
-                substitute_uses(op, substitutions);
+            } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                // Substitute in branch condition
+                substitute_uses(branch->condition(), substitutions);
+            } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+                // Return values: substitute handled via expression walk
+                for (auto* val : ret->values()) {
+                    substitute_uses(val, substitutions);
+                }
             }
             
             new_insts.push_back(inst);

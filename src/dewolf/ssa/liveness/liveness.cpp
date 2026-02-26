@@ -31,47 +31,53 @@ void LivenessAnalysis::extract_vars(Expression* expr, std::unordered_set<std::st
         for (auto* child : op->operands()) {
             extract_vars(child, out);
         }
+    } else if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (auto* child : list->operands()) {
+            extract_vars(child, out);
+        }
     }
 }
 
 void LivenessAnalysis::init_usages_definitions_of_blocks() {
     for (BasicBlock* block : cfg_.blocks()) {
         for (Instruction* inst : block->instructions()) {
-            Operation* op = inst->operation();
-            if (!op) continue;
-
-            if (op->type() == OperationType::phi) {
-                // Phi structure: target is op->operands()[0], sources are the rest (usually pair of block, var)
-                // For simplicity, we just extract all uses from sources
-                if (!op->operands().empty()) {
-                    std::unordered_set<std::string> defs;
-                    extract_vars(op->operands()[0], defs);
-                    for (const auto& d : defs) defs_phi_block_[block].insert(d);
-
-                    for (size_t i = 1; i < op->operands().size(); ++i) {
+            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+                // Phi: destination is a definition, operands are uses
+                if (Variable* def_var = phi->dest_var()) {
+                    defs_phi_block_[block].insert(def_var->name());
+                }
+                if (auto* op_list = phi->operand_list()) {
+                    for (auto* operand : op_list->operands()) {
                         std::unordered_set<std::string> uses;
-                        extract_vars(op->operands()[i], uses);
+                        extract_vars(operand, uses);
                         for (const auto& u : uses) {
-                            // We need to associate this with predecessor block, but for now we just track it.
-                            // In a real Phi node, operands contain info about which predecessor it comes from.
-                            // We will approximate it here.
                             uses_phi_block_[block].insert(u);
                         }
                     }
                 }
-            } else if (op->type() == OperationType::assign && op->operands().size() == 2) {
+            } else if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                // Assignment: destination is a definition, value is a use
                 std::unordered_set<std::string> defs;
-                extract_vars(op->operands()[0], defs);
+                extract_vars(assign->destination(), defs);
                 for (const auto& d : defs) defs_block_[block].insert(d);
 
                 std::unordered_set<std::string> uses;
-                extract_vars(op->operands()[1], uses);
+                extract_vars(assign->value(), uses);
                 for (const auto& u : uses) uses_block_[block].insert(u);
-            } else {
+            } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                // Branch: condition variables are uses
                 std::unordered_set<std::string> uses;
-                extract_vars(op, uses);
+                extract_vars(branch->condition(), uses);
                 for (const auto& u : uses) uses_block_[block].insert(u);
+            } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+                // Return: return values are uses
+                for (auto* val : ret->values()) {
+                    std::unordered_set<std::string> uses;
+                    extract_vars(val, uses);
+                    for (const auto& u : uses) uses_block_[block].insert(u);
+                }
             }
+            // Break, Continue, Comment have no variable references
         }
     }
 }
@@ -103,8 +109,6 @@ void LivenessAnalysis::create_live_sets() {
     
     for (BasicBlock* block : cfg_.blocks()) {
         for (const std::string& var : uses_phi_block_[block]) {
-            // For true Phi logic, we trace back to specific predecessor.
-            // Here we assume it flows to all predecessors uniformly for simplicity in this stub.
             for (Edge* e : block->predecessors()) {
                 BasicBlock* pred = e->source();
                 if (pred) {

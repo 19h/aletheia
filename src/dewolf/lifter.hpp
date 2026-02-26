@@ -23,7 +23,10 @@ private:
 
     BasicBlock* process_block(const ida::graph::BasicBlock& ida_block, std::unordered_map<ida::Address, BasicBlock*>& block_map);
     Instruction* lift_instruction(const ida::instruction::Instruction& insn);
-    Operation* map_operation(const ida::instruction::Instruction& insn);
+    
+    // Operand lifting helpers
+    std::vector<Expression*> lift_operands(const ida::instruction::Instruction& insn);
+    Expression* lift_operand(const ida::instruction::Operand& op, ida::Address insn_addr);
 };
 
 } // namespace dewolf

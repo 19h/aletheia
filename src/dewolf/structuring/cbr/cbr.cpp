@@ -24,14 +24,18 @@ AstNode* ConditionBasedRefinement::refine(
             if (CodeNode* cnode = dynamic_cast<CodeNode*>(node)) {
                 if (!cnode->block()->instructions().empty()) {
                     Instruction* last_inst = cnode->block()->instructions().back();
-                    if (last_inst->operation()->type() >= OperationType::eq && last_inst->operation()->type() <= OperationType::ge) {
-                        branch_cond = arena.create<ExprAstNode>(last_inst->operation());
+                    
+                    // Check if the last instruction is a Branch (conditional)
+                    if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+                        branch_cond = arena.create<ExprAstNode>(branch->condition());
+                        
+                        // Remove the branch instruction from the block
                         auto insts = cnode->block()->instructions();
                         insts.pop_back();
                         cnode->block()->set_instructions(std::move(insts));
                         
                         dewolf_logic::Z3Converter conv(ctx);
-                        dewolf_logic::LogicCondition extracted_cond = conv.convert_to_condition(last_inst->operation());
+                        dewolf_logic::LogicCondition extracted_cond = conv.convert_to_condition(branch->condition());
                         
                         new_seq->add_node(node);
                         i++;

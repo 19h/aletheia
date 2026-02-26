@@ -19,6 +19,15 @@ static bool contains_variable(Expression* expr, const std::string& var_name) {
             }
         }
     }
+
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (auto* child : list->operands()) {
+            if (contains_variable(child, var_name)) {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -62,97 +71,85 @@ void ExpressionPropagationStage::execute(DecompilerTask& task) {
         std::unordered_map<std::string, Expression*> local_defs;
 
         for (Instruction* inst : block->instructions()) {
-            Operation* op = inst->operation();
-            
-            if (op->type() == OperationType::assign && op->operands().size() == 2) {
-                Expression* target = op->operands()[0];
-                Expression* source = op->operands()[1];
+            // --- Handle Assignment instructions ---
+            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                Expression* target = assign->destination();
+                Expression* source = assign->value();
 
+                // Propagate known definitions into the source (RHS)
                 for (const auto& [vname, expr] : local_defs) {
                     source = replace_variable(task.arena(), source, vname, expr);
                 }
 
                 if (auto* v = dynamic_cast<Variable*>(target)) {
-                    // Update definition locally but DO NOT inline away side-effectful or multi-use variables completely
-                    // DeWolf's GraphExpressionFolding does this strictly over SSA chains
                     local_defs[v->name()] = source;
-                    // We must still emit the SSA assignment for visibility!
-                    Operation* new_op = task.arena().create<Operation>(OperationType::assign, 
-                        std::vector<Expression*>{target, source}, op->size_bytes);
-                    new_instructions.push_back(task.arena().create<Instruction>(inst->address(), new_op));
-                    continue; 
+                    auto* new_assign = task.arena().create<Assignment>(target, source);
+                    new_assign->set_address(assign->address());
+                    new_instructions.push_back(new_assign);
+                    continue;
                 } else {
-                    Operation* new_op = task.arena().create<Operation>(OperationType::assign, 
-                        std::vector<Expression*>{target, source}, op->size_bytes);
-                    new_instructions.push_back(task.arena().create<Instruction>(inst->address(), new_op));
+                    // Memory store: target is a complex expression
+                    auto* new_assign = task.arena().create<Assignment>(target, source);
+                    new_assign->set_address(assign->address());
+                    new_instructions.push_back(new_assign);
                     if (dynamic_cast<Operation*>(target)) {
-                        local_defs.clear();
+                        local_defs.clear(); // Memory write invalidates defs
                     }
                 }
-            } else if (op->type() == OperationType::call) {
-                std::vector<Expression*> new_ops;
-                new_ops.push_back(op->operands()[0]);
-                for (size_t i = 1; i < op->operands().size(); ++i) {
-                    Expression* arg = op->operands()[i];
-                    for (const auto& [vname, expr] : local_defs) {
-                        arg = replace_variable(task.arena(), arg, vname, expr);
-                    }
-                    new_ops.push_back(arg);
-                }
+                continue;
+            }
+
+            // --- Handle Branch instructions ---
+            if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                Condition* cond = branch->condition();
                 
-                Operation* new_op = task.arena().create<Operation>(op->type(), std::move(new_ops), op->size_bytes);
-                new_instructions.push_back(task.arena().create<Instruction>(inst->address(), new_op));
-                local_defs.clear();
-            } else if (op->type() >= OperationType::eq && op->type() <= OperationType::ge) {
-                // Combine flags/conditions (CMP + B.LE)
-                // A branch operation itself!
-                std::vector<Expression*> new_ops;
-                for (auto* arg : op->operands()) {
-                    for (const auto& [vname, expr] : local_defs) {
-                        arg = replace_variable(task.arena(), arg, vname, expr);
-                    }
-                    new_ops.push_back(arg);
+                // Propagate into branch condition operands
+                Expression* lhs = cond->lhs();
+                Expression* rhs = cond->rhs();
+                for (const auto& [vname, expr] : local_defs) {
+                    lhs = replace_variable(task.arena(), lhs, vname, expr);
+                    rhs = replace_variable(task.arena(), rhs, vname, expr);
                 }
 
-                // If previous instruction was a CMP (sub), fold its operands into this branch!
-                if (!new_instructions.empty()) {
-                    Instruction* last_inst = new_instructions.back();
-                    if (last_inst->operation()->type() == OperationType::sub && last_inst->operation()->operands().size() == 2) {
-                        // Fold it! (e.g. b.le becomes (a <= b))
-                        std::vector<Expression*> cmp_ops = last_inst->operation()->operands();
-                        Operation* cond_op = task.arena().create<Operation>(op->type(), std::move(cmp_ops), 0);
-                        
-                        // Replace the cmp and the branch with just the branch holding the condition
-                        new_instructions.pop_back();
-                        new_instructions.push_back(task.arena().create<Instruction>(inst->address(), cond_op));
-                        continue;
-                    } else if (last_inst->operation()->type() == OperationType::assign && last_inst->operation()->operands().size() == 2) {
-                        // Sometimes CMP is folded into an assign if mapped incorrectly, let's look for a sub inside the assign
-                        if (auto* rhs_sub = dynamic_cast<Operation*>(last_inst->operation()->operands()[1])) {
-                            if (rhs_sub->type() == OperationType::sub && rhs_sub->operands().size() == 2) {
-                                std::vector<Expression*> cmp_ops = rhs_sub->operands();
-                                Operation* cond_op = task.arena().create<Operation>(op->type(), std::move(cmp_ops), 0);
-                                new_instructions.pop_back();
-                                new_instructions.push_back(task.arena().create<Instruction>(inst->address(), cond_op));
-                                continue;
+                // CMP+branch folding: if the LHS was propagated from a subtraction
+                // (flags = a - b), fold the CMP operands into the branch condition.
+                if (auto* sub_op = dynamic_cast<Operation*>(lhs)) {
+                    if (sub_op->type() == OperationType::sub && sub_op->operands().size() == 2) {
+                        // Replace: if (flags CMP 0) with if (a CMP b)
+                        if (auto* zero = dynamic_cast<Constant*>(rhs)) {
+                            if (zero->value() == 0) {
+                                lhs = sub_op->operands()[0];
+                                rhs = sub_op->operands()[1];
                             }
                         }
                     }
                 }
-                
-                Operation* new_op = task.arena().create<Operation>(op->type(), std::move(new_ops), op->size_bytes);
-                new_instructions.push_back(task.arena().create<Instruction>(inst->address(), new_op));
-            } else {
-                std::vector<Expression*> new_ops;
-                for (auto* arg : op->operands()) {
-                    for (const auto& [vname, expr] : local_defs) {
-                        arg = replace_variable(task.arena(), arg, vname, expr);
-                    }
-                    new_ops.push_back(arg);
-                }
-                Operation* new_op = task.arena().create<Operation>(op->type(), std::move(new_ops), op->size_bytes);
-                new_instructions.push_back(task.arena().create<Instruction>(inst->address(), new_op));
+
+                auto* new_cond = task.arena().create<Condition>(cond->type(), lhs, rhs, cond->size_bytes);
+                auto* new_branch = task.arena().create<Branch>(new_cond);
+                new_branch->set_address(branch->address());
+                new_instructions.push_back(new_branch);
+                continue;
             }
+
+            // --- Handle Return instructions ---
+            if (auto* ret = dynamic_cast<Return*>(inst)) {
+                std::vector<Expression*> new_vals;
+                for (auto* val : ret->values()) {
+                    Expression* new_val = val;
+                    for (const auto& [vname, expr] : local_defs) {
+                        new_val = replace_variable(task.arena(), new_val, vname, expr);
+                    }
+                    new_vals.push_back(new_val);
+                }
+                auto* new_ret = task.arena().create<Return>(std::move(new_vals));
+                new_ret->set_address(ret->address());
+                new_instructions.push_back(new_ret);
+                continue;
+            }
+
+            // --- Everything else (Break, Continue, Comment, Phi) passes through ---
+            new_instructions.push_back(inst);
         }
         
         block->set_instructions(std::move(new_instructions));

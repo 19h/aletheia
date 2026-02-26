@@ -27,11 +27,7 @@ void CExpressionGenerator::visit(Variable* v) {
 }
 
 void CExpressionGenerator::visit(Operation* o) {
-    if (o->type() == OperationType::assign && o->operands().size() == 2) {
-        std::string lhs = generate(o->operands()[0]);
-        std::string rhs = generate(o->operands()[1]);
-        result_ = lhs + " = " + rhs;
-    } else if (o->type() == OperationType::add && o->operands().size() == 2) {
+    if (o->type() == OperationType::add && o->operands().size() == 2) {
         result_ = generate(o->operands()[0]) + " + " + generate(o->operands()[1]);
     } else if (o->type() == OperationType::sub && o->operands().size() == 2) {
         result_ = generate(o->operands()[0]) + " - " + generate(o->operands()[1]);
@@ -41,37 +37,81 @@ void CExpressionGenerator::visit(Operation* o) {
         result_ = generate(o->operands()[0]) + " / " + generate(o->operands()[1]);
     } else if (o->type() == OperationType::deref && !o->operands().empty()) {
         result_ = "*(" + generate(o->operands()[0]) + ")";
-    } else if (o->type() >= OperationType::eq && o->type() <= OperationType::ge && o->operands().size() == 2) {
-        std::string op_str = " == ";
-        if (o->type() == OperationType::neq) op_str = " != ";
-        if (o->type() == OperationType::lt) op_str = " < ";
-        if (o->type() == OperationType::le) op_str = " <= ";
-        if (o->type() == OperationType::gt) op_str = " > ";
-        if (o->type() == OperationType::ge) op_str = " >= ";
-        result_ = generate(o->operands()[0]) + op_str + generate(o->operands()[1]);
     } else if (o->type() == OperationType::call && !o->operands().empty()) {
         std::string func = generate(o->operands()[0]);
-        if (func == "ret") {
-            result_ = "return";
-            if (o->operands().size() > 1) {
-                result_ += " " + generate(o->operands()[1]);
-            }
-        } else {
-            result_ = func + "()";
+        result_ = func + "(";
+        for (size_t i = 1; i < o->operands().size(); ++i) {
+            if (i > 1) result_ += ", ";
+            result_ += generate(o->operands()[i]);
         }
+        result_ += ")";
     } else if (o->type() == OperationType::unknown && !o->operands().empty()) {
         std::string func = generate(o->operands()[0]);
         result_ = func + "()";
     } else {
-        // Unary op logic like b.le() -> ble flag
-        if (o->type() == OperationType::le) result_ = "FLAG <= 0";
-        else if (o->type() == OperationType::lt) result_ = "FLAG < 0";
-        else if (o->type() == OperationType::ge) result_ = "FLAG >= 0";
-        else if (o->type() == OperationType::gt) result_ = "FLAG > 0";
-        else if (o->type() == OperationType::eq) result_ = "FLAG == 0";
-        else if (o->type() == OperationType::neq) result_ = "FLAG != 0";
-        else result_ = "unknown_op";
+        result_ = "unknown_op";
     }
+}
+
+void CExpressionGenerator::visit(Condition* c) {
+    std::string op_str = " == ";
+    switch (c->type()) {
+        case OperationType::eq:  op_str = " == "; break;
+        case OperationType::neq: op_str = " != "; break;
+        case OperationType::lt:  op_str = " < "; break;
+        case OperationType::le:  op_str = " <= "; break;
+        case OperationType::gt:  op_str = " > "; break;
+        case OperationType::ge:  op_str = " >= "; break;
+        default: op_str = " ?? "; break;
+    }
+    result_ = generate(c->lhs()) + op_str + generate(c->rhs());
+}
+
+void CExpressionGenerator::visit_assignment(Assignment* i) {
+    std::string lhs = generate(i->destination());
+    std::string rhs = generate(i->value());
+    if (lhs.empty() || lhs == "unknown_op") {
+        // Void call assignment: just print the RHS
+        result_ = rhs;
+    } else {
+        result_ = lhs + " = " + rhs;
+    }
+}
+
+void CExpressionGenerator::visit_return(Return* i) {
+    if (i->has_value()) {
+        result_ = "return " + generate(i->values()[0]);
+    } else {
+        result_ = "return";
+    }
+}
+
+void CExpressionGenerator::visit_phi(Phi* i) {
+    std::string dest = generate(i->dest_var());
+    result_ = dest + " = phi(";
+    if (i->operand_list()) {
+        for (size_t j = 0; j < i->operand_list()->operands().size(); ++j) {
+            if (j > 0) result_ += ", ";
+            result_ += generate(i->operand_list()->operands()[j]);
+        }
+    }
+    result_ += ")";
+}
+
+void CExpressionGenerator::visit_branch(Branch* i) {
+    result_ = "if (" + generate(i->condition()) + ")";
+}
+
+void CExpressionGenerator::visit_break(BreakInstr* i) {
+    result_ = "break";
+}
+
+void CExpressionGenerator::visit_continue(ContinueInstr* i) {
+    result_ = "continue";
+}
+
+void CExpressionGenerator::visit_comment(Comment* i) {
+    result_ = "/* " + i->message() + " */";
 }
 
 std::vector<std::string> CodeVisitor::generate_code(AbstractSyntaxForest* forest) {
@@ -98,7 +138,7 @@ void CodeVisitor::visit_node(AstNode* node) {
         if (block) {
             for (Instruction* inst : block->instructions()) {
                 indent();
-                std::string expr = expr_gen_.generate(inst->operation());
+                std::string expr = expr_gen_.generate(inst);
                 if (!expr.empty() && expr != "unknown_op") {
                     current_line_ += expr + ";";
                     lines_.push_back(current_line_);

@@ -8,7 +8,8 @@
 
 namespace dewolf {
 
-class BasicBlock;
+// Note: BasicBlock is forward-declared in dataflow.hpp for Phi::origin_block.
+// The actual definition is here.
 
 enum class EdgeType {
     Unconditional,
@@ -46,17 +47,11 @@ private:
     std::uint64_t case_value_;
 };
 
-class Instruction : public ArenaAllocated {
-public:
-    Instruction(Address address, Operation* op) : address_(address), op_(op) {}
-    
-    Address address() const { return address_; }
-    Operation* operation() const { return op_; }
-
-private:
-    Address address_;
-    Operation* op_;
-};
+// =============================================================================
+// BasicBlock -- A sequence of instructions with control-flow edges
+// =============================================================================
+// BasicBlock now stores Instruction* from the dataflow hierarchy (Assignment,
+// Branch, Return, Phi, etc.) instead of the old thin wrapper class.
 
 class BasicBlock : public ArenaAllocated {
 public:
@@ -69,6 +64,7 @@ public:
     }
 
     const std::vector<Instruction*>& instructions() const { return instructions_; }
+    std::vector<Instruction*>& mutable_instructions() { return instructions_; }
     void set_instructions(std::vector<Instruction*> insts) { instructions_ = std::move(insts); }
 
     void add_predecessor(Edge* edge) { predecessors_.push_back(edge); }
@@ -103,5 +99,46 @@ private:
     BasicBlock* entry_block_ = nullptr;
     std::vector<BasicBlock*> blocks_;
 };
+
+// =============================================================================
+// Migration helpers
+// =============================================================================
+// These helpers ease the transition from the old Operation-centric code to the
+// new Instruction hierarchy. They will be removed once all consumers are fully
+// migrated.
+
+/// Extract the Operation* from an Instruction, if it is an Assignment whose
+/// value is an Operation, or if the instruction wraps a known expression type.
+/// Returns nullptr if the instruction does not contain an Operation.
+inline Operation* get_operation(Instruction* inst) {
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        return dynamic_cast<Operation*>(assign->value());
+    }
+    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        return branch->condition();  // Condition IS-A Operation
+    }
+    return nullptr;
+}
+
+/// Check if an Instruction is an assignment (including Phi).
+inline bool is_assignment(Instruction* inst) {
+    return dynamic_cast<Assignment*>(inst) != nullptr;
+}
+
+/// Check if an Instruction is a phi function.
+inline bool is_phi(Instruction* inst) {
+    return dynamic_cast<Phi*>(inst) != nullptr;
+}
+
+/// Check if an Instruction is a branch (conditional or indirect).
+inline bool is_branch(Instruction* inst) {
+    return dynamic_cast<Branch*>(inst) != nullptr ||
+           dynamic_cast<IndirectBranch*>(inst) != nullptr;
+}
+
+/// Check if an Instruction is a return.
+inline bool is_return(Instruction* inst) {
+    return dynamic_cast<Return*>(inst) != nullptr;
+}
 
 } // namespace dewolf
