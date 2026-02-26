@@ -9,14 +9,24 @@ namespace dewolf {
 class AstNode : public ArenaAllocated {
 public:
     virtual ~AstNode() = default;
+    virtual BasicBlock* get_original_block() const { return nullptr; }
 };
 
 class CodeNode : public AstNode {
 public:
     explicit CodeNode(BasicBlock* block) : block_(block) {}
     BasicBlock* block() const { return block_; }
+    BasicBlock* get_original_block() const override { return block_; }
 private:
     BasicBlock* block_;
+};
+
+class ExprAstNode : public AstNode {
+public:
+    explicit ExprAstNode(Expression* expr) : expr_(expr) {}
+    Expression* expr() const { return expr_; }
+private:
+    Expression* expr_;
 };
 
 class SeqNode : public AstNode {

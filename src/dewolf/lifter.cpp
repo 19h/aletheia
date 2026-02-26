@@ -28,6 +28,7 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(ida::Addres
     for (const auto& ida_block : *flowchart_res) {
         BasicBlock* block = block_map[id];
 
+        // Lift instructions
         for (ida::Address addr = ida_block.start; addr < ida_block.end; ) {
             auto insn_res = ida::instruction::decode(addr);
             if (!insn_res) {
@@ -43,12 +44,34 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(ida::Addres
             addr += insn_res->size();
         }
 
-        for (int succ_id : ida_block.successors) {
-            if (block_map.contains(succ_id)) {
-                BasicBlock* target = block_map[succ_id];
-                Edge* edge = arena_.create<Edge>(block, target, EdgeType::Unconditional);
-                block->add_successor(edge);
-                target->add_predecessor(edge);
+        // Lift edges properly
+        if (ida_block.successors.size() == 2) {
+            // Check the last instruction for a conditional branch
+            // Simple heuristic for arm64/x86: if it ends in a jump, we mark True/False branches
+            BasicBlock* target0 = block_map.contains(ida_block.successors[0]) ? block_map[ida_block.successors[0]] : nullptr;
+            BasicBlock* target1 = block_map.contains(ida_block.successors[1]) ? block_map[ida_block.successors[1]] : nullptr;
+            
+            if (target0) {
+                Edge* e0 = arena_.create<Edge>(block, target0, EdgeType::True);
+                block->add_successor(e0);
+                target0->add_predecessor(e0);
+            }
+            if (target1) {
+                Edge* e1 = arena_.create<Edge>(block, target1, EdgeType::False);
+                block->add_successor(e1);
+                target1->add_predecessor(e1);
+            }
+        } else {
+            for (int succ_id : ida_block.successors) {
+                if (block_map.contains(succ_id)) {
+                    BasicBlock* target = block_map[succ_id];
+                    EdgeType etype = EdgeType::Unconditional;
+                    if (ida_block.successors.size() > 2) etype = EdgeType::Switch;
+                    
+                    Edge* edge = arena_.create<Edge>(block, target, etype);
+                    block->add_successor(edge);
+                    target->add_predecessor(edge);
+                }
             }
         }
         
@@ -74,13 +97,18 @@ Operation* Lifter::map_operation(const ida::instruction::Instruction& insn) {
     OperationType type = OperationType::unknown;
 
     if (lmnem == "add" || lmnem == "adds") type = OperationType::add;
-    else if (lmnem == "sub" || lmnem == "subs") type = OperationType::sub;
+    else if (lmnem == "sub" || lmnem == "subs" || lmnem == "cmp") type = OperationType::sub;
     else if (lmnem == "mul") type = OperationType::mul;
     else if (lmnem == "sdiv" || lmnem == "udiv") type = OperationType::div;
     else if (lmnem == "mov") type = OperationType::assign;
     else if (lmnem == "str" || lmnem == "stur") type = OperationType::assign;
     else if (lmnem == "ldr" || lmnem == "ldur") type = OperationType::assign;
-    else if (lmnem == "cmp") type = OperationType::sub; // Simplified modeling
+    else if (lmnem == "b.le" || lmnem == "ble") type = OperationType::le;
+    else if (lmnem == "b.lt" || lmnem == "blt") type = OperationType::lt;
+    else if (lmnem == "b.ge" || lmnem == "bge") type = OperationType::ge;
+    else if (lmnem == "b.gt" || lmnem == "bgt") type = OperationType::gt;
+    else if (lmnem == "b.eq" || lmnem == "beq") type = OperationType::eq;
+    else if (lmnem == "b.ne" || lmnem == "bne") type = OperationType::neq;
     else if (lmnem == "ret") {
         type = OperationType::call; // Model ret as a call for now
     }
@@ -113,10 +141,13 @@ Operation* Lifter::map_operation(const ida::instruction::Instruction& insn) {
         if (operands.size() >= 3) {
             auto rhs = arena_.create<Operation>(type, std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
             return arena_.create<Operation>(OperationType::assign, std::vector<Expression*>{operands[0], rhs}, operands[0]->size_bytes);
-        } else if (operands.size() == 2) {
+        } else if (operands.size() == 2 && lmnem != "cmp") {
             // e.g. x86 style ADD RAX, RBX -> RAX = RAX + RBX
             auto rhs = arena_.create<Operation>(type, std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
             return arena_.create<Operation>(OperationType::assign, std::vector<Expression*>{operands[0], rhs}, operands[0]->size_bytes);
+        } else if (lmnem == "cmp" && operands.size() == 2) {
+            // Expose cmp as a subtraction that sets flags (we just capture the op for now)
+            return arena_.create<Operation>(type, std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
         }
     }
 

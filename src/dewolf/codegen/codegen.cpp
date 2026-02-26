@@ -12,7 +12,6 @@ std::string CExpressionGenerator::generate(DataflowObject* obj) {
 }
 
 void CExpressionGenerator::visit(Constant* c) {
-    // Standard integer to hex formatting
     char buf[32];
     snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)c->value());
     result_ = buf;
@@ -37,6 +36,14 @@ void CExpressionGenerator::visit(Operation* o) {
         result_ = generate(o->operands()[0]) + " / " + generate(o->operands()[1]);
     } else if (o->type() == OperationType::deref && !o->operands().empty()) {
         result_ = "*(" + generate(o->operands()[0]) + ")";
+    } else if (o->type() >= OperationType::eq && o->type() <= OperationType::ge && o->operands().size() == 2) {
+        std::string op_str = " == ";
+        if (o->type() == OperationType::neq) op_str = " != ";
+        if (o->type() == OperationType::lt) op_str = " < ";
+        if (o->type() == OperationType::le) op_str = " <= ";
+        if (o->type() == OperationType::gt) op_str = " > ";
+        if (o->type() == OperationType::ge) op_str = " >= ";
+        result_ = generate(o->operands()[0]) + op_str + generate(o->operands()[1]);
     } else if (o->type() == OperationType::call && !o->operands().empty()) {
         std::string func = generate(o->operands()[0]);
         if (func == "ret") {
@@ -51,7 +58,14 @@ void CExpressionGenerator::visit(Operation* o) {
         std::string func = generate(o->operands()[0]);
         result_ = func + "()";
     } else {
-        result_ = "unknown_op";
+        // Unary op logic like b.le() -> ble flag
+        if (o->type() == OperationType::le) result_ = "FLAG <= 0";
+        else if (o->type() == OperationType::lt) result_ = "FLAG < 0";
+        else if (o->type() == OperationType::ge) result_ = "FLAG >= 0";
+        else if (o->type() == OperationType::gt) result_ = "FLAG > 0";
+        else if (o->type() == OperationType::eq) result_ = "FLAG == 0";
+        else if (o->type() == OperationType::neq) result_ = "FLAG != 0";
+        else result_ = "unknown_op";
     }
 }
 
@@ -93,7 +107,13 @@ void CodeVisitor::visit_node(AstNode* node) {
         }
     } else if (IfNode* inode = dynamic_cast<IfNode*>(node)) {
         indent();
-        current_line_ += "if (/* condition */) {";
+        std::string cond_str = "/* condition */";
+        if (inode->cond()) {
+            if (auto* expr_ast = dynamic_cast<ExprAstNode*>(inode->cond())) {
+                cond_str = expr_gen_.generate(expr_ast->expr());
+            }
+        }
+        current_line_ += "if (" + cond_str + ") {";
         lines_.push_back(current_line_);
         current_line_.clear();
         
