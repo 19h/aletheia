@@ -4,6 +4,7 @@
 #include "graph_slice/graph_slice.hpp"
 #include "reaching_conditions/reaching_conditions.hpp"
 #include "cbr/cbr.hpp"
+#include "car/car.hpp"
 #include <unordered_set>
 #include <string>
 
@@ -51,39 +52,32 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
 void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
     if (!cfg.entry()) return;
 
-    // Simulate acyclic region extraction
-    // In Python DeWolf: acyclic_region_finder.find(node)
     std::unordered_set<TransitionBlock*> all_nodes;
     for (auto* b : cfg.blocks()) {
         all_nodes.insert(b);
     }
 
-    // Call the exact structuring method
     restructure_region(&cfg, cfg.entry(), all_nodes);
 }
 
 void AcyclicRegionRestructurer::restructure_region(TransitionCFG* t_cfg, TransitionBlock* header, const std::unordered_set<TransitionBlock*>& region) {
-    // 1. Compute graph slice
     TransitionCFG* slice = GraphSlice::compute_graph_slice_for_region(arena_, t_cfg, header, region, false);
 
-    // 2. Compute Reaching Conditions
     z3::context ctx;
     auto reaching_conditions = ReachingConditions::compute(ctx, slice, header, t_cfg);
 
-    // 3. Construct Initial AST
-    // Translate the slice into a SeqNode where each slice node is mapped to a CodeNode.
     SeqNode* seq = arena_.create<SeqNode>();
     for (TransitionBlock* block : slice->blocks()) {
         seq->add_node(block->ast_node());
     }
 
-    // 4. Apply Condition-Based Refinement (CBR)
-    // Passes the flat sequence and the mathematical reaching conditions to the Refiner,
-    // which recursively collapses complementary condition expressions into nested IfNodes/SwitchNodes.
-    AstNode* structured_root = ConditionBasedRefinement::refine(arena_, ctx, seq, reaching_conditions);
+    // 4. Condition-Based Refinement (CBR) - De Morgan's Law Application & Branch Synthesis
+    AstNode* cbr_root = ConditionBasedRefinement::refine(arena_, ctx, seq, reaching_conditions);
 
-    // Update the transition CFG entry with the final refined AST structure
-    header->set_ast_node(structured_root);
+    // 5. Condition-Aware Refinement (CAR) - Switch Statement Extraction
+    AstNode* car_root = ConditionAwareRefinement::refine(arena_, ctx, cbr_root, reaching_conditions);
+
+    header->set_ast_node(car_root);
 }
 
 } // namespace dewolf

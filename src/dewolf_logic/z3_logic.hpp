@@ -26,6 +26,27 @@ public:
         return *this;
     }
 
+    bool is_equivalent_to(const LogicCondition& other) const {
+        // A <-> B means solver.check(!(A <-> B)) == unsat
+        z3::solver solver(expr_.ctx());
+        solver.add(!z3::implies(expr_, other.expression()) || !z3::implies(other.expression(), expr_));
+        return solver.check() == z3::unsat;
+    }
+
+    bool is_complementary_to(const LogicCondition& other) const {
+        // A == !B -> A <-> !B -> unsat(!(A <-> !B))
+        z3::solver solver(expr_.ctx());
+        solver.add(!z3::implies(expr_, !other.expression()) || !z3::implies(!other.expression(), expr_));
+        return solver.check() == z3::unsat;
+    }
+
+    bool does_imply(const LogicCondition& other) const {
+        // A -> B means solver.check(!(A -> B)) == unsat
+        z3::solver solver(expr_.ctx());
+        solver.add(!z3::implies(expr_, other.expression()));
+        return solver.check() == z3::unsat;
+    }
+
 private:
     z3::expr expr_;
 };
