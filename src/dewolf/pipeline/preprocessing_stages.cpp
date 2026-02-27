@@ -1,10 +1,12 @@
 #include "preprocessing_stages.hpp"
+#include "../ssa/dominators.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <deque>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1442,6 +1444,313 @@ void RemoveNoreturnBoilerplateStage::execute(DecompilerTask& task) {
 
     if (changed) {
         remove_unreachable_blocks(task.cfg());
+    }
+}
+
+namespace {
+
+bool instruction_uses_var_key(Instruction* inst, const VarKey& key) {
+    if (inst == nullptr) {
+        return false;
+    }
+    for (Variable* req : inst->requirements()) {
+        if (req != nullptr && var_key(req) == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+BasicBlock* common_dominator_for_use_blocks(const std::unordered_set<BasicBlock*>& use_blocks,
+                                            DominatorTree& dom,
+                                            BasicBlock* fallback) {
+    if (use_blocks.empty()) {
+        return fallback;
+    }
+
+    auto it = use_blocks.begin();
+    BasicBlock* candidate = *it;
+    ++it;
+
+    for (; it != use_blocks.end(); ++it) {
+        BasicBlock* target = *it;
+        while (candidate != nullptr && !dom.dominates(candidate, target)) {
+            candidate = dom.idom(candidate);
+        }
+        if (candidate == nullptr) {
+            return fallback;
+        }
+    }
+
+    for (BasicBlock* block : use_blocks) {
+        if (candidate == nullptr || !dom.dominates(candidate, block)) {
+            return fallback;
+        }
+    }
+
+    return candidate != nullptr ? candidate : fallback;
+}
+
+std::size_t insertion_index_for_missing_definition(BasicBlock* block, const VarKey& key) {
+    if (block == nullptr) {
+        return 0;
+    }
+
+    const auto& insts = block->instructions();
+    std::size_t phi_prefix = 0;
+    while (phi_prefix < insts.size() && dynamic_cast<Phi*>(insts[phi_prefix]) != nullptr) {
+        ++phi_prefix;
+    }
+
+    std::size_t first_use = insts.size();
+    for (std::size_t i = 0; i < insts.size(); ++i) {
+        if (instruction_uses_var_key(insts[i], key)) {
+            first_use = i;
+            break;
+        }
+    }
+
+    if (first_use < insts.size()) {
+        return std::max(first_use, phi_prefix);
+    }
+
+    std::size_t idx = insts.size();
+    if (!insts.empty() && (is_branch(insts.back()) || is_return(insts.back()))) {
+        idx = insts.size() - 1;
+    }
+    if (idx < phi_prefix) {
+        idx = phi_prefix;
+    }
+    return idx;
+}
+
+} // namespace
+
+void InsertMissingDefinitionsStage::execute(DecompilerTask& task) {
+    if (!task.cfg() || task.cfg()->entry_block() == nullptr) {
+        return;
+    }
+
+    DominatorTree dom(*task.cfg());
+
+    std::unordered_set<VarKey, VarKeyHash> defined_aliased;
+    std::unordered_set<VarKey, VarKeyHash> used_aliased;
+    std::unordered_map<VarKey, Variable*, VarKeyHash> exemplar_for_key;
+    std::unordered_map<VarKey, std::unordered_set<BasicBlock*>, VarKeyHash> use_blocks_for_key;
+    std::unordered_map<std::string, std::set<std::size_t>> defined_versions;
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            for (Variable* def : inst->definitions()) {
+                if (def == nullptr || !def->is_aliased()) {
+                    continue;
+                }
+                VarKey key = var_key(def);
+                defined_aliased.insert(key);
+                exemplar_for_key.try_emplace(key, def);
+                defined_versions[def->name()].insert(def->ssa_version());
+            }
+            for (Variable* req : inst->requirements()) {
+                if (req == nullptr || !req->is_aliased()) {
+                    continue;
+                }
+                VarKey key = var_key(req);
+                used_aliased.insert(key);
+                exemplar_for_key.try_emplace(key, req);
+                use_blocks_for_key[key].insert(block);
+            }
+        }
+    }
+
+    std::vector<VarKey> missing;
+    for (const VarKey& key : used_aliased) {
+        if (!defined_aliased.contains(key)) {
+            missing.push_back(key);
+        }
+    }
+
+    std::sort(missing.begin(), missing.end(), [](const VarKey& lhs, const VarKey& rhs) {
+        if (lhs.name != rhs.name) {
+            return lhs.name < rhs.name;
+        }
+        return lhs.version < rhs.version;
+    });
+
+    for (const VarKey& key : missing) {
+        // Version 0 aliased values are treated as entry-known baseline.
+        if (key.version == 0) {
+            defined_aliased.insert(key);
+            defined_versions[key.name].insert(0);
+            continue;
+        }
+
+        auto sample_it = exemplar_for_key.find(key);
+        if (sample_it == exemplar_for_key.end() || sample_it->second == nullptr) {
+            continue;
+        }
+        Variable* sample = sample_it->second;
+
+        auto uses_it = use_blocks_for_key.find(key);
+        if (uses_it == use_blocks_for_key.end() || uses_it->second.empty()) {
+            continue;
+        }
+
+        std::size_t rhs_version = 0;
+        auto& known_versions = defined_versions[key.name];
+        auto prev_it = known_versions.lower_bound(key.version);
+        if (prev_it != known_versions.begin()) {
+            --prev_it;
+            rhs_version = *prev_it;
+        }
+
+        BasicBlock* insertion_block = common_dominator_for_use_blocks(
+            uses_it->second,
+            dom,
+            task.cfg()->entry_block());
+        if (insertion_block == nullptr) {
+            insertion_block = task.cfg()->entry_block();
+        }
+
+        std::size_t insert_idx = insertion_index_for_missing_definition(insertion_block, key);
+
+        auto* lhs = task.arena().create<Variable>(key.name, sample->size_bytes);
+        lhs->set_ssa_version(key.version);
+        lhs->set_aliased(true);
+        lhs->set_ir_type(sample->ir_type());
+
+        auto* rhs = task.arena().create<Variable>(key.name, sample->size_bytes);
+        rhs->set_ssa_version(rhs_version);
+        rhs->set_aliased(true);
+        rhs->set_ir_type(sample->ir_type());
+
+        auto* inserted_def = task.arena().create<Assignment>(lhs, rhs);
+
+        auto insts = insertion_block->instructions();
+        if (insert_idx > insts.size()) {
+            insert_idx = insts.size();
+        }
+        insts.insert(insts.begin() + static_cast<std::ptrdiff_t>(insert_idx), inserted_def);
+        insertion_block->set_instructions(std::move(insts));
+
+        defined_aliased.insert(key);
+        defined_versions[key.name].insert(key.version);
+        exemplar_for_key[key] = lhs;
+    }
+}
+
+namespace {
+
+std::unordered_map<VarKey, BasicBlock*, VarKeyHash>
+definition_block_map(ControlFlowGraph* cfg) {
+    std::unordered_map<VarKey, BasicBlock*, VarKeyHash> map;
+    if (!cfg) {
+        return map;
+    }
+
+    for (BasicBlock* block : cfg->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            for (Variable* def : inst->definitions()) {
+                if (def != nullptr) {
+                    map[var_key(def)] = block;
+                }
+            }
+        }
+    }
+    return map;
+}
+
+std::unordered_map<BasicBlock*, Variable*> phi_operand_definition_blocks(
+    Phi* phi,
+    const std::unordered_map<VarKey, BasicBlock*, VarKeyHash>& def_block_of,
+    BasicBlock* entry_block) {
+    std::unordered_map<BasicBlock*, Variable*> out;
+    if (!phi) {
+        return out;
+    }
+
+    for (Variable* req : phi->requirements()) {
+        if (req == nullptr) {
+            continue;
+        }
+
+        BasicBlock* def_block = entry_block;
+        auto it = def_block_of.find(var_key(req));
+        if (it != def_block_of.end()) {
+            def_block = it->second;
+        }
+
+        if (!out.contains(def_block)) {
+            out.emplace(def_block, req);
+        }
+    }
+    return out;
+}
+
+Variable* find_live_phi_operand_for_predecessor(
+    BasicBlock* predecessor,
+    DominatorTree& dom,
+    const std::unordered_map<BasicBlock*, Variable*>& operand_of_block,
+    BasicBlock* entry_block) {
+    BasicBlock* current = predecessor;
+    while (current != nullptr) {
+        auto it = operand_of_block.find(current);
+        if (it != operand_of_block.end()) {
+            return it->second;
+        }
+        current = dom.idom(current);
+    }
+
+    auto it_entry = operand_of_block.find(entry_block);
+    if (it_entry != operand_of_block.end()) {
+        return it_entry->second;
+    }
+    return nullptr;
+}
+
+} // namespace
+
+void PhiFunctionFixerStage::execute(DecompilerTask& task) {
+    if (!task.cfg() || task.cfg()->entry_block() == nullptr) {
+        return;
+    }
+
+    DominatorTree dom(*task.cfg());
+    const auto def_block_of = definition_block_map(task.cfg());
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            auto* phi = dynamic_cast<Phi*>(inst);
+            if (!phi) {
+                continue;
+            }
+
+            auto operand_def_blocks = phi_operand_definition_blocks(phi, def_block_of, task.cfg()->entry_block());
+            if (operand_def_blocks.empty()) {
+                continue;
+            }
+
+            std::unordered_map<BasicBlock*, Expression*> origin;
+            for (Edge* pred_edge : block->predecessors()) {
+                BasicBlock* pred = pred_edge ? pred_edge->source() : nullptr;
+                if (!pred) {
+                    continue;
+                }
+
+                Variable* live_var = find_live_phi_operand_for_predecessor(
+                    pred,
+                    dom,
+                    operand_def_blocks,
+                    task.cfg()->entry_block());
+                if (live_var != nullptr) {
+                    origin[pred] = live_var;
+                }
+            }
+
+            if (!origin.empty()) {
+                phi->mutable_origin_block().clear();
+                phi->update_phi_function(origin);
+            }
+        }
     }
 }
 

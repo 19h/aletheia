@@ -27,6 +27,7 @@
 #include "../src/dewolf/pipeline/optimization_stages.hpp"
 #include "../src/dewolf_logic/range_simplifier.hpp"
 #include "../src/dewolf_logic/operation_simplifier.hpp"
+#include "../src/dewolf_logic/normal_form.hpp"
 
 
 
@@ -714,6 +715,68 @@ void test_logic_operation_simplifier() {
     std::cout << "[+] test_logic_operation_simplifier passed.\n";
 }
 
+void test_logic_normal_form_conversion() {
+    using namespace dewolf_logic;
+
+    {
+        LogicDag dag;
+        auto* a = dag.create_node<DagVariable>("a");
+        auto* b = dag.create_node<DagVariable>("b");
+        auto* c = dag.create_node<DagVariable>("c");
+
+        auto* and_bc = dag.create_node<DagOperation>(LogicOp::And);
+        and_bc->add_child(b);
+        and_bc->add_child(c);
+
+        auto* or_expr = dag.create_node<DagOperation>(LogicOp::Or);
+        or_expr->add_child(a);
+        or_expr->add_child(and_bc);
+
+        DagNode* cnf = ToCnfVisitor::convert(dag, or_expr);
+        auto* cnf_op = dynamic_cast<DagOperation*>(cnf);
+        ASSERT_TRUE(cnf_op != nullptr);
+        ASSERT_EQ(cnf_op->op(), LogicOp::And);
+        ASSERT_EQ(cnf_op->children().size(), 2);
+
+        for (DagNode* child : cnf_op->children()) {
+            auto* clause = dynamic_cast<DagOperation*>(child);
+            ASSERT_TRUE(clause != nullptr);
+            ASSERT_EQ(clause->op(), LogicOp::Or);
+            ASSERT_EQ(clause->children().size(), 2);
+        }
+    }
+
+    {
+        LogicDag dag;
+        auto* a = dag.create_node<DagVariable>("a");
+        auto* b = dag.create_node<DagVariable>("b");
+        auto* c = dag.create_node<DagVariable>("c");
+
+        auto* or_bc = dag.create_node<DagOperation>(LogicOp::Or);
+        or_bc->add_child(b);
+        or_bc->add_child(c);
+
+        auto* and_expr = dag.create_node<DagOperation>(LogicOp::And);
+        and_expr->add_child(a);
+        and_expr->add_child(or_bc);
+
+        DagNode* dnf = ToDnfVisitor::convert(dag, and_expr);
+        auto* dnf_op = dynamic_cast<DagOperation*>(dnf);
+        ASSERT_TRUE(dnf_op != nullptr);
+        ASSERT_EQ(dnf_op->op(), LogicOp::Or);
+        ASSERT_EQ(dnf_op->children().size(), 2);
+
+        for (DagNode* child : dnf_op->children()) {
+            auto* term = dynamic_cast<DagOperation*>(child);
+            ASSERT_TRUE(term != nullptr);
+            ASSERT_EQ(term->op(), LogicOp::And);
+            ASSERT_EQ(term->children().size(), 2);
+        }
+    }
+
+    std::cout << "[+] test_logic_normal_form_conversion passed.\n";
+}
+
 
 #include "../src/dewolf/ssa/phi_dependency_resolver.hpp"
 
@@ -1290,6 +1353,97 @@ void test_codegen_constant_formatting() {
     ASSERT_EQ(gen.generate(s64), "0x1L");
 
     std::cout << "[+] test_codegen_constant_formatting passed.\n";
+}
+
+void test_codegen_if_branch_swapping() {
+    dewolf::DecompilerArena arena;
+
+    auto has_substr = [](const std::vector<std::string>& lines, const std::string& needle) {
+        for (const auto& line : lines) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Else-if chain heuristic: if exactly one branch is an IfNode, move it to false branch.
+    {
+        auto* x = arena.create<dewolf::Variable>("x", 1);
+        auto* y = arena.create<dewolf::Variable>("y", 1);
+
+        auto* tb = arena.create<dewolf::BasicBlock>(910);
+        tb->add_instruction(arena.create<dewolf::Assignment>(
+            arena.create<dewolf::Variable>("a", 4),
+            arena.create<dewolf::Constant>(1, 4)));
+        auto* fb = arena.create<dewolf::BasicBlock>(911);
+        fb->add_instruction(arena.create<dewolf::Assignment>(
+            arena.create<dewolf::Variable>("b", 4),
+            arena.create<dewolf::Constant>(2, 4)));
+        auto* else_block = arena.create<dewolf::BasicBlock>(912);
+        else_block->add_instruction(arena.create<dewolf::Assignment>(
+            arena.create<dewolf::Variable>("c", 4),
+            arena.create<dewolf::Constant>(3, 4)));
+
+        auto* nested_if = arena.create<dewolf::IfNode>(
+            arena.create<dewolf::ExprAstNode>(y),
+            arena.create<dewolf::CodeNode>(tb),
+            arena.create<dewolf::CodeNode>(fb));
+        auto* outer_if = arena.create<dewolf::IfNode>(
+            arena.create<dewolf::ExprAstNode>(x),
+            nested_if,
+            arena.create<dewolf::CodeNode>(else_block));
+
+        auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+        forest->set_root(outer_if);
+
+        dewolf::CodeVisitor visitor;
+        auto lines = visitor.generate_code(forest);
+        ASSERT_TRUE(has_substr(lines, "if (!(x)) {"));
+        ASSERT_TRUE(has_substr(lines, "} else if (y) {"));
+    }
+
+    // Configurable preference: `smallest` puts smaller branch on true side.
+    const char* previous_pref = std::getenv("DEWOLF_IF_BRANCH_PREFERENCE");
+    std::string previous_pref_value = previous_pref ? previous_pref : "";
+    setenv("DEWOLF_IF_BRANCH_PREFERENCE", "smallest", 1);
+
+    {
+        auto* x = arena.create<dewolf::Variable>("x", 1);
+
+        auto* heavy = arena.create<dewolf::BasicBlock>(913);
+        heavy->add_instruction(arena.create<dewolf::Assignment>(
+            arena.create<dewolf::Variable>("h1", 4),
+            arena.create<dewolf::Constant>(11, 4)));
+        heavy->add_instruction(arena.create<dewolf::Assignment>(
+            arena.create<dewolf::Variable>("h2", 4),
+            arena.create<dewolf::Constant>(12, 4)));
+
+        auto* light = arena.create<dewolf::BasicBlock>(914);
+        light->add_instruction(arena.create<dewolf::Assignment>(
+            arena.create<dewolf::Variable>("l1", 4),
+            arena.create<dewolf::Constant>(21, 4)));
+
+        auto* root_if = arena.create<dewolf::IfNode>(
+            arena.create<dewolf::ExprAstNode>(x),
+            arena.create<dewolf::CodeNode>(heavy),
+            arena.create<dewolf::CodeNode>(light));
+
+        auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+        forest->set_root(root_if);
+
+        dewolf::CodeVisitor visitor;
+        auto lines = visitor.generate_code(forest);
+        ASSERT_TRUE(has_substr(lines, "if (!(x)) {"));
+    }
+
+    if (previous_pref) {
+        setenv("DEWOLF_IF_BRANCH_PREFERENCE", previous_pref_value.c_str(), 1);
+    } else {
+        unsetenv("DEWOLF_IF_BRANCH_PREFERENCE");
+    }
+
+    std::cout << "[+] test_codegen_if_branch_swapping passed.\n";
 }
 
 void test_array_access_detection_stage() {
@@ -2486,6 +2640,125 @@ void test_remove_noreturn_boilerplate_stage() {
     std::cout << "[+] test_remove_noreturn_boilerplate_stage passed.\n";
 }
 
+void test_insert_missing_definitions_stage() {
+    DecompilerTask task(0x5200);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* entry = task.arena().create<BasicBlock>(27);
+    auto* left = task.arena().create<BasicBlock>(28);
+    auto* right = task.arena().create<BasicBlock>(29);
+    cfg->set_entry_block(entry);
+    cfg->add_block(entry);
+    cfg->add_block(left);
+    cfg->add_block(right);
+    task.set_cfg(std::move(cfg));
+
+    auto* e_true = task.arena().create<Edge>(entry, left, EdgeType::True);
+    auto* e_false = task.arena().create<Edge>(entry, right, EdgeType::False);
+    entry->add_successor(e_true);
+    entry->add_successor(e_false);
+    left->add_predecessor(e_true);
+    right->add_predecessor(e_false);
+
+    auto* mem_v1 = task.arena().create<Variable>("mem", 8);
+    mem_v1->set_ssa_version(1);
+    mem_v1->set_aliased(true);
+    entry->add_instruction(task.arena().create<Assignment>(mem_v1, task.arena().create<Constant>(7, 8)));
+
+    auto* cond_v = task.arena().create<Variable>("cond", 1);
+    auto* branch = task.arena().create<Branch>(
+        task.arena().create<Condition>(OperationType::neq, cond_v, task.arena().create<Constant>(0, 1), 1));
+    entry->add_instruction(branch);
+
+    auto* mem_v2_left = task.arena().create<Variable>("mem", 8);
+    mem_v2_left->set_ssa_version(2);
+    mem_v2_left->set_aliased(true);
+    auto* out_l = task.arena().create<Variable>("out_l", 8);
+    left->add_instruction(task.arena().create<Assignment>(out_l, mem_v2_left));
+
+    auto* mem_v2_right = task.arena().create<Variable>("mem", 8);
+    mem_v2_right->set_ssa_version(2);
+    mem_v2_right->set_aliased(true);
+    auto* out_r = task.arena().create<Variable>("out_r", 8);
+    right->add_instruction(task.arena().create<Assignment>(out_r, mem_v2_right));
+
+    InsertMissingDefinitionsStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(entry->instructions().size(), 3);
+    auto* inserted = dynamic_cast<Assignment*>(entry->instructions()[1]);
+    ASSERT_TRUE(inserted != nullptr);
+
+    auto* lhs = dynamic_cast<Variable*>(inserted->destination());
+    auto* rhs = dynamic_cast<Variable*>(inserted->value());
+    ASSERT_TRUE(lhs != nullptr && rhs != nullptr);
+    ASSERT_EQ(lhs->name(), "mem");
+    ASSERT_EQ(lhs->ssa_version(), 2);
+    ASSERT_TRUE(lhs->is_aliased());
+    ASSERT_EQ(rhs->name(), "mem");
+    ASSERT_EQ(rhs->ssa_version(), 1);
+    ASSERT_TRUE(rhs->is_aliased());
+
+    ASSERT_EQ(left->instructions().size(), 1);
+    ASSERT_EQ(right->instructions().size(), 1);
+
+    std::cout << "[+] test_insert_missing_definitions_stage passed.\n";
+}
+
+void test_phi_function_fixer_stage() {
+    DecompilerTask task(0x5300);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* entry = task.arena().create<BasicBlock>(30);
+    auto* left = task.arena().create<BasicBlock>(31);
+    auto* right = task.arena().create<BasicBlock>(32);
+    auto* join = task.arena().create<BasicBlock>(33);
+    cfg->set_entry_block(entry);
+    cfg->add_block(entry);
+    cfg->add_block(left);
+    cfg->add_block(right);
+    cfg->add_block(join);
+    task.set_cfg(std::move(cfg));
+
+    auto* e0 = task.arena().create<Edge>(entry, left, EdgeType::True);
+    auto* e1 = task.arena().create<Edge>(entry, right, EdgeType::False);
+    auto* e2 = task.arena().create<Edge>(left, join, EdgeType::Unconditional);
+    auto* e3 = task.arena().create<Edge>(right, join, EdgeType::Unconditional);
+    entry->add_successor(e0);
+    entry->add_successor(e1);
+    left->add_predecessor(e0);
+    right->add_predecessor(e1);
+    left->add_successor(e2);
+    right->add_successor(e3);
+    join->add_predecessor(e2);
+    join->add_predecessor(e3);
+
+    auto* x1 = task.arena().create<Variable>("x", 4);
+    x1->set_ssa_version(1);
+    auto* x2 = task.arena().create<Variable>("x", 4);
+    x2->set_ssa_version(2);
+    auto* x3 = task.arena().create<Variable>("x", 4);
+    x3->set_ssa_version(3);
+
+    left->add_instruction(task.arena().create<Assignment>(x1, task.arena().create<Constant>(1, 4)));
+    right->add_instruction(task.arena().create<Assignment>(x2, task.arena().create<Constant>(2, 4)));
+
+    auto* phi_ops = task.arena().create<ListOperation>(std::vector<Expression*>{x1, x2}, 4);
+    auto* phi = task.arena().create<Phi>(x3, phi_ops);
+    join->add_instruction(phi);
+
+    PhiFunctionFixerStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(phi->origin_block().size(), 2);
+    ASSERT_TRUE(phi->origin_block().contains(left));
+    ASSERT_TRUE(phi->origin_block().contains(right));
+    ASSERT_TRUE(phi->origin_block().at(left) == x1);
+    ASSERT_TRUE(phi->origin_block().at(right) == x2);
+
+    std::cout << "[+] test_phi_function_fixer_stage passed.\n";
+}
+
 void test_identity_elimination_stage() {
     DecompilerTask task(0x7000);
 
@@ -3133,6 +3406,101 @@ void test_edge_pruner_stage() {
     std::cout << "[+] test_edge_pruner_stage passed.\n";
 }
 
+void test_bitfield_comparison_unrolling_stage() {
+    DecompilerTask task(0x7d00);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(81);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* amount = task.arena().create<Variable>("amount", 4);
+
+    auto make_mask_test = [&](std::uint64_t mask) -> Expression* {
+        auto* shift = task.arena().create<Operation>(
+            OperationType::shl,
+            std::vector<Expression*>{task.arena().create<Constant>(1, 4), amount->copy(task.arena())},
+            4);
+        return task.arena().create<Operation>(
+            OperationType::bit_and,
+            std::vector<Expression*>{shift, task.arena().create<Constant>(mask, 1)},
+            1);
+    };
+
+    auto* neq_branch = task.arena().create<Branch>(
+        task.arena().create<Condition>(
+            OperationType::neq,
+            make_mask_test(0x0A),
+            task.arena().create<Constant>(0, 1),
+            1));
+    auto* eq_branch = task.arena().create<Branch>(
+        task.arena().create<Condition>(
+            OperationType::eq,
+            make_mask_test(0x05),
+            task.arena().create<Constant>(0, 1),
+            1));
+
+    bb->add_instruction(neq_branch);
+    bb->add_instruction(eq_branch);
+
+    BitFieldComparisonUnrollingStage stage;
+    stage.execute(task);
+
+    auto collect_eq_constants = [&](auto&& self, Expression* expr, std::vector<std::uint64_t>& out) -> bool {
+        auto* stripped = expr;
+        while (auto* cast_op = dynamic_cast<Operation*>(stripped)) {
+            if (cast_op->type() != OperationType::cast || cast_op->operands().size() != 1) {
+                break;
+            }
+            stripped = cast_op->operands()[0];
+        }
+
+        if (auto* cond = dynamic_cast<Condition*>(stripped)) {
+            if (cond->type() != OperationType::eq) {
+                return false;
+            }
+            auto* lhs_var = dynamic_cast<Variable*>(cond->lhs());
+            auto* rhs_const = dynamic_cast<Constant*>(cond->rhs());
+            if (!lhs_var || !rhs_const || lhs_var->name() != "amount") {
+                return false;
+            }
+            out.push_back(rhs_const->value());
+            return true;
+        }
+
+        auto* op = dynamic_cast<Operation*>(stripped);
+        if (!op || op->type() != OperationType::logical_or || op->operands().size() != 2) {
+            return false;
+        }
+        return self(self, op->operands()[0], out) && self(self, op->operands()[1], out);
+    };
+
+    auto verify_branch = [&](Branch* branch, OperationType expected_cmp, std::vector<std::uint64_t> expected_bits) {
+        auto* cond = branch->condition();
+        ASSERT_TRUE(cond != nullptr);
+        ASSERT_EQ(cond->type(), expected_cmp);
+
+        auto* zero = dynamic_cast<Constant*>(cond->rhs());
+        ASSERT_TRUE(zero != nullptr);
+        ASSERT_EQ(zero->value(), 0);
+
+        std::vector<std::uint64_t> extracted;
+        ASSERT_TRUE(collect_eq_constants(collect_eq_constants, cond->lhs(), extracted));
+        std::sort(extracted.begin(), extracted.end());
+        std::sort(expected_bits.begin(), expected_bits.end());
+        ASSERT_EQ(extracted.size(), expected_bits.size());
+        for (std::size_t i = 0; i < extracted.size(); ++i) {
+            ASSERT_EQ(extracted[i], expected_bits[i]);
+        }
+    };
+
+    verify_branch(neq_branch, OperationType::neq, {1, 3});
+    verify_branch(eq_branch, OperationType::eq, {0, 2});
+
+    std::cout << "[+] test_bitfield_comparison_unrolling_stage passed.\n";
+}
+
 void test_redundant_casts_elimination_stage() {
     DecompilerTask task(0x7900);
 
@@ -3224,6 +3592,52 @@ void test_coherence_stage() {
     std::cout << "[+] test_coherence_stage passed.\n";
 }
 
+void test_type_propagation_stage() {
+    DecompilerTask task(0x7e00);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(82);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto ptr_widget_type = std::make_shared<const Pointer>(
+        std::make_shared<const CustomType>("Widget", 64),
+        64);
+
+    auto* v0 = task.arena().create<Variable>("v0", 8);
+    auto* v1 = task.arena().create<Variable>("v1", 8);
+    auto* v2 = task.arena().create<Variable>("v2", 8);
+    auto* v3 = task.arena().create<Variable>("v3", 8);
+    auto* prim_src = task.arena().create<Variable>("prim_src", 4);
+    auto* prim_dst = task.arena().create<Variable>("prim_dst", 4);
+
+    v1->set_ir_type(ptr_widget_type);
+    v2->set_ir_type(Integer::int32_t());
+    prim_src->set_ir_type(Integer::int32_t());
+
+    bb->add_instruction(task.arena().create<Assignment>(v0, v1));
+    bb->add_instruction(task.arena().create<Assignment>(v2, v0));
+    bb->add_instruction(task.arena().create<Assignment>(v3, v2));
+    bb->add_instruction(task.arena().create<Assignment>(prim_dst, prim_src));
+
+    TypePropagationStage stage;
+    stage.execute(task);
+
+    ASSERT_TRUE(v0->ir_type() != nullptr);
+    ASSERT_TRUE(v1->ir_type() != nullptr);
+    ASSERT_TRUE(v2->ir_type() != nullptr);
+    ASSERT_TRUE(v3->ir_type() != nullptr);
+    ASSERT_TRUE(*(v0->ir_type()) == *ptr_widget_type);
+    ASSERT_TRUE(*(v1->ir_type()) == *ptr_widget_type);
+    ASSERT_TRUE(*(v2->ir_type()) == *ptr_widget_type);
+    ASSERT_TRUE(*(v3->ir_type()) == *ptr_widget_type);
+
+    ASSERT_TRUE(prim_dst->ir_type() == nullptr);
+
+    std::cout << "[+] test_type_propagation_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_codegen_switch_case();
@@ -3231,6 +3645,7 @@ int main() {
     test_codegen_operator_precedence();
     test_codegen_compound_assignment_increment();
     test_codegen_constant_formatting();
+    test_codegen_if_branch_swapping();
     test_array_access_detection_stage();
     test_global_variable_declarations();
     test_variable_name_generation_default();
@@ -3265,10 +3680,13 @@ int main() {
     test_remove_go_prologue_stage();
     test_remove_stack_canary_stage();
     test_remove_noreturn_boilerplate_stage();
+    test_insert_missing_definitions_stage();
+    test_phi_function_fixer_stage();
     test_identity_elimination_stage();
     test_common_subexpression_existing_replacer_stage();
     test_common_subexpression_definition_generator_stage();
     test_edge_pruner_stage();
+    test_bitfield_comparison_unrolling_stage();
     test_expression_simplification_collapse_constants();
     test_expression_simplification_trivial_arithmetic();
     test_expression_simplification_trivial_bit_arithmetic();
@@ -3277,10 +3695,12 @@ int main() {
     test_dead_component_pruner_stage();
     test_redundant_casts_elimination_stage();
     test_coherence_stage();
+    test_type_propagation_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
     test_logic_operation_simplifier();
+    test_logic_normal_form_conversion();
     std::cout << "All tests passed successfully.\n";
     return 0;
 }

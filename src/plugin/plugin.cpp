@@ -84,19 +84,23 @@ struct DeWolfPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<dewolf::RemoveGoPrologueStage>());
         pipeline.add_stage(std::make_unique<dewolf::RemoveStackCanaryStage>());
         pipeline.add_stage(std::make_unique<dewolf::RemoveNoreturnBoilerplateStage>());
+        pipeline.add_stage(std::make_unique<dewolf::InsertMissingDefinitionsStage>());
         pipeline.add_stage(std::make_unique<dewolf::SwitchVariableDetectionStage>());
         pipeline.add_stage(std::make_unique<dewolf::CoherenceStage>());
+        pipeline.add_stage(std::make_unique<dewolf::TypePropagationStage>());
         pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
         pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationStage>());
         pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
         pipeline.add_stage(std::make_unique<dewolf::IdentityEliminationStage>());
         pipeline.add_stage(std::make_unique<dewolf::CommonSubexpressionEliminationStage>());
         pipeline.add_stage(std::make_unique<dewolf::EdgePrunerStage>());
+        pipeline.add_stage(std::make_unique<dewolf::BitFieldComparisonUnrollingStage>());
         pipeline.add_stage(std::make_unique<dewolf::ExpressionSimplificationStage>());
         pipeline.add_stage(std::make_unique<dewolf::RedundantCastsEliminationStage>());
         pipeline.add_stage(std::make_unique<dewolf::ArrayAccessDetectionStage>());
         pipeline.add_stage(std::make_unique<dewolf::DeadComponentPrunerStage>());
         pipeline.add_stage(std::make_unique<dewolf::DeadCodeEliminationStage>());
+        pipeline.add_stage(std::make_unique<dewolf::PhiFunctionFixerStage>());
         pipeline.add_stage(std::make_unique<dewolf::SsaDestructor>());
         pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
         

@@ -2412,10 +2412,336 @@ void annotate_array_access_inst(Instruction* inst) {
     }
 }
 
+Expression* strip_cast_expr(Expression* expr) {
+    Expression* current = expr;
+    while (auto* op = dynamic_cast<Operation*>(current)) {
+        if (op->type() != OperationType::cast || op->operands().size() != 1 || op->operands()[0] == nullptr) {
+            break;
+        }
+        current = op->operands()[0];
+    }
+    return current;
+}
+
+bool match_shift_one(Expression* expr, Expression*& amount_expr) {
+    auto* op = dynamic_cast<Operation*>(strip_cast_expr(expr));
+    if (!op || op->type() != OperationType::shl || op->operands().size() != 2) {
+        return false;
+    }
+
+    auto* one = dynamic_cast<Constant*>(strip_cast_expr(op->operands()[0]));
+    if (!one || one->value() != 1) {
+        return false;
+    }
+
+    amount_expr = strip_cast_expr(op->operands()[1]);
+    return amount_expr != nullptr;
+}
+
+bool match_bitfield_mask(Expression* expr, Expression*& amount_expr, std::uint64_t& mask, std::size_t& mask_bytes) {
+    auto* op = dynamic_cast<Operation*>(strip_cast_expr(expr));
+    if (!op || op->type() != OperationType::bit_and || op->operands().size() != 2) {
+        return false;
+    }
+
+    auto try_form = [&](Expression* shift_side, Expression* mask_side) -> bool {
+        Expression* amount = nullptr;
+        if (!match_shift_one(shift_side, amount)) {
+            return false;
+        }
+
+        auto* mask_const = dynamic_cast<Constant*>(strip_cast_expr(mask_side));
+        if (!mask_const) {
+            return false;
+        }
+
+        amount_expr = amount;
+        mask = mask_const->value();
+        mask_bytes = mask_const->size_bytes == 0 ? 8 : mask_const->size_bytes;
+        return true;
+    };
+
+    return try_form(op->operands()[0], op->operands()[1]) ||
+           try_form(op->operands()[1], op->operands()[0]);
+}
+
+Expression* build_unrolled_amount_checks(
+    DecompilerTask& task,
+    Expression* amount_expr,
+    std::uint64_t mask,
+    std::size_t mask_bytes) {
+    if (!amount_expr) {
+        return nullptr;
+    }
+
+    const std::size_t bit_width = std::min<std::size_t>(64, std::max<std::size_t>(1, mask_bytes * 8));
+    std::vector<Expression*> checks;
+    checks.reserve(bit_width);
+
+    for (std::size_t bit = 0; bit < bit_width; ++bit) {
+        if ((mask & (std::uint64_t{1} << bit)) == 0) {
+            continue;
+        }
+
+        auto* bit_const = task.arena().create<Constant>(bit, amount_expr->size_bytes > 0 ? amount_expr->size_bytes : 4);
+        auto* eq = task.arena().create<Condition>(OperationType::eq, amount_expr->copy(task.arena()), bit_const, 1);
+        checks.push_back(eq);
+    }
+
+    if (checks.empty()) {
+        return task.arena().create<Constant>(0, 1);
+    }
+
+    Expression* combined = checks.front();
+    for (std::size_t i = 1; i < checks.size(); ++i) {
+        combined = task.arena().create<Operation>(
+            OperationType::logical_or,
+            std::vector<Expression*>{combined, checks[i]},
+            1);
+    }
+    return combined;
+}
+
+bool is_non_primitive_type(const TypePtr& type) {
+    if (!type) {
+        return false;
+    }
+    if (dynamic_cast<const UnknownType*>(type.get()) != nullptr) {
+        return false;
+    }
+    if (dynamic_cast<const Integer*>(type.get()) != nullptr) {
+        return false;
+    }
+    if (dynamic_cast<const Float*>(type.get()) != nullptr) {
+        return false;
+    }
+    if (dynamic_cast<const CustomType*>(type.get()) != nullptr) {
+        return false;
+    }
+    return true;
+}
+
+void collect_rhs_variables(Expression* expr, std::vector<Variable*>& out) {
+    if (!expr) {
+        return;
+    }
+    std::unordered_set<Variable*> seen;
+    expr->collect_requirements(seen);
+    out.reserve(out.size() + seen.size());
+    for (Variable* var : seen) {
+        if (var != nullptr) {
+            out.push_back(var);
+        }
+    }
+}
+
+void add_type_graph_edge(
+    const VarKey& lhs,
+    const VarKey& rhs,
+    std::unordered_map<VarKey, std::unordered_set<VarKey, VarKeyHash>, VarKeyHash>& graph) {
+    graph[lhs].insert(rhs);
+    graph[rhs].insert(lhs);
+}
+
+const TypePtr* find_dominant_non_primitive_type(
+    const std::vector<VarKey>& component,
+    const std::unordered_map<VarKey, std::vector<Variable*>, VarKeyHash>& occurrences,
+    std::vector<std::pair<TypePtr, std::size_t>>& accumulator) {
+    accumulator.clear();
+
+    for (const VarKey& key : component) {
+        auto it = occurrences.find(key);
+        if (it == occurrences.end()) {
+            continue;
+        }
+        for (Variable* var : it->second) {
+            if (!var || !is_non_primitive_type(var->ir_type())) {
+                continue;
+            }
+
+            bool matched = false;
+            for (auto& [candidate, count] : accumulator) {
+                if (candidate && var->ir_type() && *candidate == *var->ir_type()) {
+                    ++count;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                accumulator.emplace_back(var->ir_type(), 1);
+            }
+        }
+    }
+
+    if (accumulator.empty()) {
+        return nullptr;
+    }
+
+    std::sort(
+        accumulator.begin(),
+        accumulator.end(),
+        [](const std::pair<TypePtr, std::size_t>& lhs, const std::pair<TypePtr, std::size_t>& rhs) {
+            if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+            }
+            const std::string lhs_name = lhs.first ? lhs.first->to_string() : std::string();
+            const std::string rhs_name = rhs.first ? rhs.first->to_string() : std::string();
+            return lhs_name < rhs_name;
+        });
+
+    return &accumulator.front().first;
+}
+
+bool try_unroll_bitfield_branch_condition(DecompilerTask& task, Branch* branch) {
+    if (!branch || !branch->condition()) {
+        return false;
+    }
+
+    Condition* cond = branch->condition();
+    if (cond->type() != OperationType::eq && cond->type() != OperationType::neq) {
+        return false;
+    }
+
+    auto is_zero_const = [](Expression* expr) -> bool {
+        auto* c = dynamic_cast<Constant*>(strip_cast_expr(expr));
+        return c != nullptr && c->value() == 0;
+    };
+
+    Expression* tested_expr = nullptr;
+    if (is_zero_const(cond->lhs())) {
+        tested_expr = cond->rhs();
+    } else if (is_zero_const(cond->rhs())) {
+        tested_expr = cond->lhs();
+    } else {
+        return false;
+    }
+
+    Expression* amount_expr = nullptr;
+    std::uint64_t mask = 0;
+    std::size_t mask_bytes = 0;
+    if (!match_bitfield_mask(tested_expr, amount_expr, mask, mask_bytes)) {
+        return false;
+    }
+
+    Expression* unrolled = build_unrolled_amount_checks(task, amount_expr, mask, mask_bytes);
+    if (!unrolled) {
+        return false;
+    }
+
+    auto* zero = task.arena().create<Constant>(0, 1);
+    auto* replacement = task.arena().create<Condition>(cond->type(), unrolled, zero, 1);
+    branch->set_condition(replacement);
+    return true;
+}
+
 } // namespace
 
-void TypePropagationStage::execute(DecompilerTask& task) {}
-void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {}
+void TypePropagationStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) {
+        return;
+    }
+
+    std::unordered_map<VarKey, std::unordered_set<VarKey, VarKeyHash>, VarKeyHash> type_graph;
+    std::unordered_map<VarKey, std::vector<Variable*>, VarKeyHash> occurrences;
+
+    auto note_variable = [&](Variable* var) {
+        if (!var) {
+            return;
+        }
+        VarKey key = var_key(var);
+        occurrences[key].push_back(var);
+        if (!type_graph.contains(key)) {
+            type_graph.emplace(key, std::unordered_set<VarKey, VarKeyHash>{});
+        }
+    };
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            for (Variable* req : inst->requirements()) {
+                note_variable(req);
+            }
+            for (Variable* def : inst->definitions()) {
+                note_variable(def);
+            }
+
+            auto* assign = dynamic_cast<Assignment*>(inst);
+            auto* dst = assign ? dynamic_cast<Variable*>(assign->destination()) : nullptr;
+            if (!dst) {
+                continue;
+            }
+
+            std::vector<Variable*> rhs_vars;
+            collect_rhs_variables(assign->value(), rhs_vars);
+            for (Variable* rhs_var : rhs_vars) {
+                if (!rhs_var) {
+                    continue;
+                }
+                note_variable(rhs_var);
+                add_type_graph_edge(var_key(dst), var_key(rhs_var), type_graph);
+            }
+        }
+    }
+
+    std::unordered_set<VarKey, VarKeyHash> visited;
+    std::vector<VarKey> stack;
+    std::vector<VarKey> component;
+    std::vector<std::pair<TypePtr, std::size_t>> type_counts;
+
+    for (const auto& [start, _] : type_graph) {
+        if (visited.contains(start)) {
+            continue;
+        }
+
+        component.clear();
+        stack.clear();
+        stack.push_back(start);
+        visited.insert(start);
+
+        while (!stack.empty()) {
+            VarKey current = stack.back();
+            stack.pop_back();
+            component.push_back(current);
+
+            auto it = type_graph.find(current);
+            if (it == type_graph.end()) {
+                continue;
+            }
+            for (const VarKey& neighbor : it->second) {
+                if (!visited.contains(neighbor)) {
+                    visited.insert(neighbor);
+                    stack.push_back(neighbor);
+                }
+            }
+        }
+
+        const TypePtr* dominant = find_dominant_non_primitive_type(component, occurrences, type_counts);
+        if (dominant == nullptr || !(*dominant)) {
+            continue;
+        }
+
+        for (const VarKey& key : component) {
+            auto occ_it = occurrences.find(key);
+            if (occ_it == occurrences.end()) {
+                continue;
+            }
+            for (Variable* var : occ_it->second) {
+                if (var != nullptr) {
+                    var->set_ir_type(*dominant);
+                }
+            }
+        }
+    }
+}
+void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                (void)try_unroll_bitfield_branch_condition(task, branch);
+            }
+        }
+    }
+}
 void ExpressionSimplificationStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
     for (BasicBlock* block : task.cfg()->blocks()) {

@@ -119,6 +119,104 @@ std::size_t configured_hex_threshold() {
     return static_cast<std::size_t>(parsed);
 }
 
+enum class IfBranchPreference {
+    None,
+    Smallest,
+    Largest,
+};
+
+IfBranchPreference configured_if_branch_preference() {
+    const char* value = std::getenv("DEWOLF_IF_BRANCH_PREFERENCE");
+    if (!value || *value == '\0') {
+        return IfBranchPreference::None;
+    }
+
+    std::string pref(value);
+    if (pref == "smallest") {
+        return IfBranchPreference::Smallest;
+    }
+    if (pref == "largest") {
+        return IfBranchPreference::Largest;
+    }
+    return IfBranchPreference::None;
+}
+
+std::size_t ast_node_weight(AstNode* node) {
+    if (!node) {
+        return 0;
+    }
+
+    if (auto* cnode = dynamic_cast<CodeNode*>(node)) {
+        if (!cnode->block()) {
+            return 1;
+        }
+        return std::max<std::size_t>(1, cnode->block()->instructions().size());
+    }
+    if (auto* seq = dynamic_cast<SeqNode*>(node)) {
+        std::size_t sum = 0;
+        for (AstNode* child : seq->nodes()) {
+            sum += ast_node_weight(child);
+        }
+        return std::max<std::size_t>(1, sum);
+    }
+    if (auto* inode = dynamic_cast<IfNode*>(node)) {
+        return 1 + ast_node_weight(inode->true_branch()) + ast_node_weight(inode->false_branch());
+    }
+    if (auto* loop = dynamic_cast<LoopNode*>(node)) {
+        return 1 + ast_node_weight(loop->body());
+    }
+    if (auto* snode = dynamic_cast<SwitchNode*>(node)) {
+        std::size_t sum = 1;
+        for (CaseNode* c : snode->cases()) {
+            sum += ast_node_weight(c);
+        }
+        return sum;
+    }
+    if (auto* cnode = dynamic_cast<CaseNode*>(node)) {
+        return 1 + ast_node_weight(cnode->body());
+    }
+
+    return 1;
+}
+
+bool should_swap_if_branches(IfNode* inode) {
+    if (!inode || !inode->true_branch() || !inode->false_branch()) {
+        return false;
+    }
+
+    const bool true_is_if = dynamic_cast<IfNode*>(inode->true_branch()) != nullptr;
+    const bool false_is_if = dynamic_cast<IfNode*>(inode->false_branch()) != nullptr;
+    if (true_is_if != false_is_if) {
+        return true_is_if;
+    }
+
+    const IfBranchPreference pref = configured_if_branch_preference();
+    if (pref == IfBranchPreference::None) {
+        return false;
+    }
+
+    const std::size_t true_weight = ast_node_weight(inode->true_branch());
+    const std::size_t false_weight = ast_node_weight(inode->false_branch());
+
+    if (pref == IfBranchPreference::Smallest) {
+        return true_weight > false_weight;
+    }
+    if (pref == IfBranchPreference::Largest) {
+        return true_weight < false_weight;
+    }
+    return false;
+}
+
+std::string negate_condition_string(std::string cond) {
+    if (cond.empty()) {
+        return "!(/* condition */)";
+    }
+    if (cond.starts_with("!(") && cond.ends_with(')')) {
+        return cond.substr(2, cond.size() - 3);
+    }
+    return "!(" + cond + ")";
+}
+
 char nibble_to_hex(unsigned value) {
     return static_cast<char>(value < 10 ? ('0' + value) : ('a' + (value - 10)));
 }
@@ -793,36 +891,7 @@ void CodeVisitor::visit_node(AstNode* node) {
             visit_node(child);
         }
     } else if (IfNode* inode = dynamic_cast<IfNode*>(node)) {
-        indent();
-        std::string cond_str = "/* condition */";
-        if (inode->cond()) {
-            if (auto* expr_ast = dynamic_cast<ExprAstNode*>(inode->cond())) {
-                cond_str = expr_gen_.generate(expr_ast->expr());
-            }
-        }
-        current_line_ += "if (" + cond_str + ") {";
-        lines_.push_back(current_line_);
-        current_line_.clear();
-        
-        indent_level_++;
-        visit_node(inode->true_branch());
-        indent_level_--;
-        
-        if (inode->false_branch()) {
-            indent();
-            current_line_ += "} else {";
-            lines_.push_back(current_line_);
-            current_line_.clear();
-            
-            indent_level_++;
-            visit_node(inode->false_branch());
-            indent_level_--;
-        }
-
-        indent();
-        current_line_ += "}";
-        lines_.push_back(current_line_);
-        current_line_.clear();
+        visit_if_chain(inode, false);
     } else if (auto* snode = dynamic_cast<SwitchNode*>(node)) {
         indent();
         std::string cond_str = "/* switch_expr */";
@@ -920,6 +989,57 @@ void CodeVisitor::visit_node(AstNode* node) {
         lines_.push_back(current_line_);
         current_line_.clear();
     }
+}
+
+void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
+    if (!inode) {
+        return;
+    }
+
+    std::string cond_str = "/* condition */";
+    if (inode->cond()) {
+        if (auto* expr_ast = dynamic_cast<ExprAstNode*>(inode->cond())) {
+            cond_str = expr_gen_.generate(expr_ast->expr());
+        }
+    }
+
+    AstNode* true_branch = inode->true_branch();
+    AstNode* false_branch = inode->false_branch();
+    if (should_swap_if_branches(inode)) {
+        std::swap(true_branch, false_branch);
+        cond_str = negate_condition_string(cond_str);
+    }
+
+    indent();
+    current_line_ += else_if_prefix ? "} else if (" : "if (";
+    current_line_ += cond_str + ") {";
+    lines_.push_back(current_line_);
+    current_line_.clear();
+
+    indent_level_++;
+    visit_node(true_branch);
+    indent_level_--;
+
+    if (auto* nested_if = dynamic_cast<IfNode*>(false_branch)) {
+        visit_if_chain(nested_if, true);
+        return;
+    }
+
+    if (false_branch != nullptr) {
+        indent();
+        current_line_ += "} else {";
+        lines_.push_back(current_line_);
+        current_line_.clear();
+
+        indent_level_++;
+        visit_node(false_branch);
+        indent_level_--;
+    }
+
+    indent();
+    current_line_ += "}";
+    lines_.push_back(current_line_);
+    current_line_.clear();
 }
 
 void CodeVisitor::indent() {

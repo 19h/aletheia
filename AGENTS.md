@@ -572,33 +572,39 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] L.11.3 Remove dead code after noreturn calls.
     - *Implemented `RemoveNoreturnBoilerplateStage` in `preprocessing_stages.hpp/.cpp`: computes post-dominator sets/tree on CFG exits, identifies known noreturn call sites (`__stack_chk_fail`, `__assert_fail`, `abort`, `exit`, etc.) from lifted call targets, truncates dead instructions after noreturn calls, removes outgoing edges from noreturn blocks, and prunes now-unreachable blocks. Wired stage into both plugin and CLI pipelines (`plugin.cpp`, `src/cli/idump.cpp`). Added `test_remove_noreturn_boilerplate_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.12** Implement `InsertMissingDefinitions` Preprocessing Stage (currently missing)
+- [x] **L.12** Implement `InsertMissingDefinitions` Preprocessing Stage (currently missing)
   - *The Python reference inserts definitions for undefined aliased variables at appropriate locations using dominator tree and memory version tracking.*
-  - [ ] L.12.1 Find undefined aliased variables.
-  - [ ] L.12.2 Insert definitions at dominator-appropriate locations.
+  - [x] L.12.1 Find undefined aliased variables.
+  - [x] L.12.2 Insert definitions at dominator-appropriate locations.
+    - *Implemented `InsertMissingDefinitionsStage` in `preprocessing_stages.hpp/.cpp`: detects aliased variables that appear in requirements without definitions, computes dominating insertion points via `DominatorTree`, selects previous SSA version per variable-name lineage, and inserts synthetic assignments (`v#missing = v#previous`) before first local use or before terminators. Wired into both plugin and CLI preprocessing pipelines (`plugin.cpp`, `src/cli/idump.cpp`). Added `test_insert_missing_definitions_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.13** Implement `PhiFunctionFixer` Preprocessing Stage (currently missing)
+- [x] **L.13** Implement `PhiFunctionFixer` Preprocessing Stage (currently missing)
   - *The Python reference computes `origin_block` for each Phi by walking the dominator tree from each predecessor to find which phi operand is live there. This is critical for correct phi lifting.*
-  - [ ] L.13.1 Build `basic_block_of_definition` map.
-  - [ ] L.13.2 For each phi, walk predecessors up the dominator tree to find the live operand.
-  - [ ] L.13.3 Populate `Phi.origin_block`.
+  - [x] L.13.1 Build `basic_block_of_definition` map.
+  - [x] L.13.2 For each phi, walk predecessors up the dominator tree to find the live operand.
+  - [x] L.13.3 Populate `Phi.origin_block`.
+    - *Implemented `PhiFunctionFixerStage` in `preprocessing_stages.hpp/.cpp`: builds a definition-block map for SSA variables, derives phi-operand definition origins, walks predecessor `idom` chains to resolve the live incoming operand per predecessor, and populates `Phi.origin_block` deterministically. Wired stage into both plugin and CLI pipelines before out-of-SSA (`plugin.cpp`, `src/cli/idump.cpp`). Added `test_phi_function_fixer_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.14** Implement `BitFieldComparisonUnrolling` Stage for Real (currently a stub)
+- [x] **L.14** Implement `BitFieldComparisonUnrolling` Stage for Real (currently a stub)
   - *The Python reference transforms `if((1 << amount) & bitmask)` into chains of equality comparisons. Creates nested conditional blocks in CFG.*
-  - [ ] L.14.1 Detect `(1 << amount) & bitmask` patterns.
-  - [ ] L.14.2 Unroll into `amount == 1 || amount == 3 || ...` chains.
+  - [x] L.14.1 Detect `(1 << amount) & bitmask` patterns.
+  - [x] L.14.2 Unroll into `amount == 1 || amount == 3 || ...` chains.
+    - *Implemented in `optimization_stages.cpp`: `BitFieldComparisonUnrollingStage` now matches cast-tolerant branch conditions of form `((1 << amount) & mask) == 0` / `!= 0`, extracts set bits from the mask, and rewrites the tested expression to an OR-chain of equality checks (`amount == bit0 || amount == bit1 ...`) while preserving original eq/neq polarity. Wired stage into both plugin and CLI pipelines (`src/plugin/plugin.cpp`, `src/cli/idump.cpp`). Added `test_bitfield_comparison_unrolling_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.15** Implement `TypePropagation` Stage for Real (currently a stub, and depends on C.2)
+- [x] **L.15** Implement `TypePropagation` Stage for Real (currently a stub, and depends on C.2)
   - *The Python reference does horizontal type propagation through equivalence classes connected by assignments. Builds a `TypeGraph`, finds connected components, propagates the most common non-primitive type.*
-  - [ ] L.15.1 Build type equivalence graph from assignment chains.
-  - [ ] L.15.2 Find connected components, propagate dominant type.
+  - [x] L.15.1 Build type equivalence graph from assignment chains.
+  - [x] L.15.2 Find connected components, propagate dominant type.
+    - *Implemented `TypePropagationStage` in `optimization_stages.cpp`: collects variable occurrences by SSA key, builds an undirected type-equivalence graph from assignment def-use chains, computes connected components, and propagates the dominant non-primitive type in each component to all variable occurrences. Added deterministic tie-breaking by type string and primitive filtering (`UnknownType`/`Integer`/`Float`/`CustomType`). Wired stage into both plugin and CLI pipelines right after coherence (`src/plugin/plugin.cpp`, `src/cli/idump.cpp`). Added `test_type_propagation_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.16** Implement CNF/DNF Normal Form Conversion in Logic Engine (currently missing)
+- [x] **L.16** Implement CNF/DNF Normal Form Conversion in Logic Engine (currently missing)
   - *The Python reference has `ToCnfVisitor` and `ToDnfVisitor` that transform logic expressions into Conjunctive/Disjunctive Normal Form by distributing AND over OR (or vice versa). Used by condition-based refinement for identifying complementary conditions and subexpression matching.*
-  - [ ] L.16.1 Implement `ToCnfVisitor`: recursively distribute OR over AND.
-  - [ ] L.16.2 Implement `ToDnfVisitor`: recursively distribute AND over OR.
+  - [x] L.16.1 Implement `ToCnfVisitor`: recursively distribute OR over AND.
+  - [x] L.16.2 Implement `ToDnfVisitor`: recursively distribute AND over OR.
+    - *Implemented `ToCnfVisitor`/`ToDnfVisitor` in new `src/dewolf_logic/normal_form.hpp/.cpp`: converts expressions to NNF (with De Morgan/not-pushing), then recursively distributes OR over AND (CNF) or AND over OR (DNF) with n-ary flattening and simplification via `simplify_node`. Added `test_logic_normal_form_conversion` in `tests/test_main.cpp` covering both directions, and wired build integration in `CMakeLists.txt` (`src/dewolf_logic/normal_form.cpp`). `build/dewolf_tests` passes.*
 
-- [ ] **L.17** Implement If-Else Branch Swapping Heuristic in `CodeVisitor` (currently branches are emitted in tree order)
+- [x] **L.17** Implement If-Else Branch Swapping Heuristic in `CodeVisitor` (currently branches are emitted in tree order)
   - *The Python reference swaps if/else branches to: (1) ensure else-if chaining (put ConditionNode in false branch), (2) use configurable "smallest" or "largest" true-branch preference for readability.*
-  - [ ] L.17.1 Detect else-if chain opportunity: if exactly one branch is a ConditionNode, swap so it's the false branch.
-  - [ ] L.17.2 Implement configurable branch preference (smallest/largest/none).
+  - [x] L.17.1 Detect else-if chain opportunity: if exactly one branch is a ConditionNode, swap so it's the false branch.
+  - [x] L.17.2 Implement configurable branch preference (smallest/largest/none).
+    - *Implemented in `codegen.cpp`/`codegen.hpp`: added `visit_if_chain()` with else-if chain emission (`} else if (...) {`), branch swap heuristic (single IfNode branch forced to false side), and configurable preference via `DEWOLF_IF_BRANCH_PREFERENCE` (`smallest`, `largest`, `none`). Swaps are semantics-preserving by negating emitted conditions. Added `test_codegen_if_branch_swapping` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
