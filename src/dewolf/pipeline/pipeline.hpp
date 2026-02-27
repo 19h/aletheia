@@ -6,6 +6,8 @@
 #include "../../dewolf_idioms/idioms.hpp"
 #include <memory>
 #include <string>
+#include <unordered_set>
+#include <vector>
 #include <ida/idax.hpp>
 #include <z3++.h>
 
@@ -17,6 +19,18 @@ enum class OutOfSsaMode {
     LiftMinimal,
     Conditional,
     Sreedhar,
+};
+
+enum class StageExecutionStatus {
+    Success,
+    Failed,
+    SkippedMissingDependency,
+};
+
+struct StageExecutionRecord {
+    std::string stage_name;
+    StageExecutionStatus status = StageExecutionStatus::Success;
+    std::string detail;
 };
 
 class DecompilerTask {
@@ -50,6 +64,28 @@ public:
     OutOfSsaMode out_of_ssa_mode() const { return out_of_ssa_mode_; }
     void set_out_of_ssa_mode(OutOfSsaMode mode) { out_of_ssa_mode_ = mode; }
 
+    const std::vector<StageExecutionRecord>& stage_records() const { return stage_records_; }
+    bool failed() const { return failed_; }
+    const std::string& failure_stage() const { return failure_stage_; }
+    const std::string& failure_message() const { return failure_message_; }
+
+    void clear_pipeline_status() {
+        stage_records_.clear();
+        failed_ = false;
+        failure_stage_.clear();
+        failure_message_.clear();
+    }
+
+    void record_stage(StageExecutionRecord record) {
+        stage_records_.push_back(std::move(record));
+    }
+
+    void fail_pipeline(std::string stage_name, std::string message) {
+        failed_ = true;
+        failure_stage_ = std::move(stage_name);
+        failure_message_ = std::move(message);
+    }
+
 private:
     ida::Address function_address_;
     DecompilerArena arena_;
@@ -60,6 +96,10 @@ private:
     TypePtr function_type_;
     std::vector<dewolf_idioms::IdiomTag> idiom_tags_;
     OutOfSsaMode out_of_ssa_mode_ = OutOfSsaMode::LiftMinimal;
+    std::vector<StageExecutionRecord> stage_records_;
+    bool failed_ = false;
+    std::string failure_stage_;
+    std::string failure_message_;
 };
 
 class PipelineStage {
@@ -68,6 +108,7 @@ public:
     
     virtual const char* name() const = 0;
     virtual void execute(DecompilerTask& task) = 0;
+    virtual std::vector<std::string> dependencies() const { return {}; }
 };
 
 class DecompilerPipeline {
@@ -79,8 +120,66 @@ public:
     }
 
     void run(DecompilerTask& task) {
+        task.clear_pipeline_status();
+
+        std::unordered_set<std::string> completed;
+        completed.reserve(stages_.size());
+
         for (auto& stage : stages_) {
-            stage->execute(task);
+            const std::string stage_name = stage->name();
+
+            std::vector<std::string> missing;
+            for (const auto& dep : stage->dependencies()) {
+                if (!completed.contains(dep)) {
+                    missing.push_back(dep);
+                }
+            }
+
+            if (!missing.empty()) {
+                std::string message = "missing dependencies: ";
+                for (std::size_t i = 0; i < missing.size(); ++i) {
+                    if (i > 0) {
+                        message += ", ";
+                    }
+                    message += missing[i];
+                }
+
+                task.record_stage(StageExecutionRecord{
+                    stage_name,
+                    StageExecutionStatus::SkippedMissingDependency,
+                    message,
+                });
+                task.fail_pipeline(stage_name, message);
+                break;
+            }
+
+            try {
+                stage->execute(task);
+                completed.insert(stage_name);
+                task.record_stage(StageExecutionRecord{
+                    stage_name,
+                    StageExecutionStatus::Success,
+                    {},
+                });
+            } catch (const std::exception& ex) {
+                const std::string message = ex.what();
+                task.record_stage(StageExecutionRecord{
+                    stage_name,
+                    StageExecutionStatus::Failed,
+                    message,
+                });
+                task.fail_pipeline(stage_name, message);
+                break;
+            } catch (...) {
+                const std::string message = "unknown exception";
+                task.record_stage(StageExecutionRecord{
+                    stage_name,
+                    StageExecutionStatus::Failed,
+                    message,
+                });
+                task.fail_pipeline(stage_name, message);
+                break;
+            }
         }
     }
 

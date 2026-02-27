@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <cstdlib>
+#include <stdexcept>
 #include <utility>
 #include <unordered_set>
 #include "../src/common/arena.hpp"
@@ -40,6 +41,39 @@
 
 using namespace dewolf;
 
+class PipelineTestStage final : public PipelineStage {
+public:
+    PipelineTestStage(std::string stage_name,
+                      std::vector<std::string> deps,
+                      bool* executed,
+                      bool throw_error = false)
+        : stage_name_(std::move(stage_name)),
+          deps_(std::move(deps)),
+          executed_(executed),
+          throw_error_(throw_error) {}
+
+    const char* name() const override { return stage_name_.c_str(); }
+
+    std::vector<std::string> dependencies() const override {
+        return deps_;
+    }
+
+    void execute(DecompilerTask&) override {
+        if (executed_) {
+            *executed_ = true;
+        }
+        if (throw_error_) {
+            throw std::runtime_error("stage boom: " + stage_name_);
+        }
+    }
+
+private:
+    std::string stage_name_;
+    std::vector<std::string> deps_;
+    bool* executed_ = nullptr;
+    bool throw_error_ = false;
+};
+
 void test_arena() {
     DecompilerArena arena;
     auto* b1 = arena.create<BasicBlock>(1);
@@ -53,6 +87,82 @@ void test_arena() {
     }
     
     std::cout << "[+] test_arena passed.\n";
+}
+
+void test_pipeline_stage_tracking() {
+    {
+        DecompilerTask task(0x1110);
+        DecompilerPipeline pipeline;
+
+        bool ran_a = false;
+        bool ran_b = false;
+        bool ran_c = false;
+
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "A",
+            std::vector<std::string>{},
+            &ran_a));
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "B",
+            std::vector<std::string>{"A"},
+            &ran_b));
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "C",
+            std::vector<std::string>{"Missing"},
+            &ran_c));
+
+        pipeline.run(task);
+
+        ASSERT_TRUE(ran_a);
+        ASSERT_TRUE(ran_b);
+        ASSERT_TRUE(!ran_c);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(task.failure_stage(), std::string("C"));
+        ASSERT_TRUE(task.failure_message().find("missing dependencies") != std::string::npos);
+
+        ASSERT_EQ(task.stage_records().size(), 3);
+        ASSERT_EQ(task.stage_records()[0].status, StageExecutionStatus::Success);
+        ASSERT_EQ(task.stage_records()[1].status, StageExecutionStatus::Success);
+        ASSERT_EQ(task.stage_records()[2].status, StageExecutionStatus::SkippedMissingDependency);
+    }
+
+    {
+        DecompilerTask task(0x1120);
+        DecompilerPipeline pipeline;
+
+        bool ran_x = false;
+        bool ran_y = false;
+        bool ran_z = false;
+
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "X",
+            std::vector<std::string>{},
+            &ran_x));
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "Y",
+            std::vector<std::string>{},
+            &ran_y,
+            true));
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "Z",
+            std::vector<std::string>{},
+            &ran_z));
+
+        pipeline.run(task);
+
+        ASSERT_TRUE(ran_x);
+        ASSERT_TRUE(ran_y);
+        ASSERT_TRUE(!ran_z);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(task.failure_stage(), std::string("Y"));
+        ASSERT_TRUE(task.failure_message().find("stage boom") != std::string::npos);
+
+        ASSERT_EQ(task.stage_records().size(), 2);
+        ASSERT_EQ(task.stage_records()[0].status, StageExecutionStatus::Success);
+        ASSERT_EQ(task.stage_records()[1].status, StageExecutionStatus::Failed);
+    }
+
+    std::cout << "[+] test_pipeline_stage_tracking passed.\n";
 }
 
 void test_dominators() {
@@ -3940,6 +4050,7 @@ int main() {
     test_phi_dependency();
     std::cout << "Running DeWolf tests...\n";
     test_arena();
+    test_pipeline_stage_tracking();
     test_dominators();
     test_ssa_phi_insertion();
     test_phi_lifting_edge_splitting();

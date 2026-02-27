@@ -55,6 +55,7 @@ class PhiFunctionFixerStage : public PipelineStage {
 public:
     const char* name() const override { return "PhiFunctionFixer"; }
     void execute(DecompilerTask& task) override;
+    std::vector<std::string> dependencies() const override { return {"SsaConstructor"}; }
 };
 
 class CoherenceStage : public PipelineStage {

@@ -167,6 +167,14 @@ std::vector<std::string> decompile_function(
     auto pipeline = build_pipeline();
     pipeline.run(task);
 
+    if (task.failed()) {
+        std::cerr << "idump: pipeline stopped at stage '" << task.failure_stage() << "'";
+        if (!task.failure_message().empty()) {
+            std::cerr << ": " << task.failure_message();
+        }
+        std::cerr << "\n";
+    }
+
     if (!task.ast() || !task.ast()->root()) {
         auto fallback_ast = std::make_unique<dewolf::AbstractSyntaxForest>();
         auto* seq = task.arena().create<dewolf::SeqNode>();
