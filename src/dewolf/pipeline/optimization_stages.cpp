@@ -269,6 +269,78 @@ static void remove_redundant_phis(ControlFlowGraph* cfg, DecompilerArena& arena)
 }
 
 // =============================================================================
+// IdentityElimination helpers
+// =============================================================================
+
+namespace {
+
+struct DisjointSet {
+    std::vector<int> parent;
+    std::vector<int> rank;
+
+    explicit DisjointSet(std::size_t n) : parent(n), rank(n, 0) {
+        for (std::size_t i = 0; i < n; ++i) parent[i] = static_cast<int>(i);
+    }
+
+    int find(int x) {
+        if (parent[x] != x) parent[x] = find(parent[x]);
+        return parent[x];
+    }
+
+    bool unite(int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) return false;
+        if (rank[a] < rank[b]) std::swap(a, b);
+        parent[b] = a;
+        if (rank[a] == rank[b]) ++rank[a];
+        return true;
+    }
+};
+
+struct PhiIdentityInfo {
+    VarKey dest;
+    std::vector<VarKey> operands;
+};
+
+static bool type_compatible_for_identity(Variable* a, Variable* b) {
+    if (!a || !b) return false;
+
+    if (a->is_aliased() != b->is_aliased()) return false;
+    if (a->is_aliased() && b->is_aliased() && a->name() != b->name()) return false;
+
+    auto ta = a->ir_type();
+    auto tb = b->ir_type();
+    if (ta && tb) {
+        return ta->to_string() == tb->to_string();
+    }
+
+    return a->size_bytes == b->size_bytes;
+}
+
+static Variable* representative_for_identity_component(
+    const std::vector<VarKey>& keys,
+    const std::unordered_map<VarKey, Variable*, VarKeyHash>& sample_of) {
+    if (keys.empty()) return nullptr;
+
+    const VarKey* chosen = &keys[0];
+    for (const VarKey& key : keys) {
+        if (key.ssa_version < chosen->ssa_version) {
+            chosen = &key;
+            continue;
+        }
+        if (key.ssa_version == chosen->ssa_version && key.name < chosen->name) {
+            chosen = &key;
+        }
+    }
+
+    auto it = sample_of.find(*chosen);
+    return (it != sample_of.end()) ? it->second : nullptr;
+}
+
+} // namespace
+
+// =============================================================================
 // Dangerous Memory Check Helpers
 // =============================================================================
 
@@ -926,6 +998,205 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
             }
             if (changed) break;
         }
+    }
+}
+
+void IdentityEliminationStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+
+    // Step 1: collect variable universe + direct identity edges + phi candidates
+    std::unordered_map<VarKey, int, VarKeyHash> id_of;
+    std::vector<VarKey> keys;
+    std::unordered_map<VarKey, Variable*, VarKeyHash> sample_of;
+    std::vector<std::pair<VarKey, VarKey>> direct_identity_edges;
+    std::vector<PhiIdentityInfo> phi_infos;
+
+    auto intern = [&](Variable* v) {
+        if (!v) return;
+        VarKey k = var_key(v);
+        if (!id_of.contains(k)) {
+            id_of[k] = static_cast<int>(keys.size());
+            keys.push_back(k);
+        }
+        if (!sample_of.contains(k)) {
+            sample_of[k] = v;
+        }
+    };
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            for (Variable* req : inst->requirements()) intern(req);
+            for (Variable* def : inst->definitions()) intern(def);
+
+            auto* assign = dynamic_cast<Assignment*>(inst);
+            if (!assign) continue;
+
+            auto* dest = dynamic_cast<Variable*>(assign->destination());
+            if (!dest) continue;
+
+            if (auto* src = dynamic_cast<Variable*>(assign->value())) {
+                if (type_compatible_for_identity(dest, src)) {
+                    direct_identity_edges.push_back({var_key(dest), var_key(src)});
+                }
+                continue;
+            }
+
+            auto* phi = dynamic_cast<Phi*>(inst);
+            if (!phi || !phi->operand_list()) continue;
+
+            PhiIdentityInfo info{var_key(dest), {}};
+            for (Expression* op : phi->operand_list()->operands()) {
+                auto* ov = dynamic_cast<Variable*>(op);
+                if (!ov) {
+                    info.operands.clear();
+                    break;
+                }
+                info.operands.push_back(var_key(ov));
+            }
+            if (!info.operands.empty()) {
+                phi_infos.push_back(std::move(info));
+            }
+        }
+    }
+
+    if (keys.empty()) return;
+
+    // Step 2: union-find over identity graph (direct identities first)
+    DisjointSet dsu(keys.size());
+    for (auto& [a, b] : direct_identity_edges) {
+        auto ia = id_of.find(a);
+        auto ib = id_of.find(b);
+        if (ia != id_of.end() && ib != id_of.end()) {
+            dsu.unite(ia->second, ib->second);
+        }
+    }
+
+    // Step 3: phi-mediated identities fixed-point
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& phi : phi_infos) {
+            auto it_dest = id_of.find(phi.dest);
+            if (it_dest == id_of.end() || phi.operands.empty()) continue;
+
+            auto it_first = id_of.find(phi.operands[0]);
+            if (it_first == id_of.end()) continue;
+            int first_root = dsu.find(it_first->second);
+
+            bool all_same = true;
+            for (const VarKey& op : phi.operands) {
+                auto it = id_of.find(op);
+                if (it == id_of.end() || dsu.find(it->second) != first_root) {
+                    all_same = false;
+                    break;
+                }
+            }
+            if (!all_same) continue;
+
+            Variable* dest_var = sample_of[phi.dest];
+            Variable* src_var = sample_of[phi.operands[0]];
+            if (!type_compatible_for_identity(dest_var, src_var)) continue;
+
+            if (dsu.unite(it_dest->second, it_first->second)) {
+                changed = true;
+            }
+        }
+    }
+
+    // Step 4: connected components -> representative variable
+    std::unordered_map<int, std::vector<VarKey>> components;
+    for (const VarKey& key : keys) {
+        int root = dsu.find(id_of[key]);
+        components[root].push_back(key);
+    }
+
+    std::unordered_map<VarKey, Variable*, VarKeyHash> replacement_for;
+    for (auto& [root, members] : components) {
+        (void)root;
+        if (members.size() <= 1) continue;
+
+        Variable* rep = representative_for_identity_component(members, sample_of);
+        if (!rep) continue;
+
+        for (const VarKey& k : members) {
+            replacement_for[k] = rep;
+        }
+    }
+
+    if (replacement_for.empty()) return;
+
+    // Step 5: rewrite all instructions to representative variables
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            std::vector<Variable*> vars = inst->requirements();
+            auto defs = inst->definitions();
+            vars.insert(vars.end(), defs.begin(), defs.end());
+
+            std::unordered_set<VarKey, VarKeyHash> seen;
+            for (Variable* old_var : vars) {
+                if (!old_var) continue;
+                VarKey k = var_key(old_var);
+                if (!seen.insert(k).second) continue;
+
+                auto it_rep = replacement_for.find(k);
+                if (it_rep != replacement_for.end() && it_rep->second != old_var) {
+                    inst->substitute(old_var, it_rep->second);
+                }
+            }
+        }
+    }
+
+    // Step 6: remove degenerate identity instructions and simplify identity phis
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        std::vector<Instruction*> rewritten;
+        rewritten.reserve(block->instructions().size());
+
+        for (Instruction* inst : block->instructions()) {
+            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+                Variable* dest = phi->dest_var();
+                if (!dest || !phi->operand_list()) {
+                    continue;
+                }
+
+                Variable* single = nullptr;
+                bool all_same = true;
+                for (Expression* op : phi->operand_list()->operands()) {
+                    auto* ov = dynamic_cast<Variable*>(op);
+                    if (!ov) {
+                        all_same = false;
+                        break;
+                    }
+                    if (var_key(ov) == var_key(dest)) continue;
+                    if (!single) single = ov;
+                    else if (var_key(single) != var_key(ov)) {
+                        all_same = false;
+                        break;
+                    }
+                }
+
+                if (all_same) {
+                    if (!single) {
+                        // phi(dest, dest, ...) is a no-op
+                        continue;
+                    }
+                    auto* repl = task.arena().create<Assignment>(dest, single);
+                    repl->set_address(phi->address());
+                    inst = repl;
+                }
+            }
+
+            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                auto* dst = dynamic_cast<Variable*>(assign->destination());
+                auto* src = dynamic_cast<Variable*>(assign->value());
+                if (dst && src && var_key(dst) == var_key(src)) {
+                    continue;
+                }
+            }
+
+            rewritten.push_back(inst);
+        }
+
+        block->set_instructions(std::move(rewritten));
     }
 }
 

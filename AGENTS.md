@@ -368,10 +368,11 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] M.1.3 Make the out-of-SSA strategy configurable (default: `lift_minimal`).
     - *Added `OutOfSsaMode` to `DecompilerTask` (default `LiftMinimal`) and mode parsing in `SsaDestructor::parse_mode()`. `SsaDestructor::execute()` now dispatches among `simple`, `min`/`minimization`, `lift_minimal`, `conditional`, and `sreedhar` strategies, with `lift_minimal` as default. Plugin reads `DEWOLF_OUT_OF_SSA_MODE` to configure strategy at runtime. Added `test_out_of_ssa_mode_config` in `tests/test_main.cpp`.*
 
-- [ ] **M.2** Implement `IdentityElimination` Stage (currently missing)
+- [x] **M.2** Implement `IdentityElimination` Stage (currently missing)
   - *The Python reference builds an `_IdentityGraph` of direct identities (`a = b`) and indirect identities (phi chains). It finds connected components of congruent variables, prunes non-identity phis via disjoint path analysis, and merges each identity group into a single replacement variable. This goes beyond what `GraphExpressionFolding` catches by handling phi-mediated identities.*
-  - [ ] M.2.1 Build identity graph from assignments and phi functions.
-  - [ ] M.2.2 Find connected components, merge each into a single variable.
+  - [x] M.2.1 Build identity graph from assignments and phi functions.
+  - [x] M.2.2 Find connected components, merge each into a single variable.
+    - *Implemented `IdentityEliminationStage` in `optimization_stages.cpp`: builds a union-find identity graph from direct copy assignments (`a=b`) and phi edges (fixed-point over phi chains), computes connected components, rewrites all variable uses/defs to component representatives, simplifies/removes identity phis, and drops redundant identity assignments. Wired stage into plugin pipeline after graph folding and added `test_identity_elimination_stage` in `tests/test_main.cpp`.*
 
 - [ ] **M.3** Implement `CommonSubexpressionElimination` Stage for Real (currently a stub)
   - *The Python reference has two phases: `ExistingSubexpressionReplacer` (replaces subexpressions already assigned to variables, dominator-aware) and `DefinitionGenerator` (creates new temporaries for repeated subexpressions). Threshold-based with complexity and occurrence filters.*

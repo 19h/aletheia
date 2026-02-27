@@ -83,6 +83,7 @@ struct DeWolfPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
         pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationStage>());
         pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
+        pipeline.add_stage(std::make_unique<dewolf::IdentityEliminationStage>());
         pipeline.add_stage(std::make_unique<dewolf::DeadCodeEliminationStage>());
         pipeline.add_stage(std::make_unique<dewolf::SsaDestructor>());
         pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());

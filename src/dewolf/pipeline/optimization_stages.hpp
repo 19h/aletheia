@@ -45,6 +45,12 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class IdentityEliminationStage : public PipelineStage {
+public:
+    const char* name() const override { return "IdentityElimination"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class CommonSubexpressionEliminationStage : public PipelineStage {
 public:
     const char* name() const override { return "CommonSubexpressionElimination"; }

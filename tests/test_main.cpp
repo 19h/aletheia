@@ -17,6 +17,7 @@
 
 #include "../src/dewolf/pipeline/pipeline.hpp"
 #include "../src/dewolf/pipeline/preprocessing_stages.hpp"
+#include "../src/dewolf/pipeline/optimization_stages.hpp"
 #include "../src/dewolf_logic/range_simplifier.hpp"
 
 
@@ -1139,6 +1140,81 @@ void test_remove_stack_canary_stage() {
     std::cout << "[+] test_remove_stack_canary_stage passed.\n";
 }
 
+void test_identity_elimination_stage() {
+    DecompilerTask task(0x7000);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(40);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* a1 = task.arena().create<Variable>("a", 4); a1->set_ssa_version(1);
+    auto* b1 = task.arena().create<Variable>("b", 4); b1->set_ssa_version(1);
+    auto* c1 = task.arena().create<Variable>("c", 4); c1->set_ssa_version(1);
+    auto* p1 = task.arena().create<Variable>("p", 4); p1->set_ssa_version(1);
+    auto* out1 = task.arena().create<Variable>("out", 4); out1->set_ssa_version(1);
+
+    auto* def_a = task.arena().create<Assignment>(a1, task.arena().create<Constant>(10, 4));
+    auto* def_b = task.arena().create<Assignment>(b1, a1);
+    auto* def_c = task.arena().create<Assignment>(c1, b1);
+
+    auto* phi_ops = task.arena().create<ListOperation>(std::vector<Expression*>{c1, b1});
+    auto* phi = task.arena().create<Phi>(p1, phi_ops);
+
+    auto* add = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{p1, task.arena().create<Constant>(1, 4)},
+        4);
+    auto* use = task.arena().create<Assignment>(out1, add);
+
+    bb->add_instruction(def_a);
+    bb->add_instruction(def_b);
+    bb->add_instruction(def_c);
+    bb->add_instruction(phi);
+    bb->add_instruction(use);
+
+    IdentityEliminationStage stage;
+    stage.execute(task);
+
+    const auto& insts = bb->instructions();
+    ASSERT_TRUE(insts.size() <= 3);
+
+    bool found_out = false;
+    for (Instruction* inst : insts) {
+        ASSERT_TRUE(dynamic_cast<Phi*>(inst) == nullptr);
+
+        if (auto* asg = dynamic_cast<Assignment*>(inst)) {
+            auto* dst = dynamic_cast<Variable*>(asg->destination());
+            if (!dst) continue;
+            if (dst->name() == "out") {
+                auto* op = dynamic_cast<Operation*>(asg->value());
+                ASSERT_TRUE(op != nullptr);
+                ASSERT_EQ(op->type(), OperationType::add);
+                auto* lhs = dynamic_cast<Variable*>(op->operands()[0]);
+                ASSERT_TRUE(lhs != nullptr);
+                ASSERT_EQ(lhs->name(), "a");
+                ASSERT_EQ(lhs->ssa_version(), 1);
+                found_out = true;
+            }
+        }
+
+        std::vector<Variable*> vars = inst->requirements();
+        auto defs = inst->definitions();
+        vars.insert(vars.end(), defs.begin(), defs.end());
+        for (Variable* v : vars) {
+            ASSERT_TRUE(v != nullptr);
+            ASSERT_TRUE(v->name() != "b");
+            ASSERT_TRUE(v->name() != "c");
+            ASSERT_TRUE(v->name() != "p");
+        }
+    }
+
+    ASSERT_TRUE(found_out);
+
+    std::cout << "[+] test_identity_elimination_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -1155,6 +1231,7 @@ int main() {
     test_switch_variable_detection_stage();
     test_remove_go_prologue_stage();
     test_remove_stack_canary_stage();
+    test_identity_elimination_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
