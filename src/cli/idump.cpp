@@ -110,6 +110,7 @@ dewolf::DecompilerPipeline build_pipeline() {
     pipeline.add_stage(std::make_unique<dewolf::RemoveNoreturnBoilerplateStage>());
     pipeline.add_stage(std::make_unique<dewolf::InsertMissingDefinitionsStage>());
     pipeline.add_stage(std::make_unique<dewolf::SwitchVariableDetectionStage>());
+    pipeline.add_stage(std::make_unique<dewolf::MemPhiConverterStage>());
     pipeline.add_stage(std::make_unique<dewolf::CoherenceStage>());
     pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
     pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());

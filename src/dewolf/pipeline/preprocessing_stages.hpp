@@ -21,6 +21,12 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class MemPhiConverterStage : public PipelineStage {
+public:
+    const char* name() const override { return "MemPhiConverter"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class RemoveGoPrologueStage : public PipelineStage {
 public:
     const char* name() const override { return "RemoveGoPrologue"; }

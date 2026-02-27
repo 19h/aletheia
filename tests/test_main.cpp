@@ -778,6 +778,46 @@ void test_logic_normal_form_conversion() {
     std::cout << "[+] test_logic_normal_form_conversion passed.\n";
 }
 
+void test_z3_converter_no_hard_false_fallback() {
+    z3::context ctx;
+    dewolf_logic::Z3Converter converter(ctx);
+    dewolf::DecompilerArena arena;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* y = arena.create<dewolf::Variable>("y", 4);
+
+    auto* unknown_op = arena.create<dewolf::Operation>(
+        dewolf::OperationType::unknown,
+        std::vector<dewolf::Expression*>{x},
+        4);
+
+    auto unknown_cond = converter.convert_to_condition(unknown_op);
+    ASSERT_TRUE(unknown_cond.is_satisfiable());
+    ASSERT_TRUE(unknown_cond.negate().is_satisfiable());
+
+    auto* power_op = arena.create<dewolf::Operation>(
+        dewolf::OperationType::power,
+        std::vector<dewolf::Expression*>{x, y},
+        4);
+    auto power_cond = converter.convert_to_condition(power_op);
+    ASSERT_TRUE(power_cond.is_satisfiable());
+    ASSERT_TRUE(power_cond.negate().is_satisfiable());
+
+    auto* add_expr = arena.create<dewolf::Operation>(
+        dewolf::OperationType::add,
+        std::vector<dewolf::Expression*>{x, arena.create<dewolf::Constant>(1, 4)},
+        4);
+    auto* cmp_expr = arena.create<dewolf::Condition>(
+        dewolf::OperationType::gt,
+        add_expr,
+        arena.create<dewolf::Constant>(0, 4),
+        1);
+    auto cmp_cond = converter.convert_to_condition(cmp_expr);
+    ASSERT_TRUE(cmp_cond.is_satisfiable());
+
+    std::cout << "[+] test_z3_converter_no_hard_false_fallback passed.\n";
+}
+
 
 #include "../src/dewolf/ssa/phi_dependency_resolver.hpp"
 
@@ -2555,6 +2595,89 @@ void test_switch_variable_detection_stage() {
     std::cout << "[+] test_switch_variable_detection_stage passed.\n";
 }
 
+void test_mem_phi_converter_stage() {
+    {
+        DecompilerTask task(0x3a00);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(6);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* aliased_v1 = task.arena().create<Variable>("v", 8);
+        aliased_v1->set_ssa_version(1);
+        aliased_v1->set_aliased(true);
+        bb->add_instruction(task.arena().create<Assignment>(aliased_v1, task.arena().create<Constant>(1, 8)));
+
+        auto* mem3 = task.arena().create<Variable>("mem", 8);
+        mem3->set_ssa_version(3);
+        auto* mem4 = task.arena().create<Variable>("mem", 8);
+        mem4->set_ssa_version(4);
+        auto* mem5 = task.arena().create<Variable>("mem", 8);
+        mem5->set_ssa_version(5);
+
+        auto* memphi_args = task.arena().create<ListOperation>(std::vector<Expression*>{mem4, mem3}, 8);
+        auto* memphi = task.arena().create<MemPhi>(mem5, memphi_args);
+        bb->add_instruction(memphi);
+
+        MemPhiConverterStage stage;
+        stage.execute(task);
+
+        const auto& insts = bb->instructions();
+        ASSERT_EQ(insts.size(), 2);
+        ASSERT_TRUE(dynamic_cast<MemPhi*>(insts[1]) == nullptr);
+
+        auto* phi = dynamic_cast<Phi*>(insts[1]);
+        ASSERT_TRUE(phi != nullptr);
+        auto* phi_dst = phi->dest_var();
+        ASSERT_TRUE(phi_dst != nullptr);
+        ASSERT_EQ(phi_dst->name(), "v");
+        ASSERT_EQ(phi_dst->ssa_version(), 5);
+        ASSERT_TRUE(phi_dst->is_aliased());
+
+        auto* phi_ops = phi->operand_list();
+        ASSERT_TRUE(phi_ops != nullptr);
+        ASSERT_EQ(phi_ops->operands().size(), 2);
+        auto* op0 = dynamic_cast<Variable*>(phi_ops->operands()[0]);
+        auto* op1 = dynamic_cast<Variable*>(phi_ops->operands()[1]);
+        ASSERT_TRUE(op0 != nullptr && op1 != nullptr);
+        ASSERT_EQ(op0->name(), "v");
+        ASSERT_EQ(op1->name(), "v");
+        ASSERT_EQ(op0->ssa_version(), 4);
+        ASSERT_EQ(op1->ssa_version(), 3);
+        ASSERT_TRUE(op0->is_aliased() && op1->is_aliased());
+    }
+
+    {
+        DecompilerTask task(0x3a10);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(7);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* mem1 = task.arena().create<Variable>("mem", 8);
+        mem1->set_ssa_version(1);
+        auto* mem2 = task.arena().create<Variable>("mem", 8);
+        mem2->set_ssa_version(2);
+        auto* mem3 = task.arena().create<Variable>("mem", 8);
+        mem3->set_ssa_version(3);
+
+        auto* memphi_args = task.arena().create<ListOperation>(std::vector<Expression*>{mem2, mem1}, 8);
+        auto* memphi = task.arena().create<MemPhi>(mem3, memphi_args);
+        bb->add_instruction(memphi);
+
+        MemPhiConverterStage stage;
+        stage.execute(task);
+
+        ASSERT_TRUE(bb->instructions().empty());
+    }
+
+    std::cout << "[+] test_mem_phi_converter_stage passed.\n";
+}
+
 void test_remove_go_prologue_stage() {
     DecompilerTask task(0x4000);
 
@@ -3755,6 +3878,7 @@ int main() {
     test_compiler_idiom_handling_stage();
     test_register_pair_handling_stage();
     test_switch_variable_detection_stage();
+    test_mem_phi_converter_stage();
     test_remove_go_prologue_stage();
     test_remove_stack_canary_stage();
     test_remove_noreturn_boilerplate_stage();
@@ -3779,6 +3903,7 @@ int main() {
     test_range_simplifier();
     test_logic_operation_simplifier();
     test_logic_normal_form_conversion();
+    test_z3_converter_no_hard_false_fallback();
     std::cout << "All tests passed successfully.\n";
     return 0;
 }

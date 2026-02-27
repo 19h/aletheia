@@ -430,7 +430,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
         auto has_any_dangerous_use = [&](Instruction* def, Instruction* target) {
             auto def_loc = loc_map[def];
             auto target_loc = loc_map[target];
-            
+
             for (Instruction* use : dangerous_uses) {
                 auto use_loc = loc_map[use];
                 if (def_loc.block == target_loc.block) {
@@ -499,7 +499,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                         if (contains_aliased_variable(def->destination()) ||
                             contains_aliased_variable(def->value()) ||
                             contains_dereference(def->value())) {
-                            
+
                             if (has_any_dangerous_use(def, inst)) continue;
                         }
                     }
@@ -599,7 +599,7 @@ void DeadPathEliminationStage::execute(DecompilerTask& task) {
             if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
                 // If the branch is a generic Branch (not indirect), check its condition
                 dewolf_logic::LogicCondition cond = converter.convert_to_condition(branch->condition());
-                
+
                 for (Edge* edge : block->successors()) {
                     bool invalid = false;
                     if (edge->type() == EdgeType::False) {
@@ -619,14 +619,14 @@ void DeadPathEliminationStage::execute(DecompilerTask& task) {
 
     for (Edge* dead_edge : dead_edges) {
         BasicBlock* source = dead_edge->source();
-        
+
         // Remove the branch instruction if it's there
         if (!source->instructions().empty()) {
             if (dynamic_cast<Branch*>(source->instructions().back())) {
                 source->mutable_instructions().pop_back();
             }
         }
-        
+
         // Remove the dead edge from the graph
         task.cfg()->remove_edge(dead_edge);
 
@@ -641,7 +641,7 @@ void DeadPathEliminationStage::execute(DecompilerTask& task) {
     // Find unreachable blocks
     std::vector<BasicBlock*> reachable_list = task.cfg()->post_order();
     std::unordered_set<BasicBlock*> reachable(reachable_list.begin(), reachable_list.end());
-    
+
     std::unordered_set<BasicBlock*> dead_blocks;
     for (BasicBlock* block : task.cfg()->blocks()) {
         if (!reachable.contains(block)) {
@@ -723,7 +723,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
                     bool multiple_values = false;
                     for (auto& [var_block, expr] : phi->origin_block()) {
                         if (auto* c = dynamic_cast<Constant*>(expr)) {
-                            // If var_block == block, or no path exists from block to var_block 
+                            // If var_block == block, or no path exists from block to var_block
                             // (we skip precise dominator checks here for simplicity and assume it's valid if it reaches)
                             if (!unique_upstream_value) {
                                 unique_upstream_value = c;
@@ -752,7 +752,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
 
                 if (auto* patched_cond = dynamic_cast<Condition*>(patched_condition_expr)) {
                     dewolf_logic::LogicCondition cond = converter.convert_to_condition(patched_cond);
-                    
+
                     Edge* sat_edge = nullptr;
                     Edge* unsat_edge = nullptr;
 
@@ -822,7 +822,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
     // Unreachable blocks / fix origin phis logic (same as dead path)
     std::vector<BasicBlock*> reachable_list = task.cfg()->post_order();
     std::unordered_set<BasicBlock*> reachable(reachable_list.begin(), reachable_list.end());
-    
+
     std::unordered_set<BasicBlock*> dead_blocks;
     for (BasicBlock* block : task.cfg()->blocks()) {
         if (!reachable.contains(block)) {
@@ -860,7 +860,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
 
         using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
         DefMap def_map;
-        
+
         using UseSet = std::unordered_set<Instruction*>;
         std::unordered_map<VarKey, UseSet, VarKeyHash> use_map;
 
@@ -886,7 +886,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                 Instruction* inst = instrs[i];
                 std::unordered_set<Variable*> reqs;
                 inst->collect_requirements(reqs);
-                
+
                 for (Variable* req_var : reqs) {
                     VarKey key = var_key(req_var);
                     auto it_def = def_map.find(key);
@@ -1217,16 +1217,28 @@ struct ExistingSubexpressionDef {
 static std::size_t expression_complexity(Expression* expr) {
     if (!expr) return 0;
     if (dynamic_cast<Constant*>(expr) || dynamic_cast<Variable*>(expr)) return 1;
-    std::size_t score = 1;
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
-        for (Expression* child : op->operands()) score += expression_complexity(child);
-        return score;
+
+    std::vector<Expression*> stack;
+    stack.push_back(expr);
+    std::size_t score = 0;
+
+    while (!stack.empty()) {
+        Expression* current = stack.back();
+        stack.pop_back();
+        ++score;
+
+        if (auto* op = dynamic_cast<Operation*>(current)) {
+            for (Expression* child : op->operands()) {
+                stack.push_back(child);
+            }
+        } else if (auto* list = dynamic_cast<ListOperation*>(current)) {
+            for (Expression* child : list->operands()) {
+                stack.push_back(child);
+            }
+        }
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
-        for (Expression* child : list->operands()) score += expression_complexity(child);
-        return score;
-    }
-    return 1;
+
+    return score;
 }
 
 static std::string expression_fingerprint(Expression* expr) {

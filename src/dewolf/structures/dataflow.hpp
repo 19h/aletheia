@@ -29,6 +29,7 @@ class Branch;
 class IndirectBranch;
 class Return;
 class Phi;
+class MemPhi;
 class BreakInstr;
 class ContinueInstr;
 class Comment;
@@ -935,6 +936,90 @@ public:
 
 private:
     std::unordered_map<BasicBlock*, Expression*> origin_block_;
+};
+
+// =============================================================================
+// MemPhi -- Memory phi wrapper used before preprocessing conversion
+// =============================================================================
+
+class MemPhi : public Phi {
+public:
+    MemPhi(Variable* destination, ListOperation* operands)
+        : Phi(destination, operands) {}
+
+    Instruction* copy(DecompilerArena& arena) const override {
+        auto* new_dest = dest_var() ? static_cast<Variable*>(dest_var()->copy(arena)) : nullptr;
+        auto* new_ops = operand_list() ? static_cast<ListOperation*>(operand_list()->copy(arena)) : nullptr;
+        auto* p = arena.create<MemPhi>(new_dest, new_ops);
+        p->set_address(address());
+        p->set_ir_type(ir_type());
+        p->update_phi_function(origin_block());
+        return p;
+    }
+
+    // MemPhi is an intermediate pseudo-instruction; preprocessing converts it
+    // to regular Phi instructions and therefore substitution is intentionally
+    // disabled.
+    void substitute(Expression* replacee, Expression* replacement) override {
+        (void)replacee;
+        (void)replacement;
+    }
+
+    std::vector<Phi*> create_phi_functions_for_variables(
+        const std::vector<Variable*>& variables,
+        DecompilerArena& arena) const {
+        std::vector<Phi*> phis;
+        auto* mem_dest = dest_var();
+        auto* mem_sources = operand_list();
+        if (!mem_dest || !mem_sources) {
+            return phis;
+        }
+
+        for (Variable* base : variables) {
+            if (!base) {
+                continue;
+            }
+
+            auto* target = static_cast<Variable*>(base->copy(arena));
+            target->set_ssa_version(mem_dest->ssa_version());
+            target->set_aliased(true);
+
+            std::vector<Expression*> phi_args;
+            phi_args.reserve(mem_sources->size());
+            for (Expression* src_expr : mem_sources->operands()) {
+                if (auto* src_var = dynamic_cast<Variable*>(src_expr)) {
+                    auto* arg = static_cast<Variable*>(base->copy(arena));
+                    arg->set_ssa_version(src_var->ssa_version());
+                    arg->set_aliased(true);
+                    phi_args.push_back(arg);
+                }
+            }
+
+            auto* value = arena.create<ListOperation>(std::move(phi_args), base->size_bytes);
+            auto* phi = arena.create<Phi>(target, value);
+            phi->set_address(address());
+            phi->set_ir_type(base->ir_type());
+
+            std::unordered_map<BasicBlock*, Expression*> origins;
+            for (const auto& [pred, mem_expr] : origin_block()) {
+                auto* mem_var = dynamic_cast<Variable*>(mem_expr);
+                if (!pred || !mem_var) {
+                    continue;
+                }
+                auto* arg = static_cast<Variable*>(base->copy(arena));
+                arg->set_ssa_version(mem_var->ssa_version());
+                arg->set_aliased(true);
+                origins[pred] = arg;
+            }
+            if (!origins.empty()) {
+                phi->update_phi_function(origins);
+            }
+
+            phis.push_back(phi);
+        }
+
+        return phis;
+    }
 };
 
 // =============================================================================

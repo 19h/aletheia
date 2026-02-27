@@ -634,13 +634,15 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - *Gap: true/false edge assignment currently depends on successor ordering, which can invert branch semantics when backend order changes.*
   - *Implemented in `src/dewolf/lifter.cpp`: two-successor edge typing now infers the taken (True) edge from explicit branch targets instead of successor index order. The resolver first uses code xrefs from the terminating instruction (`Jump*` vs `Flow`) and falls back to direct conditional-branch target extraction from the decoded instruction mnemonic/operands (`jcc`, `b.xx`, `cbz/cbnz`, `tbz/tbnz`). Edge emission now maps True/False to matched successor block start addresses with deterministic fallback only when metadata is unavailable. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
 
-- [ ] **P.5** Harden `Z3Converter` operation coverage and remove unsound hard-false fallback behavior.
+- [x] **P.5** Harden `Z3Converter` operation coverage and remove unsound hard-false fallback behavior.
   - *Gap: unsupported operations currently collapse to `false` in conversion paths, which can over-prune paths in dead-path/loop elimination.*
+  - *Implemented in `src/dewolf_logic/z3_logic.hpp/.cpp`: expanded conversion coverage for arithmetic (`add/sub/mul/div/mod`, signed+unsigned variants), bitwise, shifts (`shl/lshr/ashr`), ternary, comparisons (signed+unsigned), carry variants, cast/low coercions, and logical n-ary folding. Replaced all hard-false fallbacks with fresh symbolic bool/bitvector placeholders (`fresh_bool`/`fresh_bv`) and added explicit bool coercion in `convert_to_condition` (`bv != 0`) to avoid sort mismatches. Added `test_z3_converter_no_hard_false_fallback` in `tests/test_main.cpp` to assert unsupported ops remain satisfiable/complement-satisfiable (no accidental UNSAT pruning). Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
 
 ### MEDIUM FOLLOW-UPS
 
-- [ ] **P.6** Add `MemPhi` parity support (IR + preprocessing conversion/fix-up path).
+- [x] **P.6** Add `MemPhi` parity support (IR + preprocessing conversion/fix-up path).
   - *Gap: memory-phi semantics from Python reference are not represented in the current C++ IR/pipeline, limiting memory-SSA fidelity for aliased paths.*
+  - *Implemented MemPhi parity in three layers: (1) new `MemPhi` IR class in `src/dewolf/structures/dataflow.hpp` (Phi wrapper with `create_phi_functions_for_variables()` and copy semantics), (2) new `MemPhiConverterStage` in `src/dewolf/pipeline/preprocessing_stages.hpp/.cpp` that collects aliased base variables, expands each `MemPhi` into regular aliased `Phi` functions, or removes mem-phis when no aliased variables exist, and (3) pipeline wiring in both runtime entry points (`src/plugin/plugin.cpp`, `src/cli/idump.cpp`). Added `test_mem_phi_converter_stage` in `tests/test_main.cpp` covering both conversion and removal paths. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
 
 - [ ] **P.7** Improve unknown-operation output policy to emit explicit placeholders instead of dropping lines.
   - *Gap: codegen suppresses `unknown_op` instructions, causing silent semantic loss in emitted C.*

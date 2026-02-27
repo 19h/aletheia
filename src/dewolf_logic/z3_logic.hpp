@@ -1,6 +1,7 @@
 #pragma once
 #include <z3++.h>
 #include <memory>
+#include <cstdint>
 #include "../dewolf/structures/dataflow.hpp"
 #include "../common/arena.hpp"
 
@@ -73,16 +74,20 @@ public:
     z3::expr convert(dewolf::DataflowObject* obj);
     
     // Explicit condition conversions
-    LogicCondition convert_to_condition(dewolf::DataflowObject* obj) {
-        return LogicCondition(convert(obj));
-    }
+    LogicCondition convert_to_condition(dewolf::DataflowObject* obj);
 
 private:
     z3::context& ctx_;
+    std::uint64_t fresh_symbol_id_ = 0;
 
     z3::expr convert_constant(dewolf::Constant* c);
     z3::expr convert_variable(dewolf::Variable* v);
     z3::expr convert_operation(dewolf::Operation* o);
+
+    z3::expr ensure_bool(z3::expr e);
+    z3::expr ensure_bv(z3::expr e, unsigned size_bits);
+    z3::expr fresh_bool(const char* prefix = "sym_bool");
+    z3::expr fresh_bv(unsigned size_bits, const char* prefix = "sym_bv");
 };
 
 } // namespace dewolf_logic

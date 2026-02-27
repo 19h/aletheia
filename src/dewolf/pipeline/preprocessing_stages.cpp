@@ -304,6 +304,23 @@ struct VarKey {
     }
 };
 
+struct AliasedBaseKey {
+    std::string name;
+    std::size_t size_bytes{};
+
+    bool operator==(const AliasedBaseKey& other) const {
+        return name == other.name && size_bytes == other.size_bytes;
+    }
+};
+
+struct AliasedBaseKeyHash {
+    std::size_t operator()(const AliasedBaseKey& key) const {
+        std::size_t h1 = std::hash<std::string>{}(key.name);
+        std::size_t h2 = std::hash<std::size_t>{}(key.size_bytes);
+        return h1 ^ (h2 << 1);
+    }
+};
+
 struct VarKeyHash {
     std::size_t operator()(const VarKey& key) const {
         std::size_t h1 = std::hash<std::string>{}(key.name);
@@ -314,6 +331,60 @@ struct VarKeyHash {
 
 VarKey var_key(const Variable* var) {
     return VarKey{var->name(), var->ssa_version()};
+}
+
+void collect_aliased_base_variables_from_instruction(
+    Instruction* inst,
+    std::unordered_map<AliasedBaseKey, Variable*, AliasedBaseKeyHash>& out,
+    DecompilerTask& task) {
+    if (inst == nullptr) {
+        return;
+    }
+
+    auto collect_var = [&](Variable* var) {
+        if (var == nullptr || !var->is_aliased()) {
+            return;
+        }
+
+        AliasedBaseKey key{var->name(), var->size_bytes};
+        if (out.contains(key)) {
+            return;
+        }
+
+        auto* base = task.arena().create<Variable>(var->name(), var->size_bytes);
+        base->set_aliased(true);
+        base->set_ir_type(var->ir_type());
+        out.emplace(std::move(key), base);
+    };
+
+    for (Variable* req : inst->requirements()) {
+        collect_var(req);
+    }
+    for (Variable* def : inst->definitions()) {
+        collect_var(def);
+    }
+}
+
+std::vector<Variable*> collect_aliased_base_variables(DecompilerTask& task) {
+    std::unordered_map<AliasedBaseKey, Variable*, AliasedBaseKeyHash> unique;
+    if (!task.cfg()) {
+        return {};
+    }
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            collect_aliased_base_variables_from_instruction(inst, unique, task);
+        }
+    }
+
+    std::vector<Variable*> out;
+    out.reserve(unique.size());
+    for (auto& [_, var] : unique) {
+        if (var != nullptr) {
+            out.push_back(var);
+        }
+    }
+    return out;
 }
 
 using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
@@ -1134,6 +1205,47 @@ void SwitchVariableDetectionStage::execute(DecompilerTask& task) {
 
         if (switch_expr != candidate) {
             switch_inst->substitute(switch_expr, candidate);
+        }
+    }
+}
+
+void MemPhiConverterStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) {
+        return;
+    }
+
+    const std::vector<Variable*> aliased_bases = collect_aliased_base_variables(task);
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!block) {
+            continue;
+        }
+
+        std::vector<Instruction*> rewritten;
+        rewritten.reserve(block->instructions().size());
+        bool changed = false;
+
+        for (Instruction* inst : block->instructions()) {
+            auto* mem_phi = dynamic_cast<MemPhi*>(inst);
+            if (!mem_phi) {
+                rewritten.push_back(inst);
+                continue;
+            }
+
+            changed = true;
+            if (aliased_bases.empty()) {
+                // No aliased variables in this function: mem-phis are dead wrappers.
+                continue;
+            }
+
+            std::vector<Phi*> phis = mem_phi->create_phi_functions_for_variables(aliased_bases, task.arena());
+            for (Phi* phi : phis) {
+                rewritten.push_back(phi);
+            }
+        }
+
+        if (changed) {
+            block->set_instructions(std::move(rewritten));
         }
     }
 }
