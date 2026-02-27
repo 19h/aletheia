@@ -647,6 +647,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
 - [x] **P.7** Improve unknown-operation output policy to emit explicit placeholders instead of dropping lines.
   - *Gap: codegen suppresses `unknown_op` instructions, causing silent semantic loss in emitted C.*
   - *Implemented in `src/dewolf/codegen/codegen.cpp`: unknown/unsupported operations now render explicit placeholders (`__dewolf_unknown_op(...)` and `__dewolf_unhandled_op(...)`) with operand context, assignment rendering treats these as unknown LHS placeholders, and `CodeVisitor::visit_node()` no longer drops unknown-expression statements. Added `test_codegen_unknown_operation_placeholder` in `tests/test_main.cpp` to ensure placeholders are emitted as code lines. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
+  - *Follow-up readability hardening (fallback mode): branch instructions in linearized `CodeNode` output now emit explicit comments (`/* branch if (...) */`, `/* indirect branch ... */`) instead of misleading empty-body `if (...);` statements. Added `test_codegen_fallback_branch_marker` in `tests/test_main.cpp`; verified in `/tmp/idump_sample.dewolf.c` output.*
 
 - [ ] **P.8** Add stage dependency/failure tracking to pipeline execution.
   - *Gap: pipeline currently executes linearly without dependency validation and without structured per-stage failure records.*

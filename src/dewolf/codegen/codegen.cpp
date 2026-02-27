@@ -454,6 +454,10 @@ bool is_unknown_placeholder(std::string_view text) {
            text.starts_with("__dewolf_unhandled_op");
 }
 
+bool is_comment_line(std::string_view text) {
+    return text.starts_with("/*") && text.ends_with("*/");
+}
+
 std::string format_unknown_operation(Operation* o, CExpressionGenerator& gen, std::string_view placeholder_name) {
     std::string rendered = std::string(placeholder_name) + "(";
     if (o != nullptr) {
@@ -898,9 +902,27 @@ void CodeVisitor::visit_node(AstNode* node) {
         if (block) {
             for (Instruction* inst : block->instructions()) {
                 indent();
+
+                if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                    current_line_ += "/* branch if (" + expr_gen_.generate(branch->condition()) + ") */";
+                    lines_.push_back(current_line_);
+                    current_line_.clear();
+                    continue;
+                }
+
+                if (auto* indirect = dynamic_cast<IndirectBranch*>(inst)) {
+                    current_line_ += "/* indirect branch " + expr_gen_.generate(indirect->expression()) + " */";
+                    lines_.push_back(current_line_);
+                    current_line_.clear();
+                    continue;
+                }
+
                 std::string expr = expr_gen_.generate(inst);
                 if (!expr.empty()) {
-                    current_line_ += expr + ";";
+                    current_line_ += expr;
+                    if (!is_comment_line(expr)) {
+                        current_line_ += ";";
+                    }
                     lines_.push_back(current_line_);
                     current_line_.clear();
                 }

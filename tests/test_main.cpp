@@ -1430,6 +1430,42 @@ void test_codegen_unknown_operation_placeholder() {
     std::cout << "[+] test_codegen_unknown_operation_placeholder passed.\n";
 }
 
+void test_codegen_fallback_branch_marker() {
+    dewolf::DecompilerArena arena;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* cond = arena.create<dewolf::Condition>(
+        dewolf::OperationType::neq,
+        x,
+        arena.create<dewolf::Constant>(0, 4),
+        1);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(173);
+    bb->add_instruction(arena.create<dewolf::Branch>(cond));
+
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+
+    dewolf::CodeVisitor visitor;
+    auto lines = visitor.generate_code(forest);
+
+    bool has_comment_marker = false;
+    bool has_empty_if = false;
+    for (const auto& line : lines) {
+        if (line.find("/* branch if (") != std::string::npos) {
+            has_comment_marker = true;
+        }
+        if (line.find("if (") != std::string::npos && line.find(");") != std::string::npos) {
+            has_empty_if = true;
+        }
+    }
+
+    ASSERT_TRUE(has_comment_marker);
+    ASSERT_TRUE(!has_empty_if);
+
+    std::cout << "[+] test_codegen_fallback_branch_marker passed.\n";
+}
+
 void test_codegen_if_branch_swapping() {
     dewolf::DecompilerArena arena;
 
@@ -3880,6 +3916,7 @@ int main() {
     test_codegen_compound_assignment_increment();
     test_codegen_constant_formatting();
     test_codegen_unknown_operation_placeholder();
+    test_codegen_fallback_branch_marker();
     test_codegen_if_branch_swapping();
     test_array_access_detection_stage();
     test_global_variable_declarations();
