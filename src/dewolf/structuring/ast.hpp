@@ -318,6 +318,9 @@ public:
     bool is_default() const { return is_default_; }
     bool break_case() const { return break_case_; }
 
+    void set_body(AstNode* body) { body_ = body; }
+    void set_break_case(bool value) { break_case_ = value; }
+
 private:
     std::uint64_t value_;
     AstNode* body_;
@@ -331,6 +334,7 @@ public:
     void add_case(CaseNode* c) { cases_.push_back(c); }
     AstNode* cond() const { return cond_; }
     const std::vector<CaseNode*>& cases() const { return cases_; }
+    std::vector<CaseNode*>& mutable_cases() { return cases_; }
 
     bool does_end_with_break() const override { return false; }
     bool does_contain_break() const override { return false; }

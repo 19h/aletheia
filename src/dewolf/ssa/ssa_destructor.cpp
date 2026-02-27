@@ -181,9 +181,90 @@ std::optional<OutOfSsaMode> SsaDestructor::parse_mode(std::string_view text) {
 }
 
 void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph& cfg, const LivenessAnalysis& liveness) {
-    for (BasicBlock* bb : cfg.blocks()) {
+    std::size_t next_block_id = 0;
+    for (BasicBlock* block : cfg.blocks()) {
+        next_block_id = std::max(next_block_id, block->id() + 1);
+    }
+
+    const std::vector<BasicBlock*> original_blocks = cfg.blocks();
+    for (BasicBlock* bb : original_blocks) {
         std::vector<Instruction*> new_insts;
-        
+        std::unordered_map<BasicBlock*, BasicBlock*> split_block_for_pred;
+
+        auto find_edge = [](BasicBlock* src, BasicBlock* dst) -> Edge* {
+            if (!src || !dst) return nullptr;
+            for (Edge* edge : src->successors()) {
+                if (edge && edge->target() == dst) {
+                    return edge;
+                }
+            }
+            return nullptr;
+        };
+
+        auto insert_copy_into_block = [](BasicBlock* block, Assignment* copy_assign) {
+            auto insts = block->instructions();
+            if (!insts.empty()) {
+                Instruction* last_inst = insts.back();
+                if (is_branch(last_inst) || is_return(last_inst)) {
+                    insts.insert(insts.end() - 1, copy_assign);
+                } else {
+                    insts.push_back(copy_assign);
+                }
+            } else {
+                insts.push_back(copy_assign);
+            }
+            block->set_instructions(std::move(insts));
+        };
+
+        auto ensure_edge_split_block = [&](BasicBlock* pred_block) -> BasicBlock* {
+            if (!pred_block) return nullptr;
+            if (auto it = split_block_for_pred.find(pred_block); it != split_block_for_pred.end()) {
+                return it->second;
+            }
+
+            Edge* pred_to_bb = find_edge(pred_block, bb);
+            if (!pred_to_bb) return nullptr;
+
+            const bool conditional_edge = pred_to_bb->type() != EdgeType::Unconditional ||
+                                          pred_block->successors().size() > 1;
+            if (!conditional_edge) {
+                return nullptr;
+            }
+
+            auto* split_block = arena.create<BasicBlock>(next_block_id++);
+            cfg.add_block(split_block);
+
+            cfg.remove_edge(pred_to_bb);
+
+            Edge* pred_to_split = nullptr;
+            if (auto* switch_edge = dynamic_cast<SwitchEdge*>(pred_to_bb)) {
+                pred_to_split = arena.create<SwitchEdge>(pred_block, split_block, switch_edge->case_value());
+            } else {
+                pred_to_split = arena.create<Edge>(pred_block, split_block, pred_to_bb->type());
+            }
+            pred_block->add_successor(pred_to_split);
+            split_block->add_predecessor(pred_to_split);
+
+            auto* split_to_phi = arena.create<Edge>(split_block, bb, EdgeType::Unconditional);
+            split_block->add_successor(split_to_phi);
+            bb->add_predecessor(split_to_phi);
+
+            split_block_for_pred[pred_block] = split_block;
+            return split_block;
+        };
+
+        auto place_phi_copy = [&](BasicBlock* pred_block, Expression* final_target, Expression* source_expr) {
+            if (!pred_block || !source_expr || !final_target) return;
+
+            BasicBlock* insertion_block = ensure_edge_split_block(pred_block);
+            if (!insertion_block) {
+                insertion_block = pred_block;
+            }
+
+            auto* copy_assign = arena.create<Assignment>(final_target, source_expr);
+            insert_copy_into_block(insertion_block, copy_assign);
+        };
+
         for (Instruction* inst : bb->instructions()) {
             auto* phi = dynamic_cast<Phi*>(inst);
             if (!phi) {
@@ -191,56 +272,36 @@ void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph
                 continue;
             }
 
-            // Process phi node: insert copy operations in predecessor blocks
             Variable* target = phi->dest_var();
             if (!target) continue;
 
             auto* op_list = phi->operand_list();
             if (!op_list || op_list->empty()) continue;
 
-            // Use origin_block if available, otherwise fall back to positional matching
+            // Use origin_block if available, otherwise fall back to positional matching.
             if (!phi->origin_block().empty()) {
                 for (auto& [pred_block, source_expr] : phi->origin_block()) {
-                    if (!source_expr) continue;
+                    if (!pred_block || !source_expr) continue;
 
-                    // Check interference: is the target live-out at the predecessor?
                     bool interference = liveness.live_out(pred_block).contains(target->name());
 
                     Expression* final_target = target;
                     if (interference) {
-                        // Create a temporary to break the interference
                         auto* tmp = arena.create<Variable>(target->name() + "_tmp", target->size_bytes);
                         final_target = tmp;
-                        
-                        // Insert copy from tmp to real target at the start of the phi's block
                         auto* bb_copy = arena.create<Assignment>(target, tmp);
                         new_insts.push_back(bb_copy);
                     }
 
-                    // Insert copy at the end of predecessor block (before branch if present)
-                    auto* copy_assign = arena.create<Assignment>(final_target, source_expr);
-                    auto pred_insts = pred_block->instructions();
-                    
-                    if (!pred_insts.empty()) {
-                        Instruction* last_inst = pred_insts.back();
-                        // Insert before branch/return at end of predecessor
-                        if (is_branch(last_inst) || is_return(last_inst)) {
-                            pred_insts.insert(pred_insts.end() - 1, copy_assign);
-                        } else {
-                            pred_insts.push_back(copy_assign);
-                        }
-                    } else {
-                        pred_insts.push_back(copy_assign);
-                    }
-                    
-                    pred_block->set_instructions(std::move(pred_insts));
+                    place_phi_copy(pred_block, final_target, source_expr);
                 }
             } else {
                 // Fallback: positional matching (predecessor index -> operand index)
                 for (size_t i = 0; i < op_list->operands().size() && i < bb->predecessors().size(); ++i) {
                     Expression* source = op_list->operands()[i];
                     BasicBlock* pred = bb->predecessors()[i]->source();
-                    
+                    if (!pred || !source) continue;
+
                     bool interference = liveness.live_out(pred).contains(target->name());
 
                     Expression* final_target = target;
@@ -251,25 +312,11 @@ void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph
                         new_insts.push_back(bb_copy);
                     }
 
-                    auto* copy_assign = arena.create<Assignment>(final_target, source);
-                    auto pred_insts = pred->instructions();
-                    
-                    if (!pred_insts.empty()) {
-                        Instruction* last_inst = pred_insts.back();
-                        if (is_branch(last_inst) || is_return(last_inst)) {
-                            pred_insts.insert(pred_insts.end() - 1, copy_assign);
-                        } else {
-                            pred_insts.push_back(copy_assign);
-                        }
-                    } else {
-                        pred_insts.push_back(copy_assign);
-                    }
-                    
-                    pred->set_instructions(std::move(pred_insts));
+                    place_phi_copy(pred, final_target, source);
                 }
             }
         }
-        
+
         bb->set_instructions(std::move(new_insts));
     }
 }

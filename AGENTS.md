@@ -381,7 +381,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] M.3.2 Implement `DefinitionGenerator`: detect repeated subexpressions, create temporaries.
     - *Implemented definition generation in `CommonSubexpressionEliminationStage` (`optimization_stages.cpp`): collects structural subexpression usages, selects high-complexity repeated candidates, computes insertion block via common dominator, inserts `cse_N` temporaries before first dominated use, and rewrites all dominated occurrences by structural fingerprint. Added `test_common_subexpression_definition_generator_stage` in `tests/test_main.cpp`.*
 
-- [ ] **M.4** Implement `ExpressionSimplification` Rules (currently missing entirely)
+- [x] **M.4** Implement `ExpressionSimplification` Rules (currently missing entirely)
   - *The Python reference applies algebraic simplification rules in 3 phases: pre-rules (none), rules (`TermOrder`, `SubToAdd`, `SimplifyRedundantReference`, `SimplifyTrivialArithmetic`, `SimplifyTrivialBitArithmetic`, `SimplifyTrivialLogicArithmetic`, `SimplifyTrivialShift`, `CollapseConstants`, `CollapseNestedConstants`), post-rules (`CollapseAddNeg`, `PositiveConstants`). These transform expressions like `x + 0 -> x`, `x * 1 -> x`, `x & 0xFFFFFFFF -> x`, `x - (-y) -> x + y`, `(x + 3) + 5 -> x + 8`, etc.*
   - [x] M.4.1 Implement `CollapseConstants`: evaluate binary operations on two constants at compile time.
     - *Implemented `ExpressionSimplificationStage` constant folding in `optimization_stages.cpp` with recursive expression-tree simplification and binary constant evaluation for arithmetic/bitwise/logic/comparison ops (`add/sub/mul/div/mod`, shifts, `and/or/xor`, comparisons including signed/unsigned variants, `power`). Stage rewrites `Assignment`, `Branch`, `IndirectBranch`, and `Return` operands; branch constant conditions are normalized to `neq(const, 0)`. Added `test_expression_simplification_collapse_constants` in `tests/test_main.cpp`; `build/dewolf_tests` passes with this coverage.*
@@ -389,54 +389,64 @@ You are not allowed from finishing two or more tasks at once, even if that means
     - *Extended `simplify_expression_tree()` in `optimization_stages.cpp` with algebraic identity rewrites for binary arithmetic (`add`, `mul`/`mul_us`, `sub`, `div`/`div_us`) after recursive child simplification. Added `test_expression_simplification_trivial_arithmetic` in `tests/test_main.cpp` covering all listed identities; `build/dewolf_tests` passes.*
   - [x] M.4.3 Implement `SimplifyTrivialBitArithmetic`: `x & 0 -> 0`, `x | 0 -> x`, `x ^ 0 -> x`, `x & all_ones -> x`.
     - *Extended `simplify_expression_tree()` in `optimization_stages.cpp` with bit-identity rewrites for `bit_and`/`bit_or`/`bit_xor`, including canonicalization of `x & 0`, `x | 0`, `x ^ 0`, and mask-aware `x & all_ones` using width-derived masks. Added `test_expression_simplification_trivial_bit_arithmetic` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
-  - [ ] M.4.4 Implement `SubToAdd`: convert `x - (-c)` to `x + c` for readability.
-  - [ ] M.4.5 Implement `CollapseNestedConstants`: `(x + c1) + c2 -> x + (c1+c2)`, similarly for nested multiplications.
+  - [x] M.4.4 Implement `SubToAdd`: convert `x - (-c)` to `x + c` for readability.
+    - *Implemented in `simplify_expression_tree()` (`optimization_stages.cpp`): rewrites `sub(lhs, negate(const))` into `add(lhs, const)` while preserving expression size/type metadata on the rebuilt operation. Added `test_expression_simplification_sub_to_add` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+  - [x] M.4.5 Implement `CollapseNestedConstants`: `(x + c1) + c2 -> x + (c1+c2)`, similarly for nested multiplications.
+    - *Implemented `try_collapse_nested_constants()` in `optimization_stages.cpp` for additive and multiplicative nesting (`add`, `mul`, `mul_us`) across both operand orientations. It combines inner/outer constants via existing constant-fold logic and rebuilds `x OP (c1 OP c2)` while preserving size/type metadata. Added `test_expression_simplification_collapse_nested_constants` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.5** Implement `DeadComponentPruner` Stage (currently missing)
+- [x] **M.5** Implement `DeadComponentPruner` Stage (currently missing)
   - *The Python reference builds an `ExpressionGraph` from the CFG, identifies sink nodes (calls, dereference writes, non-assignment instructions), and removes instructions not reachable from any sink. This catches dead code that `DeadCodeElimination` misses because it only looks at unused definitions, not unreachable expression subgraphs.*
-  - [ ] M.5.1 Build `ExpressionGraph` from CFG instructions.
-  - [ ] M.5.2 Compute reachability from sinks, remove unreachable instructions.
+  - [x] M.5.1 Build `ExpressionGraph` from CFG instructions.
+  - [x] M.5.2 Compute reachability from sinks, remove unreachable instructions.
+    - *Implemented `DeadComponentPrunerStage` in `optimization_stages.cpp` and declared in `optimization_stages.hpp`. Added `ExpressionGraph` construction from CFG instruction def-use dependencies (`Instruction::definitions()` / `requirements()` with SSA `VarKey`) and sink detection for non-assignment instructions, call assignments, and side-effecting destinations. Added backward reachability from sinks to retain only live instruction components and prune dead instructions per block. Wired stage into plugin pipeline (`plugin.cpp`) after expression simplification and before dead code elimination. Added `test_dead_component_pruner_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.6** Implement `SwitchNode` / `CaseNode` Code Generation in `CodeVisitor` (currently AST nodes exist but visitor does not handle them)
+- [x] **M.6** Implement `SwitchNode` / `CaseNode` Code Generation in `CodeVisitor` (currently AST nodes exist but visitor does not handle them)
   - *`SwitchNode` and `CaseNode` are defined in `ast.hpp` but `CodeVisitor::visit_node()` has no case for them. If `ConditionAwareRefinement` produces a switch, it will be silently skipped in the output.*
-  - [ ] M.6.1 Add `SwitchNode` handling: emit `switch (expr) {`, visit each case child, emit `}`.
-  - [ ] M.6.2 Add `CaseNode` handling: emit `case N:` or `default:`, visit body, emit `break;` if `break_case`.
+  - [x] M.6.1 Add `SwitchNode` handling: emit `switch (expr) {`, visit each case child, emit `}`.
+  - [x] M.6.2 Add `CaseNode` handling: emit `case N:` or `default:`, visit body, emit `break;` if `break_case`.
+    - *Implemented `SwitchNode`/`CaseNode` branches in `CodeVisitor::visit_node()` (`codegen.cpp`): emits `switch (...) {}`, per-case labels (`case N:`/`default:`), visits case bodies, and appends `break;` when `CaseNode::break_case()` is true. Added `test_codegen_switch_case` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.7** Implement Do-While and For-Loop Code Generation in `CodeVisitor` (currently only `while(true)` is emitted)
+- [x] **M.7** Implement Do-While and For-Loop Code Generation in `CodeVisitor` (currently only `while(true)` is emitted)
   - *After implementing loop structuring rules (C.3), the AST will contain `WhileLoopNode`, `DoWhileLoopNode`, and `ForLoopNode`. The code visitor must emit the correct syntax for each.*
-  - [ ] M.7.1 `WhileLoopNode`: emit `while (condition) { body }`.
-  - [ ] M.7.2 `DoWhileLoopNode`: emit `do { body } while (condition);`.
-  - [ ] M.7.3 `ForLoopNode`: emit `for (declaration; condition; modification) { body }`.
+  - [x] M.7.1 `WhileLoopNode`: emit `while (condition) { body }`.
+  - [x] M.7.2 `DoWhileLoopNode`: emit `do { body } while (condition);`.
+  - [x] M.7.3 `ForLoopNode`: emit `for (declaration; condition; modification) { body }`.
+    - *`CodeVisitor::visit_node()` (`codegen.cpp`) now emits all three loop forms: `while (...) {}`, `do { ... } while (...);`, and `for (decl; cond; mod) {}`. Added `test_codegen_loop_variants` in `tests/test_main.cpp` validating emitted syntax for each loop type; `build/dewolf_tests` passes.*
 
-- [ ] **M.8** Implement `ConditionHandler` / `ConditionSymbol` System (currently absent)
+- [x] **M.8** Implement `ConditionHandler` / `ConditionSymbol` System (currently absent)
   - *The Python reference uses a symbol table mapping `LogicCondition` Z3 symbols to concrete `Condition` IR objects. `ConditionHandler.add_condition()` creates new symbols and detects zero-case conditions. `SwitchHandler` detects equality-based conditions suitable for switch-case. The C++ port converts directly from IR operations to Z3, losing the ability to map back from Z3 symbols to IR conditions during code generation.*
-  - [ ] M.8.1 Implement `ConditionHandler` class maintaining a bidirectional map between Z3 symbols and `Condition*` IR objects.
-  - [ ] M.8.2 Implement `CaseNodeProperties` tracking expression, constant, and negation flag per symbol.
-  - [ ] M.8.3 Update `TransitionCFG::generate()` to use `ConditionHandler` for edge tag creation.
+  - [x] M.8.1 Implement `ConditionHandler` class maintaining a bidirectional map between Z3 symbols and `Condition*` IR objects.
+  - [x] M.8.2 Implement `CaseNodeProperties` tracking expression, constant, and negation flag per symbol.
+  - [x] M.8.3 Update `TransitionCFG::generate()` to use `ConditionHandler` for edge tag creation.
+    - *Added `src/dewolf/structuring/condition_handler.hpp` with `ConditionHandler` and `CaseNodeProperties`. `add_condition()` now allocates stable boolean symbols (`cond_N`), supports reverse lookups, and records eq/neq case metadata (expression, constant, negated). Updated transition edge-tag construction in `PatternIndependentRestructuringStage::build_initial_transition_cfg()` (`structuring_stage.cpp`) to create true/false edge tags from `ConditionHandler` symbols (and negations) instead of embedding raw converted conditions. Added `test_condition_handler` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.9** Enhance `ConditionBasedRefinement` (CBR) to Handle CNF Subexpression Matching (currently only does linear branch scanning)
+- [x] **M.9** Enhance `ConditionBasedRefinement` (CBR) to Handle CNF Subexpression Matching (currently only does linear branch scanning)
   - *The Python reference's CBR has two phases: (1) complementary condition pairing (A and ~A -> if-else), and (2) CNF subexpression matching using `ConditionCandidates` -- a logic graph with formula/clause/symbol layers that groups nodes whose reaching conditions share common CNF subexpressions. The C++ CBR only does the linear branch-scanning phase.*
-  - [ ] M.9.1 Implement complementary condition detection between pairs of SeqNode children.
-  - [ ] M.9.2 Implement `ConditionCandidates` logic graph for CNF clause/symbol decomposition.
-  - [ ] M.9.3 Implement subexpression matching across candidates for grouping.
+  - [x] M.9.1 Implement complementary condition detection between pairs of SeqNode children.
+  - [x] M.9.2 Implement `ConditionCandidates` logic graph for CNF clause/symbol decomposition.
+  - [x] M.9.3 Implement subexpression matching across candidates for grouping.
+    - *Enhanced `ConditionBasedRefinement::refine()` in `structuring/cbr/cbr.cpp` with two post-passes over SeqNode children: (1) complementary adjacent If-node pairing using Z3 logical complement checks, and (2) CNF-aware grouping using a new internal `ConditionCandidates` graph (`formula -> clauses -> symbols`) built from conjunction/disjunction decomposition. Added clause-removal + regrouping logic to factor shared CNF clauses into outer If-nodes and keep reduced inner conditions. Added `test_cbr_complementary_conditions` and `test_cbr_cnf_subexpression_grouping` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.10** Enhance `ConditionAwareRefinement` (CAR) with Full 4-Stage Switch Recovery Pipeline (currently only converts consecutive equality IfNodes)
+- [x] **M.10** Enhance `ConditionAwareRefinement` (CAR) with Full 4-Stage Switch Recovery Pipeline (currently only converts consecutive equality IfNodes)
   - *The Python reference CAR has: `InitialSwitchNodeConstructor` (extracts switches from nested conditions, constructs from sequences), `MissingCaseFinderCondition` (finds cases in condition-node branches), `SwitchExtractor` (extracts switches from redundant condition wrappers), `MissingCaseFinderSequence` (finds cases among sequence siblings, detects default cases). The C++ CAR only converts consecutive `if (x == const)` patterns.*
-  - [ ] M.10.1 Implement `InitialSwitchNodeConstructor` with nested condition extraction.
-  - [ ] M.10.2 Implement `MissingCaseFinderCondition` for finding cases in branch arms.
-  - [ ] M.10.3 Implement `SwitchExtractor` for extracting switches from redundant wrappers.
-  - [ ] M.10.4 Implement `MissingCaseFinderSequence` for sibling analysis and default case detection.
+  - [x] M.10.1 Implement `InitialSwitchNodeConstructor` with nested condition extraction.
+  - [x] M.10.2 Implement `MissingCaseFinderCondition` for finding cases in branch arms.
+  - [x] M.10.3 Implement `SwitchExtractor` for extracting switches from redundant wrappers.
+  - [x] M.10.4 Implement `MissingCaseFinderSequence` for sibling analysis and default case detection.
+    - *Implemented a 4-pass CAR pipeline in `structuring/car/car.cpp`: `InitialSwitchNodeConstructor` (else-if chain to switch), `MissingCaseFinderCondition` (extract nested switch-arm cases), `SwitchExtractor` (merge wrapper If + inner switch), and `MissingCaseFinderSequence` (absorb adjacent if-cases and infer default). Added `CaseNode` mutation helpers and `SwitchNode::mutable_cases()` in `ast.hpp` to support rewrites. Added tests `test_car_initial_switch_constructor`, `test_car_switch_extractor_and_missing_case_sequence`, and `test_car_missing_case_finder_condition` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.11** Implement `ReachabilityGraph` and `SiblingReachability` for Correct `SeqNode` Child Ordering (currently relying on topological sort from graph slice)
+- [x] **M.11** Implement `ReachabilityGraph` and `SiblingReachability` for Correct `SeqNode` Child Ordering (currently relying on topological sort from graph slice)
   - *The Python reference tracks code-node-level reachability and uses `SiblingReachability` to determine execution order for `SeqNode.sort_children()`. `CaseDependencyGraph` extends this for switch-case ordering. Without proper reachability, children of a SeqNode may be emitted in an order that doesn't match the original execution semantics.*
-  - [ ] M.11.1 Implement `ReachabilityGraph` tracking which code nodes can reach which others.
-  - [ ] M.11.2 Implement `SiblingReachability` for determining partial order of sibling AST nodes.
-  - [ ] M.11.3 Implement `CaseDependencyGraph` for switch-case ordering.
+  - [x] M.11.1 Implement `ReachabilityGraph` tracking which code nodes can reach which others.
+  - [x] M.11.2 Implement `SiblingReachability` for determining partial order of sibling AST nodes.
+  - [x] M.11.3 Implement `CaseDependencyGraph` for switch-case ordering.
+    - *Added `src/dewolf/structuring/reachability.hpp` with `ReachabilityGraph` (per-node transitive reachability), `SiblingReachability` (partial-order topological sibling ordering), and `CaseDependencyGraph` (deterministic switch case ordering with default-last policy). Updated `AcyclicRegionRestructurer::restructure_region()` (`structurer.cpp`) to order `SeqNode` children via sibling reachability instead of raw slice order, and updated `ConditionAwareRefinement` (`car.cpp`) to normalize switch case order via `CaseDependencyGraph`. Added tests `test_sibling_reachability` and `test_case_dependency_graph_ordering` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.12** Implement `RedundantCastsElimination` Stage (currently missing)
+- [x] **M.12** Implement `RedundantCastsElimination` Stage (currently missing)
   - *The Python reference simplifies redundant cast operations: same-type cast removal, constant-value cast folding, etc.*
-  - [ ] M.12.1 Detect and remove casts where source and target types are identical.
-  - [ ] M.12.2 Fold constant-to-constant casts at compile time.
+  - [x] M.12.1 Detect and remove casts where source and target types are identical.
+  - [x] M.12.2 Fold constant-to-constant casts at compile time.
+    - *Implemented `RedundantCastsEliminationStage` in `optimization_stages.cpp`/`optimization_stages.hpp`: recursively simplifies cast expressions, removes no-op casts when source/target `Type` objects are equal, and folds constant casts with target-width truncation and boolean normalization. Wired the stage into plugin pipeline in `plugin.cpp` after expression simplification. Added `test_redundant_casts_elimination_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
 - [x] **M.13** Implement the 5 Preprocessing Stages for Real (currently all empty stubs)
   - *`CompilerIdiomHandling`: traverse CFG and replace tagged idiom sequences with high-level operations (depends on H.17). `RegisterPairHandling`: combine `edx:eax` 64-bit register pairs into single variables with bitwise decomposition. `SwitchVariableDetection`: trace switch variables backward via def-use chains to find clean predecessors. `RemoveGoPrologue`: pattern-match and remove Go runtime `runtime_morestack` prologues. `RemoveStackCanary`: detect and remove `__stack_chk_fail` patterns.*
@@ -451,32 +461,37 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] M.13.5 `RemoveStackCanaryStage`: detect `__stack_chk_fail` leaf nodes and remove the branch condition.
     - *Implemented stack-canary pruning in preprocessing: finds fail leaves by direct `__stack_chk_fail` call detection or failed-canary edge signatures (`eq`+False or `neq`+True with `fsbase/gsbase+0x28` operand), recursively removes empty relay blocks on fail paths, strips terminal canary-check branches, and deletes now-unreachable nodes. Wired stage into plugin pipeline before SSA and added `test_remove_stack_canary_stage` in `tests/test_main.cpp`.*
 
-- [ ] **M.14** Implement Operator Precedence and Bracket Insertion in `CExpressionGenerator` (currently absent)
+- [x] **M.14** Implement Operator Precedence and Bracket Insertion in `CExpressionGenerator` (currently absent)
   - *The Python reference has a `PRECEDENCE` dictionary mapping every `OperationType` to an integer priority (150 for calls, 140 for unary, 130 for mul/div, 120 for add/sub, etc.) and uses `_has_lower_precedence()` to decide when to insert parentheses. Without this, expressions like `a + b * c` might be emitted as `a + b * c` (correct) or `(a + b) * c` (incorrect) depending on tree structure, and expressions like `*ptr + 1` might be misparsed as `*(ptr + 1)`.*
-  - [ ] M.14.1 Implement `PRECEDENCE` table.
-  - [ ] M.14.2 Implement bracketing logic in `visit(Operation*)`: compare child precedence with parent, wrap in `()` when needed.
+  - [x] M.14.1 Implement `PRECEDENCE` table.
+  - [x] M.14.2 Implement bracketing logic in `visit(Operation*)`: compare child precedence with parent, wrap in `()` when needed.
+    - *Implemented precedence-aware expression emission in `codegen.cpp`: added a `precedence_for_operation()` table spanning call/member/unary/mul/add/shift/compare/bitwise/logical/ternary groups, `precedence_for_expression()` dispatch, and rhs equal-precedence parenthesis handling for non-associative operators (e.g. `sub`, `div`, comparisons, shifts). Updated binary infix generation in `CExpressionGenerator::visit(Operation*)` to parenthesize children when required. Added `test_codegen_operator_precedence` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.15** Improve Acyclic Region Finding with "Improved DREAM" Minimal Subset Algorithm (currently uses simple forward-DFS)
+- [x] **M.15** Improve Acyclic Region Finding with "Improved DREAM" Minimal Subset Algorithm (currently uses simple forward-DFS)
   - *The Python reference tries to find the smallest region dominated by the header that has at most one exit. It iterates possible exit nodes, checks if removing the dominated subtree of each gives a smaller valid region. The C++ version uses a simpler forward-DFS requiring all predecessors to be in the region, which may fail to find valid regions in complex graphs.*
-  - [ ] M.15.1 Compute full dominance region (all nodes dominated by head).
-  - [ ] M.15.2 Check restructurability: region size, exit count, postdominator.
-  - [ ] M.15.3 Try each possible exit node: remove its dominated set, check if remaining region has single exit.
+  - [x] M.15.1 Compute full dominance region (all nodes dominated by head).
+  - [x] M.15.2 Check restructurability: region size, exit count, postdominator.
+  - [x] M.15.3 Try each possible exit node: remove its dominated set, check if remaining region has single exit.
+    - *Reworked acyclic region candidate selection in `AcyclicRegionRestructurer::process()` (`structurer.cpp`): added dominated-region construction from `cfg.dominates()`, explicit restructurability checks (header inclusion, intra-region reachability, predecessor closure, <=1 exit), and improved subset minimization by trimming dominated subtrees rooted at candidate exit nodes. The smallest valid trimmed region is now selected per header before global best-region selection. `build/dewolf_tests` passes after the update.*
 
-- [ ] **M.16** Implement Edge Splitting for Phi Lifting Along Conditional Edges (currently copies are inserted at the end of predecessors)
+- [x] **M.16** Implement Edge Splitting for Phi Lifting Along Conditional Edges (currently copies are inserted at the end of predecessors)
   - *The Python reference's `PhiFunctionLifter` creates new basic blocks when inserting copies along conditional edges (where the predecessor has multiple successors). Inserting copies directly at the end of a conditional predecessor can be incorrect because those copies would execute on ALL paths, not just the path leading to the phi's block. The C++ code handles branch-aware insertion but doesn't split edges.*
-  - [ ] M.16.1 When the predecessor's edge to the phi block is conditional (not unconditional), create a new intermediate basic block, insert copies there, and redirect the edge through it.
+  - [x] M.16.1 When the predecessor's edge to the phi block is conditional (not unconditional), create a new intermediate basic block, insert copies there, and redirect the edge through it.
+    - *Updated `SsaDestructor::eliminate_phi_nodes()` (`ssa_destructor.cpp`) to split conditional predecessor edges during phi copy insertion: for each conditional `pred -> phi_block` edge, create/reuse an intermediate split block, move the edge to `pred -> split -> phi_block`, and place phi copies in the split block so they execute only on the intended path. Preserves edge type metadata (including `SwitchEdge` case values) on the redirected predecessor edge. Added `test_phi_lifting_edge_splitting` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.17** Implement `Coherence` Preprocessing Stage (currently missing)
+- [x] **M.17** Implement `Coherence` Preprocessing Stage (currently missing)
   - *The Python reference harmonizes variable types and aliased status across all occurrences. Enforces consistent types for same `(name, ssa_label)` combinations.*
-  - [ ] M.17.1 Build a map of `(variable_name, ssa_version)` -> first-seen type.
-  - [ ] M.17.2 Enforce uniform types across all occurrences.
+  - [x] M.17.1 Build a map of `(variable_name, ssa_version)` -> first-seen type.
+  - [x] M.17.2 Enforce uniform types across all occurrences.
+    - *Implemented `CoherenceStage` in `preprocessing_stages.cpp`/`preprocessing_stages.hpp`: first pass records first-seen non-null `Type` per `(name, ssa_version)` key, second pass rewrites mismatched or missing variable types to the canonical type across all instruction requirements/definitions. Wired into plugin preprocessing pipeline (`plugin.cpp`) before SSA construction. Added `test_coherence_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **M.18** Implement Logic Engine Operation Simplification (constant folding, factorization, De Morgan's, associative/commutative folding)
+- [x] **M.18** Implement Logic Engine Operation Simplification (constant folding, factorization, De Morgan's, associative/commutative folding)
   - *The Python reference `dewolf-logic` has rich `Operation.simplify()` on every operation type: `CommutativeOperation._fold_constants()` evaluates all constant operands into one, `_promote_subexpression()` flattens nested same-type ops, `BitwiseAnd._simple_folding()` removes duplicates and detects collisions (a & ~a = 0), `CommonBitwiseAndOr._associative_folding()` applies pairwise simplification rules, `BaseAddSub._factorize()` finds common factors. Without these, the logic engine cannot simplify conditions before feeding them to the DREAM algorithm.*
-  - [ ] M.18.1 Implement constant folding on the DAG: evaluate operations whose operands are all constants.
-  - [ ] M.18.2 Implement De Morgan's law application for `BitwiseNegate` over `BitwiseAnd`/`BitwiseOr`.
-  - [ ] M.18.3 Implement associative promotion: flatten `(a & (b & c))` -> `(a & b & c)`.
-  - [ ] M.18.4 Implement commutative duplicate removal and collision detection.
+  - [x] M.18.1 Implement constant folding on the DAG: evaluate operations whose operands are all constants.
+  - [x] M.18.2 Implement De Morgan's law application for `BitwiseNegate` over `BitwiseAnd`/`BitwiseOr`.
+  - [x] M.18.3 Implement associative promotion: flatten `(a & (b & c))` -> `(a & b & c)`.
+  - [x] M.18.4 Implement commutative duplicate removal and collision detection.
+    - *Implemented logic DAG simplification in new `src/dewolf_logic/operation_simplifier.cpp`/`.hpp` via `simplify_node()`: recursive constant folding for boolean/comparison operations, De Morgan rewrites for `Not(And/Or)`, associative flattening for `And/Or`, and commutative canonicalization with duplicate removal plus `a && !a` / `a || !a` collision detection. Added the new source to `dewolf_logic` in `CMakeLists.txt` and covered behavior with `test_logic_operation_simplifier` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
 ---
 

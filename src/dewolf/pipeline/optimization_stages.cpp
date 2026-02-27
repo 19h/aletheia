@@ -1792,6 +1792,56 @@ std::optional<FoldedConstant> collapse_binary_constants(
     OperationType type,
     const Constant* lhs,
     const Constant* rhs,
+    std::size_t out_size_bytes);
+
+Expression* try_collapse_nested_constants(DecompilerTask& task, Operation* op) {
+    if (!op || op->operands().size() != 2) return nullptr;
+    if (op->type() != OperationType::add && op->type() != OperationType::mul &&
+        op->type() != OperationType::mul_us) {
+        return nullptr;
+    }
+
+    auto try_orientation = [&](Expression* inner_candidate, Expression* outer_constant_candidate) -> Expression* {
+        auto* outer_const = dynamic_cast<Constant*>(outer_constant_candidate);
+        if (!outer_const) return nullptr;
+
+        auto* inner = dynamic_cast<Operation*>(inner_candidate);
+        if (!inner || inner->type() != op->type() || inner->operands().size() != 2) {
+            return nullptr;
+        }
+
+        Constant* inner_const = dynamic_cast<Constant*>(inner->operands()[0]);
+        Expression* inner_other = inner->operands()[1];
+        if (!inner_const) {
+            inner_const = dynamic_cast<Constant*>(inner->operands()[1]);
+            inner_other = inner->operands()[0];
+        }
+        if (!inner_const) return nullptr;
+
+        auto folded = collapse_binary_constants(op->type(), inner_const, outer_const, op->size_bytes);
+        if (!folded) return nullptr;
+
+        auto* merged_const = task.arena().create<Constant>(folded->value, folded->size_bytes);
+        merged_const->set_ir_type(inner_const->ir_type());
+
+        auto* rebuilt = task.arena().create<Operation>(
+            op->type(),
+            std::vector<Expression*>{inner_other, merged_const},
+            op->size_bytes);
+        rebuilt->set_ir_type(op->ir_type());
+        return rebuilt;
+    };
+
+    if (Expression* first = try_orientation(op->operands()[0], op->operands()[1])) {
+        return first;
+    }
+    return try_orientation(op->operands()[1], op->operands()[0]);
+}
+
+std::optional<FoldedConstant> collapse_binary_constants(
+    OperationType type,
+    const Constant* lhs,
+    const Constant* rhs,
     std::size_t out_size_bytes) {
     if (!lhs || !rhs) return std::nullopt;
 
@@ -1930,6 +1980,17 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                 if (is_constant_value(lhs_expr, 1)) return rhs_expr;
                 break;
             case OperationType::sub:
+                if (auto* rhs_op = dynamic_cast<Operation*>(rhs_expr);
+                    rhs_op && rhs_op->type() == OperationType::negate && rhs_op->operands().size() == 1) {
+                    if (auto* negated_const = dynamic_cast<Constant*>(rhs_op->operands()[0])) {
+                        auto* as_add = task.arena().create<Operation>(
+                            OperationType::add,
+                            std::vector<Expression*>{lhs_expr, negated_const},
+                            op->size_bytes);
+                        as_add->set_ir_type(op->ir_type());
+                        return as_add;
+                    }
+                }
                 if (is_constant_value(rhs_expr, 0)) return lhs_expr;
                 break;
             case OperationType::div:
@@ -1953,6 +2014,10 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                 break;
             default:
                 break;
+        }
+
+        if (Expression* nested = try_collapse_nested_constants(task, op)) {
+            return nested;
         }
 
         auto* lhs = dynamic_cast<Constant*>(op->operands()[0]);
@@ -2028,6 +2093,202 @@ void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
     }
 }
 
+Expression* simplify_cast_expression_tree(DecompilerTask& task, Expression* expr) {
+    if (!expr) return nullptr;
+    if (dynamic_cast<Constant*>(expr) || dynamic_cast<Variable*>(expr)) return expr;
+
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression*& child : list->mutable_operands()) {
+            child = simplify_cast_expression_tree(task, child);
+        }
+        return expr;
+    }
+
+    auto* op = dynamic_cast<Operation*>(expr);
+    if (!op) return expr;
+
+    for (Expression*& child : op->mutable_operands()) {
+        child = simplify_cast_expression_tree(task, child);
+    }
+
+    if (op->type() != OperationType::cast || op->operands().size() != 1) {
+        return expr;
+    }
+
+    Expression* src = op->operands()[0];
+    const TypePtr& target_type = op->ir_type();
+    const TypePtr& src_type = src->ir_type();
+
+    // Rule 1: Remove same-type casts.
+    if (target_type && src_type && (*target_type == *src_type)) {
+        return src;
+    }
+
+    // Rule 2: Fold constant-to-constant casts.
+    if (auto* c = dynamic_cast<Constant*>(src)) {
+        uint64_t value = c->value();
+        std::size_t out_size = op->size_bytes != 0 ? op->size_bytes : c->size_bytes;
+
+        if (target_type) {
+            if (target_type->is_boolean()) {
+                value = value == 0 ? 0 : 1;
+            } else {
+                const std::size_t bits = target_type->size();
+                if (bits > 0 && bits < 64) {
+                    value &= ((1ULL << bits) - 1ULL);
+                }
+            }
+            if (target_type->size_bytes() > 0) {
+                out_size = target_type->size_bytes();
+            }
+        } else if (out_size > 0 && out_size < 8) {
+            value &= mask_for_size(out_size);
+        }
+
+        auto* folded = task.arena().create<Constant>(value, out_size == 0 ? c->size_bytes : out_size);
+        folded->set_ir_type(target_type ? target_type : c->ir_type());
+        return folded;
+    }
+
+    return expr;
+}
+
+void simplify_instruction_casts(DecompilerTask& task, Instruction* inst) {
+    if (!inst) return;
+
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        Expression* new_value = simplify_cast_expression_tree(task, assign->value());
+        if (new_value != assign->value()) {
+            assign->set_value(new_value);
+        }
+
+        if (!dynamic_cast<Variable*>(assign->destination())) {
+            Expression* new_dest = simplify_cast_expression_tree(task, assign->destination());
+            if (new_dest != assign->destination()) {
+                assign->set_destination(new_dest);
+            }
+        }
+        return;
+    }
+
+    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        Condition* cond = branch->condition();
+        if (!cond) return;
+        Expression* lhs = simplify_cast_expression_tree(task, cond->lhs());
+        Expression* rhs = simplify_cast_expression_tree(task, cond->rhs());
+        branch->set_condition(task.arena().create<Condition>(cond->type(), lhs, rhs, cond->size_bytes));
+        return;
+    }
+
+    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+        Expression* expr = ib->expression();
+        Expression* simplified = simplify_cast_expression_tree(task, expr);
+        if (simplified != expr) {
+            ib->substitute(expr, simplified);
+        }
+        return;
+    }
+
+    if (auto* ret = dynamic_cast<Return*>(inst)) {
+        for (Expression* value : ret->values()) {
+            Expression* simplified = simplify_cast_expression_tree(task, value);
+            if (simplified != value) {
+                ret->substitute(value, simplified);
+            }
+        }
+    }
+}
+
+} // namespace
+
+namespace {
+
+struct ExpressionGraph {
+    std::unordered_map<Instruction*, std::vector<Instruction*>> dependencies;
+    std::unordered_set<Instruction*> sinks;
+};
+
+bool assignment_has_call_value(const Assignment* assign) {
+    if (!assign) return false;
+    if (dynamic_cast<const Call*>(assign->value())) return true;
+    const auto* op = dynamic_cast<const Operation*>(assign->value());
+    return op && op->type() == OperationType::call;
+}
+
+bool assignment_has_side_effect_destination(const Assignment* assign) {
+    if (!assign) return false;
+    // Any non-variable destination is treated as a side-effecting write
+    // (e.g., dereference/member store). Keep it conservatively.
+    return dynamic_cast<const Variable*>(assign->destination()) == nullptr;
+}
+
+ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
+    ExpressionGraph graph;
+    if (!cfg) return graph;
+
+    std::unordered_map<VarKey, Instruction*, VarKeyHash> definition_of;
+
+    // Pass 1: collect variable definitions.
+    for (BasicBlock* block : cfg->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            for (Variable* def : inst->definitions()) {
+                if (!def) continue;
+                definition_of[var_key(def)] = inst;
+            }
+        }
+    }
+
+    // Pass 2: connect use -> def dependencies and identify sink instructions.
+    for (BasicBlock* block : cfg->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                if (assignment_has_call_value(assign) || assignment_has_side_effect_destination(assign)) {
+                    graph.sinks.insert(inst);
+                }
+            } else {
+                graph.sinks.insert(inst);
+            }
+
+            std::vector<Instruction*> deps;
+            for (Variable* req : inst->requirements()) {
+                if (!req) continue;
+                auto it = definition_of.find(var_key(req));
+                if (it != definition_of.end() && it->second != inst) {
+                    deps.push_back(it->second);
+                }
+            }
+            if (!deps.empty()) {
+                std::sort(deps.begin(), deps.end());
+                deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
+                graph.dependencies[inst] = std::move(deps);
+            }
+        }
+    }
+
+    return graph;
+}
+
+std::unordered_set<Instruction*> compute_live_component(const ExpressionGraph& graph) {
+    std::unordered_set<Instruction*> live;
+    std::vector<Instruction*> worklist(graph.sinks.begin(), graph.sinks.end());
+
+    while (!worklist.empty()) {
+        Instruction* current = worklist.back();
+        worklist.pop_back();
+        if (!current || !live.insert(current).second) continue;
+
+        auto it = graph.dependencies.find(current);
+        if (it == graph.dependencies.end()) continue;
+        for (Instruction* dep : it->second) {
+            if (dep && !live.contains(dep)) {
+                worklist.push_back(dep);
+            }
+        }
+    }
+
+    return live;
+}
+
 } // namespace
 
 void TypePropagationStage::execute(DecompilerTask& task) {}
@@ -2037,6 +2298,36 @@ void ExpressionSimplificationStage::execute(DecompilerTask& task) {
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
             simplify_instruction_constants(task, inst);
+        }
+    }
+}
+
+void RedundantCastsEliminationStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            simplify_instruction_casts(task, inst);
+        }
+    }
+}
+
+void DeadComponentPrunerStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+
+    ExpressionGraph graph = build_expression_graph(task.cfg());
+    if (graph.sinks.empty()) return;
+
+    const std::unordered_set<Instruction*> live = compute_live_component(graph);
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        std::vector<Instruction*> kept;
+        kept.reserve(block->instructions().size());
+        for (Instruction* inst : block->instructions()) {
+            if (live.contains(inst)) {
+                kept.push_back(inst);
+            }
+        }
+        if (kept.size() != block->instructions().size()) {
+            block->set_instructions(std::move(kept));
         }
     }
 }

@@ -57,6 +57,18 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class DeadComponentPrunerStage : public PipelineStage {
+public:
+    const char* name() const override { return "DeadComponentPruner"; }
+    void execute(DecompilerTask& task) override;
+};
+
+class RedundantCastsEliminationStage : public PipelineStage {
+public:
+    const char* name() const override { return "RedundantCastsElimination"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class CommonSubexpressionEliminationStage : public PipelineStage {
 public:
     const char* name() const override { return "CommonSubexpressionElimination"; }

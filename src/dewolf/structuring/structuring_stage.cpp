@@ -1,5 +1,6 @@
 #include "../../dewolf_logic/z3_logic.hpp"
 #include "structuring_stage.hpp"
+#include "condition_handler.hpp"
 #include <unordered_map>
 
 namespace dewolf {
@@ -43,40 +44,34 @@ void PatternIndependentRestructuringStage::build_initial_transition_cfg(Decompil
         tcfg.add_block(tb);
     }
 
-    // Connect edges
-dewolf_logic::Z3Converter z3_conv(task.z3_ctx());
-for (BasicBlock* bb : task.cfg()->blocks()) {
-    TransitionBlock* src = block_map[bb];
-    for (Edge* e : bb->successors()) {
-        if (e->target()) {
-            TransitionBlock* dst = block_map[e->target()];
+    // Connect edges with condition-symbol tags.
+    ConditionHandler condition_handler(task.z3_ctx());
+    for (BasicBlock* bb : task.cfg()->blocks()) {
+        TransitionBlock* src = block_map[bb];
+        for (Edge* e : bb->successors()) {
+            if (e->target()) {
+                TransitionBlock* dst = block_map[e->target()];
 
-            // Compute edge condition tag
-            dewolf_logic::LogicCondition tag(task.z3_ctx().bool_val(true));
-
-            if (e->type() == EdgeType::True || e->type() == EdgeType::False) {
-                if (!bb->instructions().empty()) {
-                    Instruction* last_inst = bb->instructions().back();
-                    if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
-                        dewolf_logic::LogicCondition c = z3_conv.convert_to_condition(branch->condition());
-                        if (e->type() == EdgeType::True) {
-                            tag = c;
-                        } else {
-                            tag = c.negate();
+                dewolf_logic::LogicCondition tag(task.z3_ctx().bool_val(true));
+                if (e->type() == EdgeType::True || e->type() == EdgeType::False) {
+                    if (!bb->instructions().empty()) {
+                        Instruction* last_inst = bb->instructions().back();
+                        if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+                            dewolf_logic::LogicCondition symbol_cond = condition_handler.add_condition(branch->condition());
+                            tag = (e->type() == EdgeType::True) ? symbol_cond : symbol_cond.negate();
                         }
                     }
                 }
-            }
 
-                            std::optional<EdgeProperty> prop = std::nullopt;
+                std::optional<EdgeProperty> prop = std::nullopt;
                 if (task.cfg()->edge_properties().contains(e)) {
                     prop = task.cfg()->edge_properties().at(e);
                 }
-                
+
                 tcfg.add_edge(src, dst, tag, prop);
+            }
         }
     }
-}
 
 }
 

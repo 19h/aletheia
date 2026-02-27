@@ -1,5 +1,6 @@
 #include "structurer.hpp"
 #include "loop_structurer.hpp"
+#include "reachability.hpp"
 #include "../ssa/dominators.hpp"
 #include "../../dewolf_logic/z3_logic.hpp"
 #include "graph_slice/graph_slice.hpp"
@@ -10,6 +11,89 @@
 #include <string>
 
 namespace dewolf {
+
+namespace {
+
+std::unordered_set<TransitionBlock*> compute_dominated_region(TransitionCFG& cfg, TransitionBlock* header) {
+    std::unordered_set<TransitionBlock*> dominated;
+    if (!header) return dominated;
+    for (TransitionBlock* node : cfg.blocks()) {
+        if (cfg.dominates(header, node)) {
+            dominated.insert(node);
+        }
+    }
+    return dominated;
+}
+
+std::unordered_set<TransitionBlock*> compute_region_exits(
+    const std::unordered_set<TransitionBlock*>& region) {
+    std::unordered_set<TransitionBlock*> exits;
+    for (TransitionBlock* node : region) {
+        for (TransitionBlock* succ : node->successors_blocks()) {
+            if (!region.contains(succ)) {
+                exits.insert(succ);
+            }
+        }
+    }
+    return exits;
+}
+
+std::unordered_set<TransitionBlock*> compute_dominated_subset(
+    TransitionCFG& cfg,
+    TransitionBlock* dominator,
+    const std::unordered_set<TransitionBlock*>& candidates) {
+    std::unordered_set<TransitionBlock*> subset;
+    if (!dominator) return subset;
+    for (TransitionBlock* node : candidates) {
+        if (cfg.dominates(dominator, node)) {
+            subset.insert(node);
+        }
+    }
+    return subset;
+}
+
+bool is_restructurable_region(
+    TransitionCFG& cfg,
+    TransitionBlock* header,
+    const std::unordered_set<TransitionBlock*>& region,
+    TransitionBlock** out_exit) {
+    if (!header || !region.contains(header) || region.size() <= 1) return false;
+
+    // Connectivity inside region from header.
+    std::unordered_set<TransitionBlock*> reachable;
+    std::vector<TransitionBlock*> stack = {header};
+    while (!stack.empty()) {
+        TransitionBlock* cur = stack.back();
+        stack.pop_back();
+        if (!cur || reachable.contains(cur) || !region.contains(cur)) continue;
+        reachable.insert(cur);
+        for (TransitionBlock* succ : cur->successors_blocks()) {
+            if (region.contains(succ) && !reachable.contains(succ)) {
+                stack.push_back(succ);
+            }
+        }
+    }
+    if (reachable.size() != region.size()) return false;
+
+    // Closed predecessors (except header entry).
+    for (TransitionBlock* node : region) {
+        if (node == header) continue;
+        for (TransitionBlock* pred : node->predecessors_blocks()) {
+            if (!region.contains(pred)) {
+                return false;
+            }
+        }
+    }
+
+    auto exits = compute_region_exits(region);
+    if (exits.size() > 1) return false;
+    if (out_exit) {
+        *out_exit = exits.empty() ? nullptr : *exits.begin();
+    }
+    return true;
+}
+
+} // namespace
 
 void CyclicRegionFinder::process(TransitionCFG& cfg) {
     if (!cfg.entry()) return;
@@ -330,52 +414,39 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
         TransitionBlock* best_exit = nullptr;
 
         for (TransitionBlock* header : cfg.blocks()) {
-            std::unordered_set<TransitionBlock*> region;
-            std::unordered_set<TransitionBlock*> visited;
-            std::vector<TransitionBlock*> stack = {header};
-            
-            while (!stack.empty()) {
-                TransitionBlock* curr = stack.back();
-                stack.pop_back();
-                
-                if (visited.contains(curr)) continue;
-                visited.insert(curr);
-                
-                bool all_preds_in = true;
-                if (curr != header) {
-                    for (auto* p : curr->predecessors_blocks()) {
-                        if (!region.contains(p)) {
-                            all_preds_in = false;
-                            break;
-                        }
-                    }
-                }
-                
-                if (all_preds_in) {
-                    region.insert(curr);
-                    for (auto* s : curr->successors_blocks()) {
-                        stack.push_back(s);
-                    }
-                }
+            std::unordered_set<TransitionBlock*> full_region = compute_dominated_region(cfg, header);
+            TransitionBlock* full_exit = nullptr;
+            if (!is_restructurable_region(cfg, header, full_region, &full_exit)) {
+                continue;
             }
-            
-            if (region.size() <= 1) continue;
 
-            std::unordered_set<TransitionBlock*> exits;
-            for (auto* node : region) {
-                for (auto* s : node->successors_blocks()) {
-                    if (!region.contains(s)) {
-                        exits.insert(s);
-                    }
+            std::unordered_set<TransitionBlock*> candidate_region = full_region;
+            TransitionBlock* candidate_exit = full_exit;
+
+            // Improved DREAM subset search:
+            // try trimming each dominated subtree rooted at a potential exit node.
+            for (TransitionBlock* possible_exit : full_region) {
+                if (possible_exit == header) continue;
+
+                std::unordered_set<TransitionBlock*> trimmed = full_region;
+                std::unordered_set<TransitionBlock*> dominated_by_exit =
+                    compute_dominated_subset(cfg, possible_exit, full_region);
+                for (TransitionBlock* node : dominated_by_exit) {
+                    trimmed.erase(node);
+                }
+
+                TransitionBlock* trimmed_exit = nullptr;
+                if (is_restructurable_region(cfg, header, trimmed, &trimmed_exit) &&
+                    trimmed.size() < candidate_region.size()) {
+                    candidate_region = std::move(trimmed);
+                    candidate_exit = trimmed_exit;
                 }
             }
-            
-            if (exits.size() <= 1) {
-                if (best_region.empty() || region.size() < best_region.size()) {
-                    best_region = region;
-                    best_header = header;
-                    best_exit = exits.empty() ? nullptr : *exits.begin();
-                }
+
+            if (best_region.empty() || candidate_region.size() < best_region.size()) {
+                best_region = std::move(candidate_region);
+                best_header = header;
+                best_exit = candidate_exit;
             }
         }
 
@@ -432,8 +503,12 @@ void AcyclicRegionRestructurer::restructure_region(TransitionCFG* t_cfg, Transit
     z3::context& ctx = task_.z3_ctx();
     auto reaching_conditions = ReachingConditions::compute(ctx, slice, header, t_cfg);
 
+    ReachabilityGraph reachability(slice);
+    SiblingReachability sibling_reachability(reachability);
+    std::vector<TransitionBlock*> ordered_blocks = sibling_reachability.order_blocks(slice->blocks());
+
     SeqNode* seq = arena_.create<SeqNode>();
-    for (TransitionBlock* block : slice->blocks()) {
+    for (TransitionBlock* block : ordered_blocks) {
         seq->add_node(block->ast_node());
     }
 

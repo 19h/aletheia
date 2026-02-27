@@ -33,4 +33,10 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class CoherenceStage : public PipelineStage {
+public:
+    const char* name() const override { return "Coherence"; }
+    void execute(DecompilerTask& task) override;
+};
+
 } // namespace dewolf

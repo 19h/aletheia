@@ -1200,4 +1200,59 @@ void RemoveStackCanaryStage::execute(DecompilerTask& task) {
     remove_unreachable_blocks(cfg);
 }
 
+void CoherenceStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) {
+        return;
+    }
+
+    std::unordered_map<VarKey, TypePtr, VarKeyHash> first_seen_type;
+
+    auto note_first_type = [&](Variable* var) {
+        if (var == nullptr || !var->ir_type()) {
+            return;
+        }
+        VarKey key = var_key(var);
+        if (!first_seen_type.contains(key)) {
+            first_seen_type.emplace(std::move(key), var->ir_type());
+        }
+    };
+
+    auto apply_type = [&](Variable* var) {
+        if (var == nullptr) {
+            return;
+        }
+        auto it = first_seen_type.find(var_key(var));
+        if (it == first_seen_type.end()) {
+            return;
+        }
+        if (!var->ir_type() || *(var->ir_type()) != *(it->second)) {
+            var->set_ir_type(it->second);
+        }
+    };
+
+    // Pass 1: collect first-seen type per (name, ssa_version).
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            for (Variable* req : inst->requirements()) {
+                note_first_type(req);
+            }
+            for (Variable* def : inst->definitions()) {
+                note_first_type(def);
+            }
+        }
+    }
+
+    // Pass 2: enforce coherence across all occurrences.
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            for (Variable* req : inst->requirements()) {
+                apply_type(req);
+            }
+            for (Variable* def : inst->definitions()) {
+                apply_type(def);
+            }
+        }
+    }
+}
+
 } // namespace dewolf

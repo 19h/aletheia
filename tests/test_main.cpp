@@ -8,7 +8,11 @@
 #include "../src/dewolf/structures/dataflow.hpp"
 #include "../src/dewolf/structures/types.hpp"
 #include "../src/dewolf/structuring/ast.hpp"
+#include "../src/dewolf/structuring/condition_handler.hpp"
 #include "../src/dewolf/structuring/loop_structurer.hpp"
+#include "../src/dewolf/structuring/cbr/cbr.hpp"
+#include "../src/dewolf/structuring/car/car.hpp"
+#include "../src/dewolf/structuring/reachability.hpp"
 #include "../src/dewolf/ssa/dominators.hpp"
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
 #include "../src/dewolf/ssa/ssa_destructor.hpp"
@@ -19,6 +23,7 @@
 #include "../src/dewolf/pipeline/preprocessing_stages.hpp"
 #include "../src/dewolf/pipeline/optimization_stages.hpp"
 #include "../src/dewolf_logic/range_simplifier.hpp"
+#include "../src/dewolf_logic/operation_simplifier.hpp"
 
 
 
@@ -143,6 +148,90 @@ void test_ssa_phi_insertion() {
     ASSERT_TRUE(found_phi);
     
     std::cout << "[+] test_ssa_phi_insertion passed.\n";
+}
+
+void test_phi_lifting_edge_splitting() {
+    DecompilerTask task(0x5000);
+    task.set_out_of_ssa_mode(OutOfSsaMode::Sreedhar);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* entry = task.arena().create<BasicBlock>(200);
+    auto* pred = task.arena().create<BasicBlock>(201);
+    auto* other = task.arena().create<BasicBlock>(202);
+    auto* phi_bb = task.arena().create<BasicBlock>(203);
+
+    cfg->set_entry_block(entry);
+    cfg->add_block(entry);
+    cfg->add_block(pred);
+    cfg->add_block(other);
+    cfg->add_block(phi_bb);
+
+    auto* e0 = task.arena().create<Edge>(entry, pred, EdgeType::Unconditional);
+    entry->add_successor(e0);
+    pred->add_predecessor(e0);
+
+    auto* e_true = task.arena().create<Edge>(pred, phi_bb, EdgeType::True);
+    auto* e_false = task.arena().create<Edge>(pred, other, EdgeType::False);
+    pred->add_successor(e_true);
+    pred->add_successor(e_false);
+    phi_bb->add_predecessor(e_true);
+    other->add_predecessor(e_false);
+
+    auto* e_other = task.arena().create<Edge>(other, phi_bb, EdgeType::Unconditional);
+    other->add_successor(e_other);
+    phi_bb->add_predecessor(e_other);
+
+    auto* cond_v = task.arena().create<Variable>("cond", 1);
+    auto* p_src = task.arena().create<Variable>("p_src", 4);
+    auto* o_src = task.arena().create<Variable>("o_src", 4);
+
+    pred->add_instruction(task.arena().create<Assignment>(p_src, task.arena().create<Constant>(1, 4)));
+    pred->add_instruction(task.arena().create<Branch>(
+        task.arena().create<Condition>(OperationType::neq, cond_v, task.arena().create<Constant>(0, 1), 1)));
+
+    other->add_instruction(task.arena().create<Assignment>(o_src, task.arena().create<Constant>(2, 4)));
+
+    auto* dst = task.arena().create<Variable>("dst", 4);
+    auto* phi_ops = task.arena().create<ListOperation>(std::vector<Expression*>{p_src, o_src}, 4);
+    auto* phi = task.arena().create<Phi>(dst, phi_ops);
+    phi->update_phi_function({{pred, p_src}, {other, o_src}});
+    phi_bb->add_instruction(phi);
+    phi_bb->add_instruction(task.arena().create<Return>(std::vector<Expression*>{dst}));
+
+    task.set_cfg(std::move(cfg));
+
+    SsaDestructor dtor;
+    dtor.execute(task);
+
+    bool direct_pred_to_phi = false;
+    BasicBlock* split_block = nullptr;
+    for (Edge* e : pred->successors()) {
+        if (e->target() == phi_bb) {
+            direct_pred_to_phi = true;
+        } else if (e->target() != other) {
+            split_block = e->target();
+        }
+    }
+    ASSERT_TRUE(!direct_pred_to_phi);
+    ASSERT_TRUE(split_block != nullptr);
+
+    bool split_reaches_phi = false;
+    bool split_has_copy = false;
+    for (Edge* e : split_block->successors()) {
+        if (e->target() == phi_bb) {
+            split_reaches_phi = true;
+        }
+    }
+    for (Instruction* inst : split_block->instructions()) {
+        if (dynamic_cast<Assignment*>(inst) != nullptr) {
+            split_has_copy = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(split_reaches_phi);
+    ASSERT_TRUE(split_has_copy);
+
+    std::cout << "[+] test_phi_lifting_edge_splitting passed.\n";
 }
 
 void test_instruction_hierarchy() {
@@ -563,6 +652,65 @@ void test_range_simplifier() {
     std::cout << "[+] test_range_simplifier passed.\n";
 }
 
+void test_logic_operation_simplifier() {
+    using namespace dewolf_logic;
+
+    LogicDag dag;
+
+    // Constant folding: true && false -> false.
+    auto* c1 = dag.create_node<DagConstant>(1);
+    auto* c0 = dag.create_node<DagConstant>(0);
+    auto* and_const = dag.create_node<DagOperation>(LogicOp::And);
+    and_const->add_child(c1);
+    and_const->add_child(c0);
+    DagNode* folded = simplify_node(dag, and_const);
+    auto* folded_const = dynamic_cast<DagConstant*>(folded);
+    ASSERT_TRUE(folded_const != nullptr);
+    ASSERT_EQ(folded_const->value(), 0);
+
+    // De Morgan: !(a || b) -> !a && !b.
+    auto* a = dag.create_node<DagVariable>("a");
+    auto* b = dag.create_node<DagVariable>("b");
+    auto* or_ab = dag.create_node<DagOperation>(LogicOp::Or);
+    or_ab->add_child(a);
+    or_ab->add_child(b);
+    auto* not_or = dag.create_node<DagOperation>(LogicOp::Not);
+    not_or->add_child(or_ab);
+    DagNode* demorgan = simplify_node(dag, not_or);
+    auto* demorgan_op = dynamic_cast<DagOperation*>(demorgan);
+    ASSERT_TRUE(demorgan_op != nullptr);
+    ASSERT_EQ(demorgan_op->op(), LogicOp::And);
+    ASSERT_EQ(demorgan_op->children().size(), 2);
+
+    // Associative flattening: a && (b && c) -> a && b && c.
+    auto* c = dag.create_node<DagVariable>("c");
+    auto* inner_and = dag.create_node<DagOperation>(LogicOp::And);
+    inner_and->add_child(b);
+    inner_and->add_child(c);
+    auto* outer_and = dag.create_node<DagOperation>(LogicOp::And);
+    outer_and->add_child(a);
+    outer_and->add_child(inner_and);
+    DagNode* flattened = simplify_node(dag, outer_and);
+    auto* flattened_op = dynamic_cast<DagOperation*>(flattened);
+    ASSERT_TRUE(flattened_op != nullptr);
+    ASSERT_EQ(flattened_op->op(), LogicOp::And);
+    ASSERT_EQ(flattened_op->children().size(), 3);
+
+    // Collision detection: a && !a -> false.
+    auto* not_a = dag.create_node<DagOperation>(LogicOp::Not);
+    not_a->add_child(a);
+    auto* coll = dag.create_node<DagOperation>(LogicOp::And);
+    coll->add_child(a);
+    coll->add_child(a); // duplicate removal path
+    coll->add_child(not_a);
+    DagNode* collided = simplify_node(dag, coll);
+    auto* collided_const = dynamic_cast<DagConstant*>(collided);
+    ASSERT_TRUE(collided_const != nullptr);
+    ASSERT_EQ(collided_const->value(), 0);
+
+    std::cout << "[+] test_logic_operation_simplifier passed.\n";
+}
+
 
 #include "../src/dewolf/ssa/phi_dependency_resolver.hpp"
 
@@ -862,6 +1010,520 @@ void test_codegen_dump() {
         std::cout << line << "\n";
     }
     std::cout << "-------------------------\n\n";
+}
+
+void test_codegen_switch_case() {
+    dewolf::DecompilerArena arena;
+
+    auto* sel = arena.create<dewolf::Variable>("sel", 4);
+    auto* z = arena.create<dewolf::Variable>("z", 4);
+
+    auto* bb_case0 = arena.create<dewolf::BasicBlock>(110);
+    bb_case0->add_instruction(arena.create<dewolf::Assignment>(z, arena.create<dewolf::Constant>(1, 4)));
+    auto* node_case0 = arena.create<dewolf::CodeNode>(bb_case0);
+
+    auto* bb_default = arena.create<dewolf::BasicBlock>(111);
+    bb_default->add_instruction(arena.create<dewolf::Assignment>(z, arena.create<dewolf::Constant>(0, 4)));
+    auto* node_default = arena.create<dewolf::CodeNode>(bb_default);
+
+    auto* case0 = arena.create<dewolf::CaseNode>(0, node_case0, false, true);
+    auto* def = arena.create<dewolf::CaseNode>(0, node_default, true, true);
+
+    auto* sw = arena.create<dewolf::SwitchNode>(arena.create<dewolf::ExprAstNode>(sel));
+    sw->add_case(case0);
+    sw->add_case(def);
+
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(sw);
+
+    dewolf::CodeVisitor visitor;
+    auto lines = visitor.generate_code(forest);
+
+    auto has_substr = [&](const std::string& needle) {
+        for (const auto& line : lines) {
+            if (line.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    ASSERT_TRUE(has_substr("switch (sel) {"));
+    ASSERT_TRUE(has_substr("case 0:"));
+    ASSERT_TRUE(has_substr("default:"));
+    ASSERT_TRUE(has_substr("break;"));
+
+    std::cout << "[+] test_codegen_switch_case passed.\n";
+}
+
+void test_codegen_loop_variants() {
+    dewolf::DecompilerArena arena;
+
+    auto* i = arena.create<dewolf::Variable>("i", 4);
+    auto* ten = arena.create<dewolf::Constant>(10, 4);
+
+    auto* while_cond = arena.create<dewolf::Condition>(dewolf::OperationType::lt, i, ten, 1);
+    auto* do_cond = arena.create<dewolf::Condition>(dewolf::OperationType::lt, i, ten, 1);
+    auto* for_cond = arena.create<dewolf::Condition>(dewolf::OperationType::lt, i, ten, 1);
+
+    auto* bb_while = arena.create<dewolf::BasicBlock>(120);
+    bb_while->add_instruction(arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(1, 4)));
+    auto* while_body = arena.create<dewolf::CodeNode>(bb_while);
+    auto* while_node = arena.create<dewolf::WhileLoopNode>(while_body, while_cond);
+
+    auto* bb_do = arena.create<dewolf::BasicBlock>(121);
+    bb_do->add_instruction(arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(2, 4)));
+    auto* do_body = arena.create<dewolf::CodeNode>(bb_do);
+    auto* do_node = arena.create<dewolf::DoWhileLoopNode>(do_body, do_cond);
+
+    auto* bb_for = arena.create<dewolf::BasicBlock>(122);
+    bb_for->add_instruction(arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(3, 4)));
+    auto* for_body = arena.create<dewolf::CodeNode>(bb_for);
+    auto* for_decl = arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(0, 4));
+    auto* for_mod = arena.create<dewolf::Assignment>(
+        i,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{i, arena.create<dewolf::Constant>(1, 4)},
+            4));
+    auto* for_node = arena.create<dewolf::ForLoopNode>(for_body, for_cond, for_decl, for_mod);
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(while_node);
+    seq->add_node(do_node);
+    seq->add_node(for_node);
+
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(seq);
+
+    dewolf::CodeVisitor visitor;
+    auto lines = visitor.generate_code(forest);
+
+    auto has_substr = [&](const std::string& needle) {
+        for (const auto& line : lines) {
+            if (line.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    ASSERT_TRUE(has_substr("while (i < 0xa) {"));
+    ASSERT_TRUE(has_substr("do {"));
+    ASSERT_TRUE(has_substr("} while (i < 0xa);"));
+    ASSERT_TRUE(has_substr("for (i = 0x0; i < 0xa; i = i + 0x1) {"));
+
+    std::cout << "[+] test_codegen_loop_variants passed.\n";
+}
+
+void test_codegen_operator_precedence() {
+    dewolf::DecompilerArena arena;
+
+    auto* a = arena.create<dewolf::Variable>("a", 4);
+    auto* b = arena.create<dewolf::Variable>("b", 4);
+    auto* c = arena.create<dewolf::Variable>("c", 4);
+
+    auto* out1 = arena.create<dewolf::Variable>("p1", 4);
+    auto* out2 = arena.create<dewolf::Variable>("p2", 4);
+    auto* out3 = arena.create<dewolf::Variable>("p3", 4);
+
+    auto* expr1 = arena.create<dewolf::Operation>(
+        dewolf::OperationType::mul,
+        std::vector<dewolf::Expression*>{
+            arena.create<dewolf::Operation>(
+                dewolf::OperationType::add,
+                std::vector<dewolf::Expression*>{a, b},
+                4),
+            c},
+        4);
+    auto* expr2 = arena.create<dewolf::Operation>(
+        dewolf::OperationType::add,
+        std::vector<dewolf::Expression*>{
+            a,
+            arena.create<dewolf::Operation>(
+                dewolf::OperationType::mul,
+                std::vector<dewolf::Expression*>{b, c},
+                4)},
+        4);
+    auto* expr3 = arena.create<dewolf::Operation>(
+        dewolf::OperationType::sub,
+        std::vector<dewolf::Expression*>{
+            a,
+            arena.create<dewolf::Operation>(
+                dewolf::OperationType::sub,
+                std::vector<dewolf::Expression*>{b, c},
+                4)},
+        4);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(160);
+    bb->add_instruction(arena.create<dewolf::Assignment>(out1, expr1));
+    bb->add_instruction(arena.create<dewolf::Assignment>(out2, expr2));
+    bb->add_instruction(arena.create<dewolf::Assignment>(out3, expr3));
+
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+
+    dewolf::CodeVisitor visitor;
+    auto lines = visitor.generate_code(forest);
+
+    auto has_substr = [&](const std::string& needle) {
+        for (const auto& line : lines) {
+            if (line.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    ASSERT_TRUE(has_substr("p1 = (a + b) * c;"));
+    ASSERT_TRUE(has_substr("p2 = a + b * c;"));
+    ASSERT_TRUE(has_substr("p3 = a - (b - c);"));
+
+    std::cout << "[+] test_codegen_operator_precedence passed.\n";
+}
+
+void test_condition_handler() {
+    z3::context ctx;
+    ConditionHandler handler(ctx);
+    dewolf::DecompilerArena arena;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* c0 = arena.create<dewolf::Constant>(0, 4);
+    auto* c1 = arena.create<dewolf::Constant>(1, 4);
+
+    auto* eq = arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, c0, 1);
+    auto eq_symbol = handler.add_condition(eq);
+    auto eq_name = handler.symbol_for_condition(eq);
+    ASSERT_TRUE(eq_name.has_value());
+    ASSERT_TRUE(handler.condition_for_symbol(*eq_name) == eq);
+
+    auto eq_props = handler.case_properties_for_symbol(*eq_name);
+    ASSERT_TRUE(eq_props.has_value());
+    ASSERT_TRUE(eq_props->expression == x);
+    ASSERT_TRUE(eq_props->constant == c0);
+    ASSERT_TRUE(!eq_props->negated);
+
+    auto* neq = arena.create<dewolf::Condition>(dewolf::OperationType::neq, x, c1, 1);
+    auto neq_symbol = handler.add_condition(neq);
+    auto neq_name = handler.symbol_for_condition(neq);
+    ASSERT_TRUE(neq_name.has_value());
+    ASSERT_TRUE(handler.condition_for_symbol(*neq_name) == neq);
+
+    auto neq_props = handler.case_properties_for_symbol(*neq_name);
+    ASSERT_TRUE(neq_props.has_value());
+    ASSERT_TRUE(neq_props->expression == x);
+    ASSERT_TRUE(neq_props->constant == c1);
+    ASSERT_TRUE(neq_props->negated);
+
+    auto eq_symbol_again = handler.add_condition(eq);
+    ASSERT_EQ(eq_symbol.expression().to_string(), eq_symbol_again.expression().to_string());
+    ASSERT_TRUE(eq_symbol.expression().to_string() != neq_symbol.expression().to_string());
+
+    std::cout << "[+] test_condition_handler passed.\n";
+}
+
+void test_cbr_complementary_conditions() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* c0 = arena.create<dewolf::Constant>(0, 4);
+    auto* cond_eq = arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, c0, 1);
+    auto* cond_neq = arena.create<dewolf::Condition>(dewolf::OperationType::neq, x, c0, 1);
+
+    auto* y = arena.create<dewolf::Variable>("y", 4);
+
+    auto* bb_true = arena.create<dewolf::BasicBlock>(140);
+    bb_true->add_instruction(arena.create<dewolf::Assignment>(y, arena.create<dewolf::Constant>(1, 4)));
+    auto* bb_false = arena.create<dewolf::BasicBlock>(141);
+    bb_false->add_instruction(arena.create<dewolf::Assignment>(y, arena.create<dewolf::Constant>(2, 4)));
+
+    auto* if_true = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(cond_eq), arena.create<dewolf::CodeNode>(bb_true));
+    auto* if_false = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(cond_neq), arena.create<dewolf::CodeNode>(bb_false));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(if_true);
+    seq->add_node(if_false);
+
+    auto refined = dewolf::ConditionBasedRefinement::refine(
+        arena,
+        ctx,
+        seq,
+        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+
+    auto* refined_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    ASSERT_TRUE(refined_seq != nullptr);
+    ASSERT_EQ(refined_seq->nodes().size(), 1);
+
+    auto* merged = dynamic_cast<dewolf::IfNode*>(refined_seq->nodes()[0]);
+    ASSERT_TRUE(merged != nullptr);
+    ASSERT_TRUE(merged->false_branch() != nullptr);
+
+    std::cout << "[+] test_cbr_complementary_conditions passed.\n";
+}
+
+void test_cbr_cnf_subexpression_grouping() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* y = arena.create<dewolf::Variable>("y", 4);
+    auto* z = arena.create<dewolf::Variable>("z", 4);
+
+    auto* cond_a = arena.create<dewolf::Condition>(
+        dewolf::OperationType::eq,
+        x,
+        arena.create<dewolf::Constant>(0, 4),
+        1);
+    auto* cond_b = arena.create<dewolf::Condition>(
+        dewolf::OperationType::gt,
+        y,
+        arena.create<dewolf::Constant>(1, 4),
+        1);
+    auto* cond_c = arena.create<dewolf::Condition>(
+        dewolf::OperationType::lt,
+        z,
+        arena.create<dewolf::Constant>(5, 4),
+        1);
+
+    auto* and1 = arena.create<dewolf::Operation>(
+        dewolf::OperationType::logical_and,
+        std::vector<dewolf::Expression*>{cond_a, cond_b},
+        1);
+    auto* and2 = arena.create<dewolf::Operation>(
+        dewolf::OperationType::logical_and,
+        std::vector<dewolf::Expression*>{cond_a, cond_c},
+        1);
+
+    auto* out = arena.create<dewolf::Variable>("out", 4);
+    auto* bb1 = arena.create<dewolf::BasicBlock>(142);
+    bb1->add_instruction(arena.create<dewolf::Assignment>(out, arena.create<dewolf::Constant>(1, 4)));
+    auto* bb2 = arena.create<dewolf::BasicBlock>(143);
+    bb2->add_instruction(arena.create<dewolf::Assignment>(out, arena.create<dewolf::Constant>(2, 4)));
+
+    auto* if1 = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(and1), arena.create<dewolf::CodeNode>(bb1));
+    auto* if2 = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(and2), arena.create<dewolf::CodeNode>(bb2));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(if1);
+    seq->add_node(if2);
+
+    auto refined = dewolf::ConditionBasedRefinement::refine(
+        arena,
+        ctx,
+        seq,
+        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+
+    auto* refined_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    ASSERT_TRUE(refined_seq != nullptr);
+    ASSERT_EQ(refined_seq->nodes().size(), 1);
+
+    auto* outer_if = dynamic_cast<dewolf::IfNode*>(refined_seq->nodes()[0]);
+    ASSERT_TRUE(outer_if != nullptr);
+    auto* outer_cond_ast = dynamic_cast<dewolf::ExprAstNode*>(outer_if->cond());
+    ASSERT_TRUE(outer_cond_ast != nullptr);
+    ASSERT_TRUE(outer_cond_ast->expr() == cond_a);
+
+    auto* grouped_seq = dynamic_cast<dewolf::SeqNode*>(outer_if->true_branch());
+    ASSERT_TRUE(grouped_seq != nullptr);
+    ASSERT_EQ(grouped_seq->nodes().size(), 2);
+
+    auto* grouped_if1 = dynamic_cast<dewolf::IfNode*>(grouped_seq->nodes()[0]);
+    auto* grouped_if2 = dynamic_cast<dewolf::IfNode*>(grouped_seq->nodes()[1]);
+    ASSERT_TRUE(grouped_if1 != nullptr && grouped_if2 != nullptr);
+
+    auto* grouped_cond1 = dynamic_cast<dewolf::ExprAstNode*>(grouped_if1->cond());
+    auto* grouped_cond2 = dynamic_cast<dewolf::ExprAstNode*>(grouped_if2->cond());
+    ASSERT_TRUE(grouped_cond1 != nullptr && grouped_cond2 != nullptr);
+    ASSERT_TRUE(grouped_cond1->expr() == cond_b);
+    ASSERT_TRUE(grouped_cond2->expr() == cond_c);
+
+    std::cout << "[+] test_cbr_cnf_subexpression_grouping passed.\n";
+}
+
+void test_car_initial_switch_constructor() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+
+    auto* bb1 = arena.create<dewolf::BasicBlock>(150);
+    bb1->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("v1", 4), arena.create<dewolf::Constant>(1, 4)));
+    auto* bb2 = arena.create<dewolf::BasicBlock>(151);
+    bb2->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("v2", 4), arena.create<dewolf::Constant>(2, 4)));
+    auto* bb_def = arena.create<dewolf::BasicBlock>(152);
+    bb_def->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("vd", 4), arena.create<dewolf::Constant>(3, 4)));
+
+    auto* if2 = arena.create<dewolf::IfNode>(
+        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(2, 4), 1)),
+        arena.create<dewolf::CodeNode>(bb2),
+        arena.create<dewolf::CodeNode>(bb_def));
+    auto* if1 = arena.create<dewolf::IfNode>(
+        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(1, 4), 1)),
+        arena.create<dewolf::CodeNode>(bb1),
+        if2);
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(if1);
+
+    auto* refined = dewolf::ConditionAwareRefinement::refine(
+        arena,
+        ctx,
+        seq,
+        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+
+    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    ASSERT_TRUE(out_seq != nullptr);
+    ASSERT_EQ(out_seq->nodes().size(), 1);
+    auto* sw = dynamic_cast<dewolf::SwitchNode*>(out_seq->nodes()[0]);
+    ASSERT_TRUE(sw != nullptr);
+    ASSERT_EQ(sw->cases().size(), 3);
+
+    std::cout << "[+] test_car_initial_switch_constructor passed.\n";
+}
+
+void test_car_switch_extractor_and_missing_case_sequence() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+
+    auto* bb_case1 = arena.create<dewolf::BasicBlock>(153);
+    bb_case1->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("a", 4), arena.create<dewolf::Constant>(11, 4)));
+    auto* bb_case2 = arena.create<dewolf::BasicBlock>(154);
+    bb_case2->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("b", 4), arena.create<dewolf::Constant>(22, 4)));
+    auto* bb_case3 = arena.create<dewolf::BasicBlock>(155);
+    bb_case3->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("c", 4), arena.create<dewolf::Constant>(33, 4)));
+    auto* bb_default = arena.create<dewolf::BasicBlock>(156);
+    bb_default->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("d", 4), arena.create<dewolf::Constant>(44, 4)));
+
+    auto* inner_switch = arena.create<dewolf::SwitchNode>(arena.create<dewolf::ExprAstNode>(x));
+    inner_switch->add_case(arena.create<dewolf::CaseNode>(2, arena.create<dewolf::CodeNode>(bb_case2)));
+
+    auto* wrapper_if = arena.create<dewolf::IfNode>(
+        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(1, 4), 1)),
+        arena.create<dewolf::CodeNode>(bb_case1),
+        inner_switch);
+
+    auto* sibling_if = arena.create<dewolf::IfNode>(
+        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(3, 4), 1)),
+        arena.create<dewolf::CodeNode>(bb_case3),
+        arena.create<dewolf::CodeNode>(bb_default));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(wrapper_if);
+    seq->add_node(sibling_if);
+
+    auto* refined = dewolf::ConditionAwareRefinement::refine(
+        arena,
+        ctx,
+        seq,
+        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+
+    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    ASSERT_TRUE(out_seq != nullptr);
+    ASSERT_EQ(out_seq->nodes().size(), 1);
+    auto* sw = dynamic_cast<dewolf::SwitchNode*>(out_seq->nodes()[0]);
+    ASSERT_TRUE(sw != nullptr);
+
+    bool has1 = false, has2 = false, has3 = false, has_default = false;
+    for (auto* c : sw->cases()) {
+        if (c->is_default()) has_default = true;
+        if (!c->is_default() && c->value() == 1) has1 = true;
+        if (!c->is_default() && c->value() == 2) has2 = true;
+        if (!c->is_default() && c->value() == 3) has3 = true;
+    }
+    ASSERT_TRUE(has1 && has2 && has3 && has_default);
+
+    std::cout << "[+] test_car_switch_extractor_and_missing_case_sequence passed.\n";
+}
+
+void test_car_missing_case_finder_condition() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+
+    auto* bb_nested = arena.create<dewolf::BasicBlock>(157);
+    bb_nested->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("m", 4), arena.create<dewolf::Constant>(55, 4)));
+    auto* bb_rest = arena.create<dewolf::BasicBlock>(158);
+    bb_rest->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("n", 4), arena.create<dewolf::Constant>(66, 4)));
+
+    auto* nested_if = arena.create<dewolf::IfNode>(
+        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(4, 4), 1)),
+        arena.create<dewolf::CodeNode>(bb_nested),
+        arena.create<dewolf::CodeNode>(bb_rest));
+
+    auto* sw = arena.create<dewolf::SwitchNode>(arena.create<dewolf::ExprAstNode>(x));
+    sw->add_case(arena.create<dewolf::CaseNode>(1, nested_if));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(sw);
+
+    auto* refined = dewolf::ConditionAwareRefinement::refine(
+        arena,
+        ctx,
+        seq,
+        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+
+    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    ASSERT_TRUE(out_seq != nullptr);
+    auto* out_sw = dynamic_cast<dewolf::SwitchNode*>(out_seq->nodes()[0]);
+    ASSERT_TRUE(out_sw != nullptr);
+
+    bool has_case1 = false;
+    bool has_case4 = false;
+    for (auto* c : out_sw->cases()) {
+        if (!c->is_default() && c->value() == 1) has_case1 = true;
+        if (!c->is_default() && c->value() == 4) has_case4 = true;
+    }
+    ASSERT_TRUE(has_case1 && has_case4);
+
+    std::cout << "[+] test_car_missing_case_finder_condition passed.\n";
+}
+
+void test_sibling_reachability() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* b1 = arena.create<dewolf::TransitionBlock>(arena.create<dewolf::SeqNode>());
+    auto* b2 = arena.create<dewolf::TransitionBlock>(arena.create<dewolf::SeqNode>());
+    auto* b3 = arena.create<dewolf::TransitionBlock>(arena.create<dewolf::SeqNode>());
+
+    dewolf::TransitionCFG cfg(arena);
+    cfg.set_entry(b1);
+    // Intentionally non-topological insertion order
+    cfg.add_block(b3);
+    cfg.add_block(b2);
+    cfg.add_block(b1);
+    cfg.add_edge(b1, b2, dewolf_logic::LogicCondition(ctx.bool_val(true)));
+
+    dewolf::ReachabilityGraph reach(&cfg);
+    dewolf::SiblingReachability siblings(reach);
+    auto ordered = siblings.order_blocks(cfg.blocks());
+
+    std::size_t pos_b1 = 0;
+    std::size_t pos_b2 = 0;
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+        if (ordered[i] == b1) pos_b1 = i;
+        if (ordered[i] == b2) pos_b2 = i;
+    }
+    ASSERT_TRUE(pos_b1 < pos_b2);
+
+    std::cout << "[+] test_sibling_reachability passed.\n";
+}
+
+void test_case_dependency_graph_ordering() {
+    dewolf::DecompilerArena arena;
+
+    auto* empty = arena.create<dewolf::SeqNode>();
+    auto* c3 = arena.create<dewolf::CaseNode>(3, empty, false, true);
+    auto* def = arena.create<dewolf::CaseNode>(0, empty, true, true);
+    auto* c1 = arena.create<dewolf::CaseNode>(1, empty, false, true);
+    auto* c2 = arena.create<dewolf::CaseNode>(2, empty, false, true);
+
+    std::vector<dewolf::CaseNode*> ordered = dewolf::CaseDependencyGraph::order_cases({c3, def, c1, c2});
+    ASSERT_EQ(ordered.size(), 4);
+    ASSERT_TRUE(!ordered[0]->is_default() && ordered[0]->value() == 1);
+    ASSERT_TRUE(!ordered[1]->is_default() && ordered[1]->value() == 2);
+    ASSERT_TRUE(!ordered[2]->is_default() && ordered[2]->value() == 3);
+    ASSERT_TRUE(ordered[3]->is_default());
+
+    std::cout << "[+] test_case_dependency_graph_ordering passed.\n";
 }
 
 void test_compiler_idiom_handling_stage() {
@@ -1549,13 +2211,286 @@ void test_expression_simplification_trivial_bit_arithmetic() {
     std::cout << "[+] test_expression_simplification_trivial_bit_arithmetic passed.\n";
 }
 
+void test_expression_simplification_sub_to_add() {
+    DecompilerTask task(0x7600);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(73);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    auto* out = task.arena().create<Variable>("out", 4);
+
+    auto* neg_const = task.arena().create<Operation>(
+        OperationType::negate,
+        std::vector<Expression*>{task.arena().create<Constant>(7, 4)},
+        4);
+    auto* sub_expr = task.arena().create<Operation>(
+        OperationType::sub,
+        std::vector<Expression*>{x, neg_const},
+        4);
+    auto* assign = task.arena().create<Assignment>(out, sub_expr);
+    bb->add_instruction(assign);
+
+    ExpressionSimplificationStage stage;
+    stage.execute(task);
+
+    auto* simplified = dynamic_cast<Operation*>(assign->value());
+    ASSERT_TRUE(simplified != nullptr);
+    ASSERT_EQ(simplified->type(), OperationType::add);
+    ASSERT_TRUE(simplified->operands()[0] == x);
+
+    auto* rhs = dynamic_cast<Constant*>(simplified->operands()[1]);
+    ASSERT_TRUE(rhs != nullptr);
+    ASSERT_EQ(rhs->value(), 7);
+
+    std::cout << "[+] test_expression_simplification_sub_to_add passed.\n";
+}
+
+void test_expression_simplification_collapse_nested_constants() {
+    DecompilerTask task(0x7700);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(74);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    auto* y = task.arena().create<Variable>("y", 4);
+    auto* out_add = task.arena().create<Variable>("out_add", 4);
+    auto* out_mul = task.arena().create<Variable>("out_mul", 4);
+
+    auto* inner_add = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{x, task.arena().create<Constant>(3, 4)},
+        4);
+    auto* nested_add = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{inner_add, task.arena().create<Constant>(5, 4)},
+        4);
+
+    auto* inner_mul = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{task.arena().create<Constant>(4, 4), y},
+        4);
+    auto* nested_mul = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{task.arena().create<Constant>(8, 4), inner_mul},
+        4);
+
+    auto* add_assign = task.arena().create<Assignment>(out_add, nested_add);
+    auto* mul_assign = task.arena().create<Assignment>(out_mul, nested_mul);
+
+    bb->add_instruction(add_assign);
+    bb->add_instruction(mul_assign);
+
+    ExpressionSimplificationStage stage;
+    stage.execute(task);
+
+    auto* add_value = dynamic_cast<Operation*>(add_assign->value());
+    ASSERT_TRUE(add_value != nullptr);
+    ASSERT_EQ(add_value->type(), OperationType::add);
+    ASSERT_TRUE(add_value->operands()[0] == x);
+    auto* add_const = dynamic_cast<Constant*>(add_value->operands()[1]);
+    ASSERT_TRUE(add_const != nullptr);
+    ASSERT_EQ(add_const->value(), 8);
+
+    auto* mul_value = dynamic_cast<Operation*>(mul_assign->value());
+    ASSERT_TRUE(mul_value != nullptr);
+    ASSERT_EQ(mul_value->type(), OperationType::mul);
+    ASSERT_TRUE(mul_value->operands()[0] == y);
+    auto* mul_const = dynamic_cast<Constant*>(mul_value->operands()[1]);
+    ASSERT_TRUE(mul_const != nullptr);
+    ASSERT_EQ(mul_const->value(), 32);
+
+    std::cout << "[+] test_expression_simplification_collapse_nested_constants passed.\n";
+}
+
+void test_dead_component_pruner_stage() {
+    DecompilerTask task(0x7800);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(75);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* a = task.arena().create<Variable>("a", 4);
+    auto* b = task.arena().create<Variable>("b", 4);
+    auto* t1 = task.arena().create<Variable>("t1", 4);
+    auto* t2 = task.arena().create<Variable>("t2", 4);
+    auto* dead1 = task.arena().create<Variable>("dead1", 4);
+    auto* dead2 = task.arena().create<Variable>("dead2", 4);
+    auto* out = task.arena().create<Variable>("out", 4);
+
+    auto* i1 = task.arena().create<Assignment>(
+        t1,
+        task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{a, task.arena().create<Constant>(1, 4)},
+            4));
+    auto* i2 = task.arena().create<Assignment>(
+        t2,
+        task.arena().create<Operation>(
+            OperationType::mul,
+            std::vector<Expression*>{t1, task.arena().create<Constant>(2, 4)},
+            4));
+
+    auto* d1 = task.arena().create<Assignment>(
+        dead1,
+        task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{b, task.arena().create<Constant>(3, 4)},
+            4));
+    auto* d2 = task.arena().create<Assignment>(
+        dead2,
+        task.arena().create<Operation>(
+            OperationType::mul,
+            std::vector<Expression*>{dead1, task.arena().create<Constant>(4, 4)},
+            4));
+    (void)d2;
+
+    auto* i3 = task.arena().create<Assignment>(
+        out,
+        task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{t2, task.arena().create<Constant>(5, 4)},
+            4));
+    auto* ret = task.arena().create<Return>(std::vector<Expression*>{out});
+
+    bb->add_instruction(i1);
+    bb->add_instruction(i2);
+    bb->add_instruction(d1);
+    bb->add_instruction(d2);
+    bb->add_instruction(i3);
+    bb->add_instruction(ret);
+
+    DeadComponentPrunerStage stage;
+    stage.execute(task);
+
+    const auto& insts = bb->instructions();
+    ASSERT_EQ(insts.size(), 4);
+    ASSERT_TRUE(insts[0] == i1);
+    ASSERT_TRUE(insts[1] == i2);
+    ASSERT_TRUE(insts[2] == i3);
+    ASSERT_TRUE(insts[3] == ret);
+
+    std::cout << "[+] test_dead_component_pruner_stage passed.\n";
+}
+
+void test_redundant_casts_elimination_stage() {
+    DecompilerTask task(0x7900);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(76);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    x->set_ir_type(Integer::int32_t());
+    auto* out1 = task.arena().create<Variable>("cast_out_1", 4);
+    auto* out2 = task.arena().create<Variable>("cast_out_2", 1);
+
+    auto* same_cast = task.arena().create<Operation>(
+        OperationType::cast,
+        std::vector<Expression*>{x},
+        4);
+    same_cast->set_ir_type(Integer::int32_t());
+
+    auto* const_src = task.arena().create<Constant>(0x1234, 4);
+    const_src->set_ir_type(Integer::uint32_t());
+    auto* const_cast_expr = task.arena().create<Operation>(
+        OperationType::cast,
+        std::vector<Expression*>{const_src},
+        1);
+    const_cast_expr->set_ir_type(Integer::uint8_t());
+
+    auto* a1 = task.arena().create<Assignment>(out1, same_cast);
+    auto* a2 = task.arena().create<Assignment>(out2, const_cast_expr);
+    bb->add_instruction(a1);
+    bb->add_instruction(a2);
+
+    RedundantCastsEliminationStage stage;
+    stage.execute(task);
+
+    ASSERT_TRUE(a1->value() == x);
+    auto* folded = dynamic_cast<Constant*>(a2->value());
+    ASSERT_TRUE(folded != nullptr);
+    ASSERT_EQ(folded->value(), 0x34);
+    ASSERT_EQ(folded->size_bytes, 1);
+
+    std::cout << "[+] test_redundant_casts_elimination_stage passed.\n";
+}
+
+void test_coherence_stage() {
+    DecompilerTask task(0x7a00);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(77);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x_typed = task.arena().create<Variable>("x", 4);
+    x_typed->set_ir_type(Integer::int32_t());
+
+    auto* x_mismatch = task.arena().create<Variable>("x", 4);
+    x_mismatch->set_ir_type(Integer::uint32_t());
+
+    auto* x_untyped = task.arena().create<Variable>("x", 4);
+
+    auto* out1 = task.arena().create<Variable>("coh1", 4);
+    auto* out2 = task.arena().create<Variable>("coh2", 4);
+    auto* out3 = task.arena().create<Variable>("coh3", 4);
+
+    bb->add_instruction(task.arena().create<Assignment>(out1, x_typed));
+    bb->add_instruction(task.arena().create<Assignment>(
+        out2,
+        task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{x_mismatch, task.arena().create<Constant>(1, 4)},
+            4)));
+    bb->add_instruction(task.arena().create<Assignment>(
+        out3,
+        task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{x_untyped, task.arena().create<Constant>(2, 4)},
+            4)));
+
+    CoherenceStage stage;
+    stage.execute(task);
+
+    ASSERT_TRUE(x_mismatch->ir_type() != nullptr);
+    ASSERT_TRUE(x_untyped->ir_type() != nullptr);
+    ASSERT_TRUE(*(x_mismatch->ir_type()) == *(Integer::int32_t()));
+    ASSERT_TRUE(*(x_untyped->ir_type()) == *(Integer::int32_t()));
+
+    std::cout << "[+] test_coherence_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
+    test_codegen_switch_case();
+    test_codegen_loop_variants();
+    test_codegen_operator_precedence();
+    test_condition_handler();
+    test_cbr_complementary_conditions();
+    test_cbr_cnf_subexpression_grouping();
+    test_car_initial_switch_constructor();
+    test_car_switch_extractor_and_missing_case_sequence();
+    test_car_missing_case_finder_condition();
+    test_sibling_reachability();
+    test_case_dependency_graph_ordering();
     test_phi_dependency();
     std::cout << "Running DeWolf tests...\n";
     test_arena();
     test_dominators();
     test_ssa_phi_insertion();
+    test_phi_lifting_edge_splitting();
     test_instruction_hierarchy();
     test_minimal_variable_renamer();
     test_conditional_variable_renamer();
@@ -1571,9 +2506,15 @@ int main() {
     test_expression_simplification_collapse_constants();
     test_expression_simplification_trivial_arithmetic();
     test_expression_simplification_trivial_bit_arithmetic();
+    test_expression_simplification_sub_to_add();
+    test_expression_simplification_collapse_nested_constants();
+    test_dead_component_pruner_stage();
+    test_redundant_casts_elimination_stage();
+    test_coherence_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
+    test_logic_operation_simplifier();
     std::cout << "All tests passed successfully.\n";
     return 0;
 }

@@ -4,6 +4,129 @@
 
 namespace dewolf {
 
+namespace {
+
+int precedence_for_operation(OperationType type) {
+    switch (type) {
+        case OperationType::call:
+        case OperationType::member_access:
+        case OperationType::field:
+            return 150;
+
+        case OperationType::negate:
+        case OperationType::bit_not:
+        case OperationType::logical_not:
+        case OperationType::deref:
+        case OperationType::address_of:
+        case OperationType::cast:
+        case OperationType::pointer:
+        case OperationType::low:
+            return 140;
+
+        case OperationType::power:
+            return 135;
+
+        case OperationType::mul:
+        case OperationType::mul_us:
+        case OperationType::mul_float:
+        case OperationType::div:
+        case OperationType::div_us:
+        case OperationType::div_float:
+        case OperationType::mod:
+        case OperationType::mod_us:
+            return 130;
+
+        case OperationType::add:
+        case OperationType::add_with_carry:
+        case OperationType::add_float:
+        case OperationType::sub:
+        case OperationType::sub_with_carry:
+        case OperationType::sub_float:
+        case OperationType::adc:
+            return 120;
+
+        case OperationType::shl:
+        case OperationType::shr:
+        case OperationType::shr_us:
+        case OperationType::sar:
+        case OperationType::left_rotate:
+        case OperationType::right_rotate:
+        case OperationType::left_rotate_carry:
+        case OperationType::right_rotate_carry:
+            return 110;
+
+        case OperationType::eq:
+        case OperationType::neq:
+        case OperationType::lt:
+        case OperationType::le:
+        case OperationType::gt:
+        case OperationType::ge:
+        case OperationType::lt_us:
+        case OperationType::le_us:
+        case OperationType::gt_us:
+        case OperationType::ge_us:
+            return 100;
+
+        case OperationType::bit_and:
+            return 90;
+        case OperationType::bit_xor:
+            return 80;
+        case OperationType::bit_or:
+            return 70;
+        case OperationType::logical_and:
+            return 60;
+        case OperationType::logical_or:
+            return 50;
+        case OperationType::ternary:
+            return 40;
+        default:
+            return 30;
+    }
+}
+
+int precedence_for_expression(Expression* expr) {
+    if (auto* cond = dynamic_cast<Condition*>(expr)) {
+        return precedence_for_operation(cond->type());
+    }
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        return precedence_for_operation(op->type());
+    }
+    return 1000; // constants/variables bind strongest for printing
+}
+
+bool needs_parentheses_for_equal_precedence_rhs(OperationType parent_type) {
+    switch (parent_type) {
+        case OperationType::sub:
+        case OperationType::sub_with_carry:
+        case OperationType::sub_float:
+        case OperationType::div:
+        case OperationType::div_us:
+        case OperationType::div_float:
+        case OperationType::mod:
+        case OperationType::mod_us:
+        case OperationType::shl:
+        case OperationType::shr:
+        case OperationType::shr_us:
+        case OperationType::sar:
+        case OperationType::power:
+        case OperationType::eq:
+        case OperationType::neq:
+        case OperationType::lt:
+        case OperationType::le:
+        case OperationType::gt:
+        case OperationType::ge:
+        case OperationType::lt_us:
+        case OperationType::le_us:
+        case OperationType::gt_us:
+        case OperationType::ge_us:
+            return true;
+        default:
+            return false;
+    }
+}
+
+} // namespace
+
 std::string CExpressionGenerator::generate(DataflowObject* obj) {
     result_.clear();
     if (obj) {
@@ -79,7 +202,20 @@ void CExpressionGenerator::visit(Operation* o) {
             default: break;
         }
         if (infix) {
-            result_ = generate(ops[0]) + infix + generate(ops[1]);
+            const int parent_prec = precedence_for_operation(type);
+            auto render_operand = [&](Expression* operand, bool is_rhs) {
+                std::string rendered = generate(operand);
+                const int child_prec = precedence_for_expression(operand);
+                const bool needs_brackets =
+                    (child_prec < parent_prec) ||
+                    (is_rhs && child_prec == parent_prec && needs_parentheses_for_equal_precedence_rhs(type));
+                if (needs_brackets) {
+                    return "(" + rendered + ")";
+                }
+                return rendered;
+            };
+
+            result_ = render_operand(ops[0], false) + infix + render_operand(ops[1], true);
             return;
         }
     }
@@ -387,6 +523,48 @@ void CodeVisitor::visit_node(AstNode* node) {
         current_line_ += "}";
         lines_.push_back(current_line_);
         current_line_.clear();
+    } else if (auto* snode = dynamic_cast<SwitchNode*>(node)) {
+        indent();
+        std::string cond_str = "/* switch_expr */";
+        if (snode->cond()) {
+            if (auto* expr_ast = dynamic_cast<ExprAstNode*>(snode->cond())) {
+                cond_str = expr_gen_.generate(expr_ast->expr());
+            }
+        }
+
+        current_line_ += "switch (" + cond_str + ") {";
+        lines_.push_back(current_line_);
+        current_line_.clear();
+
+        indent_level_++;
+        for (CaseNode* cnode : snode->cases()) {
+            visit_node(cnode);
+        }
+        indent_level_--;
+
+        indent();
+        current_line_ += "}";
+        lines_.push_back(current_line_);
+        current_line_.clear();
+    } else if (auto* cnode = dynamic_cast<CaseNode*>(node)) {
+        indent();
+        if (cnode->is_default()) {
+            current_line_ += "default:";
+        } else {
+            current_line_ += "case " + std::to_string(cnode->value()) + ":";
+        }
+        lines_.push_back(current_line_);
+        current_line_.clear();
+
+        indent_level_++;
+        visit_node(cnode->body());
+        if (cnode->break_case()) {
+            indent();
+            current_line_ += "break;";
+            lines_.push_back(current_line_);
+            current_line_.clear();
+        }
+        indent_level_--;
     } else if (auto* dowhile = dynamic_cast<DoWhileLoopNode*>(node)) {
         indent();
         current_line_ += "do {";
