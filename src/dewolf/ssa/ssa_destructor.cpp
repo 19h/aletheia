@@ -1,4 +1,5 @@
 #include "ssa_destructor.hpp"
+#include "phi_dependency_resolver.hpp"
 #include "liveness/liveness.hpp"
 #include "../pipeline/pipeline.hpp"
 #include <vector>
@@ -7,6 +8,7 @@ namespace dewolf {
 
 void SsaDestructor::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
+    PhiDependencyResolver::resolve(task.arena(), *task.cfg());
     LivenessAnalysis liveness(*task.cfg());
     eliminate_phi_nodes(task.arena(), *task.cfg(), liveness);
 }

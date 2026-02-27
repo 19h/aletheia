@@ -302,31 +302,32 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.11.4 Update `ReachingConditions::compute()`
     - *Added `TransitionEdge` class storing source, sink, `LogicCondition` tag, and `EdgeProperty`. Replaced `TransitionBlock` predecessor/successor vectors with edge pointers. Updated `ReachingConditions` to read tags directly. Added shared `z3::context` to `DecompilerTask`.* to read edge tags directly from `TransitionEdge` instead of re-deriving from original basic block instructions.
 
-- [ ] **H.12** Implement Function Signature Generation in Code Output (currently absent -- no return type, function name, or parameters in output)
+- [x] **H.12** Implement Function Signature Generation in Code Output (currently absent -- no return type, function name, or parameters in output)
   - *The Python reference's `CodeGenerator` uses `string.Template` to emit: `$return_type $name($parameters) { $local_declarations $function_body }`. Without function signatures, the output is a bare block of statements with no function header -- not valid C code.*
-  - [ ] H.12.1 Extract function name from IDA via `ida::function` APIs.
-  - [ ] H.12.2 Extract return type and parameter types (requires Type system, C.2).
-  - [ ] H.12.3 Emit the function signature as the first line of the viewer output.
+  - [x] H.12.1 Extract function name from IDA via `ida::function` APIs.
+  - [x] H.12.2 Extract return type and parameter types (requires Type system, C.2).
+  - [x] H.12.3 Emit the function signature as the first line of the viewer output.
 
-- [ ] **H.13** Implement Local Variable Declarations in Code Output (currently absent -- variables are used without declaration)
+- [x] **H.13** Implement Local Variable Declarations in Code Output (currently absent -- variables are used without declaration)
   - *The Python reference's `LocalDeclarationGenerator` walks the AST collecting all variables, filters out parameters and globals, groups by type, and emits C declarations (`int var_0, var_1;`). Without this, the output uses undeclared variables.*
-  - [ ] H.13.1 Implement AST walker that collects all `Variable` references.
-  - [ ] H.13.2 Group by type, sort alphabetically, emit declarations.
+  - [x] H.13.1 Implement AST walker that collects all `Variable` references.
+  - [x] H.13.2 Group by type, sort alphabetically, emit declarations.
 
-- [ ] **H.14** Implement `PhiFunctionCleaner` (removes trivial phis where all operands are identical)
+- [x] **H.14** Implement `PhiFunctionCleaner` (removes trivial phis where all operands are identical)
   - *The Python reference removes phis like `a = phi(b, b)` by replacing with `a = b` and removing the phi. It also handles chains: if removing one phi makes another trivial, it continues. Without this, redundant copy instructions are generated for trivial phis.*
-  - [ ] H.14.1 For each phi, check if all RHS operands (ignoring self-references) are the same value. If so, replace with a simple assignment and remove the phi.
+  - [x] H.14.1 For each phi, check if all RHS operands (ignoring self-references) are the same value. If so, replace with a simple assignment and remove the phi.
 
-- [ ] **H.15** Implement `PhiDependencyResolver` (breaks circular phi dependencies before lifting)
+- [x] **H.15** Implement `PhiDependencyResolver` (breaks circular phi dependencies before lifting)
+  - *Implemented `PhiDependencyResolver::resolve` in `phi_dependency_resolver.cpp`. It computes a topological sort of Phi nodes based on their requirements (DFS post-order), identifies back-edges to compute a directed feedback vertex set (FVS), and breaks cycles by renaming the definition of the FVS node to a `copy_var` while inserting a copy assignment. Integrated into `SsaDestructor::execute` right before `eliminate_phi_nodes`. Added `test_phi_dependency` to `test_main.cpp`.*
   - *The Python reference builds a `PhiDependencyGraph` (directed edges from phi to phi it depends on), computes a directed feedback vertex set, and for each phi in the FVS, introduces a copy variable to break the cycle. Without this, circular phi dependencies (e.g., `a = phi(b, ...)` and `b = phi(a, ...)`) may produce incorrect copy insertion during out-of-SSA.*
-  - [ ] H.15.1 Build dependency graph among phis within each block.
-  - [ ] H.15.2 Compute directed FVS (approximate: DFS + back-edge detection).
-  - [ ] H.15.3 For each FVS member, create a copy variable, rename the phi definition, insert a copy assignment after phis.
+  - [x] H.15.1 Build dependency graph among phis within each block.
+  - [x] H.15.2 Compute directed FVS (approximate: DFS + back-edge detection).
+  - [x] H.15.3 For each FVS member, create a copy variable, rename the phi definition, insert a copy assignment after phis.
 
-- [ ] **H.16** Fix `std::string` Memory Leak in Arena-Allocated `Variable` Nodes
+- [x] **H.16** Fix `std::string` Memory Leak in Arena-Allocated `Variable` Nodes
   - *`Variable::name_` is `std::string`, which may heap-allocate for long names (beyond SSO). Since `ArenaAllocated` objects never have their destructors called (arena memory is freed in bulk), the string's internal heap buffer leaks. For short register names this is mitigated by SSO, but for longer generated names (e.g., `"copy_eax_phi_3"`, `"entry_0x401000"`) this is a real leak.*
-  - [ ] H.16.1 Option A: Store names as `std::string_view` into a separate arena-allocated string pool (interning). The pool owns the memory; variable nodes just reference it.
-  - [ ] H.16.2 Option B: Call destructors explicitly for `Variable` nodes before arena reset (add a destructor registry to `DecompilerArena`).
+  - [x] H.16.1 Option A: Store names as `std::string_view` into a separate arena-allocated string pool (interning). The pool owns the memory; variable nodes just reference it.
+  - [x] H.16.2 Option B: Call destructors explicitly for `Variable` nodes before arena reset (add a destructor registry to `DecompilerArena`).
 
 - [ ] **H.17** Implement the Idiom Pattern Matching Engine for Real (currently `match_magic_division()` is an empty stub)
   - *The Python reference has 5 active matchers (signed division, unsigned division, signed modulo, unsigned modulo, signed multiplication), hundreds of JSON/YAML pattern files across optimization levels, register-agnostic operand anonymization, magic number precomputation tables (signed 32-bit, unsigned 32-bit, 64-bit), complex backtracking for magic constant resolution, and a `Match` output with address, length, operation, operand, constant. Without the idiom engine, compiler-optimized divisions/modulos appear as obfuscated `imul`/`shr`/`sar`/`sub` sequences.*

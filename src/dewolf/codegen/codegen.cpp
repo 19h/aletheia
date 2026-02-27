@@ -1,4 +1,5 @@
 #include "codegen.hpp"
+#include "local_declarations.hpp"
 #include <ida/lines.hpp>
 
 namespace dewolf {
@@ -292,6 +293,17 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
 
     lines_.push_back(sig);
     indent_level_++;
+
+    auto decls = LocalDeclarationGenerator::generate(task, expr_gen_);
+    for (const auto& decl : decls) {
+        indent();
+        lines_.push_back(current_line_ + decl);
+        current_line_.clear();
+    }
+    
+    if (!decls.empty()) {
+        lines_.push_back(""); // empty line after declarations
+    }
 
     if (task.ast() && task.ast()->root()) {
         visit_node(task.ast()->root());

@@ -3,13 +3,14 @@
 #include <cstddef>
 #include <vector>
 #include <memory>
+#include <type_traits>
 
 namespace dewolf {
 
 class DecompilerArena {
 public:
     DecompilerArena(std::size_t block_size = 64 * 1024);
-    ~DecompilerArena() = default;
+    ~DecompilerArena() { reset(); }
 
     // Delete copy and move semantics
     DecompilerArena(const DecompilerArena&) = delete;
@@ -22,12 +23,22 @@ public:
     template <typename T, typename... Args>
     T* create(Args&&... args) {
         void* ptr = allocate(sizeof(T), alignof(T));
-        return new (ptr) T(std::forward<Args>(args)...);
+        T* obj = new (ptr) T(std::forward<Args>(args)...);
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            destructors_.push_back({[](void* p) { static_cast<T*>(p)->~T(); }, obj});
+        }
+        return obj;
     }
 
     void reset();
 
 private:
+    struct DtorNode {
+        void (*dtor)(void*);
+        void* obj;
+    };
+    std::vector<DtorNode> destructors_;
+
     struct Block {
         std::vector<uint8_t> data;
         std::size_t used = 0;

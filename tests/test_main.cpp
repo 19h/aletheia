@@ -556,7 +556,68 @@ void test_range_simplifier() {
     std::cout << "[+] test_range_simplifier passed.\n";
 }
 
+
+#include "../src/dewolf/ssa/phi_dependency_resolver.hpp"
+
+void test_phi_dependency() {
+    dewolf::DecompilerArena arena;
+    dewolf::ControlFlowGraph cfg;
+    
+    auto* bb = arena.create<dewolf::BasicBlock>(0x1000);
+    cfg.add_block(bb);
+    
+    auto* var_a = arena.create<dewolf::Variable>("a", 4); var_a->set_ssa_version(1);
+    auto* var_b = arena.create<dewolf::Variable>("b", 4); var_b->set_ssa_version(1);
+    
+    auto* var_a0 = arena.create<dewolf::Variable>("a", 4); var_a0->set_ssa_version(0);
+    auto* var_b0 = arena.create<dewolf::Variable>("b", 4); var_b0->set_ssa_version(0);
+
+    // Phi1: a_1 = phi(a_0, b_1)
+    auto* phi1_ops = arena.create<dewolf::ListOperation>(std::vector<dewolf::Expression*>{var_a0, var_b});
+    auto* phi1 = arena.create<dewolf::Phi>(var_a, phi1_ops);
+
+    // Phi2: b_1 = phi(b_0, a_1)
+    auto* phi2_ops = arena.create<dewolf::ListOperation>(std::vector<dewolf::Expression*>{var_b0, var_a});
+    auto* phi2 = arena.create<dewolf::Phi>(var_b, phi2_ops);
+    
+    // Add in reverse topological order or arbitrary order
+    bb->add_instruction(phi1);
+    bb->add_instruction(phi2);
+    
+    dewolf::PhiDependencyResolver::resolve(arena, cfg);
+    
+    auto insts = bb->instructions();
+    // We expect the cycle to be broken. One of the Phis should have its definition renamed.
+    // And an assignment should be added.
+    bool found_copy = false;
+    bool found_renamed_phi = false;
+    for (auto* inst : insts) {
+        if (auto* assign = dynamic_cast<dewolf::Assignment*>(inst)) {
+            if (!dynamic_cast<dewolf::Phi*>(inst)) {
+                if (auto* dest = dynamic_cast<dewolf::Variable*>(assign->destination())) {
+                    if (dest->name() == "a" || dest->name() == "b") {
+                        found_copy = true;
+                    }
+                }
+            }
+        }
+        if (auto* phi = dynamic_cast<dewolf::Phi*>(inst)) {
+            if (phi->dest_var()->name().find("copy_") != std::string::npos) {
+                found_renamed_phi = true;
+            }
+        }
+    }
+    
+    if (!found_copy || !found_renamed_phi) {
+        std::cerr << "test_phi_dependency FAILED: missing copy or renamed phi.\n";
+        exit(1);
+    }
+    
+    std::cout << "[+] test_phi_dependency passed.\n";
+}
+
 int main() {
+    test_phi_dependency();
     std::cout << "Running DeWolf tests...\n";
     test_arena();
     test_dominators();
