@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -290,6 +292,299 @@ void rewrite_register_pairs_in_instruction(DecompilerTask& task, Instruction* in
     }
 }
 
+struct VarKey {
+    std::string name;
+    std::size_t version{};
+
+    bool operator==(const VarKey& other) const {
+        return name == other.name && version == other.version;
+    }
+};
+
+struct VarKeyHash {
+    std::size_t operator()(const VarKey& key) const {
+        std::size_t h1 = std::hash<std::string>{}(key.name);
+        std::size_t h2 = std::hash<std::size_t>{}(key.version);
+        return h1 ^ (h2 << 1);
+    }
+};
+
+VarKey var_key(const Variable* var) {
+    return VarKey{var->name(), var->ssa_version()};
+}
+
+using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
+using UseMap = std::unordered_map<VarKey, std::vector<Instruction*>, VarKeyHash>;
+
+Variable* as_variable_ignoring_cast(Expression* expr) {
+    Expression* current = strip_cast(expr);
+    return dynamic_cast<Variable*>(current);
+}
+
+std::string expression_fingerprint(Expression* expr) {
+    if (expr == nullptr) {
+        return "null";
+    }
+    if (auto* c = dynamic_cast<Constant*>(expr)) {
+        return "c:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
+    }
+    if (auto* v = dynamic_cast<Variable*>(expr)) {
+        return "v:" + v->name() + "#" + std::to_string(v->ssa_version());
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        std::string out = "l(";
+        bool first = true;
+        for (Expression* item : list->operands()) {
+            if (!first) {
+                out += ",";
+            }
+            first = false;
+            out += expression_fingerprint(item);
+        }
+        out += ")";
+        return out;
+    }
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        std::string out = "o:" + std::to_string(static_cast<int>(op->type())) + "(";
+        bool first = true;
+        for (Expression* item : op->operands()) {
+            if (!first) {
+                out += ",";
+            }
+            first = false;
+            out += expression_fingerprint(item);
+        }
+        out += ")";
+        return out;
+    }
+    return "expr";
+}
+
+void collect_deref_fingerprints(Expression* expr, std::unordered_set<std::string>& out) {
+    if (expr == nullptr) {
+        return;
+    }
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        if (op->type() == OperationType::deref) {
+            out.insert(expression_fingerprint(expr));
+        }
+        for (Expression* item : op->operands()) {
+            collect_deref_fingerprints(item, out);
+        }
+        return;
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* item : list->operands()) {
+            collect_deref_fingerprints(item, out);
+        }
+    }
+}
+
+void collect_variables(Expression* expr,
+                       std::vector<Variable*>& out,
+                       std::unordered_set<VarKey, VarKeyHash>& seen) {
+    if (expr == nullptr) {
+        return;
+    }
+    if (auto* var = dynamic_cast<Variable*>(expr)) {
+        VarKey key = var_key(var);
+        if (seen.insert(key).second) {
+            out.push_back(var);
+        }
+        return;
+    }
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        for (Expression* item : op->operands()) {
+            collect_variables(item, out, seen);
+        }
+        return;
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* item : list->operands()) {
+            collect_variables(item, out, seen);
+        }
+    }
+}
+
+Variable* first_variable(Expression* expr) {
+    std::vector<Variable*> vars;
+    std::unordered_set<VarKey, VarKeyHash> seen;
+    collect_variables(expr, vars, seen);
+    if (!vars.empty()) {
+        return vars.front();
+    }
+    return nullptr;
+}
+
+void build_def_use_maps(ControlFlowGraph* cfg,
+                        DefMap& def_map,
+                        UseMap& use_map,
+                        std::unordered_set<std::string>& branch_dereferences) {
+    for (BasicBlock* block : cfg->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                if (auto* dst = dynamic_cast<Variable*>(assign->destination())) {
+                    def_map[var_key(dst)] = assign;
+                }
+            }
+
+            for (Variable* req : inst->requirements()) {
+                use_map[var_key(req)].push_back(inst);
+            }
+
+            if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                collect_deref_fingerprints(branch->condition(), branch_dereferences);
+            }
+        }
+    }
+}
+
+bool instruction_requires_single_var(Instruction* inst, const VarKey& key) {
+    auto req = inst->requirements();
+    if (req.size() != 1 || req[0] == nullptr) {
+        return false;
+    }
+    return var_key(req[0]) == key;
+}
+
+bool is_copy_assigned(const Variable* value, const DefMap& def_map) {
+    auto it = def_map.find(var_key(value));
+    if (it == def_map.end() || it->second == nullptr) {
+        return false;
+    }
+    return as_variable_ignoring_cast(it->second->value()) != nullptr;
+}
+
+bool is_used_in_condition_assignment(const Variable* value, const UseMap& use_map) {
+    auto it = use_map.find(var_key(value));
+    if (it == use_map.end()) {
+        return false;
+    }
+    for (Instruction* use : it->second) {
+        auto* assign = dynamic_cast<Assignment*>(use);
+        if (assign == nullptr) {
+            continue;
+        }
+        if (dynamic_cast<Condition*>(assign->value()) == nullptr) {
+            continue;
+        }
+        if (instruction_requires_single_var(assign, var_key(value))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_used_in_branch(const Variable* value, const UseMap& use_map) {
+    auto it = use_map.find(var_key(value));
+    if (it == use_map.end()) {
+        return false;
+    }
+    for (Instruction* use : it->second) {
+        auto* branch = dynamic_cast<Branch*>(use);
+        if (branch == nullptr) {
+            continue;
+        }
+        if (instruction_requires_single_var(branch, var_key(value))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_predecessor_dereferenced_in_branch(const Variable* value,
+                                           const DefMap& def_map,
+                                           const std::unordered_set<std::string>& branch_dereferences) {
+    auto it = def_map.find(var_key(value));
+    if (it == def_map.end() || it->second == nullptr) {
+        return false;
+    }
+
+    Expression* rhs = it->second->value();
+    if (rhs == nullptr) {
+        return false;
+    }
+
+    if (branch_dereferences.contains(expression_fingerprint(rhs))) {
+        return true;
+    }
+
+    std::unordered_set<std::string> def_dereferences;
+    collect_deref_fingerprints(rhs, def_dereferences);
+    for (const std::string& fp : def_dereferences) {
+        if (branch_dereferences.contains(fp)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_bounds_checked(const Variable* value,
+                       const DefMap& def_map,
+                       const UseMap& use_map,
+                       const std::unordered_set<std::string>& branch_dereferences) {
+    return is_copy_assigned(value, def_map)
+        || is_used_in_condition_assignment(value, use_map)
+        || is_used_in_branch(value, use_map)
+        || is_predecessor_dereferenced_in_branch(value, def_map, branch_dereferences);
+}
+
+Variable* find_switch_candidate(Variable* start,
+                                const DefMap& def_map,
+                                const UseMap& use_map,
+                                const std::unordered_set<std::string>& branch_dereferences) {
+    if (start == nullptr) {
+        return nullptr;
+    }
+
+    std::deque<Variable*> todo;
+    std::unordered_set<VarKey, VarKeyHash> visited;
+    todo.push_back(start);
+
+    while (!todo.empty()) {
+        Variable* current = todo.front();
+        todo.pop_front();
+        if (current == nullptr) {
+            continue;
+        }
+
+        VarKey key = var_key(current);
+        if (!visited.insert(key).second) {
+            continue;
+        }
+
+        if (is_bounds_checked(current, def_map, use_map, branch_dereferences)) {
+            return current;
+        }
+
+        auto it = def_map.find(key);
+        if (it == def_map.end() || it->second == nullptr || it->second->value() == nullptr) {
+            continue;
+        }
+
+        std::vector<Variable*> predecessors;
+        std::unordered_set<VarKey, VarKeyHash> seen;
+        collect_variables(it->second->value(), predecessors, seen);
+        for (Variable* pred : predecessors) {
+            if (pred != nullptr && !visited.contains(var_key(pred))) {
+                todo.push_back(pred);
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+bool is_switch_block(BasicBlock* block) {
+    bool has_indirect = !block->instructions().empty()
+        && dynamic_cast<IndirectBranch*>(block->instructions().back()) != nullptr;
+    bool has_switch_edge = std::any_of(
+        block->successors().begin(),
+        block->successors().end(),
+        [](Edge* e) { return e != nullptr && e->type() == EdgeType::Switch; });
+    return has_switch_edge || (has_indirect && block->successors().size() > 1);
+}
+
 } // namespace
 
 void CompilerIdiomHandlingStage::execute(DecompilerTask& task) {
@@ -404,7 +699,43 @@ void RegisterPairHandlingStage::execute(DecompilerTask& task) {
 }
 
 void SwitchVariableDetectionStage::execute(DecompilerTask& task) {
-    // Detect switch statements based on indirect jumps and known patterns
+    if (!task.cfg()) {
+        return;
+    }
+
+    DefMap def_map;
+    UseMap use_map;
+    std::unordered_set<std::string> branch_dereferences;
+    build_def_use_maps(task.cfg(), def_map, use_map, branch_dereferences);
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!is_switch_block(block) || block->instructions().empty()) {
+            continue;
+        }
+
+        auto* switch_inst = dynamic_cast<IndirectBranch*>(block->instructions().back());
+        if (switch_inst == nullptr) {
+            continue;
+        }
+
+        Expression* switch_expr = switch_inst->expression();
+        Variable* traced = as_variable_ignoring_cast(switch_expr);
+        if (traced == nullptr) {
+            traced = first_variable(switch_expr);
+        }
+        if (traced == nullptr) {
+            continue;
+        }
+
+        Variable* candidate = find_switch_candidate(traced, def_map, use_map, branch_dereferences);
+        if (candidate == nullptr) {
+            continue;
+        }
+
+        if (switch_expr != candidate) {
+            switch_inst->substitute(switch_expr, candidate);
+        }
+    }
 }
 
 void RemoveGoPrologueStage::execute(DecompilerTask& task) {

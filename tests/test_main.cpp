@@ -774,6 +774,68 @@ void test_register_pair_handling_stage() {
     std::cout << "[+] test_register_pair_handling_stage passed.\n";
 }
 
+void test_switch_variable_detection_stage() {
+    DecompilerTask task(0x3000);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* switch_block = task.arena().create<BasicBlock>(3);
+    auto* case_a = task.arena().create<BasicBlock>(4);
+    auto* case_b = task.arena().create<BasicBlock>(5);
+    cfg->set_entry_block(switch_block);
+    cfg->add_block(switch_block);
+    cfg->add_block(case_a);
+    cfg->add_block(case_b);
+    task.set_cfg(std::move(cfg));
+
+    auto* arg = task.arena().create<Variable>("arg0", 4);
+    auto* idx = task.arena().create<Variable>("idx", 4);
+    auto* scaled = task.arena().create<Variable>("scaled", 8);
+    auto* jtab_addr = task.arena().create<Variable>("jtab_addr", 8);
+    auto* jump_target = task.arena().create<Variable>("jump_target", 8);
+
+    auto* copy_idx = task.arena().create<Assignment>(idx, arg);
+    copy_idx->set_address(0x3000);
+
+    auto* sh_const = task.arena().create<Constant>(2, 4);
+    auto* sh_expr = task.arena().create<Operation>(OperationType::shl, std::vector<Expression*>{idx, sh_const}, 8);
+    auto* def_scaled = task.arena().create<Assignment>(scaled, sh_expr);
+    def_scaled->set_address(0x3002);
+
+    auto* base = task.arena().create<Constant>(0x1000, 8);
+    auto* addr_expr = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{scaled, base}, 8);
+    auto* def_addr = task.arena().create<Assignment>(jtab_addr, addr_expr);
+    def_addr->set_address(0x3004);
+
+    auto* deref = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{jtab_addr}, 8);
+    auto* def_target = task.arena().create<Assignment>(jump_target, deref);
+    def_target->set_address(0x3006);
+
+    auto* ib = task.arena().create<IndirectBranch>(jump_target);
+    ib->set_address(0x3008);
+
+    switch_block->add_instruction(copy_idx);
+    switch_block->add_instruction(def_scaled);
+    switch_block->add_instruction(def_addr);
+    switch_block->add_instruction(def_target);
+    switch_block->add_instruction(ib);
+
+    auto* edge_a = task.arena().create<Edge>(switch_block, case_a, EdgeType::Switch);
+    auto* edge_b = task.arena().create<Edge>(switch_block, case_b, EdgeType::Switch);
+    switch_block->add_successor(edge_a);
+    switch_block->add_successor(edge_b);
+    case_a->add_predecessor(edge_a);
+    case_b->add_predecessor(edge_b);
+
+    SwitchVariableDetectionStage stage;
+    stage.execute(task);
+
+    auto* new_expr = dynamic_cast<Variable*>(ib->expression());
+    ASSERT_TRUE(new_expr != nullptr);
+    ASSERT_EQ(new_expr->name(), "idx");
+
+    std::cout << "[+] test_switch_variable_detection_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -784,6 +846,7 @@ int main() {
     test_instruction_hierarchy();
     test_compiler_idiom_handling_stage();
     test_register_pair_handling_stage();
+    test_switch_variable_detection_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
