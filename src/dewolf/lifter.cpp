@@ -3,9 +3,11 @@
 #include <ida/function.hpp>
 #include <ida/type.hpp>
 #include <ida/segment.hpp>
+#include <ida/xref.hpp>
 #include <algorithm>
 #include <cctype>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include "pipeline/pipeline.hpp"
@@ -59,6 +61,104 @@ std::string global_name_from_operand(const ida::instruction::Operand& op, ida::A
         }
     }
     return hex_address_name(op.value());
+}
+
+std::string to_lower_ascii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
+bool is_conditional_branch_mnemonic(std::string_view mnemonic) {
+    static constexpr std::string_view kX86Jcc[] = {
+        "je", "jz", "jne", "jnz", "jg", "jnle", "jge", "jnl", "jl", "jnge", "jle", "jng",
+        "ja", "jnbe", "jae", "jnb", "jb", "jnae", "jbe", "jna", "js", "jns", "jo", "jno",
+        "jp", "jpe", "jnp", "jpo"
+    };
+    for (auto m : kX86Jcc) {
+        if (mnemonic == m) {
+            return true;
+        }
+    }
+
+    if (mnemonic == "cbz" || mnemonic == "cbnz" || mnemonic == "tbz" || mnemonic == "tbnz") {
+        return true;
+    }
+    if (mnemonic.size() > 2 && mnemonic[0] == 'b' && mnemonic[1] == '.') {
+        return true;
+    }
+    return false;
+}
+
+std::optional<ida::Address> branch_target_from_instruction(const ida::instruction::Instruction& insn) {
+    const std::string mnemonic = to_lower_ascii(insn.mnemonic());
+    if (!is_conditional_branch_mnemonic(mnemonic)) {
+        return std::nullopt;
+    }
+
+    std::size_t target_operand_index = 0;
+    if (mnemonic == "cbz" || mnemonic == "cbnz") {
+        target_operand_index = 1;
+    } else if (mnemonic == "tbz" || mnemonic == "tbnz") {
+        target_operand_index = 2;
+    }
+
+    const auto& operands = insn.operands();
+    if (target_operand_index >= operands.size()) {
+        return std::nullopt;
+    }
+
+    const auto& op = operands[target_operand_index];
+    const bool has_target_value =
+        op.is_immediate() ||
+        op.is_memory() ||
+        op.type() == ida::instruction::OperandType::NearAddress ||
+        op.type() == ida::instruction::OperandType::FarAddress;
+    if (!has_target_value) {
+        return std::nullopt;
+    }
+
+    return static_cast<ida::Address>(op.value());
+}
+
+std::optional<ida::Address> infer_taken_target_from_xrefs(
+    ida::Address branch_address,
+    ida::Address succ0_start,
+    ida::Address succ1_start) {
+    auto refs_res = ida::xref::code_refs_from(branch_address);
+    if (!refs_res) {
+        return std::nullopt;
+    }
+
+    std::optional<ida::Address> jump_target;
+    std::optional<ida::Address> flow_target;
+
+    for (const auto& ref : *refs_res) {
+        if (ref.to != succ0_start && ref.to != succ1_start) {
+            continue;
+        }
+
+        if (ref.type == ida::xref::ReferenceType::JumpNear ||
+            ref.type == ida::xref::ReferenceType::JumpFar) {
+            jump_target = ref.to;
+        } else if (ref.type == ida::xref::ReferenceType::Flow) {
+            flow_target = ref.to;
+        }
+    }
+
+    if (jump_target.has_value()) {
+        return jump_target;
+    }
+    if (flow_target.has_value()) {
+        if (*flow_target == succ0_start) {
+            return succ1_start;
+        }
+        if (*flow_target == succ1_start) {
+            return succ0_start;
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -143,6 +243,8 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
                 std::make_move_iterator(block_tags.end()));
         }
 
+        ida::Address last_decoded_addr = ida::BadAddress;
+
         // Lift instructions
         for (ida::Address addr = ida_block.start; addr < ida_block.end; ) {
             auto insn_res = ida::instruction::decode(addr);
@@ -150,6 +252,8 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
                 addr += 1;
                 continue;
             }
+
+            last_decoded_addr = addr;
             
             Instruction* lifted_insn = lift_instruction(*insn_res);
             if (lifted_insn) {
@@ -195,16 +299,54 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
         } else if (ida_block.successors.size() == 2) {
             BasicBlock* target0 = block_map.contains(ida_block.successors[0]) ? block_map[ida_block.successors[0]] : nullptr;
             BasicBlock* target1 = block_map.contains(ida_block.successors[1]) ? block_map[ida_block.successors[1]] : nullptr;
-            
-            if (target0) {
-                Edge* e0 = arena_.create<Edge>(block, target0, EdgeType::True);
-                block->add_successor(e0);
-                target0->add_predecessor(e0);
+
+            BasicBlock* true_target = target0;
+            BasicBlock* false_target = target1;
+
+            if (target0 && target1) {
+                const auto succ0_id = ida_block.successors[0];
+                const auto succ1_id = ida_block.successors[1];
+
+                std::optional<ida::Address> succ0_start;
+                std::optional<ida::Address> succ1_start;
+                if (succ0_id >= 0 && static_cast<std::size_t>(succ0_id) < flowchart_res->size()) {
+                    succ0_start = (*flowchart_res)[succ0_id].start;
+                }
+                if (succ1_id >= 0 && static_cast<std::size_t>(succ1_id) < flowchart_res->size()) {
+                    succ1_start = (*flowchart_res)[succ1_id].start;
+                }
+
+                std::optional<ida::Address> taken_target;
+                if (last_decoded_addr != ida::BadAddress && succ0_start.has_value() && succ1_start.has_value()) {
+                    taken_target = infer_taken_target_from_xrefs(last_decoded_addr, *succ0_start, *succ1_start);
+                    if (!taken_target.has_value()) {
+                        auto last_insn = ida::instruction::decode(last_decoded_addr);
+                        if (last_insn) {
+                            taken_target = branch_target_from_instruction(*last_insn);
+                        }
+                    }
+
+                    if (taken_target.has_value()) {
+                        if (*taken_target == *succ1_start) {
+                            true_target = target1;
+                            false_target = target0;
+                        } else if (*taken_target == *succ0_start) {
+                            true_target = target0;
+                            false_target = target1;
+                        }
+                    }
+                }
             }
-            if (target1) {
-                Edge* e1 = arena_.create<Edge>(block, target1, EdgeType::False);
-                block->add_successor(e1);
-                target1->add_predecessor(e1);
+
+            if (true_target) {
+                Edge* e_true = arena_.create<Edge>(block, true_target, EdgeType::True);
+                block->add_successor(e_true);
+                true_target->add_predecessor(e_true);
+            }
+            if (false_target && false_target != true_target) {
+                Edge* e_false = arena_.create<Edge>(block, false_target, EdgeType::False);
+                block->add_successor(e_false);
+                false_target->add_predecessor(e_false);
             }
         } else {
             for (int succ_id : ida_block.successors) {
