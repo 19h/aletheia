@@ -1,6 +1,7 @@
 #include "preprocessing_stages.hpp"
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -118,6 +119,177 @@ Instruction* synthesize_idiom_instruction(DecompilerTask& task,
     return assign;
 }
 
+struct RegisterPairSpec {
+    const char* high;
+    const char* low;
+    const char* pair;
+    uint64_t shift_bits;
+    size_t pair_size_bytes;
+};
+
+constexpr std::array<RegisterPairSpec, 3> kRegisterPairs = {
+    RegisterPairSpec{"edx", "eax", "edx_eax_pair", 32, 8},
+    RegisterPairSpec{"dx", "ax", "dx_ax_pair", 16, 4},
+    RegisterPairSpec{"rdx", "rax", "rdx_rax_pair", 64, 16},
+};
+
+Expression* strip_cast(Expression* expr) {
+    while (auto* op = dynamic_cast<Operation*>(expr)) {
+        if (op->type() != OperationType::cast || op->operands().size() != 1 || op->operands()[0] == nullptr) {
+            break;
+        }
+        expr = op->operands()[0];
+    }
+    return expr;
+}
+
+Variable* match_low_register(Expression* expr, const RegisterPairSpec& spec) {
+    auto* v = dynamic_cast<Variable*>(strip_cast(expr));
+    if (v != nullptr && v->name() == spec.low) {
+        return v;
+    }
+    return nullptr;
+}
+
+Variable* match_shifted_high_register(Expression* expr, const RegisterPairSpec& spec) {
+    auto* op = dynamic_cast<Operation*>(strip_cast(expr));
+    if (op == nullptr || op->type() != OperationType::shl || op->operands().size() != 2) {
+        return nullptr;
+    }
+
+    auto* high = dynamic_cast<Variable*>(strip_cast(op->operands()[0]));
+    auto* shift = dynamic_cast<Constant*>(strip_cast(op->operands()[1]));
+    if (high == nullptr || shift == nullptr) {
+        return nullptr;
+    }
+
+    if (high->name() != spec.high || shift->value() != spec.shift_bits) {
+        return nullptr;
+    }
+    return high;
+}
+
+Expression* rewrite_register_pair_concat(DecompilerTask& task, Operation* op) {
+    if (op == nullptr) {
+        return nullptr;
+    }
+    if ((op->type() != OperationType::add && op->type() != OperationType::bit_or) || op->operands().size() != 2) {
+        return nullptr;
+    }
+
+    Expression* lhs = op->operands()[0];
+    Expression* rhs = op->operands()[1];
+
+    for (const auto& spec : kRegisterPairs) {
+        Variable* high = match_shifted_high_register(lhs, spec);
+        Variable* low = match_low_register(rhs, spec);
+        if (high == nullptr || low == nullptr) {
+            high = match_shifted_high_register(rhs, spec);
+            low = match_low_register(lhs, spec);
+        }
+
+        if (high == nullptr || low == nullptr) {
+            continue;
+        }
+
+        auto* pair = task.arena().create<Variable>(spec.pair, spec.pair_size_bytes);
+        pair->set_aliased(high->is_aliased() || low->is_aliased());
+        pair->set_ir_type(std::make_shared<Integer>(spec.shift_bits * 2, false));
+        return pair;
+    }
+
+    return nullptr;
+}
+
+Expression* rewrite_register_pair_expression(DecompilerTask& task, Expression* expr, bool& changed) {
+    if (expr == nullptr) {
+        return nullptr;
+    }
+
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression*& item : list->mutable_operands()) {
+            Expression* rewritten = rewrite_register_pair_expression(task, item, changed);
+            if (rewritten != item && rewritten != nullptr) {
+                item = rewritten;
+                changed = true;
+            }
+        }
+        return expr;
+    }
+
+    auto* op = dynamic_cast<Operation*>(expr);
+    if (op == nullptr) {
+        return expr;
+    }
+
+    for (Expression*& item : op->mutable_operands()) {
+        Expression* rewritten = rewrite_register_pair_expression(task, item, changed);
+        if (rewritten != item && rewritten != nullptr) {
+            item = rewritten;
+            changed = true;
+        }
+    }
+
+    if (Expression* merged = rewrite_register_pair_concat(task, op); merged != nullptr) {
+        changed = true;
+        return merged;
+    }
+
+    return expr;
+}
+
+void rewrite_register_pairs_in_instruction(DecompilerTask& task, Instruction* inst, bool& changed) {
+    if (inst == nullptr) {
+        return;
+    }
+
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        Expression* new_dest = rewrite_register_pair_expression(task, assign->destination(), changed);
+        Expression* new_val = rewrite_register_pair_expression(task, assign->value(), changed);
+        if (new_dest != assign->destination()) {
+            assign->set_destination(new_dest);
+            changed = true;
+        }
+        if (new_val != assign->value()) {
+            assign->set_value(new_val);
+            changed = true;
+        }
+        return;
+    }
+
+    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        Expression* rewritten = rewrite_register_pair_expression(task, branch->condition(), changed);
+        if (rewritten != branch->condition()) {
+            if (auto* cond = dynamic_cast<Condition*>(rewritten)) {
+                branch->set_condition(cond);
+                changed = true;
+            }
+        }
+        return;
+    }
+
+    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+        Expression* before = ib->expression();
+        Expression* after = rewrite_register_pair_expression(task, before, changed);
+        if (after != before && after != nullptr) {
+            ib->substitute(before, after);
+            changed = true;
+        }
+        return;
+    }
+
+    if (auto* ret = dynamic_cast<Return*>(inst)) {
+        for (Expression* value : ret->values()) {
+            Expression* rewritten = rewrite_register_pair_expression(task, value, changed);
+            if (rewritten != value && rewritten != nullptr) {
+                ret->substitute(value, rewritten);
+                changed = true;
+            }
+        }
+        return;
+    }
+}
+
 } // namespace
 
 void CompilerIdiomHandlingStage::execute(DecompilerTask& task) {
@@ -215,7 +387,20 @@ void CompilerIdiomHandlingStage::execute(DecompilerTask& task) {
 }
 
 void RegisterPairHandlingStage::execute(DecompilerTask& task) {
-    // Combine register pairs into single larger variables (e.g. edx:eax -> rdx:rax)
+    if (!task.cfg()) {
+        return;
+    }
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        bool changed = false;
+        auto instructions = block->instructions();
+        for (Instruction* inst : instructions) {
+            rewrite_register_pairs_in_instruction(task, inst, changed);
+        }
+        if (changed) {
+            block->set_instructions(std::move(instructions));
+        }
+    }
 }
 
 void SwitchVariableDetectionStage::execute(DecompilerTask& task) {

@@ -64,6 +64,7 @@ struct DeWolfPlugin : ida::plugin::Plugin {
 
         dewolf::DecompilerPipeline pipeline;
         pipeline.add_stage(std::make_unique<dewolf::CompilerIdiomHandlingStage>());
+        pipeline.add_stage(std::make_unique<dewolf::RegisterPairHandlingStage>());
         pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
         pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationStage>());
         pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());

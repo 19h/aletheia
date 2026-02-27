@@ -739,6 +739,41 @@ void test_compiler_idiom_handling_stage() {
     std::cout << "[+] test_compiler_idiom_handling_stage passed.\n";
 }
 
+void test_register_pair_handling_stage() {
+    DecompilerTask task(0x2000);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* block = task.arena().create<BasicBlock>(2);
+    cfg->set_entry_block(block);
+    cfg->add_block(block);
+    task.set_cfg(std::move(cfg));
+
+    auto* tmp = task.arena().create<Variable>("tmp64", 8);
+    auto* edx = task.arena().create<Variable>("edx", 4);
+    auto* eax = task.arena().create<Variable>("eax", 4);
+    auto* shift = task.arena().create<Constant>(32, 4);
+    auto* high = task.arena().create<Operation>(OperationType::shl, std::vector<Expression*>{edx, shift}, 8);
+    auto* pair_expr = task.arena().create<Operation>(OperationType::bit_or, std::vector<Expression*>{high, eax}, 8);
+    auto* assign = task.arena().create<Assignment>(tmp, pair_expr);
+    assign->set_address(0x2000);
+    block->add_instruction(assign);
+
+    RegisterPairHandlingStage stage;
+    stage.execute(task);
+
+    const auto& insts = block->instructions();
+    ASSERT_EQ(insts.size(), 1);
+    auto* rewritten_assign = dynamic_cast<Assignment*>(insts[0]);
+    ASSERT_TRUE(rewritten_assign != nullptr);
+
+    auto* value_var = dynamic_cast<Variable*>(rewritten_assign->value());
+    ASSERT_TRUE(value_var != nullptr);
+    ASSERT_EQ(value_var->name(), "edx_eax_pair");
+    ASSERT_EQ(value_var->size_bytes, 8);
+
+    std::cout << "[+] test_register_pair_handling_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -748,6 +783,7 @@ int main() {
     test_ssa_phi_insertion();
     test_instruction_hierarchy();
     test_compiler_idiom_handling_stage();
+    test_register_pair_handling_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
