@@ -130,6 +130,101 @@ public:
         return block->successors();
     }
 
+
+    void refresh_edge_properties() {
+        std::unordered_map<TransitionBlock*, int> node_indices;
+        std::unordered_map<TransitionBlock*, TransitionBlock*> parent_dict;
+        int index = blocks_.size();
+        std::unordered_set<TransitionBlock*> visited_nodes;
+        
+        if (!entry_) return;
+        
+        std::vector<std::pair<TransitionBlock*, size_t>> stack;
+        stack.push_back({entry_, 0});
+        visited_nodes.insert(entry_);
+        
+        while (!stack.empty()) {
+            auto& top = stack.back();
+            TransitionBlock* parent = top.first;
+            auto& child_idx = top.second;
+            
+            auto edges = parent->successors();
+            if (child_idx < edges.size()) {
+                TransitionEdge* edge = edges[child_idx++];
+                TransitionBlock* child = edge->sink();
+                
+                if (visited_nodes.contains(child)) {
+                    EdgeProperty prop = EdgeProperty::NonLoop;
+                    if (node_indices.contains(child)) {
+                        // Forward or cross, we don't care, both map to NonLoop
+                        prop = EdgeProperty::NonLoop;
+                    } else {
+                        // Back or retreating
+                        if (dominates(child, parent)) {
+                            prop = EdgeProperty::Back;
+                        } else {
+                            prop = EdgeProperty::Retreating;
+                        }
+                    }
+                    edge->set_property(prop);
+                } else {
+                    edge->set_property(EdgeProperty::NonLoop);
+                    parent_dict[child] = parent;
+                    visited_nodes.insert(child);
+                    stack.push_back({child, 0});
+                }
+            } else {
+                node_indices[parent] = index--;
+                stack.pop_back();
+            }
+        }
+    }
+
+
+    std::vector<TransitionBlock*> get_loop_heads() const {
+        std::vector<TransitionBlock*> post_order;
+        std::unordered_set<TransitionBlock*> visited;
+        auto dfs = [&](TransitionBlock* node, auto& dfs_ref) -> void {
+            if (!node || visited.contains(node)) return;
+            visited.insert(node);
+            for (auto* succ : node->successors_blocks()) dfs_ref(succ, dfs_ref);
+            post_order.push_back(node);
+        };
+        dfs(entry_, dfs);
+        
+        std::vector<TransitionBlock*> loop_heads;
+        for (auto* node : post_order) {
+            for (auto* e : node->predecessors()) {
+                if (e->property() == EdgeProperty::Back || e->property() == EdgeProperty::Retreating) {
+                    loop_heads.push_back(node);
+                    break;
+                }
+            }
+        }
+        return loop_heads;
+    }
+
+    bool dominates(TransitionBlock* a, TransitionBlock* b) const {
+        if (a == b) return true;
+        if (a == entry_) return true;
+        if (b == entry_) return false;
+        
+        std::unordered_set<TransitionBlock*> visited;
+        std::vector<TransitionBlock*> stack = {entry_};
+        while(!stack.empty()) {
+            auto* curr = stack.back(); stack.pop_back();
+            if (curr == b) return false;
+            visited.insert(curr);
+            for(auto* succ : curr->successors_blocks()) {
+                if (succ != a && !visited.contains(succ)) {
+                    stack.push_back(succ);
+                }
+            }
+        }
+        return true;
+    }
+
+
 private:
     DecompilerArena& arena_;
     TransitionBlock* entry_ = nullptr;
