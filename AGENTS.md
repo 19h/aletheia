@@ -383,9 +383,12 @@ You are not allowed from finishing two or more tasks at once, even if that means
 
 - [ ] **M.4** Implement `ExpressionSimplification` Rules (currently missing entirely)
   - *The Python reference applies algebraic simplification rules in 3 phases: pre-rules (none), rules (`TermOrder`, `SubToAdd`, `SimplifyRedundantReference`, `SimplifyTrivialArithmetic`, `SimplifyTrivialBitArithmetic`, `SimplifyTrivialLogicArithmetic`, `SimplifyTrivialShift`, `CollapseConstants`, `CollapseNestedConstants`), post-rules (`CollapseAddNeg`, `PositiveConstants`). These transform expressions like `x + 0 -> x`, `x * 1 -> x`, `x & 0xFFFFFFFF -> x`, `x - (-y) -> x + y`, `(x + 3) + 5 -> x + 8`, etc.*
-  - [ ] M.4.1 Implement `CollapseConstants`: evaluate binary operations on two constants at compile time.
-  - [ ] M.4.2 Implement `SimplifyTrivialArithmetic`: `x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`, `x - 0 -> x`, `x / 1 -> x`.
-  - [ ] M.4.3 Implement `SimplifyTrivialBitArithmetic`: `x & 0 -> 0`, `x | 0 -> x`, `x ^ 0 -> x`, `x & all_ones -> x`.
+  - [x] M.4.1 Implement `CollapseConstants`: evaluate binary operations on two constants at compile time.
+    - *Implemented `ExpressionSimplificationStage` constant folding in `optimization_stages.cpp` with recursive expression-tree simplification and binary constant evaluation for arithmetic/bitwise/logic/comparison ops (`add/sub/mul/div/mod`, shifts, `and/or/xor`, comparisons including signed/unsigned variants, `power`). Stage rewrites `Assignment`, `Branch`, `IndirectBranch`, and `Return` operands; branch constant conditions are normalized to `neq(const, 0)`. Added `test_expression_simplification_collapse_constants` in `tests/test_main.cpp`; `build/dewolf_tests` passes with this coverage.*
+  - [x] M.4.2 Implement `SimplifyTrivialArithmetic`: `x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`, `x - 0 -> x`, `x / 1 -> x`.
+    - *Extended `simplify_expression_tree()` in `optimization_stages.cpp` with algebraic identity rewrites for binary arithmetic (`add`, `mul`/`mul_us`, `sub`, `div`/`div_us`) after recursive child simplification. Added `test_expression_simplification_trivial_arithmetic` in `tests/test_main.cpp` covering all listed identities; `build/dewolf_tests` passes.*
+  - [x] M.4.3 Implement `SimplifyTrivialBitArithmetic`: `x & 0 -> 0`, `x | 0 -> x`, `x ^ 0 -> x`, `x & all_ones -> x`.
+    - *Extended `simplify_expression_tree()` in `optimization_stages.cpp` with bit-identity rewrites for `bit_and`/`bit_or`/`bit_xor`, including canonicalization of `x & 0`, `x | 0`, `x ^ 0`, and mask-aware `x & all_ones` using width-derived masks. Added `test_expression_simplification_trivial_bit_arithmetic` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
   - [ ] M.4.4 Implement `SubToAdd`: convert `x - (-c)` to `x + c` for readability.
   - [ ] M.4.5 Implement `CollapseNestedConstants`: `(x + c1) + c2 -> x + (c1+c2)`, similarly for nested multiplications.
 

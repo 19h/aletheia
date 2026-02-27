@@ -1353,6 +1353,202 @@ void test_common_subexpression_definition_generator_stage() {
     std::cout << "[+] test_common_subexpression_definition_generator_stage passed.\n";
 }
 
+void test_expression_simplification_collapse_constants() {
+    DecompilerTask task(0x7300);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(70);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    auto* flag = task.arena().create<Variable>("flag", 1);
+
+    // x = (2 + 3) * 4  -> 20
+    auto* add = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{task.arena().create<Constant>(2, 4), task.arena().create<Constant>(3, 4)},
+        4);
+    auto* mul = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{add, task.arena().create<Constant>(4, 4)},
+        4);
+    auto* assign_x = task.arena().create<Assignment>(x, mul);
+
+    // flag = (10 > 7) -> 1
+    auto* cmp = task.arena().create<Condition>(
+        OperationType::gt,
+        task.arena().create<Constant>(10, 4),
+        task.arena().create<Constant>(7, 4),
+        1);
+    auto* assign_flag = task.arena().create<Assignment>(flag, cmp);
+
+    // if (5 <= 4) branch condition should fold into neq(0, 0)
+    auto* br_cond = task.arena().create<Condition>(
+        OperationType::le,
+        task.arena().create<Constant>(5, 4),
+        task.arena().create<Constant>(4, 4),
+        1);
+    auto* br = task.arena().create<Branch>(br_cond);
+
+    bb->add_instruction(assign_x);
+    bb->add_instruction(assign_flag);
+    bb->add_instruction(br);
+
+    ExpressionSimplificationStage stage;
+    stage.execute(task);
+
+    auto* x_val = dynamic_cast<Constant*>(assign_x->value());
+    ASSERT_TRUE(x_val != nullptr);
+    ASSERT_EQ(x_val->value(), 20);
+
+    auto* flag_val = dynamic_cast<Constant*>(assign_flag->value());
+    ASSERT_TRUE(flag_val != nullptr);
+    ASSERT_EQ(flag_val->value(), 1);
+
+    auto* folded_cond = br->condition();
+    ASSERT_TRUE(folded_cond != nullptr);
+    ASSERT_EQ(folded_cond->type(), OperationType::neq);
+    auto* lhs = dynamic_cast<Constant*>(folded_cond->lhs());
+    auto* rhs = dynamic_cast<Constant*>(folded_cond->rhs());
+    ASSERT_TRUE(lhs != nullptr && rhs != nullptr);
+    ASSERT_EQ(lhs->value(), 0);
+    ASSERT_EQ(rhs->value(), 0);
+
+    std::cout << "[+] test_expression_simplification_collapse_constants passed.\n";
+}
+
+void test_expression_simplification_trivial_arithmetic() {
+    DecompilerTask task(0x7400);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(71);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    auto* y = task.arena().create<Variable>("y", 4);
+    auto* z = task.arena().create<Variable>("z", 4);
+    auto* q = task.arena().create<Variable>("q", 4);
+    auto* r = task.arena().create<Variable>("r", 4);
+
+    auto* add_zero = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{x, task.arena().create<Constant>(0, 4)},
+        4);
+    auto* mul_one = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{y, task.arena().create<Constant>(1, 4)},
+        4);
+    auto* mul_zero = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{z, task.arena().create<Constant>(0, 4)},
+        4);
+    auto* sub_zero = task.arena().create<Operation>(
+        OperationType::sub,
+        std::vector<Expression*>{q, task.arena().create<Constant>(0, 4)},
+        4);
+    auto* div_one = task.arena().create<Operation>(
+        OperationType::div,
+        std::vector<Expression*>{r, task.arena().create<Constant>(1, 4)},
+        4);
+
+    auto* out_a = task.arena().create<Variable>("out_a", 4);
+    auto* out_b = task.arena().create<Variable>("out_b", 4);
+    auto* out_c = task.arena().create<Variable>("out_c", 4);
+    auto* out_d = task.arena().create<Variable>("out_d", 4);
+    auto* out_e = task.arena().create<Variable>("out_e", 4);
+
+    auto* a1 = task.arena().create<Assignment>(out_a, add_zero);
+    auto* a2 = task.arena().create<Assignment>(out_b, mul_one);
+    auto* a3 = task.arena().create<Assignment>(out_c, mul_zero);
+    auto* a4 = task.arena().create<Assignment>(out_d, sub_zero);
+    auto* a5 = task.arena().create<Assignment>(out_e, div_one);
+
+    bb->add_instruction(a1);
+    bb->add_instruction(a2);
+    bb->add_instruction(a3);
+    bb->add_instruction(a4);
+    bb->add_instruction(a5);
+
+    ExpressionSimplificationStage stage;
+    stage.execute(task);
+
+    ASSERT_TRUE(a1->value() == x);
+    ASSERT_TRUE(a2->value() == y);
+
+    auto* folded_zero = dynamic_cast<Constant*>(a3->value());
+    ASSERT_TRUE(folded_zero != nullptr);
+    ASSERT_EQ(folded_zero->value(), 0);
+
+    ASSERT_TRUE(a4->value() == q);
+    ASSERT_TRUE(a5->value() == r);
+
+    std::cout << "[+] test_expression_simplification_trivial_arithmetic passed.\n";
+}
+
+void test_expression_simplification_trivial_bit_arithmetic() {
+    DecompilerTask task(0x7500);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(72);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* a = task.arena().create<Variable>("a", 4);
+    auto* b = task.arena().create<Variable>("b", 4);
+    auto* c = task.arena().create<Variable>("c", 4);
+    auto* d = task.arena().create<Variable>("d", 4);
+
+    auto* and_zero = task.arena().create<Operation>(
+        OperationType::bit_and,
+        std::vector<Expression*>{a, task.arena().create<Constant>(0, 4)},
+        4);
+    auto* or_zero = task.arena().create<Operation>(
+        OperationType::bit_or,
+        std::vector<Expression*>{b, task.arena().create<Constant>(0, 4)},
+        4);
+    auto* xor_zero = task.arena().create<Operation>(
+        OperationType::bit_xor,
+        std::vector<Expression*>{task.arena().create<Constant>(0, 4), c},
+        4);
+    auto* and_all_ones = task.arena().create<Operation>(
+        OperationType::bit_and,
+        std::vector<Expression*>{task.arena().create<Constant>(0xffffffffULL, 4), d},
+        4);
+
+    auto* out_a = task.arena().create<Variable>("bit_out_a", 4);
+    auto* out_b = task.arena().create<Variable>("bit_out_b", 4);
+    auto* out_c = task.arena().create<Variable>("bit_out_c", 4);
+    auto* out_d = task.arena().create<Variable>("bit_out_d", 4);
+
+    auto* i1 = task.arena().create<Assignment>(out_a, and_zero);
+    auto* i2 = task.arena().create<Assignment>(out_b, or_zero);
+    auto* i3 = task.arena().create<Assignment>(out_c, xor_zero);
+    auto* i4 = task.arena().create<Assignment>(out_d, and_all_ones);
+
+    bb->add_instruction(i1);
+    bb->add_instruction(i2);
+    bb->add_instruction(i3);
+    bb->add_instruction(i4);
+
+    ExpressionSimplificationStage stage;
+    stage.execute(task);
+
+    auto* and_folded = dynamic_cast<Constant*>(i1->value());
+    ASSERT_TRUE(and_folded != nullptr);
+    ASSERT_EQ(and_folded->value(), 0);
+
+    ASSERT_TRUE(i2->value() == b);
+    ASSERT_TRUE(i3->value() == c);
+    ASSERT_TRUE(i4->value() == d);
+
+    std::cout << "[+] test_expression_simplification_trivial_bit_arithmetic passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -1372,6 +1568,9 @@ int main() {
     test_identity_elimination_stage();
     test_common_subexpression_existing_replacer_stage();
     test_common_subexpression_definition_generator_stage();
+    test_expression_simplification_collapse_constants();
+    test_expression_simplification_trivial_arithmetic();
+    test_expression_simplification_trivial_bit_arithmetic();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();

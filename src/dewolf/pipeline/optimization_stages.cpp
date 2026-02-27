@@ -3,6 +3,8 @@
 #include "../ssa/dominators.hpp"
 #include <algorithm>
 #include <functional>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -1716,8 +1718,329 @@ private:
 
 } // namespace
 
+namespace {
+
+struct FoldedConstant {
+    uint64_t value = 0;
+    std::size_t size_bytes = 0;
+};
+
+uint64_t mask_for_size(std::size_t size_bytes) {
+    if (size_bytes == 0 || size_bytes >= 8) {
+        return ~0ULL;
+    }
+    const std::size_t bits = size_bytes * 8;
+    return (1ULL << bits) - 1ULL;
+}
+
+int64_t as_signed(uint64_t value, std::size_t size_bytes) {
+    if (size_bytes == 0 || size_bytes >= 8) {
+        return static_cast<int64_t>(value);
+    }
+
+    const uint64_t mask = mask_for_size(size_bytes);
+    value &= mask;
+    const uint64_t sign = 1ULL << (size_bytes * 8 - 1);
+    if (value & sign) {
+        return static_cast<int64_t>(value | ~mask);
+    }
+    return static_cast<int64_t>(value);
+}
+
+bool is_boolean_result_op(OperationType type) {
+    switch (type) {
+        case OperationType::logical_and:
+        case OperationType::logical_or:
+        case OperationType::eq:
+        case OperationType::neq:
+        case OperationType::lt:
+        case OperationType::le:
+        case OperationType::gt:
+        case OperationType::ge:
+        case OperationType::lt_us:
+        case OperationType::le_us:
+        case OperationType::gt_us:
+        case OperationType::ge_us:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool is_constant_value(const Expression* expr, uint64_t value) {
+    const auto* c = dynamic_cast<const Constant*>(expr);
+    return c && c->value() == value;
+}
+
+bool is_all_ones_constant(const Expression* expr, std::size_t size_bytes) {
+    const auto* c = dynamic_cast<const Constant*>(expr);
+    if (!c) return false;
+    const std::size_t width = size_bytes == 0 ? c->size_bytes : size_bytes;
+    return c->value() == mask_for_size(width);
+}
+
+Constant* make_simplified_constant(DecompilerTask& task, const Operation* op, uint64_t value) {
+    const std::size_t out_size = op && op->size_bytes != 0 ? op->size_bytes : 1;
+    auto* c = task.arena().create<Constant>(value, out_size);
+    if (op) {
+        c->set_ir_type(op->ir_type());
+    }
+    return c;
+}
+
+std::optional<FoldedConstant> collapse_binary_constants(
+    OperationType type,
+    const Constant* lhs,
+    const Constant* rhs,
+    std::size_t out_size_bytes) {
+    if (!lhs || !rhs) return std::nullopt;
+
+    const uint64_t l = lhs->value();
+    const uint64_t r = rhs->value();
+    const std::size_t size = is_boolean_result_op(type) ? 1 : (out_size_bytes == 0 ? lhs->size_bytes : out_size_bytes);
+    const uint64_t mask = mask_for_size(size);
+
+    auto make = [&](uint64_t value) -> std::optional<FoldedConstant> {
+        return FoldedConstant{value & mask, size};
+    };
+
+    switch (type) {
+        case OperationType::add:
+        case OperationType::add_with_carry:
+            return make(l + r);
+        case OperationType::sub:
+        case OperationType::sub_with_carry:
+            return make(l - r);
+        case OperationType::mul:
+        case OperationType::mul_us:
+            return make(l * r);
+        case OperationType::div_us:
+            if (r == 0) return std::nullopt;
+            return make(l / r);
+        case OperationType::mod_us:
+            if (r == 0) return std::nullopt;
+            return make(l % r);
+        case OperationType::div: {
+            const int64_t sl = as_signed(l, size);
+            const int64_t sr = as_signed(r, size);
+            if (sr == 0) return std::nullopt;
+            if (sl == std::numeric_limits<int64_t>::min() && sr == -1) return std::nullopt;
+            return make(static_cast<uint64_t>(sl / sr));
+        }
+        case OperationType::mod: {
+            const int64_t sl = as_signed(l, size);
+            const int64_t sr = as_signed(r, size);
+            if (sr == 0) return std::nullopt;
+            if (sl == std::numeric_limits<int64_t>::min() && sr == -1) return make(0);
+            return make(static_cast<uint64_t>(sl % sr));
+        }
+        case OperationType::bit_and:
+            return make(l & r);
+        case OperationType::bit_or:
+            return make(l | r);
+        case OperationType::bit_xor:
+            return make(l ^ r);
+        case OperationType::shl: {
+            const uint64_t shift = r & 63ULL;
+            return make(l << shift);
+        }
+        case OperationType::shr:
+        case OperationType::sar: {
+            const uint64_t shift = r & 63ULL;
+            const int64_t sl = as_signed(l, size);
+            return make(static_cast<uint64_t>(sl >> shift));
+        }
+        case OperationType::shr_us: {
+            const uint64_t shift = r & 63ULL;
+            return make(l >> shift);
+        }
+        case OperationType::logical_and:
+            return make((l != 0 && r != 0) ? 1 : 0);
+        case OperationType::logical_or:
+            return make((l != 0 || r != 0) ? 1 : 0);
+        case OperationType::eq:
+            return make(l == r ? 1 : 0);
+        case OperationType::neq:
+            return make(l != r ? 1 : 0);
+        case OperationType::lt:
+            return make(as_signed(l, size) < as_signed(r, size) ? 1 : 0);
+        case OperationType::le:
+            return make(as_signed(l, size) <= as_signed(r, size) ? 1 : 0);
+        case OperationType::gt:
+            return make(as_signed(l, size) > as_signed(r, size) ? 1 : 0);
+        case OperationType::ge:
+            return make(as_signed(l, size) >= as_signed(r, size) ? 1 : 0);
+        case OperationType::lt_us:
+            return make(l < r ? 1 : 0);
+        case OperationType::le_us:
+            return make(l <= r ? 1 : 0);
+        case OperationType::gt_us:
+            return make(l > r ? 1 : 0);
+        case OperationType::ge_us:
+            return make(l >= r ? 1 : 0);
+        case OperationType::power: {
+            uint64_t base = l;
+            uint64_t exp = r;
+            uint64_t acc = 1;
+            while (exp > 0) {
+                if (exp & 1ULL) acc *= base;
+                base *= base;
+                exp >>= 1ULL;
+            }
+            return make(acc);
+        }
+        default:
+            return std::nullopt;
+    }
+}
+
+Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
+    if (!expr) return nullptr;
+    if (dynamic_cast<Constant*>(expr) || dynamic_cast<Variable*>(expr)) return expr;
+
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression*& child : list->mutable_operands()) {
+            child = simplify_expression_tree(task, child);
+        }
+        return expr;
+    }
+
+    auto* op = dynamic_cast<Operation*>(expr);
+    if (!op) return expr;
+
+    for (Expression*& child : op->mutable_operands()) {
+        child = simplify_expression_tree(task, child);
+    }
+
+    if (op->operands().size() == 2) {
+        Expression* lhs_expr = op->operands()[0];
+        Expression* rhs_expr = op->operands()[1];
+
+        switch (op->type()) {
+            case OperationType::add:
+                if (is_constant_value(rhs_expr, 0)) return lhs_expr;
+                if (is_constant_value(lhs_expr, 0)) return rhs_expr;
+                break;
+            case OperationType::mul:
+            case OperationType::mul_us:
+                if (is_constant_value(lhs_expr, 0) || is_constant_value(rhs_expr, 0)) {
+                    return make_simplified_constant(task, op, 0);
+                }
+                if (is_constant_value(rhs_expr, 1)) return lhs_expr;
+                if (is_constant_value(lhs_expr, 1)) return rhs_expr;
+                break;
+            case OperationType::sub:
+                if (is_constant_value(rhs_expr, 0)) return lhs_expr;
+                break;
+            case OperationType::div:
+            case OperationType::div_us:
+                if (is_constant_value(rhs_expr, 1)) return lhs_expr;
+                break;
+            case OperationType::bit_and:
+                if (is_constant_value(lhs_expr, 0) || is_constant_value(rhs_expr, 0)) {
+                    return make_simplified_constant(task, op, 0);
+                }
+                if (is_all_ones_constant(lhs_expr, op->size_bytes)) return rhs_expr;
+                if (is_all_ones_constant(rhs_expr, op->size_bytes)) return lhs_expr;
+                break;
+            case OperationType::bit_or:
+                if (is_constant_value(lhs_expr, 0)) return rhs_expr;
+                if (is_constant_value(rhs_expr, 0)) return lhs_expr;
+                break;
+            case OperationType::bit_xor:
+                if (is_constant_value(lhs_expr, 0)) return rhs_expr;
+                if (is_constant_value(rhs_expr, 0)) return lhs_expr;
+                break;
+            default:
+                break;
+        }
+
+        auto* lhs = dynamic_cast<Constant*>(op->operands()[0]);
+        auto* rhs = dynamic_cast<Constant*>(op->operands()[1]);
+        if (lhs && rhs) {
+            if (auto folded = collapse_binary_constants(op->type(), lhs, rhs, op->size_bytes)) {
+                auto* c = task.arena().create<Constant>(folded->value, folded->size_bytes);
+                c->set_ir_type(expr->ir_type());
+                return c;
+            }
+        }
+    }
+
+    return expr;
+}
+
+void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
+    if (!inst) return;
+
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        Expression* new_value = simplify_expression_tree(task, assign->value());
+        if (new_value != assign->value()) {
+            assign->set_value(new_value);
+        }
+
+        if (!dynamic_cast<Variable*>(assign->destination())) {
+            Expression* new_dest = simplify_expression_tree(task, assign->destination());
+            if (new_dest != assign->destination()) {
+                assign->set_destination(new_dest);
+            }
+        }
+        return;
+    }
+
+    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        Condition* cond = branch->condition();
+        if (!cond) return;
+
+        Expression* lhs = simplify_expression_tree(task, cond->lhs());
+        Expression* rhs = simplify_expression_tree(task, cond->rhs());
+        auto* rebuilt = task.arena().create<Condition>(cond->type(), lhs, rhs, cond->size_bytes);
+
+        auto* cl = dynamic_cast<Constant*>(lhs);
+        auto* cr = dynamic_cast<Constant*>(rhs);
+        if (cl && cr) {
+            if (auto folded = collapse_binary_constants(cond->type(), cl, cr, 1)) {
+                auto* folded_const = task.arena().create<Constant>(folded->value, 1);
+                auto* zero = task.arena().create<Constant>(0, 1);
+                rebuilt = task.arena().create<Condition>(OperationType::neq, folded_const, zero, 1);
+            }
+        }
+
+        branch->set_condition(rebuilt);
+        return;
+    }
+
+    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+        Expression* expr = ib->expression();
+        Expression* simplified = simplify_expression_tree(task, expr);
+        if (simplified != expr) {
+            ib->substitute(expr, simplified);
+        }
+        return;
+    }
+
+    if (auto* ret = dynamic_cast<Return*>(inst)) {
+        for (Expression* value : ret->values()) {
+            Expression* simplified = simplify_expression_tree(task, value);
+            if (simplified != value) {
+                ret->substitute(value, simplified);
+            }
+        }
+    }
+}
+
+} // namespace
+
 void TypePropagationStage::execute(DecompilerTask& task) {}
 void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {}
+void ExpressionSimplificationStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            simplify_instruction_constants(task, inst);
+        }
+    }
+}
+
 void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {
     if (!task.cfg() || !task.cfg()->entry_block()) return;
     DominatorTree dom(*task.cfg());
