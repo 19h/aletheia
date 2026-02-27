@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <deque>
 #include <optional>
 #include <string>
@@ -585,6 +586,252 @@ bool is_switch_block(BasicBlock* block) {
     return has_switch_edge || (has_indirect && block->successors().size() > 1);
 }
 
+std::string to_lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+bool constant_matches_signed(const Constant* constant, int64_t target) {
+    if (constant == nullptr) {
+        return false;
+    }
+    const int64_t as_signed = static_cast<int64_t>(constant->value());
+    return as_signed == target;
+}
+
+bool expression_has_constant(Expression* expr, int64_t target) {
+    if (expr == nullptr) {
+        return false;
+    }
+    if (auto* c = dynamic_cast<Constant*>(expr)) {
+        return constant_matches_signed(c, target);
+    }
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        for (Expression* child : op->operands()) {
+            if (expression_has_constant(child, target)) {
+                return true;
+            }
+        }
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* child : list->operands()) {
+            if (expression_has_constant(child, target)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool expression_has_variable_prefix(Expression* expr, const std::string& prefix) {
+    if (expr == nullptr) {
+        return false;
+    }
+    if (auto* v = dynamic_cast<Variable*>(expr)) {
+        return to_lower_ascii(v->name()).starts_with(prefix);
+    }
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        for (Expression* child : op->operands()) {
+            if (expression_has_variable_prefix(child, prefix)) {
+                return true;
+            }
+        }
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* child : list->operands()) {
+            if (expression_has_variable_prefix(child, prefix)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool expression_is_addressish(Expression* expr) {
+    if (expr == nullptr) {
+        return false;
+    }
+    Expression* base = strip_cast(expr);
+    if (auto* op = dynamic_cast<Operation*>(base)) {
+        if (op->type() == OperationType::address_of) {
+            return true;
+        }
+    }
+    if (auto* v = dynamic_cast<Variable*>(base)) {
+        const std::string name = to_lower_ascii(v->name());
+        return name.find("return") != std::string::npos;
+    }
+    return false;
+}
+
+bool expression_matches_go_stack_guard_rhs(Expression* expr) {
+    if (expr == nullptr) {
+        return false;
+    }
+
+    // Pattern group #1: *(r14 + 0x10)
+    if (expression_has_variable_prefix(expr, "r14") && expression_has_constant(expr, 0x10)) {
+        return true;
+    }
+
+    // Pattern group #2: *(*(... fsbase/gsbase ...)+offset)
+    const bool has_fsbase = expression_has_variable_prefix(expr, "fsbase");
+    const bool has_gsbase = expression_has_variable_prefix(expr, "gsbase");
+    if (has_fsbase || has_gsbase) {
+        constexpr std::array<int64_t, 11> kKnownOffsets = {
+            0, -4, 0x8, -8, 0x10, 0x14, 0x18, 0x28, 0x30, 0x468, 0x8A0
+        };
+        for (int64_t offset : kKnownOffsets) {
+            if (expression_has_constant(expr, offset)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool branch_condition_matches_go_root_guard(Branch* branch) {
+    if (branch == nullptr || branch->condition() == nullptr) {
+        return false;
+    }
+
+    Condition* cond = branch->condition();
+    const OperationType type = cond->type();
+    const bool is_rel = type == OperationType::lt || type == OperationType::le || type == OperationType::gt
+        || type == OperationType::ge || type == OperationType::lt_us || type == OperationType::le_us
+        || type == OperationType::gt_us || type == OperationType::ge_us;
+    if (!is_rel) {
+        return false;
+    }
+
+    Expression* lhs = cond->lhs();
+    Expression* rhs = cond->rhs();
+
+    return (expression_is_addressish(lhs) && expression_matches_go_stack_guard_rhs(rhs))
+        || (expression_is_addressish(rhs) && expression_matches_go_stack_guard_rhs(lhs));
+}
+
+bool expression_contains_morestack_call(Expression* expr) {
+    if (expr == nullptr) {
+        return false;
+    }
+
+    if (auto* call = dynamic_cast<Call*>(expr)) {
+        if (auto* target_var = dynamic_cast<Variable*>(call->target())) {
+            return to_lower_ascii(target_var->name()).find("morestack") != std::string::npos;
+        }
+        return false;
+    }
+
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        if (op->type() == OperationType::call && !op->operands().empty()) {
+            if (auto* target_var = dynamic_cast<Variable*>(op->operands()[0])) {
+                if (to_lower_ascii(target_var->name()).find("morestack") != std::string::npos) {
+                    return true;
+                }
+            }
+        }
+        for (Expression* child : op->operands()) {
+            if (expression_contains_morestack_call(child)) {
+                return true;
+            }
+        }
+    }
+
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* child : list->operands()) {
+            if (expression_contains_morestack_call(child)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool block_contains_morestack_call(BasicBlock* block) {
+    if (block == nullptr) {
+        return false;
+    }
+    for (Instruction* inst : block->instructions()) {
+        if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+            if (expression_contains_morestack_call(assign->value())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool successor_path_contains_morestack(BasicBlock* start, BasicBlock* root) {
+    if (start == nullptr) {
+        return false;
+    }
+
+    std::vector<BasicBlock*> stack{start};
+    std::unordered_set<BasicBlock*> visited;
+
+    while (!stack.empty()) {
+        BasicBlock* node = stack.back();
+        stack.pop_back();
+        if (node == nullptr || visited.contains(node)) {
+            continue;
+        }
+        visited.insert(node);
+
+        if (block_contains_morestack_call(node)) {
+            return true;
+        }
+
+        for (Edge* edge : node->successors()) {
+            if (!edge || !edge->target()) {
+                continue;
+            }
+            BasicBlock* succ = edge->target();
+            if (succ == root || !visited.contains(succ)) {
+                stack.push_back(succ);
+            }
+        }
+    }
+
+    return false;
+}
+
+void remove_unreachable_blocks(ControlFlowGraph* cfg) {
+    if (cfg == nullptr || cfg->entry_block() == nullptr) {
+        return;
+    }
+
+    std::vector<BasicBlock*> stack{cfg->entry_block()};
+    std::unordered_set<BasicBlock*> reachable;
+    while (!stack.empty()) {
+        BasicBlock* node = stack.back();
+        stack.pop_back();
+        if (node == nullptr || reachable.contains(node)) {
+            continue;
+        }
+        reachable.insert(node);
+        for (Edge* edge : node->successors()) {
+            if (edge != nullptr && edge->target() != nullptr) {
+                stack.push_back(edge->target());
+            }
+        }
+    }
+
+    std::unordered_set<BasicBlock*> dead;
+    for (BasicBlock* block : cfg->blocks()) {
+        if (!reachable.contains(block)) {
+            dead.insert(block);
+        }
+    }
+    if (!dead.empty()) {
+        cfg->remove_nodes_from(dead);
+    }
+}
+
 } // namespace
 
 void CompilerIdiomHandlingStage::execute(DecompilerTask& task) {
@@ -739,7 +986,44 @@ void SwitchVariableDetectionStage::execute(DecompilerTask& task) {
 }
 
 void RemoveGoPrologueStage::execute(DecompilerTask& task) {
-    // Pattern match and remove Go runtime stack check prologues
+    if (!task.cfg() || task.cfg()->entry_block() == nullptr) {
+        return;
+    }
+
+    ControlFlowGraph* cfg = task.cfg();
+    BasicBlock* root = cfg->entry_block();
+    if (root->successors().size() != 2 || root->instructions().empty()) {
+        return;
+    }
+
+    auto* root_branch = dynamic_cast<Branch*>(root->instructions().back());
+    if (root_branch == nullptr || !branch_condition_matches_go_root_guard(root_branch)) {
+        return;
+    }
+
+    Edge* succ0 = root->successors()[0];
+    Edge* succ1 = root->successors()[1];
+    if (succ0 == nullptr || succ1 == nullptr) {
+        return;
+    }
+
+    const bool s0_morestack = successor_path_contains_morestack(succ0->target(), root);
+    const bool s1_morestack = successor_path_contains_morestack(succ1->target(), root);
+    if (s0_morestack == s1_morestack) {
+        return;
+    }
+
+    Edge* morestack_edge = s0_morestack ? succ0 : succ1;
+    cfg->remove_edge(morestack_edge);
+
+    auto& root_insts = root->mutable_instructions();
+    if (root->successors().size() == 1
+        && !root_insts.empty()
+        && dynamic_cast<Branch*>(root_insts.back()) != nullptr) {
+        root_insts.pop_back();
+    }
+
+    remove_unreachable_blocks(cfg);
 }
 
 void RemoveStackCanaryStage::execute(DecompilerTask& task) {

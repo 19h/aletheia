@@ -836,6 +836,64 @@ void test_switch_variable_detection_stage() {
     std::cout << "[+] test_switch_variable_detection_stage passed.\n";
 }
 
+void test_remove_go_prologue_stage() {
+    DecompilerTask task(0x4000);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* root = task.arena().create<BasicBlock>(10);
+    auto* start = task.arena().create<BasicBlock>(11);
+    auto* morestack = task.arena().create<BasicBlock>(12);
+
+    cfg->set_entry_block(root);
+    cfg->add_block(root);
+    cfg->add_block(start);
+    cfg->add_block(morestack);
+    task.set_cfg(std::move(cfg));
+
+    auto* ret_addr = task.arena().create<Variable>("__return_addr", 8);
+    auto* lhs = task.arena().create<Operation>(OperationType::address_of, std::vector<Expression*>{ret_addr}, 8);
+
+    auto* r14 = task.arena().create<Variable>("r14", 8);
+    auto* plus_off = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{r14, task.arena().create<Constant>(0x10, 8)},
+        8);
+    auto* rhs = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{plus_off}, 8);
+
+    auto* cond = task.arena().create<Condition>(OperationType::le_us, lhs, rhs);
+    auto* branch = task.arena().create<Branch>(cond);
+    branch->set_address(0x4000);
+    root->add_instruction(branch);
+
+    auto* root_to_start = task.arena().create<Edge>(root, start, EdgeType::False);
+    auto* root_to_morestack = task.arena().create<Edge>(root, morestack, EdgeType::True);
+    auto* morestack_to_root = task.arena().create<Edge>(morestack, root, EdgeType::Unconditional);
+
+    root->add_successor(root_to_start);
+    root->add_successor(root_to_morestack);
+    start->add_predecessor(root_to_start);
+    morestack->add_predecessor(root_to_morestack);
+    morestack->add_successor(morestack_to_root);
+    root->add_predecessor(morestack_to_root);
+
+    auto* call_target = task.arena().create<Variable>("runtime_morestack_noctxt", 8);
+    auto* call_expr = task.arena().create<Call>(call_target, std::vector<Expression*>{}, 8);
+    auto* call_dst = task.arena().create<Variable>("tmp", 8);
+    auto* call_assign = task.arena().create<Assignment>(call_dst, call_expr);
+    call_assign->set_address(0x4010);
+    morestack->add_instruction(call_assign);
+
+    RemoveGoPrologueStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(task.cfg()->blocks().size(), 2);
+    ASSERT_EQ(root->successors().size(), 1);
+    ASSERT_EQ(root->successors()[0]->target(), start);
+    ASSERT_TRUE(root->instructions().empty() || dynamic_cast<Branch*>(root->instructions().back()) == nullptr);
+
+    std::cout << "[+] test_remove_go_prologue_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -847,6 +905,7 @@ int main() {
     test_compiler_idiom_handling_stage();
     test_register_pair_handling_stage();
     test_switch_variable_detection_stage();
+    test_remove_go_prologue_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
