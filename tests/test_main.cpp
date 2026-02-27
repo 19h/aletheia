@@ -30,6 +30,7 @@
 #include "../src/dewolf_logic/range_simplifier.hpp"
 #include "../src/dewolf_logic/operation_simplifier.hpp"
 #include "../src/dewolf_logic/normal_form.hpp"
+#include "../src/dewolf_logic/world.hpp"
 
 
 
@@ -886,6 +887,65 @@ void test_logic_normal_form_conversion() {
     }
 
     std::cout << "[+] test_logic_normal_form_conversion passed.\n";
+}
+
+void test_world_map_condition_no_simplification() {
+    using namespace dewolf_logic;
+
+    LogicDag source;
+    auto* a = source.create_node<DagVariable>("a");
+    auto* b = source.create_node<DagVariable>("b");
+    auto* one = source.create_node<DagConstant>(1);
+
+    auto* eq = source.create_node<DagOperation>(LogicOp::Eq);
+    eq->add_child(a);
+    eq->add_child(one);
+
+    auto* neg_eq = source.create_node<DagOperation>(LogicOp::Not);
+    neg_eq->add_child(eq);
+
+    auto* and_node = source.create_node<DagOperation>(LogicOp::And);
+    and_node->add_child(neg_eq);
+    and_node->add_child(b);
+    and_node->add_child(b); // duplicate child must remain (no simplification)
+
+    World world;
+    DagNode* mapped_1 = world.map_condition(and_node);
+    DagNode* mapped_2 = world.map_condition(and_node);
+
+    ASSERT_TRUE(mapped_1 != nullptr);
+    ASSERT_TRUE(mapped_1 == mapped_2); // stable DAG mapping
+    ASSERT_TRUE(mapped_1 != and_node);  // copied into world DAG
+
+    auto* mapped_and = dynamic_cast<DagOperation*>(mapped_1);
+    ASSERT_TRUE(mapped_and != nullptr);
+    ASSERT_EQ(mapped_and->op(), LogicOp::And);
+    ASSERT_EQ(mapped_and->children().size(), 3);
+
+    auto* mapped_not = dynamic_cast<DagOperation*>(mapped_and->children()[0]);
+    ASSERT_TRUE(mapped_not != nullptr);
+    ASSERT_EQ(mapped_not->op(), LogicOp::Not);
+
+    auto* mapped_eq = dynamic_cast<DagOperation*>(mapped_not->children()[0]);
+    ASSERT_TRUE(mapped_eq != nullptr);
+    ASSERT_EQ(mapped_eq->op(), LogicOp::Eq);
+
+    auto* mapped_a = dynamic_cast<DagVariable*>(mapped_eq->children()[0]);
+    auto* mapped_one = dynamic_cast<DagConstant*>(mapped_eq->children()[1]);
+    ASSERT_TRUE(mapped_a != nullptr);
+    ASSERT_TRUE(mapped_one != nullptr);
+    ASSERT_EQ(mapped_a->name(), std::string("a"));
+    ASSERT_EQ(mapped_one->value(), 1ULL);
+
+    auto* mapped_b0 = dynamic_cast<DagVariable*>(mapped_and->children()[1]);
+    auto* mapped_b1 = dynamic_cast<DagVariable*>(mapped_and->children()[2]);
+    ASSERT_TRUE(mapped_b0 != nullptr && mapped_b1 != nullptr);
+    ASSERT_TRUE(mapped_b0 == mapped_b1); // DAG sharing preserved
+    ASSERT_EQ(mapped_b0->name(), std::string("b"));
+
+    ASSERT_TRUE(world.map_condition(nullptr) == nullptr);
+
+    std::cout << "[+] test_world_map_condition_no_simplification passed.\n";
 }
 
 void test_z3_converter_no_hard_false_fallback() {
@@ -4086,6 +4146,7 @@ int main() {
     test_range_simplifier();
     test_logic_operation_simplifier();
     test_logic_normal_form_conversion();
+    test_world_map_condition_no_simplification();
     test_z3_converter_no_hard_false_fallback();
     std::cout << "All tests passed successfully.\n";
     return 0;

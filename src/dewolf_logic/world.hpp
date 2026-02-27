@@ -15,16 +15,15 @@ class World {
 public:
     World() = default;
 
-    DagNode* map_condition(DagNode* condition) {
-        // Here we would transform external AST conditions to logic DAG
-        // For now, it just returns the condition if it's already a DagNode
-        return condition;
-    }
+    DagNode* map_condition(DagNode* condition);
 
     LogicDag& dag() { return dag_; }
 
 private:
+    DagNode* map_condition_impl(DagNode* condition);
+
     LogicDag dag_;
+    std::unordered_map<const DagNode*, DagNode*> mapped_nodes_;
 };
 
 } // namespace dewolf_logic
