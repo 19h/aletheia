@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <cstdlib>
+#include <unordered_set>
 #include "../src/common/arena.hpp"
 #include "../src/dewolf/structures/cfg.hpp"
 #include "../src/dewolf/structures/dataflow.hpp"
@@ -9,6 +10,7 @@
 #include "../src/dewolf/structuring/loop_structurer.hpp"
 #include "../src/dewolf/ssa/dominators.hpp"
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
+#include "../src/dewolf/ssa/minimal_variable_renamer.hpp"
 
 #include "../src/dewolf/pipeline/pipeline.hpp"
 #include "../src/dewolf/pipeline/preprocessing_stages.hpp"
@@ -617,6 +619,59 @@ void test_phi_dependency() {
     std::cout << "[+] test_phi_dependency passed.\n";
 }
 
+void test_minimal_variable_renamer() {
+    DecompilerTask task(0x6000);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(30);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* a1 = task.arena().create<Variable>("a", 4);
+    a1->set_ssa_version(1);
+    auto* b1 = task.arena().create<Variable>("b", 4);
+    b1->set_ssa_version(1);
+    auto* c1 = task.arena().create<Variable>("c", 4);
+    c1->set_ssa_version(1);
+
+    auto* assign_a = task.arena().create<Assignment>(a1, task.arena().create<Constant>(1, 4));
+    auto* assign_b = task.arena().create<Assignment>(b1, task.arena().create<Constant>(2, 4));
+    auto* add_ab = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{a1, b1}, 4);
+    auto* assign_c = task.arena().create<Assignment>(c1, add_ab);
+    auto* ret = task.arena().create<Return>(std::vector<Expression*>{b1});
+
+    bb->add_instruction(assign_a);
+    bb->add_instruction(assign_b);
+    bb->add_instruction(assign_c);
+    bb->add_instruction(ret);
+
+    MinimalVariableRenamer::rename(task.arena(), *task.cfg());
+
+    std::unordered_set<std::string> names;
+    std::unordered_set<std::string> interfering;
+    for (Instruction* inst : bb->instructions()) {
+        std::vector<Variable*> vars = inst->requirements();
+        auto defs = inst->definitions();
+        vars.insert(vars.end(), defs.begin(), defs.end());
+        for (Variable* v : vars) {
+            ASSERT_TRUE(v != nullptr);
+            ASSERT_EQ(v->ssa_version(), 0);
+            names.insert(v->name());
+            if (inst == assign_c || inst == ret) {
+                interfering.insert(v->name());
+            }
+        }
+    }
+
+    // There should be fewer non-SSA names than original SSA variables.
+    ASSERT_TRUE(names.size() <= 2);
+    // Two simultaneously-live values (`a`/`b` around `c = a + b`) should still differ.
+    ASSERT_TRUE(interfering.size() >= 2);
+
+    std::cout << "[+] test_minimal_variable_renamer passed.\n";
+}
+
 
 #include "../src/dewolf/codegen/codegen.hpp"
 
@@ -960,6 +1015,7 @@ int main() {
     test_dominators();
     test_ssa_phi_insertion();
     test_instruction_hierarchy();
+    test_minimal_variable_renamer();
     test_compiler_idiom_handling_stage();
     test_register_pair_handling_stage();
     test_switch_variable_detection_stage();

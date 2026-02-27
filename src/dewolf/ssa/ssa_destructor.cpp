@@ -1,5 +1,6 @@
 #include "ssa_destructor.hpp"
 #include "phi_dependency_resolver.hpp"
+#include "minimal_variable_renamer.hpp"
 #include "liveness/liveness.hpp"
 #include "../pipeline/pipeline.hpp"
 #include <vector>
@@ -11,6 +12,7 @@ void SsaDestructor::execute(DecompilerTask& task) {
     PhiDependencyResolver::resolve(task.arena(), *task.cfg());
     LivenessAnalysis liveness(*task.cfg());
     eliminate_phi_nodes(task.arena(), *task.cfg(), liveness);
+    MinimalVariableRenamer::rename(task.arena(), *task.cfg());
 }
 
 void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph& cfg, const LivenessAnalysis& liveness) {
