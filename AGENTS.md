@@ -288,10 +288,11 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.9.3 Implement `back_edges()` -> map of loop head to set of back edges targeting it.
   - [x] H.9.4 Implement `retreating_edges()` -> set of all retreating edges.
 
-- [ ] **H.10** Implement Abnormal Entry / Exit Loop Restructuring (currently missing -- multi-entry and multi-exit loops are not handled)
+- [x] **H.10** Implement Abnormal Entry / Exit Loop Restructuring (currently missing -- multi-entry and multi-exit loops are not handled)
   - *The Python reference handles multi-entry loops by introducing a dispatch variable (`entry_{head}`) and cascading condition nodes to route all entries through a single head (DREAM paper Figure 12). Multi-exit loops are handled symmetrically with an `exit_{head}` dispatch variable. Without this, the DREAM algorithm will fail or produce garbage for irreducible control flow (e.g., `goto` into the middle of a loop) or loops with multiple exit points.*
-  - [ ] H.10.1 Implement `AbnormalEntryRestructurer`: detect region nodes with predecessors outside the region, introduce dispatch variable, create cascading conditions, redirect entries.
-  - [ ] H.10.2 Implement `AbnormalExitRestructurer`: detect multiple loop successors, introduce dispatch variable, create cascading conditions after the loop, redirect exits.
+  - [x] H.10.1 Implement `AbnormalEntryRestructurer`: detect region nodes with predecessors outside the region, introduce dispatch variable, create cascading conditions, redirect entries.
+  - [x] H.10.2 Implement `AbnormalExitRestructurer`: detect multiple loop successors, introduce dispatch variable, create cascading conditions after the loop, redirect exits.
+    - *Implemented in `CyclicRegionFinder::process`. Added graph slice extraction for precise loop region boundaries. Added synthetic entry/exit dispatch variables and cascading condition nodes to redirect control flow through single points, fully matching the DREAM paper figure 12.*
 
 - [x] **H.11** Add `LogicCondition` Tags to `TransitionEdge` (currently TransitionBlock only has predecessor/successor pointer lists with no edge metadata)
   - *The Python reference's `TransitionEdge` carries a `tag: LogicCondition` (the symbolic boolean condition for traversing that edge) and a `property: EdgeProperty` (back/retreating/non_loop). The C++ `TransitionBlock` uses raw predecessor/successor pointer lists with no per-edge data. This forces the reaching conditions computation to re-derive edge conditions from the original CFG's basic block instructions every time, which is fragile and loses information about switch-case edge tags (which are disjunctions of case symbols).*

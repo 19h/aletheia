@@ -41,9 +41,124 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             if (e->property() == EdgeProperty::Retreating) has_retreating = true;
         }
         if (has_retreating) {
-            // restructure abnormal entry
-            // ... (implement H.10.1) ...
+            std::unordered_map<TransitionBlock*, std::vector<TransitionEdge*>> entry_edges;
+            for (auto* node : region_set) {
+                for (auto* e : node->predecessors()) {
+                    if (!region_set.contains(e->source())) {
+                        entry_edges[node].push_back(e);
+                    }
+                }
+            }
+
+            size_t num_entries = entry_edges.size();
+            std::string var_name = "entry_" + std::to_string(reinterpret_cast<uintptr_t>(head));
+            auto* entry_var = arena_.create<Variable>(var_name, 4); entry_var->set_ir_type(Integer::int32_t());
+
+            std::vector<std::pair<TransitionBlock*, dewolf_logic::LogicCondition>> condition_nodes;
+            for (size_t i = 0; i < num_entries - 1; ++i) {
+                auto* cond_op = arena_.create<Condition>(OperationType::eq, entry_var, arena_.create<Constant>(i, 4));
+                auto* branch = arena_.create<Branch>(cond_op);
+                auto* bb = arena_.create<BasicBlock>(9000 + i);
+                bb->add_instruction(branch);
+                auto* tb = arena_.create<TransitionBlock>(arena_.create<CodeNode>(bb));
+                cfg.add_block(tb);
+                loop_region->add_block(tb);
+                
+                dewolf_logic::Z3Converter z3_conv(task_.z3_ctx());
+                condition_nodes.push_back({tb, z3_conv.convert_to_condition(cond_op)});
+            }
+
+            std::vector<TransitionBlock*> code_nodes;
+            for (size_t i = 0; i < num_entries; ++i) {
+                auto* assign = arena_.create<Assignment>(entry_var, arena_.create<Constant>(i, 4));
+                auto* bb = arena_.create<BasicBlock>(9100 + i);
+                bb->add_instruction(assign);
+                auto* tb = arena_.create<TransitionBlock>(arena_.create<CodeNode>(bb));
+                cfg.add_block(tb);
+                // Note: code_nodes are outside the loop region
+                code_nodes.push_back(tb);
+            }
+
+            TransitionBlock* new_head = condition_nodes.empty() ? head : condition_nodes[0].first;
+
+            for (auto* cn : code_nodes) {
+                cfg.add_edge(cn, new_head, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)), EdgeProperty::NonLoop);
+            }
+            for (size_t i = 0; i + 1 < condition_nodes.size(); ++i) {
+                cfg.add_edge(condition_nodes[i].first, condition_nodes[i+1].first, condition_nodes[i].second.negate(), EdgeProperty::NonLoop);
+            }
+
+            // Redirect loop edges (back/retreating) to new_head
+            std::vector<TransitionEdge*> loop_edges;
+            for (auto* e : head->predecessors()) {
+                if (e->property() == EdgeProperty::Back || e->property() == EdgeProperty::Retreating) {
+                    loop_edges.push_back(e);
+                }
+            }
+            for (auto* e : loop_edges) {
+                auto* src = e->source();
+                auto tag = e->tag();
+                auto prop = e->property();
+                cfg.remove_edge(e);
+                cfg.add_edge(src, new_head, tag, prop);
+            }
+
+            std::vector<TransitionBlock*> sorted_entries = {head};
+            for (auto& pair : entry_edges) {
+                if (pair.first != head) sorted_entries.push_back(pair.first);
+            }
+
+            std::vector<std::pair<TransitionBlock*, dewolf_logic::LogicCondition>> ext_conds = condition_nodes;
+            if (!condition_nodes.empty()) {
+                ext_conds.push_back({condition_nodes.back().first, condition_nodes.back().second.negate()});
+            } else {
+                // If there's only 1 entry (head), but it had a retreating edge, num_entries = 1, condition_nodes = 0
+                // Wait, if num_entries=1, new_head=head, no conditions. We still redirect the entry edges to code_nodes[0] -> head.
+            }
+
+            for (size_t i = 0; i < sorted_entries.size(); ++i) {
+                auto* tb = sorted_entries[i];
+                auto* cn = code_nodes[i];
+                if (i < ext_conds.size()) {
+                    cfg.add_edge(ext_conds[i].first, tb, ext_conds[i].second, EdgeProperty::NonLoop);
+                }
+                for (auto* e : entry_edges[tb]) {
+                    auto* src = e->source();
+                    auto tag = e->tag();
+                    auto prop = e->property();
+                    cfg.remove_edge(e);
+                    cfg.add_edge(src, cn, tag, prop);
+                }
+            }
+
+            for (size_t i = 1; i < sorted_entries.size(); ++i) {
+                auto* tb = sorted_entries[i];
+                auto* assign = arena_.create<Assignment>(entry_var, arena_.create<Constant>(0, 4));
+                
+                auto* ast = tb->ast_node();
+                if (auto* code_node = dynamic_cast<CodeNode*>(ast)) {
+                    code_node->block()->add_instruction(assign);
+                } else if (auto* seq_node = dynamic_cast<SeqNode*>(ast)) {
+                    auto* new_bb = arena_.create<BasicBlock>(9200 + i);
+                    new_bb->add_instruction(assign);
+                    auto* new_cn = arena_.create<CodeNode>(new_bb);
+                    seq_node->add_node(new_cn); // append to end
+                } else {
+                    auto* new_seq = arena_.create<SeqNode>();
+                    new_seq->add_node(ast);
+                    auto* new_bb = arena_.create<BasicBlock>(9200 + i);
+                    new_bb->add_instruction(assign);
+                    new_seq->add_node(arena_.create<CodeNode>(new_bb));
+                    tb->set_ast_node(new_seq);
+                }
+            }
+            
+            loop_region->set_entry(new_head);
+            head = new_head;
+            region_set.insert(new_head);
+            for(auto& p : condition_nodes) region_set.insert(p.first);
         }
+
 
         // 3. Compute Loop Successors
         std::vector<TransitionBlock*> loop_successors;
@@ -59,9 +174,77 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
 
         // 4. Restructure Abnormal Exit (TODO)
         if (loop_successors.size() > 1) {
-            // restructure abnormal exit
-            // ... (implement H.10.2) ...
+            size_t num_exits = loop_successors.size();
+            std::string var_name = "exit_" + std::to_string(reinterpret_cast<uintptr_t>(head));
+            auto* exit_var = arena_.create<Variable>(var_name, 4); exit_var->set_ir_type(Integer::int32_t());
+
+            std::vector<std::pair<TransitionBlock*, dewolf_logic::LogicCondition>> condition_nodes;
+            for (size_t i = 0; i < num_exits - 1; ++i) {
+                auto* cond_op = arena_.create<Condition>(OperationType::eq, exit_var, arena_.create<Constant>(i, 4));
+                auto* branch = arena_.create<Branch>(cond_op);
+                auto* bb = arena_.create<BasicBlock>(9300 + i);
+                bb->add_instruction(branch);
+                auto* tb = arena_.create<TransitionBlock>(arena_.create<CodeNode>(bb));
+                cfg.add_block(tb);
+                
+                dewolf_logic::Z3Converter z3_conv(task_.z3_ctx());
+                condition_nodes.push_back({tb, z3_conv.convert_to_condition(cond_op)});
+            }
+
+            std::vector<TransitionBlock*> code_nodes;
+            for (size_t i = 0; i < num_exits; ++i) {
+                auto* assign = arena_.create<Assignment>(exit_var, arena_.create<Constant>(i, 4));
+                auto* bb = arena_.create<BasicBlock>(9400 + i);
+                bb->add_instruction(assign);
+                auto* tb = arena_.create<TransitionBlock>(arena_.create<CodeNode>(bb));
+                cfg.add_block(tb);
+                loop_region->add_block(tb);
+                region_set.insert(tb);
+                code_nodes.push_back(tb);
+            }
+
+            TransitionBlock* new_successor = condition_nodes.empty() ? loop_successors[0] : condition_nodes[0].first;
+
+            for (auto* cn : code_nodes) {
+                cfg.add_edge(cn, new_successor, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)), EdgeProperty::NonLoop);
+            }
+            for (size_t i = 0; i + 1 < condition_nodes.size(); ++i) {
+                cfg.add_edge(condition_nodes[i].first, condition_nodes[i+1].first, condition_nodes[i].second.negate(), EdgeProperty::NonLoop);
+            }
+
+            std::vector<TransitionBlock*> sorted_successors = loop_successors; // python topological sorts them
+
+            std::vector<std::pair<TransitionBlock*, dewolf_logic::LogicCondition>> ext_conds = condition_nodes;
+            if (!condition_nodes.empty()) {
+                ext_conds.push_back({condition_nodes.back().first, condition_nodes.back().second.negate()});
+            }
+
+            // Reverse sorted successors according to python
+            std::vector<TransitionBlock*> reversed_succs = sorted_successors;
+            std::reverse(reversed_succs.begin(), reversed_succs.end());
+
+            for (size_t i = 0; i < reversed_succs.size(); ++i) {
+                auto* tb = reversed_succs[i];
+                auto* cn = code_nodes[i];
+                if (i < ext_conds.size()) {
+                    cfg.add_edge(ext_conds[i].first, tb, ext_conds[i].second, EdgeProperty::NonLoop);
+                }
+                
+                std::vector<TransitionEdge*> exit_edges;
+                for(auto* e : tb->predecessors()) {
+                    if (region_set.contains(e->source())) exit_edges.push_back(e);
+                }
+                for (auto* e : exit_edges) {
+                    auto* src = e->source();
+                    auto tag = e->tag();
+                    cfg.remove_edge(e);
+                    cfg.add_edge(src, cn, tag, EdgeProperty::NonLoop);
+                }
+            }
+
+            loop_successors = {new_successor}; // only 1 successor now!
         }
+
 
         // 5. Restructure acyclic loop body
         auto* loop_cfg = arena_.create<TransitionCFG>(arena_);
