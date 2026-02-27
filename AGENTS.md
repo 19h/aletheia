@@ -608,3 +608,40 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] L.17.1 Detect else-if chain opportunity: if exactly one branch is a ConditionNode, swap so it's the false branch.
   - [x] L.17.2 Implement configurable branch preference (smallest/largest/none).
     - *Implemented in `codegen.cpp`/`codegen.hpp`: added `visit_if_chain()` with else-if chain emission (`} else if (...) {`), branch swap heuristic (single IfNode branch forced to false side), and configurable preference via `DEWOLF_IF_BRANCH_PREFERENCE` (`smallest`, `largest`, `none`). Swaps are semantics-preserving by negating emitted conditions. Added `test_codegen_if_branch_swapping` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+
+---
+
+## POST-CHECKLIST PARITY AUDIT (2026-02-27)
+
+- [x] **P.0** Run a fresh parity audit against `ref/dewolf`, `ref/dewolf-logic`, and `ref/dewolf-idioms` after clearing L.1-L.17.
+  - *Audit completed with an `explore` pass across pipeline wiring, CFG/switch semantics, logic/Z3 conversion, and codegen behavior. Findings below are NEW follow-up gaps not captured in the original checklist.*
+
+### CRITICAL/HIGH FOLLOW-UPS
+
+- [x] **P.1** Wire all implemented optimization stages into both runtime pipelines (plugin + `idump`) in reference-faithful order.
+  - *Gap: `DeadPathEliminationStage`, `DeadLoopEliminationStage`, `ExpressionPropagationMemoryStage`, and `ExpressionPropagationFunctionCallStage` exist but are not run in `src/plugin/plugin.cpp` and `src/cli/idump.cpp`.*
+  - *Implemented in `src/plugin/plugin.cpp` and `src/cli/idump.cpp`: reordered CFG optimization flow to align with reference intent and wired in all missing stages (`DeadPathEliminationStage`, `DeadLoopEliminationStage`, `ExpressionPropagationMemoryStage`, `ExpressionPropagationFunctionCallStage`) plus consistent placement of `TypePropagationStage`, `DeadComponentPrunerStage`, `GraphExpressionFoldingStage`, and `EdgePrunerStage`. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` (all tests pass).* 
+
+- [ ] **P.2** Fix `idump` headless non-termination / no-output behavior on real binaries.
+  - *Observed blocker: `idump` runs against `/tmp/idump_sample.bin` and `/tmp/idump_min.o` exceeded 15-minute timeout and produced zero-byte outputs (`/tmp/idump_sample.dewolf.c`, `/tmp/idump_min.dewolf.c`).*
+  - *Note: retested after P.1 pipeline wiring changes; both inputs still exceed 180s timeout and emit zero-byte outputs, so the hang is independent of missing CFG stage wiring.*
+
+- [ ] **P.3** Implement complete switch-edge semantic propagation from lifting -> CFG -> TransitionCFG tags.
+  - *Gap: switch edges are not carrying robust case-value sets in the CFG and TransitionCFG edge tags are not reconstructing switch-case disjunction semantics, degrading CAR/CBR and reaching-condition quality.*
+
+- [ ] **P.4** Make conditional branch edge truth mapping explicit and target-based (not successor-index based).
+  - *Gap: true/false edge assignment currently depends on successor ordering, which can invert branch semantics when backend order changes.*
+
+- [ ] **P.5** Harden `Z3Converter` operation coverage and remove unsound hard-false fallback behavior.
+  - *Gap: unsupported operations currently collapse to `false` in conversion paths, which can over-prune paths in dead-path/loop elimination.*
+
+### MEDIUM FOLLOW-UPS
+
+- [ ] **P.6** Add `MemPhi` parity support (IR + preprocessing conversion/fix-up path).
+  - *Gap: memory-phi semantics from Python reference are not represented in the current C++ IR/pipeline, limiting memory-SSA fidelity for aliased paths.*
+
+- [ ] **P.7** Improve unknown-operation output policy to emit explicit placeholders instead of dropping lines.
+  - *Gap: codegen suppresses `unknown_op` instructions, causing silent semantic loss in emitted C.*
+
+- [ ] **P.8** Add stage dependency/failure tracking to pipeline execution.
+  - *Gap: pipeline currently executes linearly without dependency validation and without structured per-stage failure records.*
