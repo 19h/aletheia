@@ -359,12 +359,14 @@ You are not allowed from finishing two or more tasks at once, even if that means
 
 ### MEDIUM PRIORITY -- Improves Output Quality and Correctness
 
-- [ ] **M.1** Implement Additional Out-of-SSA Strategies (currently only basic Sreedhar-like approach)
+- [x] **M.1** Implement Additional Out-of-SSA Strategies (currently only basic Sreedhar-like approach)
   - *The Python reference has 4 strategies: `simple` (rename + lift), `minimization` (color then lift via Lex-BFS on chordal interference graph), `lift_minimal` (default: lift then color -- not optimal but practical), `conditional` (lift then dependency-weighted rename via `ConditionalVariableRenamer`). The `MinimalVariableRenamer` uses Lexicographic BFS on the interference graph to produce an optimal coloring when the graph is chordal (which it is in SSA form). `ConditionalVariableRenamer` uses a dependency graph with weighted edges to group variables that should share names.*
   - [x] M.1.1 Implement `MinimalVariableRenamer` with Lex-BFS graph coloring on the interference graph.
     - *Implemented `MinimalVariableRenamer` in `src/dewolf/ssa/minimal_variable_renamer.*`: builds SSA-keyed use/def + liveness sets, constructs an interference graph, computes reverse Lex-BFS ordering per compatibility group, applies greedy color assignment with name-frequency tie-breaks, rewrites CFG variable occurrences to color-class representatives, and removes identity assignments (`x = x`). Wired into `SsaDestructor::execute()` after phi lifting. Added `test_minimal_variable_renamer` in `tests/test_main.cpp`.*
-  - [ ] M.1.2 Implement `ConditionalVariableRenamer` with dependency-graph-weighted merging.
-  - [ ] M.1.3 Make the out-of-SSA strategy configurable (default: `lift_minimal`).
+  - [x] M.1.2 Implement `ConditionalVariableRenamer` with dependency-graph-weighted merging.
+    - *Implemented `ConditionalVariableRenamer` in `src/dewolf/ssa/conditional_variable_renamer.*`: constructs weighted variable dependency edges from assignment RHS expressions (`OPERATION_PENALTY` scoring), merges variable classes greedily by descending edge weight subject to interference/type/alias compatibility, rewrites CFG variables to merged representatives, and removes identity assignments. Added `test_conditional_variable_renamer` in `tests/test_main.cpp`.*
+  - [x] M.1.3 Make the out-of-SSA strategy configurable (default: `lift_minimal`).
+    - *Added `OutOfSsaMode` to `DecompilerTask` (default `LiftMinimal`) and mode parsing in `SsaDestructor::parse_mode()`. `SsaDestructor::execute()` now dispatches among `simple`, `min`/`minimization`, `lift_minimal`, `conditional`, and `sreedhar` strategies, with `lift_minimal` as default. Plugin reads `DEWOLF_OUT_OF_SSA_MODE` to configure strategy at runtime. Added `test_out_of_ssa_mode_config` in `tests/test_main.cpp`.*
 
 - [ ] **M.2** Implement `IdentityElimination` Stage (currently missing)
   - *The Python reference builds an `_IdentityGraph` of direct identities (`a = b`) and indirect identities (phi chains). It finds connected components of congruent variables, prunes non-identity phis via disjoint path analysis, and merges each identity group into a single replacement variable. This goes beyond what `GraphExpressionFolding` catches by handling phi-mediated identities.*

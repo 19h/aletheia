@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <cstdlib>
+#include <utility>
 #include <unordered_set>
 #include "../src/common/arena.hpp"
 #include "../src/dewolf/structures/cfg.hpp"
@@ -10,7 +11,9 @@
 #include "../src/dewolf/structuring/loop_structurer.hpp"
 #include "../src/dewolf/ssa/dominators.hpp"
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
+#include "../src/dewolf/ssa/ssa_destructor.hpp"
 #include "../src/dewolf/ssa/minimal_variable_renamer.hpp"
+#include "../src/dewolf/ssa/conditional_variable_renamer.hpp"
 
 #include "../src/dewolf/pipeline/pipeline.hpp"
 #include "../src/dewolf/pipeline/preprocessing_stages.hpp"
@@ -672,6 +675,135 @@ void test_minimal_variable_renamer() {
     std::cout << "[+] test_minimal_variable_renamer passed.\n";
 }
 
+void test_conditional_variable_renamer() {
+    DecompilerTask task(0x6100);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(31);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* arg0 = task.arena().create<Variable>("arg0", 4);
+    arg0->set_ssa_version(0);
+    auto* a1 = task.arena().create<Variable>("a", 4);
+    a1->set_ssa_version(1);
+    auto* b1 = task.arena().create<Variable>("b", 4);
+    b1->set_ssa_version(1);
+    auto* c1 = task.arena().create<Variable>("c", 4);
+    c1->set_ssa_version(1);
+
+    auto* assign_a = task.arena().create<Assignment>(a1, arg0);
+    auto* plus_one = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{a1, task.arena().create<Constant>(1, 4)},
+        4);
+    auto* assign_b = task.arena().create<Assignment>(b1, plus_one);
+    auto* assign_c = task.arena().create<Assignment>(c1, task.arena().create<Constant>(2, 4));
+    auto* ret = task.arena().create<Return>(std::vector<Expression*>{b1});
+
+    bb->add_instruction(assign_a);
+    bb->add_instruction(assign_b);
+    bb->add_instruction(assign_c);
+    bb->add_instruction(ret);
+
+    ConditionalVariableRenamer::rename(task.arena(), *task.cfg());
+
+    const auto& insts = bb->instructions();
+    Assignment* dep_assign = nullptr;
+    Assignment* const_assign = nullptr;
+    std::unordered_set<std::string> seen_names;
+
+    for (Instruction* inst : insts) {
+        auto* asg = dynamic_cast<Assignment*>(inst);
+        if (asg == nullptr) {
+            continue;
+        }
+        auto* dst = dynamic_cast<Variable*>(asg->destination());
+        ASSERT_TRUE(dst != nullptr);
+        ASSERT_EQ(dst->ssa_version(), 0);
+        seen_names.insert(dst->name());
+
+        if (auto* op = dynamic_cast<Operation*>(asg->value())) {
+            if (op->type() == OperationType::add) {
+                dep_assign = asg;
+            }
+        }
+        if (auto* c = dynamic_cast<Constant*>(asg->value())) {
+            if (c->value() == 2) {
+                const_assign = asg;
+            }
+        }
+    }
+
+    ASSERT_TRUE(dep_assign != nullptr);
+    ASSERT_TRUE(const_assign != nullptr);
+
+    auto* dep_dst = dynamic_cast<Variable*>(dep_assign->destination());
+    auto* const_dst = dynamic_cast<Variable*>(const_assign->destination());
+    ASSERT_TRUE(dep_dst != nullptr && const_dst != nullptr);
+    // Dependency-weighted path and unrelated constant path should not collapse together.
+    ASSERT_TRUE(dep_dst->name() != const_dst->name());
+
+    // There should still be at least two names after conditional merging.
+    ASSERT_TRUE(seen_names.size() >= 2);
+
+    std::cout << "[+] test_conditional_variable_renamer passed.\n";
+}
+
+void test_out_of_ssa_mode_config() {
+    auto run_mode = [](OutOfSsaMode mode) {
+        DecompilerTask task(0x6200);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(32);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+        task.set_out_of_ssa_mode(mode);
+
+        auto* x1 = task.arena().create<Variable>("x", 4);
+        x1->set_ssa_version(1);
+        auto* assign = task.arena().create<Assignment>(x1, task.arena().create<Constant>(5, 4));
+        auto* ret = task.arena().create<Return>(std::vector<Expression*>{x1});
+        bb->add_instruction(assign);
+        bb->add_instruction(ret);
+
+        SsaDestructor stage;
+        stage.execute(task);
+
+        auto* out_assign = dynamic_cast<Assignment*>(bb->instructions()[0]);
+        auto* dst = dynamic_cast<Variable*>(out_assign->destination());
+        ASSERT_TRUE(dst != nullptr);
+        return std::make_pair(dst->name(), dst->ssa_version());
+    };
+
+    auto [default_name, default_version] = run_mode(OutOfSsaMode::LiftMinimal);
+    ASSERT_TRUE(default_name.starts_with("var_"));
+    ASSERT_EQ(default_version, 0);
+
+    auto [simple_name, simple_version] = run_mode(OutOfSsaMode::Simple);
+    ASSERT_EQ(simple_name, "x_1");
+    ASSERT_EQ(simple_version, 0);
+
+    auto [sreedhar_name, sreedhar_version] = run_mode(OutOfSsaMode::Sreedhar);
+    ASSERT_EQ(sreedhar_name, "x");
+    ASSERT_EQ(sreedhar_version, 1);
+
+    auto parsed_default = SsaDestructor::parse_mode("lift_minimal");
+    ASSERT_TRUE(parsed_default.has_value());
+    ASSERT_EQ(*parsed_default, OutOfSsaMode::LiftMinimal);
+
+    auto parsed_cond = SsaDestructor::parse_mode("conditional");
+    ASSERT_TRUE(parsed_cond.has_value());
+    ASSERT_EQ(*parsed_cond, OutOfSsaMode::Conditional);
+
+    auto parsed_bad = SsaDestructor::parse_mode("not-a-mode");
+    ASSERT_TRUE(!parsed_bad.has_value());
+
+    std::cout << "[+] test_out_of_ssa_mode_config passed.\n";
+}
+
 
 #include "../src/dewolf/codegen/codegen.hpp"
 
@@ -1016,6 +1148,8 @@ int main() {
     test_ssa_phi_insertion();
     test_instruction_hierarchy();
     test_minimal_variable_renamer();
+    test_conditional_variable_renamer();
+    test_out_of_ssa_mode_config();
     test_compiler_idiom_handling_stage();
     test_register_pair_handling_stage();
     test_switch_variable_detection_stage();

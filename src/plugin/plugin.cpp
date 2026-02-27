@@ -14,6 +14,7 @@
 #include <ida/database.hpp>
 #include <ida/event.hpp>
 #include <ida/lines.hpp>
+#include <cstdlib>
 
 struct DeWolfPlugin : ida::plugin::Plugin {
     ida::event::Token event_token_{0};
@@ -47,6 +48,17 @@ struct DeWolfPlugin : ida::plugin::Plugin {
         ida::ui::message("DeWolf: Decompiling function at " + std::to_string(ea) + "...\n");
 
         dewolf::DecompilerTask task(ea);
+
+        if (const char* mode_env = std::getenv("DEWOLF_OUT_OF_SSA_MODE"); mode_env != nullptr) {
+            auto parsed = dewolf::SsaDestructor::parse_mode(mode_env);
+            if (parsed.has_value()) {
+                task.set_out_of_ssa_mode(*parsed);
+            } else {
+                ida::ui::message(std::string("DeWolf: unknown DEWOLF_OUT_OF_SSA_MODE='") + mode_env
+                                 + "', using default lift_minimal.\n");
+            }
+        }
+
         dewolf_idioms::IdiomMatcher matcher;
         dewolf::Lifter lifter(task.arena(), matcher);
         std::vector<dewolf_idioms::IdiomTag> idiom_tags;

@@ -11,6 +11,14 @@
 
 namespace dewolf {
 
+enum class OutOfSsaMode {
+    Simple,
+    Minimization,
+    LiftMinimal,
+    Conditional,
+    Sreedhar,
+};
+
 class DecompilerTask {
 public:
     explicit DecompilerTask(ida::Address function_address)
@@ -39,6 +47,9 @@ public:
     std::vector<dewolf_idioms::IdiomTag>& mutable_idiom_tags() { return idiom_tags_; }
     void set_idiom_tags(std::vector<dewolf_idioms::IdiomTag> tags) { idiom_tags_ = std::move(tags); }
 
+    OutOfSsaMode out_of_ssa_mode() const { return out_of_ssa_mode_; }
+    void set_out_of_ssa_mode(OutOfSsaMode mode) { out_of_ssa_mode_ = mode; }
+
 private:
     ida::Address function_address_;
     DecompilerArena arena_;
@@ -48,6 +59,7 @@ private:
     std::string function_name_;
     TypePtr function_type_;
     std::vector<dewolf_idioms::IdiomTag> idiom_tags_;
+    OutOfSsaMode out_of_ssa_mode_ = OutOfSsaMode::LiftMinimal;
 };
 
 class PipelineStage {
