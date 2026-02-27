@@ -10,11 +10,15 @@
 #include "../dewolf/pipeline/expressions/graph_expression_folding.hpp"
 #include "../dewolf/pipeline/dataflow_analysis/dead_code_elimination.hpp"
 #include "../dewolf/structuring/structuring_stage.hpp"
+#include "../dewolf/structuring/instruction_length_handler.hpp"
+#include "../dewolf/structuring/variable_name_generation.hpp"
+#include "../dewolf/structuring/loop_name_generator.hpp"
 #include <ida/ui.hpp>
 #include <ida/database.hpp>
 #include <ida/event.hpp>
 #include <ida/lines.hpp>
 #include <cstdlib>
+#include <string_view>
 
 struct DeWolfPlugin : ida::plugin::Plugin {
     ida::event::Token event_token_{0};
@@ -94,6 +98,21 @@ struct DeWolfPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
         
         pipeline.run(task);
+
+        dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
+
+        if (const char* naming_env = std::getenv("DEWOLF_VARIABLE_NAMING"); naming_env != nullptr) {
+            std::string_view scheme{naming_env};
+            if (scheme == "system_hungarian") {
+                dewolf::VariableNameGeneration::apply_system_hungarian(task.ast());
+            } else {
+                dewolf::VariableNameGeneration::apply_default(task.ast());
+            }
+        } else {
+            dewolf::VariableNameGeneration::apply_default(task.ast());
+        }
+        dewolf::LoopNameGenerator::apply_for_loop_counters(task.ast());
+        dewolf::LoopNameGenerator::apply_while_loop_counters(task.ast());
 
         std::vector<std::string> lines;
         lines.push_back(ida::lines::colstr("// DeWolf Decompiled Output", ida::lines::Color::RegularComment));

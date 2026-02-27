@@ -252,6 +252,168 @@ public:
     }
 };
 
+bool same_variable(const Variable* lhs, const Variable* rhs) {
+    if (!lhs || !rhs) return false;
+    return lhs->name() == rhs->name() && lhs->ssa_version() == rhs->ssa_version();
+}
+
+Variable* extract_condition_variable(Expression* expr) {
+    auto* cond = dynamic_cast<Condition*>(expr);
+    if (!cond) return nullptr;
+
+    if (auto* lhs_var = dynamic_cast<Variable*>(cond->lhs())) {
+        return lhs_var;
+    }
+    if (auto* rhs_var = dynamic_cast<Variable*>(cond->rhs())) {
+        return rhs_var;
+    }
+    return nullptr;
+}
+
+Assignment* extract_single_assignment(CodeNode* node) {
+    if (!node || !node->block()) return nullptr;
+    const auto& insts = node->block()->instructions();
+    if (insts.size() != 1) return nullptr;
+    return dynamic_cast<Assignment*>(insts[0]);
+}
+
+Assignment* extract_trailing_assignment(AstNode* body, CodeNode** owner_code) {
+    if (!body) return nullptr;
+
+    if (auto* code = dynamic_cast<CodeNode*>(body)) {
+        if (!code->block() || code->block()->instructions().empty()) return nullptr;
+        Instruction* tail = code->block()->instructions().back();
+        auto* assign = dynamic_cast<Assignment*>(tail);
+        if (assign && owner_code) *owner_code = code;
+        return assign;
+    }
+
+    auto* seq = dynamic_cast<SeqNode*>(body);
+    if (!seq || seq->nodes().empty()) return nullptr;
+    auto* tail_code = dynamic_cast<CodeNode*>(seq->last());
+    if (!tail_code || !tail_code->block() || tail_code->block()->instructions().empty()) return nullptr;
+    Instruction* tail = tail_code->block()->instructions().back();
+    auto* assign = dynamic_cast<Assignment*>(tail);
+    if (assign && owner_code) *owner_code = tail_code;
+    return assign;
+}
+
+bool is_induction_update(Assignment* assign, Variable* variable) {
+    if (!assign || !variable) return false;
+    auto* dst = dynamic_cast<Variable*>(assign->destination());
+    if (!same_variable(dst, variable)) return false;
+
+    auto* op = dynamic_cast<Operation*>(assign->value());
+    if (!op || op->operands().size() != 2) return false;
+    if (op->type() != OperationType::add && op->type() != OperationType::sub) return false;
+
+    auto* lhs_var = dynamic_cast<Variable*>(op->operands()[0]);
+    auto* rhs_var = dynamic_cast<Variable*>(op->operands()[1]);
+    return same_variable(lhs_var, variable) || same_variable(rhs_var, variable);
+}
+
+void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
+    if (!seq) return;
+    auto& nodes = seq->mutable_nodes();
+    if (nodes.size() < 2) return;
+
+    for (std::size_t i = 1; i < nodes.size(); ++i) {
+        auto* while_node = dynamic_cast<WhileLoopNode*>(nodes[i]);
+        if (!while_node || while_node->condition() == nullptr || while_node->body() == nullptr) {
+            continue;
+        }
+
+        auto* init_code = dynamic_cast<CodeNode*>(nodes[i - 1]);
+        auto* init_assign = extract_single_assignment(init_code);
+        if (!init_assign) continue;
+
+        auto* init_var = dynamic_cast<Variable*>(init_assign->destination());
+        auto* cond_var = extract_condition_variable(while_node->condition());
+        if (!same_variable(init_var, cond_var)) continue;
+
+        CodeNode* mod_owner = nullptr;
+        auto* mod_assign = extract_trailing_assignment(while_node->body(), &mod_owner);
+        if (!mod_assign) continue;
+
+        auto* mod_var = dynamic_cast<Variable*>(mod_assign->destination());
+        if (!same_variable(mod_var, init_var) || !is_induction_update(mod_assign, init_var)) {
+            continue;
+        }
+
+        if (mod_owner) {
+            mod_owner->remove_last_instruction();
+        }
+
+        auto* for_node = arena.create<ForLoopNode>(
+            while_node->body(),
+            while_node->condition(),
+            init_assign,
+            mod_assign);
+
+        nodes[i] = for_node;
+        nodes.erase(nodes.begin() + static_cast<long>(i - 1));
+        if (i > 1) {
+            --i;
+        }
+    }
+}
+
+AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
+    if (!node) return nullptr;
+
+    if (auto* seq = dynamic_cast<SeqNode*>(node)) {
+        for (AstNode*& child : seq->mutable_nodes()) {
+            child = rewrite_guarded_do_while(arena, child);
+        }
+        rewrite_while_to_for_in_sequence(arena, seq);
+        return seq;
+    }
+
+    if (auto* if_node = dynamic_cast<IfNode*>(node)) {
+        if (if_node->true_branch()) {
+            if_node->set_true_branch(rewrite_guarded_do_while(arena, if_node->true_branch()));
+        }
+        if (if_node->false_branch()) {
+            if_node->set_false_branch(rewrite_guarded_do_while(arena, if_node->false_branch()));
+        }
+
+        // Guarded do-while pattern:
+        // if (cond) { do { body } while (cond); }  -->  while (cond) { body }
+        if (if_node->false_branch() == nullptr) {
+            auto* dowhile = dynamic_cast<DoWhileLoopNode*>(if_node->true_branch());
+            Expression* guard_cond = if_node->condition_expr();
+            if (dowhile != nullptr && guard_cond != nullptr && dowhile->condition() != nullptr) {
+                if (expr_fingerprint(guard_cond) == expr_fingerprint(dowhile->condition())) {
+                    return arena.create<WhileLoopNode>(dowhile->body(), dowhile->condition());
+                }
+            }
+        }
+
+        return if_node;
+    }
+
+    if (auto* loop = dynamic_cast<LoopNode*>(node)) {
+        if (loop->body()) {
+            loop->set_body(rewrite_guarded_do_while(arena, loop->body()));
+        }
+        return loop;
+    }
+
+    if (auto* sw = dynamic_cast<SwitchNode*>(node)) {
+        for (CaseNode* c : sw->mutable_cases()) {
+            c->set_body(rewrite_guarded_do_while(arena, c->body()));
+        }
+        return sw;
+    }
+
+    if (auto* c = dynamic_cast<CaseNode*>(node)) {
+        c->set_body(rewrite_guarded_do_while(arena, c->body()));
+        return c;
+    }
+
+    return node;
+}
+
 } // namespace
 
 AstNode* ConditionAwareRefinement::refine(
@@ -275,7 +437,7 @@ AstNode* ConditionAwareRefinement::refine(
             }
         }
 
-        return seq;
+        return rewrite_guarded_do_while(arena, seq);
     }
 
     return root;

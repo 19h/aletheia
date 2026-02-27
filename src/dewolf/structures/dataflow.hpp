@@ -178,6 +178,7 @@ public:
     // Variable is a leaf: substitute() is a no-op (inherited default).
 
     const std::string& name() const { return name_; }
+    void set_name(std::string name) { name_ = std::move(name); }
 
     // SSA fields
     std::size_t ssa_version() const { return ssa_version_; }
@@ -780,6 +781,7 @@ public:
     }
 
     const std::vector<Expression*>& values() const { return values_; }
+    std::vector<Expression*>& mutable_values() { return values_; }
     bool has_value() const { return !values_.empty(); }
 
 private:

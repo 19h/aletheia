@@ -13,6 +13,9 @@
 #include "../src/dewolf/structuring/cbr/cbr.hpp"
 #include "../src/dewolf/structuring/car/car.hpp"
 #include "../src/dewolf/structuring/reachability.hpp"
+#include "../src/dewolf/structuring/instruction_length_handler.hpp"
+#include "../src/dewolf/structuring/variable_name_generation.hpp"
+#include "../src/dewolf/structuring/loop_name_generator.hpp"
 #include "../src/dewolf/ssa/dominators.hpp"
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
 #include "../src/dewolf/ssa/ssa_destructor.hpp"
@@ -1176,6 +1179,276 @@ void test_codegen_operator_precedence() {
     std::cout << "[+] test_codegen_operator_precedence passed.\n";
 }
 
+void test_variable_name_generation_default() {
+    dewolf::DecompilerArena arena;
+
+    auto* eax = arena.create<dewolf::Variable>("eax", 4);
+    eax->set_ssa_version(3);
+    auto* ebx = arena.create<dewolf::Variable>("ebx", 4);
+    ebx->set_ssa_version(5);
+    auto* ecx = arena.create<dewolf::Variable>("ecx", 4);
+    ecx->set_ssa_version(1);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(164);
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        eax,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{ebx, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        ecx,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{eax, ebx},
+            4)));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(seq);
+
+    dewolf::VariableNameGeneration::apply_default(forest);
+
+    ASSERT_TRUE(eax->name().starts_with("var_"));
+    ASSERT_TRUE(ebx->name().starts_with("var_"));
+    ASSERT_TRUE(ecx->name().starts_with("var_"));
+    ASSERT_TRUE(eax->name() != ebx->name());
+    ASSERT_TRUE(eax->name() != ecx->name());
+    ASSERT_TRUE(ebx->name() != ecx->name());
+    ASSERT_EQ(eax->ssa_version(), 0);
+    ASSERT_EQ(ebx->ssa_version(), 0);
+    ASSERT_EQ(ecx->ssa_version(), 0);
+
+    std::cout << "[+] test_variable_name_generation_default passed.\n";
+}
+
+void test_variable_name_generation_system_hungarian() {
+    dewolf::DecompilerArena arena;
+
+    auto* int_var = arena.create<dewolf::Variable>("x", 4);
+    int_var->set_ir_type(dewolf::Integer::int32_t());
+    int_var->set_ssa_version(2);
+
+    auto* ptr_var = arena.create<dewolf::Variable>("p", 8);
+    ptr_var->set_ir_type(std::make_shared<const dewolf::Pointer>(dewolf::Integer::int32_t()));
+    ptr_var->set_ssa_version(4);
+
+    auto* float_var = arena.create<dewolf::Variable>("f", 4);
+    float_var->set_ir_type(dewolf::Float::float32());
+    float_var->set_ssa_version(1);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(165);
+    bb->add_instruction(arena.create<dewolf::Assignment>(int_var, arena.create<dewolf::Constant>(1, 4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(ptr_var, int_var));
+    bb->add_instruction(arena.create<dewolf::Assignment>(float_var, int_var));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(seq);
+
+    dewolf::VariableNameGeneration::apply_system_hungarian(forest);
+
+    ASSERT_TRUE(int_var->name().starts_with("iVar"));
+    ASSERT_TRUE(ptr_var->name().starts_with("pVar"));
+    ASSERT_TRUE(float_var->name().starts_with("fVar"));
+    ASSERT_EQ(int_var->ssa_version(), 0);
+    ASSERT_EQ(ptr_var->ssa_version(), 0);
+    ASSERT_EQ(float_var->ssa_version(), 0);
+
+    std::cout << "[+] test_variable_name_generation_system_hungarian passed.\n";
+}
+
+void test_loop_name_generator_for_counters() {
+    dewolf::DecompilerArena arena;
+
+    auto* idx_a = arena.create<dewolf::Variable>("var_10", 4);
+    auto* idx_b = arena.create<dewolf::Variable>("var_11", 4);
+
+    auto* body_a_block = arena.create<dewolf::BasicBlock>(166);
+    body_a_block->add_instruction(arena.create<dewolf::Assignment>(
+        idx_a,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{idx_a, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+
+    auto* body_b_block = arena.create<dewolf::BasicBlock>(167);
+    body_b_block->add_instruction(arena.create<dewolf::Assignment>(
+        idx_b,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{idx_b, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+
+    auto* for_a = arena.create<dewolf::ForLoopNode>(
+        arena.create<dewolf::CodeNode>(body_a_block),
+        arena.create<dewolf::Condition>(dewolf::OperationType::lt, idx_a, arena.create<dewolf::Constant>(5, 4), 1),
+        arena.create<dewolf::Assignment>(idx_a, arena.create<dewolf::Constant>(0, 4)),
+        arena.create<dewolf::Assignment>(
+            idx_a,
+            arena.create<dewolf::Operation>(
+                dewolf::OperationType::add,
+                std::vector<dewolf::Expression*>{idx_a, arena.create<dewolf::Constant>(1, 4)},
+                4)));
+
+    auto* for_b = arena.create<dewolf::ForLoopNode>(
+        arena.create<dewolf::CodeNode>(body_b_block),
+        arena.create<dewolf::Condition>(dewolf::OperationType::lt, idx_b, arena.create<dewolf::Constant>(3, 4), 1),
+        arena.create<dewolf::Assignment>(idx_b, arena.create<dewolf::Constant>(0, 4)),
+        arena.create<dewolf::Assignment>(
+            idx_b,
+            arena.create<dewolf::Operation>(
+                dewolf::OperationType::add,
+                std::vector<dewolf::Expression*>{idx_b, arena.create<dewolf::Constant>(1, 4)},
+                4)));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(for_a);
+    seq->add_node(for_b);
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(seq);
+
+    dewolf::LoopNameGenerator::apply_for_loop_counters(forest);
+
+    ASSERT_EQ(idx_a->name(), "i");
+    ASSERT_EQ(idx_b->name(), "j");
+    ASSERT_EQ(idx_a->ssa_version(), 0);
+    ASSERT_EQ(idx_b->ssa_version(), 0);
+
+    std::cout << "[+] test_loop_name_generator_for_counters passed.\n";
+}
+
+void test_loop_name_generator_while_counters() {
+    dewolf::DecompilerArena arena;
+
+    auto* w0 = arena.create<dewolf::Variable>("var_20", 4);
+    auto* w1 = arena.create<dewolf::Variable>("var_21", 4);
+
+    auto* body0 = arena.create<dewolf::BasicBlock>(168);
+    body0->add_instruction(arena.create<dewolf::Assignment>(
+        w0,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{w0, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+
+    auto* body1 = arena.create<dewolf::BasicBlock>(169);
+    body1->add_instruction(arena.create<dewolf::Assignment>(
+        w1,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{w1, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+
+    auto* while0 = arena.create<dewolf::WhileLoopNode>(
+        arena.create<dewolf::CodeNode>(body0),
+        arena.create<dewolf::Condition>(dewolf::OperationType::lt, w0, arena.create<dewolf::Constant>(10, 4), 1));
+    auto* while1 = arena.create<dewolf::WhileLoopNode>(
+        arena.create<dewolf::CodeNode>(body1),
+        arena.create<dewolf::Condition>(dewolf::OperationType::lt, w1, arena.create<dewolf::Constant>(5, 4), 1));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(while0);
+    seq->add_node(while1);
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(seq);
+
+    dewolf::LoopNameGenerator::apply_while_loop_counters(forest);
+
+    ASSERT_EQ(w0->name(), "counter");
+    ASSERT_EQ(w1->name(), "counter1");
+    ASSERT_EQ(w0->ssa_version(), 0);
+    ASSERT_EQ(w1->ssa_version(), 0);
+
+    std::cout << "[+] test_loop_name_generator_while_counters passed.\n";
+}
+
+void test_instruction_length_handler() {
+    dewolf::DecompilerArena arena;
+
+    auto* a = arena.create<dewolf::Variable>("a", 4);
+    auto* b = arena.create<dewolf::Variable>("b", 4);
+    auto* c = arena.create<dewolf::Variable>("c", 4);
+    auto* d = arena.create<dewolf::Variable>("d", 4);
+    auto* out = arena.create<dewolf::Variable>("out", 4);
+
+    auto* mul_ab = arena.create<dewolf::Operation>(
+        dewolf::OperationType::mul,
+        std::vector<dewolf::Expression*>{a, b},
+        4);
+    auto* mul_cd = arena.create<dewolf::Operation>(
+        dewolf::OperationType::mul,
+        std::vector<dewolf::Expression*>{c, d},
+        4);
+    auto* add_expr = arena.create<dewolf::Operation>(
+        dewolf::OperationType::add,
+        std::vector<dewolf::Expression*>{mul_ab, mul_cd},
+        4);
+
+    auto* mul_ab_ret = arena.create<dewolf::Operation>(
+        dewolf::OperationType::mul,
+        std::vector<dewolf::Expression*>{a, b},
+        4);
+    auto* mul_cd_ret = arena.create<dewolf::Operation>(
+        dewolf::OperationType::mul,
+        std::vector<dewolf::Expression*>{c, d},
+        4);
+    auto* add_expr_ret = arena.create<dewolf::Operation>(
+        dewolf::OperationType::add,
+        std::vector<dewolf::Expression*>{mul_ab_ret, mul_cd_ret},
+        4);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(170);
+    auto* assign = arena.create<dewolf::Assignment>(out, add_expr);
+    auto* ret = arena.create<dewolf::Return>(std::vector<dewolf::Expression*>{add_expr_ret});
+    bb->add_instruction(assign);
+    bb->add_instruction(ret);
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(seq);
+
+    dewolf::InstructionLengthBounds bounds;
+    bounds.assignment_instr = 2;
+    bounds.call_operation = 1;
+    bounds.return_instr = 2;
+    dewolf::InstructionLengthHandler::apply(forest, arena, bounds);
+
+    const auto& instrs = bb->instructions();
+    ASSERT_TRUE(instrs.size() >= 4);
+    ASSERT_TRUE(dynamic_cast<dewolf::Assignment*>(instrs[0]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<dewolf::Assignment*>(instrs[1]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<dewolf::Assignment*>(instrs[instrs.size() - 2]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<dewolf::Return*>(instrs.back()) != nullptr);
+
+    auto* final_assign = dynamic_cast<dewolf::Assignment*>(instrs[instrs.size() - 2]);
+    ASSERT_TRUE(final_assign != nullptr);
+    auto* final_add = dynamic_cast<dewolf::Operation*>(final_assign->value());
+    ASSERT_TRUE(final_add != nullptr);
+    ASSERT_TRUE(dynamic_cast<dewolf::Variable*>(final_add->operands()[0]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<dewolf::Variable*>(final_add->operands()[1]) != nullptr);
+
+    auto* final_ret = dynamic_cast<dewolf::Return*>(instrs.back());
+    ASSERT_TRUE(final_ret != nullptr);
+    ASSERT_EQ(final_ret->values().size(), 1);
+    auto* ret_expr = final_ret->values()[0];
+    auto* ret_var = dynamic_cast<dewolf::Variable*>(ret_expr);
+    auto* ret_op = dynamic_cast<dewolf::Operation*>(ret_expr);
+    ASSERT_TRUE(ret_var != nullptr || ret_op != nullptr);
+    if (ret_op != nullptr) {
+        ASSERT_TRUE(ret_op->operands().size() <= 2);
+        for (auto* operand : ret_op->operands()) {
+            ASSERT_TRUE(dynamic_cast<dewolf::Variable*>(operand) != nullptr ||
+                        dynamic_cast<dewolf::Constant*>(operand) != nullptr);
+        }
+    }
+
+    std::cout << "[+] test_instruction_length_handler passed.\n";
+}
+
 void test_condition_handler() {
     z3::context ctx;
     ConditionHandler handler(ctx);
@@ -1474,6 +1747,116 @@ void test_car_missing_case_finder_condition() {
     ASSERT_TRUE(has_case1 && has_case4);
 
     std::cout << "[+] test_car_missing_case_finder_condition passed.\n";
+}
+
+void test_guarded_do_while_rewrite() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* i = arena.create<dewolf::Variable>("i", 4);
+    auto* cond = arena.create<dewolf::Condition>(
+        dewolf::OperationType::lt,
+        i,
+        arena.create<dewolf::Constant>(10, 4),
+        1);
+
+    auto* bb_body = arena.create<dewolf::BasicBlock>(159);
+    bb_body->add_instruction(arena.create<dewolf::Assignment>(
+        i,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{i, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+
+    auto* guarded = arena.create<dewolf::IfNode>(
+        arena.create<dewolf::ExprAstNode>(cond),
+        arena.create<dewolf::DoWhileLoopNode>(arena.create<dewolf::CodeNode>(bb_body), cond));
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(guarded);
+
+    auto* refined = dewolf::ConditionAwareRefinement::refine(
+        arena,
+        ctx,
+        seq,
+        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+
+    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    ASSERT_TRUE(out_seq != nullptr);
+    ASSERT_EQ(out_seq->nodes().size(), 1);
+
+    auto* while_node = dynamic_cast<dewolf::WhileLoopNode*>(out_seq->nodes()[0]);
+    ASSERT_TRUE(while_node != nullptr);
+    ASSERT_TRUE(while_node->condition() != nullptr);
+    ASSERT_TRUE(dynamic_cast<dewolf::CodeNode*>(while_node->body()) != nullptr);
+
+    std::cout << "[+] test_guarded_do_while_rewrite passed.\n";
+}
+
+void test_while_loop_replacer() {
+    dewolf::DecompilerArena arena;
+    z3::context ctx;
+
+    auto* i = arena.create<dewolf::Variable>("i", 4);
+    auto* sum = arena.create<dewolf::Variable>("sum", 4);
+
+    auto* init_block = arena.create<dewolf::BasicBlock>(161);
+    auto* init_assign = arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(0, 4));
+    init_block->add_instruction(init_assign);
+    auto* init_node = arena.create<dewolf::CodeNode>(init_block);
+
+    auto* body_work_block = arena.create<dewolf::BasicBlock>(162);
+    body_work_block->add_instruction(arena.create<dewolf::Assignment>(
+        sum,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{sum, i},
+            4)));
+
+    auto* body_update_block = arena.create<dewolf::BasicBlock>(163);
+    auto* mod_assign = arena.create<dewolf::Assignment>(
+        i,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{i, arena.create<dewolf::Constant>(1, 4)},
+            4));
+    body_update_block->add_instruction(mod_assign);
+
+    auto* body_seq = arena.create<dewolf::SeqNode>();
+    body_seq->add_node(arena.create<dewolf::CodeNode>(body_work_block));
+    body_seq->add_node(arena.create<dewolf::CodeNode>(body_update_block));
+
+    auto* cond = arena.create<dewolf::Condition>(
+        dewolf::OperationType::lt,
+        i,
+        arena.create<dewolf::Constant>(10, 4),
+        1);
+    auto* while_node = arena.create<dewolf::WhileLoopNode>(body_seq, cond);
+
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(init_node);
+    seq->add_node(while_node);
+
+    auto* refined = dewolf::ConditionAwareRefinement::refine(
+        arena,
+        ctx,
+        seq,
+        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+
+    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    ASSERT_TRUE(out_seq != nullptr);
+    ASSERT_EQ(out_seq->nodes().size(), 1);
+
+    auto* for_node = dynamic_cast<dewolf::ForLoopNode*>(out_seq->nodes()[0]);
+    ASSERT_TRUE(for_node != nullptr);
+    ASSERT_TRUE(for_node->declaration() == init_assign);
+    ASSERT_TRUE(for_node->modification() == mod_assign);
+
+    // The update assignment should be removed from loop body after extraction.
+    const auto& update_insts = body_update_block->instructions();
+    ASSERT_TRUE(update_insts.empty());
+
+    std::cout << "[+] test_while_loop_replacer passed.\n";
 }
 
 void test_sibling_reachability() {
@@ -2477,12 +2860,19 @@ int main() {
     test_codegen_switch_case();
     test_codegen_loop_variants();
     test_codegen_operator_precedence();
+    test_variable_name_generation_default();
+    test_variable_name_generation_system_hungarian();
+    test_loop_name_generator_for_counters();
+    test_loop_name_generator_while_counters();
+    test_instruction_length_handler();
     test_condition_handler();
     test_cbr_complementary_conditions();
     test_cbr_cnf_subexpression_grouping();
     test_car_initial_switch_constructor();
     test_car_switch_extractor_and_missing_case_sequence();
     test_car_missing_case_finder_condition();
+    test_guarded_do_while_rewrite();
+    test_while_loop_replacer();
     test_sibling_reachability();
     test_case_dependency_graph_ordering();
     test_phi_dependency();

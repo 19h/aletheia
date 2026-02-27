@@ -497,25 +497,32 @@ You are not allowed from finishing two or more tasks at once, even if that means
 
 ### LOW PRIORITY -- Polish and Readability Improvements
 
-- [ ] **L.1** Implement `ReadabilityBasedRefinement` AST Stage (guarded do-while removal and while-to-for-loop conversion)
+- [x] **L.1** Implement `ReadabilityBasedRefinement` AST Stage (guarded do-while removal and while-to-for-loop conversion)
   - *The Python reference detects do-while loops inside condition nodes with identical conditions and replaces with while loops. `WhileLoopReplacer` converts while loops to for loops when initialization, continuation variable, and condition variable are identified.*
-  - [ ] L.1.1 Detect guarded do-while patterns and replace with while.
-  - [ ] L.1.2 Implement `WhileLoopReplacer` for for-loop recovery.
+  - [x] L.1.1 Detect guarded do-while patterns and replace with while.
+    - *Implemented guarded do-while rewrite in `ConditionAwareRefinement` (`structuring/car/car.cpp`): recursively rewrites `if (cond) { do { body } while (cond); }` into `while (cond) { body }` by matching identical condition fingerprints and preserving loop body/condition nodes. Added `test_guarded_do_while_rewrite` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+  - [x] L.1.2 Implement `WhileLoopReplacer` for for-loop recovery.
+    - *Implemented while-to-for recovery in `ConditionAwareRefinement` (`structuring/car/car.cpp`) using sequence-context pattern matching: when a `SeqNode` contains `init; while(cond){...; i=i+1;}` with matching induction variable across declaration/condition/modification, it rewrites to `ForLoopNode(declaration, condition, modification)` and removes the trailing update from loop body. Added `test_while_loop_replacer` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.2** Implement `VariableNameGeneration` AST Stage (currently variables keep raw register/SSA names)
+- [x] **L.2** Implement `VariableNameGeneration` AST Stage (currently variables keep raw register/SSA names)
   - *The Python reference supports `default` (no rename) and `system_hungarian` (type-prefixed names like `iVar0`, `pchStr1`). Uses `SubstituteVisitor` on AST.*
-  - [ ] L.2.1 Implement default naming scheme: `var_0`, `var_1`, etc.
-  - [ ] L.2.2 Implement system Hungarian naming: prefix by type (`i` for int, `p` for pointer, `f` for float).
+  - [x] L.2.1 Implement default naming scheme: `var_0`, `var_1`, etc.
+    - *Implemented `VariableNameGeneration::apply_default()` in new `structuring/variable_name_generation.hpp/.cpp`: AST traversal renames variables by first-seen `(name, ssa_version)` to deterministic `var_N` labels and normalizes SSA suffixes to 0 for output readability. Wired invocation into plugin flow (`plugin.cpp`) after structuring. Added `test_variable_name_generation_default` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+  - [x] L.2.2 Implement system Hungarian naming: prefix by type (`i` for int, `p` for pointer, `f` for float).
+    - *Extended `VariableNameGeneration` with `apply_system_hungarian()` in `structuring/variable_name_generation.cpp`: type-aware naming emits prefixes by variable type (`iVarN`, `pVarN`, `fVarN`, fallback `vVarN`) while preserving canonical renaming per original `(name, ssa_version)` and normalizing SSA labels. Added plugin selection via `DEWOLF_VARIABLE_NAMING=system_hungarian` in `plugin.cpp` and covered behavior with `test_variable_name_generation_system_hungarian` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.3** Implement `LoopNameGenerator` AST Stage (currently no special loop variable naming)
+- [x] **L.3** Implement `LoopNameGenerator` AST Stage (currently no special loop variable naming)
   - *The Python reference renames while-loop counter variables to `counter`, `counter1`, etc. and for-loop variables to `i`, `j`, `k`, etc.*
-  - [ ] L.3.1 Detect loop counter variables and rename to `i`, `j`, `k`, ... for for-loops.
-  - [ ] L.3.2 Rename while-loop counters to `counter`, `counter1`, ...
+  - [x] L.3.1 Detect loop counter variables and rename to `i`, `j`, `k`, ... for for-loops.
+    - *Implemented `LoopNameGenerator::apply_for_loop_counters()` in new `structuring/loop_name_generator.hpp/.cpp`: traverses AST `ForLoopNode` declarations, assigns deterministic counter names (`i`, `j`, `k`, ...), and rewrites all matching variable uses/defs in conditions, declarations/modifications, and loop bodies. Wired invocation in plugin flow (`plugin.cpp`) after variable naming. Added `test_loop_name_generator_for_counters` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+  - [x] L.3.2 Rename while-loop counters to `counter`, `counter1`, ...
+    - *Extended `LoopNameGenerator` with `apply_while_loop_counters()` in `structuring/loop_name_generator.cpp`: detects `WhileLoopNode` condition variables and renames them deterministically to `counter`, `counter1`, ... while rewriting all matching uses/defs in loop conditions and bodies. Wired invocation in plugin flow (`plugin.cpp`) after for-counter naming. Added `test_loop_name_generator_while_counters` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.4** Implement `InstructionLengthHandler` AST Stage (currently overly complex expressions are not split)
+- [x] **L.4** Implement `InstructionLengthHandler` AST Stage (currently overly complex expressions are not split)
   - *The Python reference splits complex instructions into simpler temporary assignments when they exceed a configurable complexity bound. `TargetGenerator` finds exceeding instructions, `TargetSimplifier` recursively breaks down operations, inserting `tmp_N` variables.*
-  - [ ] L.4.1 Implement complexity metric for expressions.
-  - [ ] L.4.2 Split expressions exceeding the threshold into temporaries.
+  - [x] L.4.1 Implement complexity metric for expressions.
+  - [x] L.4.2 Split expressions exceeding the threshold into temporaries.
+    - *Implemented `InstructionLengthHandler` in `structuring/instruction_length_handler.hpp/.cpp` with Python-style complexity scoring (`Constant`/`Variable` = 1; operations/lists = sum of operand complexities), target simplification for assignment/call/return, and `tmp_N` extraction via inserted pre-instructions in `CodeNode` blocks. Wired execution into plugin flow (`plugin.cpp`) after structuring and before variable naming. Added `test_instruction_length_handler` in `tests/test_main.cpp` and updated `CMakeLists.txt` to compile the new source in both `dewolf` and `dewolf_core`.*
 
 - [ ] **L.5** Implement Compound Assignment and Increment Syntax in `CodeVisitor` (currently `x = x + 1` is not simplified to `x++`)
   - *The Python reference's `CodeVisitor` detects compoundable assignments (`x = x + y` -> `x += y`) and incrementable ones (`x = x + 1` -> `x++`). Uses `NON_COMPOUNDABLE_OPERATIONS` set and `COMMUTATIVE_OPERATIONS` for correctness.*
