@@ -376,7 +376,8 @@ You are not allowed from finishing two or more tasks at once, even if that means
 
 - [ ] **M.3** Implement `CommonSubexpressionElimination` Stage for Real (currently a stub)
   - *The Python reference has two phases: `ExistingSubexpressionReplacer` (replaces subexpressions already assigned to variables, dominator-aware) and `DefinitionGenerator` (creates new temporaries for repeated subexpressions). Threshold-based with complexity and occurrence filters.*
-  - [ ] M.3.1 Implement `ExistingSubexpressionReplacer`: find expressions already assigned to variables that dominate the current use.
+  - [x] M.3.1 Implement `ExistingSubexpressionReplacer`: find expressions already assigned to variables that dominate the current use.
+    - *Implemented dominator-aware existing-subexpression replacement in `CommonSubexpressionEliminationStage` (`optimization_stages.cpp`): traverses dominator tree from entry, tracks available defining expressions (`Assignment` RHS) keyed by structural fingerprints, replaces dominated subexpressions with defining variables (largest-first by expression complexity), and uses conservative alias safety (no cross-block replacement for aliased vars; no `Relation` jump-over in same block). Wired stage into plugin pipeline after identity elimination and added `test_common_subexpression_existing_replacer_stage` in `tests/test_main.cpp`.*
   - [ ] M.3.2 Implement `DefinitionGenerator`: detect repeated subexpressions, create temporaries.
 
 - [ ] **M.4** Implement `ExpressionSimplification` Rules (currently missing entirely)

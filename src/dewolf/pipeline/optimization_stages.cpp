@@ -1,5 +1,9 @@
 #include "optimization_stages.hpp"
 #include "../../dewolf_logic/z3_logic.hpp"
+#include "../ssa/dominators.hpp"
+#include <algorithm>
+#include <functional>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -1200,8 +1204,237 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
     }
 }
 
+namespace {
+
+struct ExistingSubexpressionDef {
+    Variable* variable = nullptr;
+    BasicBlock* block = nullptr;
+    std::size_t index = 0;
+};
+
+static std::size_t expression_complexity(Expression* expr) {
+    if (!expr) return 0;
+    if (dynamic_cast<Constant*>(expr) || dynamic_cast<Variable*>(expr)) return 1;
+    std::size_t score = 1;
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        for (Expression* child : op->operands()) score += expression_complexity(child);
+        return score;
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* child : list->operands()) score += expression_complexity(child);
+        return score;
+    }
+    return 1;
+}
+
+static std::string expression_fingerprint(Expression* expr) {
+    if (!expr) return "null";
+    if (auto* c = dynamic_cast<Constant*>(expr)) {
+        return "C:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
+    }
+    if (auto* v = dynamic_cast<Variable*>(expr)) {
+        return "V:" + v->name() + "#" + std::to_string(v->ssa_version());
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        std::string out = "L[";
+        bool first = true;
+        for (Expression* child : list->operands()) {
+            if (!first) out += ",";
+            first = false;
+            out += expression_fingerprint(child);
+        }
+        out += "]";
+        return out;
+    }
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        std::string out = "O:" + std::to_string(static_cast<int>(op->type())) + "(";
+        bool first = true;
+        for (Expression* child : op->operands()) {
+            if (!first) out += ",";
+            first = false;
+            out += expression_fingerprint(child);
+        }
+        out += ")";
+        return out;
+    }
+    return "X";
+}
+
+static void collect_subexpressions(Expression* root, std::vector<Expression*>& out) {
+    if (!root) return;
+    out.push_back(root);
+    if (auto* op = dynamic_cast<Operation*>(root)) {
+        for (Expression* child : op->operands()) collect_subexpressions(child, out);
+        return;
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(root)) {
+        for (Expression* child : list->operands()) collect_subexpressions(child, out);
+    }
+}
+
+static bool contains_call_expression(Expression* expr) {
+    if (!expr) return false;
+    if (dynamic_cast<Call*>(expr)) return true;
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        if (op->type() == OperationType::call) return true;
+        for (Expression* child : op->operands()) {
+            if (contains_call_expression(child)) return true;
+        }
+    }
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* child : list->operands()) {
+            if (contains_call_expression(child)) return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<Expression*> instruction_subexpressions(Instruction* inst) {
+    std::vector<Expression*> out;
+
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        collect_subexpressions(assign->value(), out);
+        if (assign->destination() && !dynamic_cast<Variable*>(assign->destination())) {
+            if (auto* op = dynamic_cast<Operation*>(assign->destination())) {
+                for (Expression* child : op->operands()) collect_subexpressions(child, out);
+            } else if (auto* list = dynamic_cast<ListOperation*>(assign->destination())) {
+                for (Expression* child : list->operands()) collect_subexpressions(child, out);
+            }
+        }
+        return out;
+    }
+
+    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        if (branch->condition()) {
+            for (Expression* child : branch->condition()->operands()) collect_subexpressions(child, out);
+        }
+        return out;
+    }
+
+    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+        collect_subexpressions(ib->expression(), out);
+        return out;
+    }
+
+    if (auto* ret = dynamic_cast<Return*>(inst)) {
+        for (Expression* value : ret->values()) collect_subexpressions(value, out);
+    }
+
+    return out;
+}
+
+static bool can_replace_subexpression(
+    const ExistingSubexpressionDef& def,
+    BasicBlock* use_block,
+    std::size_t use_index) {
+    if (!def.variable || !def.block) return false;
+
+    // Conservative alias safety: only in same block and no Relation in-between.
+    if (!def.variable->is_aliased()) return true;
+    if (def.block != use_block || use_index <= def.index) return false;
+
+    const auto& insts = use_block->instructions();
+    for (std::size_t i = def.index + 1; i < use_index && i < insts.size(); ++i) {
+        if (auto* rel = dynamic_cast<Relation*>(insts[i])) {
+            auto* dst = rel->destination();
+            if (dst && dst->name() == def.variable->name()) return false;
+        }
+    }
+    return true;
+}
+
+class ExistingSubexpressionReplacer {
+public:
+    ExistingSubexpressionReplacer(ControlFlowGraph& cfg, DominatorTree& dom)
+        : cfg_(cfg), dom_(dom) {}
+
+    void run() {
+        if (!cfg_.entry_block()) return;
+        process_block(cfg_.entry_block());
+    }
+
+private:
+    void process_block(BasicBlock* block) {
+        if (!block) return;
+
+        std::vector<std::string> inserted_keys;
+
+        auto& insts = block->mutable_instructions();
+        for (std::size_t idx = 0; idx < insts.size(); ++idx) {
+            Instruction* inst = insts[idx];
+            if (!inst) continue;
+
+            bool changed = true;
+            while (changed) {
+                changed = false;
+
+                std::vector<Expression*> subexprs = instruction_subexpressions(inst);
+                std::unordered_set<Expression*> uniq(subexprs.begin(), subexprs.end());
+                subexprs.assign(uniq.begin(), uniq.end());
+
+                std::sort(subexprs.begin(), subexprs.end(), [](Expression* a, Expression* b) {
+                    return expression_complexity(a) > expression_complexity(b);
+                });
+
+                for (Expression* subexpr : subexprs) {
+                    std::string fp = expression_fingerprint(subexpr);
+                    auto it = defining_variable_of_.find(fp);
+                    if (it == defining_variable_of_.end() || it->second.empty()) continue;
+
+                    const ExistingSubexpressionDef& def = it->second.back();
+                    if (!can_replace_subexpression(def, block, idx)) continue;
+
+                    inst->substitute(subexpr, def.variable);
+                    changed = true;
+                    break;
+                }
+            }
+
+            auto* assign = dynamic_cast<Assignment*>(inst);
+            if (!assign || dynamic_cast<Phi*>(inst)) continue;
+
+            auto* dest = dynamic_cast<Variable*>(assign->destination());
+            Expression* value = assign->value();
+            if (!dest || !value) continue;
+            if (expression_complexity(value) <= 1) continue;
+            if (contains_dereference(value) || contains_call_expression(value)) continue;
+
+            std::string fp = expression_fingerprint(value);
+            if (defining_variable_of_.contains(fp) && !defining_variable_of_[fp].empty()) continue;
+
+            defining_variable_of_[fp].push_back({dest, block, idx});
+            inserted_keys.push_back(fp);
+        }
+
+        for (BasicBlock* child : dom_.children(block)) {
+            process_block(child);
+        }
+
+        for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
+            auto map_it = defining_variable_of_.find(*it);
+            if (map_it == defining_variable_of_.end() || map_it->second.empty()) continue;
+            map_it->second.pop_back();
+            if (map_it->second.empty()) {
+                defining_variable_of_.erase(map_it);
+            }
+        }
+    }
+
+private:
+    ControlFlowGraph& cfg_;
+    DominatorTree& dom_;
+    std::unordered_map<std::string, std::vector<ExistingSubexpressionDef>> defining_variable_of_;
+};
+
+} // namespace
+
 void TypePropagationStage::execute(DecompilerTask& task) {}
 void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {}
-void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {}
+void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {
+    if (!task.cfg() || !task.cfg()->entry_block()) return;
+    DominatorTree dom(*task.cfg());
+    ExistingSubexpressionReplacer replacer(*task.cfg(), dom);
+    replacer.run();
+}
 
 } // namespace dewolf

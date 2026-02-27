@@ -1215,6 +1215,80 @@ void test_identity_elimination_stage() {
     std::cout << "[+] test_identity_elimination_stage passed.\n";
 }
 
+void test_common_subexpression_existing_replacer_stage() {
+    DecompilerTask task(0x7100);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* a = task.arena().create<BasicBlock>(50);
+    auto* b = task.arena().create<BasicBlock>(51);
+    auto* c = task.arena().create<BasicBlock>(52);
+
+    cfg->set_entry_block(a);
+    cfg->add_block(a);
+    cfg->add_block(b);
+    cfg->add_block(c);
+    task.set_cfg(std::move(cfg));
+
+    auto* e_ab = task.arena().create<Edge>(a, b, EdgeType::Unconditional);
+    auto* e_ac = task.arena().create<Edge>(a, c, EdgeType::Unconditional);
+    a->add_successor(e_ab);
+    a->add_successor(e_ac);
+    b->add_predecessor(e_ab);
+    c->add_predecessor(e_ac);
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    auto* y = task.arena().create<Variable>("y", 4);
+    auto* u = task.arena().create<Variable>("u", 4);
+    auto* v = task.arena().create<Variable>("v", 4);
+
+    auto* t = task.arena().create<Variable>("t", 4);
+    auto* z = task.arena().create<Variable>("z", 4);
+    auto* p = task.arena().create<Variable>("p", 4);
+    auto* q = task.arena().create<Variable>("q", 4);
+
+    auto* xy = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{x, y}, 4);
+    auto* a_def = task.arena().create<Assignment>(t, xy);
+    a->add_instruction(a_def);
+
+    auto* uv_b = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{u, v}, 4);
+    auto* b_def = task.arena().create<Assignment>(p, uv_b);
+    b->add_instruction(b_def);
+
+    auto* xy_c = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{x, y}, 4);
+    auto* c_use_dom = task.arena().create<Assignment>(z, xy_c);
+    auto* uv_c = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{u, v}, 4);
+    auto* c_use_nondom = task.arena().create<Assignment>(q, uv_c);
+    c->add_instruction(c_use_dom);
+    c->add_instruction(c_use_nondom);
+
+    CommonSubexpressionEliminationStage stage;
+    stage.execute(task);
+
+    const auto& c_insts = c->instructions();
+    ASSERT_EQ(c_insts.size(), 2);
+
+    auto* first = dynamic_cast<Assignment*>(c_insts[0]);
+    auto* second = dynamic_cast<Assignment*>(c_insts[1]);
+    ASSERT_TRUE(first != nullptr && second != nullptr);
+
+    // Dominated expression should be replaced by defining variable t.
+    auto* first_rhs_var = dynamic_cast<Variable*>(first->value());
+    ASSERT_TRUE(first_rhs_var != nullptr);
+    ASSERT_EQ(first_rhs_var->name(), "t");
+
+    // Non-dominated expression from sibling branch should not be replaced by p.
+    auto* second_rhs_op = dynamic_cast<Operation*>(second->value());
+    ASSERT_TRUE(second_rhs_op != nullptr);
+    ASSERT_EQ(second_rhs_op->type(), OperationType::add);
+    auto* lhs = dynamic_cast<Variable*>(second_rhs_op->operands()[0]);
+    auto* rhs = dynamic_cast<Variable*>(second_rhs_op->operands()[1]);
+    ASSERT_TRUE(lhs != nullptr && rhs != nullptr);
+    ASSERT_EQ(lhs->name(), "u");
+    ASSERT_EQ(rhs->name(), "v");
+
+    std::cout << "[+] test_common_subexpression_existing_replacer_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -1232,6 +1306,7 @@ int main() {
     test_remove_go_prologue_stage();
     test_remove_stack_canary_stage();
     test_identity_elimination_stage();
+    test_common_subexpression_existing_replacer_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
