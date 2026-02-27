@@ -67,6 +67,7 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
 
 void rename_variable(Variable* var, RenameState& state) {
     if (!var) return;
+    if (dynamic_cast<GlobalVariable*>(var) != nullptr) return;
 
     if (auto it = state.pointer_name.find(var); it != state.pointer_name.end()) {
         var->set_name(it->second);

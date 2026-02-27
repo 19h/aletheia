@@ -1200,6 +1200,251 @@ void RemoveStackCanaryStage::execute(DecompilerTask& task) {
     remove_unreachable_blocks(cfg);
 }
 
+namespace {
+
+using BlockSet = std::unordered_set<BasicBlock*>;
+using PostDomMap = std::unordered_map<BasicBlock*, BlockSet>;
+
+std::string lower_copy(std::string value) {
+    for (char& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+bool is_known_noreturn_name(const std::string& raw_name) {
+    const std::string name = lower_copy(raw_name);
+    constexpr std::array<const char*, 9> kPatterns = {
+        "__stack_chk_fail",
+        "__assert_fail",
+        "abort",
+        "exit",
+        "_exit",
+        "panic",
+        "fatal",
+        "terminate",
+        "throw",
+    };
+    for (const char* pattern : kPatterns) {
+        if (name.find(pattern) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Expression* extract_call_target_expression(Assignment* assign) {
+    if (!assign || !assign->value()) {
+        return nullptr;
+    }
+    if (auto* call = dynamic_cast<Call*>(assign->value())) {
+        return call->target();
+    }
+    auto* op = dynamic_cast<Operation*>(assign->value());
+    if (!op || op->type() != OperationType::call || op->operands().empty()) {
+        return nullptr;
+    }
+    return op->operands()[0];
+}
+
+std::string call_target_name(Expression* target) {
+    if (auto* v = dynamic_cast<Variable*>(target)) {
+        return v->name();
+    }
+    if (auto* g = dynamic_cast<GlobalVariable*>(target)) {
+        return g->name();
+    }
+    return {};
+}
+
+bool find_noreturn_call_index(BasicBlock* block, std::size_t& index_out) {
+    if (!block) {
+        return false;
+    }
+
+    const auto& insts = block->instructions();
+    for (std::size_t i = 0; i < insts.size(); ++i) {
+        auto* assign = dynamic_cast<Assignment*>(insts[i]);
+        if (!assign) {
+            continue;
+        }
+        Expression* target = extract_call_target_expression(assign);
+        if (!target) {
+            continue;
+        }
+        if (is_known_noreturn_name(call_target_name(target))) {
+            index_out = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<BasicBlock*> collect_exit_blocks(ControlFlowGraph* cfg) {
+    std::vector<BasicBlock*> exits;
+    if (!cfg) {
+        return exits;
+    }
+
+    for (BasicBlock* block : cfg->blocks()) {
+        if (block == nullptr) continue;
+        if (block->successors().empty()) {
+            exits.push_back(block);
+            continue;
+        }
+        if (!block->instructions().empty() && dynamic_cast<Return*>(block->instructions().back()) != nullptr) {
+            exits.push_back(block);
+        }
+    }
+
+    return exits;
+}
+
+PostDomMap compute_postdominators(ControlFlowGraph* cfg) {
+    PostDomMap postdom;
+    if (!cfg || cfg->blocks().empty()) {
+        return postdom;
+    }
+
+    const auto exits = collect_exit_blocks(cfg);
+    if (exits.empty()) {
+        return postdom;
+    }
+
+    BlockSet all_blocks;
+    for (BasicBlock* block : cfg->blocks()) {
+        all_blocks.insert(block);
+    }
+
+    for (BasicBlock* block : cfg->blocks()) {
+        postdom[block] = all_blocks;
+    }
+    for (BasicBlock* exit : exits) {
+        postdom[exit] = BlockSet{exit};
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (BasicBlock* block : cfg->blocks()) {
+            if (!block) continue;
+            if (std::find(exits.begin(), exits.end(), block) != exits.end()) {
+                continue;
+            }
+
+            BlockSet intersection;
+            const auto& succs = block->successors();
+            bool first = true;
+            for (Edge* edge : succs) {
+                if (!edge || !edge->target()) continue;
+                const BlockSet& succ_set = postdom[edge->target()];
+                if (first) {
+                    intersection = succ_set;
+                    first = false;
+                } else {
+                    BlockSet next;
+                    for (BasicBlock* candidate : intersection) {
+                        if (succ_set.contains(candidate)) {
+                            next.insert(candidate);
+                        }
+                    }
+                    intersection = std::move(next);
+                }
+            }
+
+            BlockSet updated = intersection;
+            updated.insert(block);
+            if (updated != postdom[block]) {
+                postdom[block] = std::move(updated);
+                changed = true;
+            }
+        }
+    }
+
+    return postdom;
+}
+
+std::unordered_map<BasicBlock*, BasicBlock*> compute_postdom_tree(const PostDomMap& postdom) {
+    std::unordered_map<BasicBlock*, BasicBlock*> ipostdom;
+
+    for (const auto& [block, set] : postdom) {
+        if (!block || set.size() <= 1) {
+            continue;
+        }
+
+        std::vector<BasicBlock*> candidates;
+        candidates.reserve(set.size());
+        for (BasicBlock* node : set) {
+            if (node != block) {
+                candidates.push_back(node);
+            }
+        }
+
+        for (BasicBlock* candidate : candidates) {
+            bool immediate = true;
+            for (BasicBlock* other : candidates) {
+                if (other == candidate) continue;
+                auto it = postdom.find(other);
+                if (it != postdom.end() && it->second.contains(candidate)) {
+                    immediate = false;
+                    break;
+                }
+            }
+            if (immediate) {
+                ipostdom[block] = candidate;
+                break;
+            }
+        }
+    }
+
+    return ipostdom;
+}
+
+} // namespace
+
+void RemoveNoreturnBoilerplateStage::execute(DecompilerTask& task) {
+    if (!task.cfg() || task.cfg()->entry_block() == nullptr) {
+        return;
+    }
+
+    // L.11.1: build post-dominator information and derive the tree.
+    const PostDomMap postdom = compute_postdominators(task.cfg());
+    const auto postdom_tree = compute_postdom_tree(postdom);
+    (void)postdom_tree;
+
+    bool changed = false;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!block) continue;
+
+        std::size_t noreturn_index = 0;
+        if (!find_noreturn_call_index(block, noreturn_index)) {
+            continue;
+        }
+
+        // L.11.3: remove dead instructions after noreturn call in same block.
+        auto& insts = block->mutable_instructions();
+        if (noreturn_index + 1 < insts.size()) {
+            insts.resize(noreturn_index + 1);
+            changed = true;
+        }
+
+        // Noreturn call means control never reaches successors.
+        auto succs = block->successors();
+        if (!succs.empty()) {
+            for (Edge* edge : succs) {
+                if (edge) {
+                    task.cfg()->remove_edge(edge);
+                }
+            }
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        remove_unreachable_blocks(task.cfg());
+    }
+}
+
 void CoherenceStage::execute(DecompilerTask& task) {
     if (!task.cfg()) {
         return;

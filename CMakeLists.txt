@@ -76,6 +76,24 @@ set_target_properties(dewolf_idalib_test PROPERTIES
     INSTALL_RPATH "${IDA_INSTALL_DIR}"
 )
 
+add_executable(idump src/cli/idump.cpp)
+target_link_libraries(idump
+    PRIVATE
+        dewolf
+        dewolf_logic
+        dewolf_idioms
+        idax::idax
+        "${IDA_INSTALL_DIR}/libidalib.dylib"
+        "${IDA_INSTALL_DIR}/libida.dylib"
+        "${IDA_INSTALL_DIR}/libz3.dylib"
+)
+target_compile_definitions(idump PRIVATE __EA64__ IDALIB_IMPL)
+target_include_directories(idump PRIVATE "${IDASDK}/include")
+set_target_properties(idump PROPERTIES
+    BUILD_RPATH "${IDA_INSTALL_DIR}"
+    INSTALL_RPATH "${IDA_INSTALL_DIR}"
+)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 

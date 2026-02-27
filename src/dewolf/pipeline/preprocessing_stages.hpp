@@ -33,6 +33,12 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class RemoveNoreturnBoilerplateStage : public PipelineStage {
+public:
+    const char* name() const override { return "RemoveNoreturnBoilerplate"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class CoherenceStage : public PipelineStage {
 public:
     const char* name() const override { return "Coherence"; }

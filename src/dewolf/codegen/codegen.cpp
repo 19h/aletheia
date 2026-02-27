@@ -399,6 +399,11 @@ void CExpressionGenerator::visit(Variable* v) {
     }
 }
 
+void CExpressionGenerator::visit(GlobalVariable* v) {
+    // Global names are rendered without SSA suffixes for stable declarations.
+    result_ = v->name();
+}
+
 void CExpressionGenerator::visit(Operation* o) {
     auto type = o->type();
     auto& ops = o->operands();
@@ -482,7 +487,9 @@ void CExpressionGenerator::visit(Operation* o) {
                 result_ = "!(" + generate(ops[0]) + ")";
                 return;
             case OperationType::deref:
-                if (o->array_access().has_value() && o->array_access()->base && o->array_access()->index) {
+                if (auto* g = dynamic_cast<GlobalVariable*>(ops[0])) {
+                    result_ = generate(g);
+                } else if (o->array_access().has_value() && o->array_access()->base && o->array_access()->index) {
                     result_ = generate(o->array_access()->base) + "[" + generate(o->array_access()->index) + "]";
                 } else {
                     result_ = "*(" + generate(ops[0]) + ")";
@@ -687,6 +694,14 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     lines_.clear();
     current_line_.clear();
     indent_level_ = 0;
+
+    auto global_decls = GlobalDeclarationGenerator::generate(task);
+    for (const auto& decl : global_decls) {
+        lines_.push_back(decl);
+    }
+    if (!global_decls.empty()) {
+        lines_.push_back("");
+    }
 
     // Generate function signature
     std::string sig = "void "; // default

@@ -14,6 +14,7 @@ public:
     // Expression visitors
     void visit(Constant* c) override;
     void visit(Variable* v) override;
+    void visit(GlobalVariable* v) override;
     void visit(Operation* o) override;
     void visit(Call* c) override;
     void visit(Condition* c) override;

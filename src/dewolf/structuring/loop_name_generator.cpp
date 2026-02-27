@@ -31,6 +31,7 @@ void rename_expression(Expression* expr, const std::unordered_map<VarKey, std::s
 
 void rename_variable(Variable* var, const std::unordered_map<VarKey, std::string, VarKeyHash>& names) {
     if (!var) return;
+    if (dynamic_cast<GlobalVariable*>(var) != nullptr) return;
     VarKey key{var->name(), var->ssa_version()};
     auto it = names.find(key);
     if (it == names.end()) return;

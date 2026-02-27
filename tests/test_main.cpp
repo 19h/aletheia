@@ -1347,6 +1347,61 @@ void test_array_access_detection_stage() {
     std::cout << "[+] test_array_access_detection_stage passed.\n";
 }
 
+void test_global_variable_declarations() {
+    DecompilerTask task(0x7d00);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(80);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* g_counter = task.arena().create<GlobalVariable>(
+        "g_counter",
+        4,
+        task.arena().create<Constant>(0, 4),
+        true);
+    g_counter->set_ir_type(Integer::int32_t());
+
+    auto* out = task.arena().create<Variable>("out", 4);
+    out->set_ir_type(Integer::int32_t());
+
+    auto* deref = task.arena().create<Operation>(
+        OperationType::deref,
+        std::vector<Expression*>{g_counter},
+        4);
+    bb->add_instruction(task.arena().create<Assignment>(out, deref));
+    bb->add_instruction(task.arena().create<Return>(std::vector<Expression*>{out}));
+
+    auto ast = std::make_unique<AbstractSyntaxForest>();
+    ast->set_root(task.arena().create<CodeNode>(bb));
+    task.set_ast(std::move(ast));
+
+    CodeVisitor visitor;
+    auto lines = visitor.generate_code(task);
+
+    bool has_global_decl = false;
+    bool has_load_use = false;
+    bool has_local_global_decl = false;
+    for (const auto& line : lines) {
+        if (line == "extern const int g_counter;") {
+            has_global_decl = true;
+        }
+        if (line.find("out = g_counter;") != std::string::npos) {
+            has_load_use = true;
+        }
+        if (line.find("int g_counter;") != std::string::npos && line.find("extern") == std::string::npos) {
+            has_local_global_decl = true;
+        }
+    }
+
+    ASSERT_TRUE(has_global_decl);
+    ASSERT_TRUE(has_load_use);
+    ASSERT_TRUE(!has_local_global_decl);
+
+    std::cout << "[+] test_global_variable_declarations passed.\n";
+}
+
 void test_variable_name_generation_default() {
     dewolf::DecompilerArena arena;
 
@@ -1426,6 +1481,38 @@ void test_variable_name_generation_system_hungarian() {
     ASSERT_EQ(float_var->ssa_version(), 0);
 
     std::cout << "[+] test_variable_name_generation_system_hungarian passed.\n";
+}
+
+void test_variable_name_generation_skips_globals() {
+    dewolf::DecompilerArena arena;
+
+    auto* g_value = arena.create<dewolf::GlobalVariable>(
+        "g_value",
+        4,
+        arena.create<dewolf::Constant>(0, 4),
+        false);
+    g_value->set_ir_type(dewolf::Integer::int32_t());
+
+    auto* x = arena.create<dewolf::Variable>("eax", 4);
+    x->set_ssa_version(2);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(172);
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::deref,
+            std::vector<dewolf::Expression*>{g_value},
+            4)));
+
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+
+    dewolf::VariableNameGeneration::apply_default(forest);
+
+    ASSERT_EQ(g_value->name(), "g_value");
+    ASSERT_TRUE(x->name().starts_with("var_"));
+
+    std::cout << "[+] test_variable_name_generation_skips_globals passed.\n";
 }
 
 void test_loop_name_generator_for_counters() {
@@ -2353,6 +2440,52 @@ void test_remove_stack_canary_stage() {
     std::cout << "[+] test_remove_stack_canary_stage passed.\n";
 }
 
+void test_remove_noreturn_boilerplate_stage() {
+    DecompilerTask task(0x5100);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* entry = task.arena().create<BasicBlock>(24);
+    auto* noreturn_block = task.arena().create<BasicBlock>(25);
+    auto* dead_tail = task.arena().create<BasicBlock>(26);
+
+    cfg->set_entry_block(entry);
+    cfg->add_block(entry);
+    cfg->add_block(noreturn_block);
+    cfg->add_block(dead_tail);
+    task.set_cfg(std::move(cfg));
+
+    auto* e0 = task.arena().create<Edge>(entry, noreturn_block, EdgeType::Unconditional);
+    entry->add_successor(e0);
+    noreturn_block->add_predecessor(e0);
+
+    auto* e1 = task.arena().create<Edge>(noreturn_block, dead_tail, EdgeType::Unconditional);
+    noreturn_block->add_successor(e1);
+    dead_tail->add_predecessor(e1);
+
+    auto* call_target = task.arena().create<Variable>("__assert_fail", 8);
+    auto* call_expr = task.arena().create<Call>(call_target, std::vector<Expression*>{}, 8);
+    auto* call_dst = task.arena().create<Variable>("tmp_nr", 8);
+    auto* call_assign = task.arena().create<Assignment>(call_dst, call_expr);
+    call_assign->set_address(0x5101);
+    noreturn_block->add_instruction(call_assign);
+
+    auto* dead_dst = task.arena().create<Variable>("dead_after_nr", 8);
+    auto* dead_assign = task.arena().create<Assignment>(dead_dst, task.arena().create<Constant>(1, 8));
+    dead_assign->set_address(0x5102);
+    noreturn_block->add_instruction(dead_assign);
+
+    dead_tail->add_instruction(task.arena().create<Return>(std::vector<Expression*>{task.arena().create<Constant>(0, 8)}));
+
+    RemoveNoreturnBoilerplateStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(noreturn_block->instructions().size(), 1);
+    ASSERT_EQ(noreturn_block->successors().size(), 0);
+    ASSERT_EQ(task.cfg()->blocks().size(), 2);
+
+    std::cout << "[+] test_remove_noreturn_boilerplate_stage passed.\n";
+}
+
 void test_identity_elimination_stage() {
     DecompilerTask task(0x7000);
 
@@ -3099,8 +3232,10 @@ int main() {
     test_codegen_compound_assignment_increment();
     test_codegen_constant_formatting();
     test_array_access_detection_stage();
+    test_global_variable_declarations();
     test_variable_name_generation_default();
     test_variable_name_generation_system_hungarian();
+    test_variable_name_generation_skips_globals();
     test_loop_name_generator_for_counters();
     test_loop_name_generator_while_counters();
     test_instruction_length_handler();
@@ -3129,6 +3264,7 @@ int main() {
     test_switch_variable_detection_stage();
     test_remove_go_prologue_stage();
     test_remove_stack_canary_stage();
+    test_remove_noreturn_boilerplate_stage();
     test_identity_elimination_stage();
     test_common_subexpression_existing_replacer_stage();
     test_common_subexpression_definition_generator_stage();

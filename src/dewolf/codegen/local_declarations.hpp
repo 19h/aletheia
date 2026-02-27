@@ -114,6 +114,9 @@ public:
         // Since we don't have argument tracking yet, we will just declare everything we find.
         
         for (auto* var : collector.variables()) {
+            if (dynamic_cast<GlobalVariable*>(var) != nullptr) {
+                continue;
+            }
             std::string var_name = expr_gen.generate(var);
             
             // Global variables should be filtered, but we don't have them yet.
@@ -138,6 +141,40 @@ public:
             decls.push_back(line);
         }
         
+        return decls;
+    }
+};
+
+class GlobalDeclarationGenerator {
+public:
+    static std::vector<std::string> generate(DecompilerTask& task) {
+        VariableCollector collector;
+        if (task.ast() && task.ast()->root()) {
+            collector.traverse(task.ast()->root());
+        }
+
+        std::map<std::string, GlobalVariable*> globals_by_name;
+        for (auto* var : collector.variables()) {
+            auto* gv = dynamic_cast<GlobalVariable*>(var);
+            if (!gv) continue;
+            globals_by_name.try_emplace(gv->name(), gv);
+        }
+
+        std::vector<std::string> decls;
+        for (const auto& [name, gv] : globals_by_name) {
+            std::string type_str = "int";
+            if (gv->ir_type()) {
+                type_str = gv->ir_type()->to_string();
+            }
+
+            std::string line = "extern ";
+            if (gv->is_constant()) {
+                line += "const ";
+            }
+            line += type_str + " " + name + ";";
+            decls.push_back(std::move(line));
+        }
+
         return decls;
     }
 };

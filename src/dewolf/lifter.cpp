@@ -2,11 +2,65 @@
 #include <ida/lines.hpp>
 #include <ida/function.hpp>
 #include <ida/type.hpp>
+#include <ida/segment.hpp>
+#include <algorithm>
+#include <cctype>
 #include <iterator>
+#include <sstream>
 #include "pipeline/pipeline.hpp"
 #include "structures/types.hpp"
 
 namespace dewolf {
+
+namespace {
+
+std::string hex_address_name(ida::Address ea) {
+    std::ostringstream oss;
+    oss << std::hex << ea;
+    return "g_" + oss.str();
+}
+
+std::string sanitize_identifier(std::string text) {
+    if (auto ptr_pos = text.find("ptr "); ptr_pos != std::string::npos) {
+        text = text.substr(ptr_pos + 4);
+    }
+    if (auto colon_pos = text.rfind(':'); colon_pos != std::string::npos) {
+        text = text.substr(colon_pos + 1);
+    }
+
+    text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) {
+        return std::isspace(c) || c == '[' || c == ']';
+    }), text.end());
+
+    for (char& c : text) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!(std::isalnum(uc) || c == '_')) {
+            c = '_';
+        }
+    }
+
+    if (text.empty()) {
+        return text;
+    }
+    const unsigned char first = static_cast<unsigned char>(text.front());
+    if (std::isdigit(first)) {
+        text = "g_" + text;
+    }
+    return text;
+}
+
+std::string global_name_from_operand(const ida::instruction::Operand& op, ida::Address insn_addr) {
+    auto op_text = ida::instruction::operand_text(insn_addr, op.index());
+    if (op_text) {
+        std::string sanitized = sanitize_identifier(*op_text);
+        if (!sanitized.empty()) {
+            return sanitized;
+        }
+    }
+    return hex_address_name(op.value());
+}
+
+} // namespace
 
 void Lifter::populate_task_signature(DecompilerTask& task) {
     auto ea = task.function_address();
@@ -155,8 +209,26 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
     } else if (op.is_immediate()) {
         expr = arena_.create<Constant>(op.value(), op.byte_width());
     } else if (op.is_memory()) {
-        auto base = arena_.create<Variable>("mem_" + std::to_string(op.value()), op.byte_width());
-        expr = arena_.create<Operation>(OperationType::deref, std::vector<Expression*>{base}, op.byte_width());
+        const std::size_t width = op.byte_width() > 0 ? static_cast<std::size_t>(op.byte_width()) : 8U;
+        if (op.type() == ida::instruction::OperandType::MemoryDirect) {
+            const std::string global_name = global_name_from_operand(op, insn_addr);
+            bool is_const = false;
+            if (auto seg = ida::segment::at(op.value())) {
+                is_const = !seg->permissions().write;
+            }
+
+            auto* initial_value = arena_.create<Constant>(0, width);
+            auto* global = arena_.create<GlobalVariable>(global_name, width, initial_value, is_const);
+            global->set_ir_type(std::make_shared<Integer>(width * 8, false));
+
+            expr = arena_.create<Operation>(
+                OperationType::deref,
+                std::vector<Expression*>{global},
+                width);
+        } else {
+            auto base = arena_.create<Variable>("mem_" + std::to_string(op.value()), width);
+            expr = arena_.create<Operation>(OperationType::deref, std::vector<Expression*>{base}, width);
+        }
     } else {
         auto txt_res = ida::instruction::operand_text(insn_addr, op.index());
         if (txt_res) {

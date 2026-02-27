@@ -551,23 +551,26 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] L.8.2 Create temporaries for repeated subexpressions above threshold.
     - *Implemented `EdgePrunerStage` in `optimization_stages.hpp/.cpp` with per-block expression-usage graphing by structural fingerprint, candidate scoring via `complexity * occurrences` thresholding, and temp extraction (`edge_N`) for repeated subexpressions. Added structural rewrite helpers for `Assignment`/`Branch`/`IndirectBranch`/`Return`, wired stage into plugin pipeline after CSE, and covered behavior with `test_edge_pruner_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.9** Implement `GlobalVariable` IR Node and Global Declaration Generation (currently missing)
+- [x] **L.9** Implement `GlobalVariable` IR Node and Global Declaration Generation (currently missing)
   - *The Python reference has `GlobalVariable` extending `Variable` with `initial_value`, `is_constant`, and an `inline_global_variable()` heuristic. `GlobalDeclarationGenerator` emits `extern` declarations for shared globals. Code generation inlines constant string globals directly.*
-  - [ ] L.9.1 Implement `GlobalVariable` class with `initial_value`, `is_constant` fields.
-  - [ ] L.9.2 During lifting, detect global data references and create `GlobalVariable` nodes.
-  - [ ] L.9.3 Implement `GlobalDeclarationGenerator` emitting `extern` declarations.
+  - [x] L.9.1 Implement `GlobalVariable` class with `initial_value`, `is_constant` fields.
+  - [x] L.9.2 During lifting, detect global data references and create `GlobalVariable` nodes.
+  - [x] L.9.3 Implement `GlobalDeclarationGenerator` emitting `extern` declarations.
+    - *Added `GlobalVariable` IR in `structures/dataflow.hpp` (with `initial_value` and `is_constant`) and visitor support. Updated lifter (`lifter.cpp`) to create `GlobalVariable` nodes for `MemoryDirect` operands (with const inference from segment write-permissions), and updated codegen to render direct derefs as global names. Implemented `GlobalDeclarationGenerator` in `codegen/local_declarations.hpp`, integrated into `CodeVisitor::generate_code(task)` so `extern` globals are emitted before function signatures while local declaration generation excludes globals. Also prevented AST renamers from rewriting globals (`variable_name_generation.cpp`, `loop_name_generator.cpp`). Added `test_global_variable_declarations` and `test_variable_name_generation_skips_globals` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.10** Implement Batch Execution and File I/O for `idump <binary>` Automation (currently stubs)
+- [x] **L.10** Implement Batch Execution and File I/O for `idump <binary>` Automation (currently stubs)
   - *The plugin should support headless mode for batch processing. Detect headless via idax or explicit configuration. Write C-code output to disk.*
-  - [ ] L.10.1 Implement headless detection (environment variable or explicit flag).
-  - [ ] L.10.2 Implement file I/O: write decompiled C code to `<binary>.c` or configurable path.
-  - [ ] L.10.3 Wire `idump <binary>` entry point to invoke the pipeline on all functions.
+  - [x] L.10.1 Implement headless detection (environment variable or explicit flag).
+  - [x] L.10.2 Implement file I/O: write decompiled C code to `<binary>.c` or configurable path.
+  - [x] L.10.3 Wire `idump <binary>` entry point to invoke the pipeline on all functions.
+    - *Implemented new headless CLI entry point `src/cli/idump.cpp` plus build target wiring in `CMakeLists.txt`. `idump` accepts `--headless` and honors `DEWOLF_HEADLESS=1` for explicit headless detection, decompiles all functions via the full pipeline, and writes output either to `-o <path>` or default `<binary>.c`. Linked idalib/ida/z3 runtime libs for standalone execution. Verified build (`cmake --build build`), tests (`DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests`), and CLI usage output (`DYLD_LIBRARY_PATH="/opt/homebrew/lib:/Applications/IDA Professional 9.3.app/Contents/MacOS" ./build/idump`).*
 
-- [ ] **L.11** Implement `RemoveNoreturnBoilerplate` Preprocessing Stage (currently missing)
+- [x] **L.11** Implement `RemoveNoreturnBoilerplate` Preprocessing Stage (currently missing)
   - *The Python reference removes boilerplate code leading to non-returning functions using post-dominance frontier calculation on a reversed CFG with merged virtual sink nodes.*
-  - [ ] L.11.1 Compute post-dominator tree.
-  - [ ] L.11.2 Identify non-returning function calls.
-  - [ ] L.11.3 Remove dead code after noreturn calls.
+  - [x] L.11.1 Compute post-dominator tree.
+  - [x] L.11.2 Identify non-returning function calls.
+  - [x] L.11.3 Remove dead code after noreturn calls.
+    - *Implemented `RemoveNoreturnBoilerplateStage` in `preprocessing_stages.hpp/.cpp`: computes post-dominator sets/tree on CFG exits, identifies known noreturn call sites (`__stack_chk_fail`, `__assert_fail`, `abort`, `exit`, etc.) from lifted call targets, truncates dead instructions after noreturn calls, removes outgoing edges from noreturn blocks, and prunes now-unreachable blocks. Wired stage into both plugin and CLI pipelines (`plugin.cpp`, `src/cli/idump.cpp`). Added `test_remove_noreturn_boilerplate_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
 - [ ] **L.12** Implement `InsertMissingDefinitions` Preprocessing Stage (currently missing)
   - *The Python reference inserts definitions for undefined aliased variables at appropriate locations using dominator tree and memory version tracking.*

@@ -16,6 +16,7 @@ namespace dewolf {
 class Expression;
 class Constant;
 class Variable;
+class GlobalVariable;
 class Operation;
 class Call;
 class ListOperation;
@@ -51,6 +52,7 @@ public:
     // --- Expression visitors ---
     virtual void visit(Constant* c) = 0;
     virtual void visit(Variable* v) = 0;
+    virtual void visit(GlobalVariable* v);
     virtual void visit(Operation* o) = 0;
 
     // Extended expression visitors (default to visit(Operation*) for
@@ -193,6 +195,55 @@ private:
     std::string name_;
     std::size_t ssa_version_ = 0;
     bool is_aliased_ = false;
+};
+
+// =============================================================================
+// GlobalVariable -- Variable with global storage metadata
+// =============================================================================
+
+class GlobalVariable : public Variable {
+public:
+    GlobalVariable(std::string name,
+                   std::size_t size,
+                   Expression* initial_value = nullptr,
+                   bool is_constant = false)
+        : Variable(std::move(name), size),
+          initial_value_(initial_value),
+          is_constant_(is_constant) {}
+
+    void accept(DataflowObjectVisitorInterface& visitor) override {
+        visitor.visit(this);
+    }
+
+    Expression* copy(DecompilerArena& arena) const override {
+        auto* g = arena.create<GlobalVariable>(
+            name(),
+            size_bytes,
+            initial_value_ ? initial_value_->copy(arena) : nullptr,
+            is_constant_);
+        g->set_ssa_version(ssa_version());
+        g->set_aliased(is_aliased());
+        g->set_ir_type(ir_type());
+        return g;
+    }
+
+    void substitute(Expression* replacee, Expression* replacement) override {
+        if (!initial_value_) return;
+        initial_value_->substitute(replacee, replacement);
+        if (initial_value_ == replacee) {
+            initial_value_ = replacement;
+        }
+    }
+
+    Expression* initial_value() const { return initial_value_; }
+    void set_initial_value(Expression* value) { initial_value_ = value; }
+
+    bool is_constant() const { return is_constant_; }
+    void set_is_constant(bool value) { is_constant_ = value; }
+
+private:
+    Expression* initial_value_ = nullptr;
+    bool is_constant_ = false;
 };
 
 // =============================================================================
@@ -960,6 +1011,11 @@ private:
 inline void DataflowObjectVisitorInterface::visit(Call* o) {
     // Fall back to generic Operation visitor since Call IS-A Operation.
     visit(static_cast<Operation*>(o));
+}
+
+inline void DataflowObjectVisitorInterface::visit(GlobalVariable* v) {
+    // Fall back to Variable visitor since GlobalVariable IS-A Variable.
+    visit(static_cast<Variable*>(v));
 }
 
 inline void DataflowObjectVisitorInterface::visit(ListOperation* o) {

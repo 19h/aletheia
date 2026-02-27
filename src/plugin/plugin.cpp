@@ -83,6 +83,7 @@ struct DeWolfPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<dewolf::RegisterPairHandlingStage>());
         pipeline.add_stage(std::make_unique<dewolf::RemoveGoPrologueStage>());
         pipeline.add_stage(std::make_unique<dewolf::RemoveStackCanaryStage>());
+        pipeline.add_stage(std::make_unique<dewolf::RemoveNoreturnBoilerplateStage>());
         pipeline.add_stage(std::make_unique<dewolf::SwitchVariableDetectionStage>());
         pipeline.add_stage(std::make_unique<dewolf::CoherenceStage>());
         pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
