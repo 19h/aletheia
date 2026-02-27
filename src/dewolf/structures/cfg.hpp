@@ -48,12 +48,32 @@ private:
 class SwitchEdge : public Edge {
 public:
     SwitchEdge(BasicBlock* source, BasicBlock* target, std::uint64_t case_value)
-        : Edge(source, target, EdgeType::Switch), case_value_(case_value) {}
+        : Edge(source, target, EdgeType::Switch), case_values_{static_cast<std::int64_t>(case_value)} {}
 
-    std::uint64_t case_value() const { return case_value_; }
+    SwitchEdge(BasicBlock* source,
+               BasicBlock* target,
+               std::vector<std::int64_t> case_values,
+               bool is_default = false)
+        : Edge(source, target, EdgeType::Switch),
+          case_values_(std::move(case_values)),
+          is_default_(is_default) {}
+
+    std::int64_t case_value() const {
+        if (case_values_.empty()) {
+            return 0;
+        }
+        return case_values_.front();
+    }
+
+    const std::vector<std::int64_t>& case_values() const { return case_values_; }
+    bool is_default() const { return is_default_; }
+
+    void add_case_value(std::int64_t value) { case_values_.push_back(value); }
+    void set_default(bool value) { is_default_ = value; }
 
 private:
-    std::uint64_t case_value_;
+    std::vector<std::int64_t> case_values_;
+    bool is_default_ = false;
 };
 
 // =============================================================================

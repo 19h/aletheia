@@ -7,6 +7,7 @@
 #include <cctype>
 #include <iterator>
 #include <sstream>
+#include <unordered_map>
 #include "pipeline/pipeline.hpp"
 #include "structures/types.hpp"
 
@@ -159,7 +160,39 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
         }
 
         // Lift edges properly
-        if (ida_block.successors.size() == 2) {
+        const bool likely_switch_dispatch =
+            ida_block.successors.size() > 2 &&
+            !block->instructions().empty() &&
+            dynamic_cast<IndirectBranch*>(block->instructions().back()) != nullptr;
+
+        if (likely_switch_dispatch) {
+            std::vector<int> ordered_targets;
+            std::unordered_map<int, std::vector<std::int64_t>> target_case_values;
+
+            for (std::size_t case_index = 0; case_index < ida_block.successors.size(); ++case_index) {
+                const int succ_id = ida_block.successors[case_index];
+                if (!target_case_values.contains(succ_id)) {
+                    ordered_targets.push_back(succ_id);
+                }
+                target_case_values[succ_id].push_back(static_cast<std::int64_t>(case_index));
+            }
+
+            for (int succ_id : ordered_targets) {
+                if (!block_map.contains(succ_id)) {
+                    continue;
+                }
+                BasicBlock* target = block_map[succ_id];
+                auto case_values_it = target_case_values.find(succ_id);
+                std::vector<std::int64_t> case_values;
+                if (case_values_it != target_case_values.end()) {
+                    case_values = case_values_it->second;
+                }
+
+                Edge* edge = arena_.create<SwitchEdge>(block, target, std::move(case_values));
+                block->add_successor(edge);
+                target->add_predecessor(edge);
+            }
+        } else if (ida_block.successors.size() == 2) {
             BasicBlock* target0 = block_map.contains(ida_block.successors[0]) ? block_map[ida_block.successors[0]] : nullptr;
             BasicBlock* target1 = block_map.contains(ida_block.successors[1]) ? block_map[ida_block.successors[1]] : nullptr;
             
@@ -177,10 +210,7 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
             for (int succ_id : ida_block.successors) {
                 if (block_map.contains(succ_id)) {
                     BasicBlock* target = block_map[succ_id];
-                    EdgeType etype = EdgeType::Unconditional;
-                    if (ida_block.successors.size() > 2) etype = EdgeType::Switch;
-                    
-                    Edge* edge = arena_.create<Edge>(block, target, etype);
+                    Edge* edge = arena_.create<Edge>(block, target, EdgeType::Unconditional);
                     block->add_successor(edge);
                     target->add_predecessor(edge);
                 }

@@ -5,6 +5,90 @@
 
 namespace dewolf {
 
+namespace {
+
+Expression* switch_selector_expression(BasicBlock* bb) {
+    if (!bb || bb->instructions().empty()) {
+        return nullptr;
+    }
+    Instruction* tail = bb->instructions().back();
+    auto* indirect = dynamic_cast<IndirectBranch*>(tail);
+    if (!indirect) {
+        return nullptr;
+    }
+    return indirect->expression();
+}
+
+std::unordered_map<Edge*, dewolf_logic::LogicCondition> build_switch_edge_tags_for_block(
+    DecompilerTask& task,
+    BasicBlock* bb,
+    ConditionHandler& condition_handler) {
+    std::unordered_map<Edge*, dewolf_logic::LogicCondition> tags;
+    if (!bb) {
+        return tags;
+    }
+
+    Expression* selector = switch_selector_expression(bb);
+    if (!selector) {
+        return tags;
+    }
+
+    const std::size_t selector_width = selector->size_bytes > 0 ? selector->size_bytes : 8;
+
+    std::vector<Edge*> default_edges;
+    z3::expr all_case_expr = task.z3_ctx().bool_val(false);
+
+    for (Edge* edge : bb->successors()) {
+        auto* switch_edge = dynamic_cast<SwitchEdge*>(edge);
+        if (!switch_edge) {
+            continue;
+        }
+
+        if (switch_edge->is_default()) {
+            default_edges.push_back(edge);
+            continue;
+        }
+
+        z3::expr edge_expr = task.z3_ctx().bool_val(false);
+        if (switch_edge->case_values().empty()) {
+            edge_expr = task.z3_ctx().bool_val(true);
+        } else {
+            for (std::int64_t case_value : switch_edge->case_values()) {
+                auto* case_const = task.arena().create<Constant>(
+                    static_cast<std::uint64_t>(case_value),
+                    selector_width);
+                auto* case_cond = task.arena().create<Condition>(OperationType::eq, selector, case_const, 1);
+                auto symbol = condition_handler.add_condition(case_cond);
+                edge_expr = edge_expr || symbol.expression();
+            }
+        }
+
+        tags.emplace(edge, dewolf_logic::LogicCondition(edge_expr).simplify());
+        all_case_expr = all_case_expr || edge_expr;
+    }
+
+    if (!default_edges.empty()) {
+        z3::expr default_expr = all_case_expr.is_false()
+            ? task.z3_ctx().bool_val(true)
+            : !all_case_expr;
+        dewolf_logic::LogicCondition default_tag(default_expr);
+        for (Edge* edge : default_edges) {
+            tags.insert_or_assign(edge, default_tag);
+        }
+    }
+
+    // Any untagged switch edges conservatively get true.
+    for (Edge* edge : bb->successors()) {
+        if (edge->type() == EdgeType::Switch && !tags.contains(edge)) {
+            tags.emplace(edge, dewolf_logic::LogicCondition(task.z3_ctx().bool_val(true)));
+        }
+    }
+
+    return tags;
+}
+
+} // namespace
+
 void PatternIndependentRestructuringStage::execute(DecompilerTask& task) {
     TransitionCFG tcfg(task.arena());
     build_initial_transition_cfg(task, tcfg);
@@ -48,12 +132,15 @@ void PatternIndependentRestructuringStage::build_initial_transition_cfg(Decompil
     ConditionHandler condition_handler(task.z3_ctx());
     for (BasicBlock* bb : task.cfg()->blocks()) {
         TransitionBlock* src = block_map[bb];
+        const auto switch_tags = build_switch_edge_tags_for_block(task, bb, condition_handler);
         for (Edge* e : bb->successors()) {
             if (e->target()) {
                 TransitionBlock* dst = block_map[e->target()];
 
                 dewolf_logic::LogicCondition tag(task.z3_ctx().bool_val(true));
-                if (e->type() == EdgeType::True || e->type() == EdgeType::False) {
+                if (auto switch_it = switch_tags.find(e); switch_it != switch_tags.end()) {
+                    tag = switch_it->second;
+                } else if (e->type() == EdgeType::True || e->type() == EdgeType::False) {
                     if (!bb->instructions().empty()) {
                         Instruction* last_inst = bb->instructions().back();
                         if (auto* branch = dynamic_cast<Branch*>(last_inst)) {

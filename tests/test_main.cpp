@@ -13,6 +13,7 @@
 #include "../src/dewolf/structuring/cbr/cbr.hpp"
 #include "../src/dewolf/structuring/car/car.hpp"
 #include "../src/dewolf/structuring/reachability.hpp"
+#include "../src/dewolf/structuring/structuring_stage.hpp"
 #include "../src/dewolf/structuring/instruction_length_handler.hpp"
 #include "../src/dewolf/structuring/variable_name_generation.hpp"
 #include "../src/dewolf/structuring/loop_name_generator.hpp"
@@ -1898,6 +1899,82 @@ void test_condition_handler() {
     std::cout << "[+] test_condition_handler passed.\n";
 }
 
+void test_transition_cfg_switch_tags() {
+    dewolf::DecompilerTask task(0x7f00);
+
+    auto cfg = std::make_unique<dewolf::ControlFlowGraph>();
+    auto* dispatch = task.arena().create<dewolf::BasicBlock>(150);
+    auto* case_a = task.arena().create<dewolf::BasicBlock>(151);
+    auto* case_b = task.arena().create<dewolf::BasicBlock>(152);
+    auto* case_default = task.arena().create<dewolf::BasicBlock>(153);
+
+    cfg->set_entry_block(dispatch);
+    cfg->add_block(dispatch);
+    cfg->add_block(case_a);
+    cfg->add_block(case_b);
+    cfg->add_block(case_default);
+
+    auto* selector = task.arena().create<dewolf::Variable>("sel", 4);
+    dispatch->add_instruction(task.arena().create<dewolf::IndirectBranch>(selector));
+
+    auto* edge_a = task.arena().create<dewolf::SwitchEdge>(
+        dispatch,
+        case_a,
+        std::vector<std::int64_t>{1, 3});
+    auto* edge_b = task.arena().create<dewolf::SwitchEdge>(
+        dispatch,
+        case_b,
+        std::vector<std::int64_t>{2});
+    auto* edge_default = task.arena().create<dewolf::SwitchEdge>(
+        dispatch,
+        case_default,
+        std::vector<std::int64_t>{},
+        true);
+
+    dispatch->add_successor(edge_a);
+    dispatch->add_successor(edge_b);
+    dispatch->add_successor(edge_default);
+    case_a->add_predecessor(edge_a);
+    case_b->add_predecessor(edge_b);
+    case_default->add_predecessor(edge_default);
+
+    task.set_cfg(std::move(cfg));
+
+    dewolf::PatternIndependentRestructuringStage stage;
+    dewolf::TransitionCFG tcfg(task.arena());
+    stage.build_initial_transition_cfg(task, tcfg);
+
+    ASSERT_TRUE(tcfg.entry() != nullptr);
+
+    std::optional<dewolf_logic::LogicCondition> tag_a;
+    std::optional<dewolf_logic::LogicCondition> tag_b;
+    std::optional<dewolf_logic::LogicCondition> tag_default;
+
+    for (auto* tedge : tcfg.entry()->successors()) {
+        auto* sink_block = tedge->sink()->ast_node()->get_original_block();
+        if (sink_block == case_a) {
+            tag_a = tedge->tag();
+        } else if (sink_block == case_b) {
+            tag_b = tedge->tag();
+        } else if (sink_block == case_default) {
+            tag_default = tedge->tag();
+        }
+    }
+
+    ASSERT_TRUE(tag_a.has_value());
+    ASSERT_TRUE(tag_b.has_value());
+    ASSERT_TRUE(tag_default.has_value());
+
+    ASSERT_TRUE(tag_a->expression().is_or());
+
+    dewolf_logic::LogicCondition all_cases(tag_a->expression() || tag_b->expression());
+    ASSERT_TRUE(tag_default->is_complementary_to(all_cases));
+    ASSERT_TRUE(tag_a->does_imply(all_cases));
+    ASSERT_TRUE(tag_b->does_imply(all_cases));
+
+    std::cout << "[+] test_transition_cfg_switch_tags passed.\n";
+}
+
 void test_cbr_complementary_conditions() {
     dewolf::DecompilerArena arena;
     z3::context ctx;
@@ -3655,6 +3732,7 @@ int main() {
     test_loop_name_generator_while_counters();
     test_instruction_length_handler();
     test_condition_handler();
+    test_transition_cfg_switch_tags();
     test_cbr_complementary_conditions();
     test_cbr_cnf_subexpression_grouping();
     test_car_initial_switch_constructor();
