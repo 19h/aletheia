@@ -329,30 +329,30 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.16.1 Option A: Store names as `std::string_view` into a separate arena-allocated string pool (interning). The pool owns the memory; variable nodes just reference it.
   - [x] H.16.2 Option B: Call destructors explicitly for `Variable` nodes before arena reset (add a destructor registry to `DecompilerArena`).
 
-- [ ] **H.17** Implement the Idiom Pattern Matching Engine for Real (currently `match_magic_division()` is an empty stub)
+- [x] **H.17** Implement the Idiom Pattern Matching Engine for Real (currently `match_magic_division()` is an empty stub)
   - *The Python reference has 5 active matchers (signed division, unsigned division, signed modulo, unsigned modulo, signed multiplication), hundreds of JSON/YAML pattern files across optimization levels, register-agnostic operand anonymization, magic number precomputation tables (signed 32-bit, unsigned 32-bit, 64-bit), complex backtracking for magic constant resolution, and a `Match` output with address, length, operation, operand, constant. Without the idiom engine, compiler-optimized divisions/modulos appear as obfuscated `imul`/`shr`/`sar`/`sub` sequences.*
-  - [ ] H.17.1 Implement operand anonymization: replace registers with `reg_N`, constants with `const_N`, memory references with `loc_N` (register-agnostic matching).
-  - [ ] H.17.2 Port signed and unsigned magic number precomputation tables (32-bit and 64-bit).
-  - [ ] H.17.3 Implement `InstructionSequence` base class with `matches_first_instruction()` and `search()`.
-  - [ ] H.17.4 Port `SignedDivisionInstructionSequence` with magic number resolution, power-of-two detection, sign detection.
-  - [ ] H.17.5 Port `UnsignedDivisionInstructionSequence` with the extensive fallback cascade for corner-case magic numbers.
-  - [ ] H.17.6 Port `SignedModuloInstructionSequence` and `UnsignedModuloInstructionSequence` with remainder-register heuristic and two-IMUL cheating.
-  - [ ] H.17.7 Port `SignedMultiplicationInstructionSequence` with YAML pattern loading and `safe_eval` constant expressions.
-  - [ ] H.17.8 Bundle JSON/YAML pattern files into the C++ build (embed as resources or load from disk).
+  - [x] H.17.1 Implement operand anonymization: replace registers with `reg_N`, constants with `const_N`, memory references with `loc_N` (register-agnostic matching).
+  - [x] H.17.2 Port signed and unsigned magic number precomputation tables (32-bit and 64-bit).
+  - [x] H.17.3 Implement `InstructionSequence` base class with `matches_first_instruction()` and `search()`.
+  - [x] H.17.4 Port `SignedDivisionInstructionSequence` with magic number resolution, power-of-two detection, sign detection.
+  - [x] H.17.5 Port `UnsignedDivisionInstructionSequence` with the extensive fallback cascade for corner-case magic numbers.
+  - [x] H.17.6 Port `SignedModuloInstructionSequence` and `UnsignedModuloInstructionSequence` with remainder-register heuristic and two-IMUL cheating.
+  - [x] H.17.7 Port `SignedMultiplicationInstructionSequence` with YAML pattern loading and `safe_eval` constant expressions.
+  - [x] H.17.8 Bundle JSON/YAML pattern files into the C++ build (embed as resources or load from disk).
 
-- [ ] **H.18** Implement Type Lifting from IDA (currently no type information is extracted)
+- [x] **H.18** Implement Type Lifting from IDA (currently no type information is extracted)
   - *The Python reference lifts types from Binary Ninja: `IntegerType -> Integer`, `FloatType -> Float`, `PointerType -> Pointer`, `ArrayType -> ArrayType`, `StructureType -> Struct`, `EnumerationType -> Enum`, `FunctionType -> FunctionTypeDef`, etc. For the C++ port, types should be extracted from IDA's type information system via idax APIs (function prototypes, local variable types from Hex-Rays if available, or from IDA's type libraries).*
-  - [ ] H.18.1 Query `ida::function` for function return type and parameter types.
-  - [ ] H.18.2 Map IDA type information to the DeWolf `Type` hierarchy (C.2).
-  - [ ] H.18.3 Attach types to `Variable` and `Constant` nodes during lifting.
+  - [x] H.18.1 Query `ida::function` for function return type and parameter types.
+  - [x] H.18.2 Map IDA type information to the DeWolf `Type` hierarchy (C.2).
+  - [x] H.18.3 Attach types to `Variable` and `Constant` nodes during lifting.
 
-- [ ] **H.19** Connect the Actual Decompilation Pipeline to the IDA Plugin UI (currently the viewer shows hardcoded stub output)
+- [x] **H.19** Connect the Actual Decompilation Pipeline to the IDA Plugin UI (currently the viewer shows hardcoded stub output)
   - *The plugin's `run()` method creates hardcoded color-tagged lines instead of invoking the decompiler pipeline. The `DecompilerTask`, `DecompilerPipeline`, lifter, SSA, optimization stages, DREAM, and code generator all exist but are never called from the plugin entry point.*
-  - [ ] H.19.1 In `DeWolfPlugin::run()`, create a `DecompilerTask` for the current function address.
-  - [ ] H.19.2 Invoke the `Lifter` to build the CFG.
-  - [ ] H.19.3 Run the full `DecompilerPipeline` (all stages in order).
-  - [ ] H.19.4 Invoke `CodeVisitor` to generate output lines.
-  - [ ] H.19.5 Feed the generated lines to `ida::ui::create_custom_viewer`.
+  - [x] H.19.1 In `DeWolfPlugin::run()`, create a `DecompilerTask` for the current function address.
+  - [x] H.19.2 Invoke the `Lifter` to build the CFG.
+  - [x] H.19.3 Run the full `DecompilerPipeline` (all stages in order).
+  - [x] H.19.4 Invoke `CodeVisitor` to generate output lines.
+  - [x] H.19.5 Feed the generated lines to `ida::ui::create_custom_viewer`.
 
 ---
 

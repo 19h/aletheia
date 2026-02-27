@@ -616,7 +616,67 @@ void test_phi_dependency() {
     std::cout << "[+] test_phi_dependency passed.\n";
 }
 
+
+#include "../src/dewolf/codegen/codegen.hpp"
+
+
+
+#include "../src/dewolf/codegen/codegen.hpp"
+void test_codegen_dump() {
+    dewolf::DecompilerArena arena;
+    
+    // x = y + 10
+    auto* var_x = arena.create<dewolf::Variable>("x", 4);
+    auto* var_y = arena.create<dewolf::Variable>("y", 4);
+    auto* const_10 = arena.create<dewolf::Constant>(10, 4);
+    auto* add_op = arena.create<dewolf::Operation>(dewolf::OperationType::add, std::vector<dewolf::Expression*>{var_y, const_10}, 4);
+    auto* assign1 = arena.create<dewolf::Assignment>(var_x, add_op);
+    
+    // if (x > 5) { z = 1; } else { z = 0; }
+    auto* const_5 = arena.create<dewolf::Constant>(5, 4);
+    auto* cond = arena.create<dewolf::Condition>(dewolf::OperationType::gt, var_x, const_5);
+    
+    auto* var_z = arena.create<dewolf::Variable>("z", 4);
+    auto* const_1 = arena.create<dewolf::Constant>(1, 4);
+    auto* assign_true = arena.create<dewolf::Assignment>(var_z, const_1);
+    
+    auto* const_0 = arena.create<dewolf::Constant>(0, 4);
+    auto* assign_false = arena.create<dewolf::Assignment>(var_z, const_0);
+    
+    auto* bb1 = arena.create<dewolf::BasicBlock>(100);
+    bb1->add_instruction(assign1);
+    auto* node1 = arena.create<dewolf::CodeNode>(bb1);
+    
+    auto* bb_true = arena.create<dewolf::BasicBlock>(101);
+    bb_true->add_instruction(assign_true);
+    auto* node_true = arena.create<dewolf::CodeNode>(bb_true);
+    
+    auto* bb_false = arena.create<dewolf::BasicBlock>(102);
+    bb_false->add_instruction(assign_false);
+    auto* node_false = arena.create<dewolf::CodeNode>(bb_false);
+    
+    auto* cond_ast = arena.create<dewolf::ExprAstNode>(cond);
+    auto* if_node = arena.create<dewolf::IfNode>(cond_ast, node_true, node_false);
+    
+    auto* seq = arena.create<dewolf::SeqNode>();
+    seq->add_node(node1);
+    seq->add_node(if_node);
+    
+    dewolf::CodeVisitor visitor;
+    
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(seq);
+    auto lines = visitor.generate_code(forest);
+    
+    std::cout << "\n--- PSEUDOCODE OUTPUT ---\n";
+    for (const auto& line : lines) {
+        std::cout << line << "\n";
+    }
+    std::cout << "-------------------------\n\n";
+}
+
 int main() {
+    test_codegen_dump();
     test_phi_dependency();
     std::cout << "Running DeWolf tests...\n";
     test_arena();
