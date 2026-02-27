@@ -1276,17 +1276,81 @@ void test_common_subexpression_existing_replacer_stage() {
     ASSERT_TRUE(first_rhs_var != nullptr);
     ASSERT_EQ(first_rhs_var->name(), "t");
 
-    // Non-dominated expression from sibling branch should not be replaced by p.
-    auto* second_rhs_op = dynamic_cast<Operation*>(second->value());
-    ASSERT_TRUE(second_rhs_op != nullptr);
-    ASSERT_EQ(second_rhs_op->type(), OperationType::add);
-    auto* lhs = dynamic_cast<Variable*>(second_rhs_op->operands()[0]);
-    auto* rhs = dynamic_cast<Variable*>(second_rhs_op->operands()[1]);
-    ASSERT_TRUE(lhs != nullptr && rhs != nullptr);
-    ASSERT_EQ(lhs->name(), "u");
-    ASSERT_EQ(rhs->name(), "v");
+    // Non-dominated sibling expression must not be replaced by the sibling-def var p.
+    if (auto* second_rhs_var = dynamic_cast<Variable*>(second->value())) {
+        ASSERT_TRUE(second_rhs_var->name() != "p");
+    } else {
+        auto* second_rhs_op = dynamic_cast<Operation*>(second->value());
+        ASSERT_TRUE(second_rhs_op != nullptr);
+        ASSERT_EQ(second_rhs_op->type(), OperationType::add);
+        auto* lhs = dynamic_cast<Variable*>(second_rhs_op->operands()[0]);
+        auto* rhs = dynamic_cast<Variable*>(second_rhs_op->operands()[1]);
+        ASSERT_TRUE(lhs != nullptr && rhs != nullptr);
+        ASSERT_EQ(lhs->name(), "u");
+        ASSERT_EQ(rhs->name(), "v");
+    }
 
     std::cout << "[+] test_common_subexpression_existing_replacer_stage passed.\n";
+}
+
+void test_common_subexpression_definition_generator_stage() {
+    DecompilerTask task(0x7200);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(60);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    auto* y = task.arena().create<Variable>("y", 4);
+
+    auto* sum1 = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{x, y}, 4);
+    auto* mul1 = task.arena().create<Operation>(OperationType::mul, std::vector<Expression*>{sum1, task.arena().create<Constant>(2, 4)}, 4);
+    auto* a = task.arena().create<Variable>("a", 4);
+    auto* inst1 = task.arena().create<Assignment>(a, mul1);
+
+    auto* sum2 = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{x, y}, 4);
+    auto* mul2 = task.arena().create<Operation>(OperationType::mul, std::vector<Expression*>{sum2, task.arena().create<Constant>(3, 4)}, 4);
+    auto* b = task.arena().create<Variable>("b", 4);
+    auto* inst2 = task.arena().create<Assignment>(b, mul2);
+
+    bb->add_instruction(inst1);
+    bb->add_instruction(inst2);
+
+    CommonSubexpressionEliminationStage stage;
+    stage.execute(task);
+
+    const auto& insts = bb->instructions();
+    ASSERT_EQ(insts.size(), 3);
+
+    auto* def = dynamic_cast<Assignment*>(insts[0]);
+    ASSERT_TRUE(def != nullptr);
+    auto* def_var = dynamic_cast<Variable*>(def->destination());
+    auto* def_val = dynamic_cast<Operation*>(def->value());
+    ASSERT_TRUE(def_var != nullptr);
+    ASSERT_TRUE(def_val != nullptr);
+    ASSERT_TRUE(def_var->name().starts_with("cse_"));
+    ASSERT_EQ(def_val->type(), OperationType::add);
+
+    auto* use1 = dynamic_cast<Assignment*>(insts[1]);
+    auto* use2 = dynamic_cast<Assignment*>(insts[2]);
+    ASSERT_TRUE(use1 != nullptr && use2 != nullptr);
+
+    auto* use1_rhs = dynamic_cast<Operation*>(use1->value());
+    auto* use2_rhs = dynamic_cast<Operation*>(use2->value());
+    ASSERT_TRUE(use1_rhs != nullptr && use2_rhs != nullptr);
+    ASSERT_EQ(use1_rhs->type(), OperationType::mul);
+    ASSERT_EQ(use2_rhs->type(), OperationType::mul);
+
+    auto* use1_lhs = dynamic_cast<Variable*>(use1_rhs->operands()[0]);
+    auto* use2_lhs = dynamic_cast<Variable*>(use2_rhs->operands()[0]);
+    ASSERT_TRUE(use1_lhs != nullptr);
+    ASSERT_TRUE(use2_lhs != nullptr);
+    ASSERT_EQ(use1_lhs->name(), def_var->name());
+    ASSERT_EQ(use2_lhs->name(), def_var->name());
+
+    std::cout << "[+] test_common_subexpression_definition_generator_stage passed.\n";
 }
 
 int main() {
@@ -1307,6 +1371,7 @@ int main() {
     test_remove_stack_canary_stage();
     test_identity_elimination_stage();
     test_common_subexpression_existing_replacer_stage();
+    test_common_subexpression_definition_generator_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();

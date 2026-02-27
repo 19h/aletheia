@@ -1426,6 +1426,294 @@ private:
     std::unordered_map<std::string, std::vector<ExistingSubexpressionDef>> defining_variable_of_;
 };
 
+struct SubexpressionUsage {
+    Expression* expr = nullptr;
+    Instruction* instruction = nullptr;
+    BasicBlock* block = nullptr;
+    std::size_t index = 0;
+};
+
+struct SubexpressionStats {
+    Expression* exemplar = nullptr;
+    std::size_t complexity = 0;
+    std::vector<SubexpressionUsage> usages;
+};
+
+class DefinitionGenerator {
+public:
+    DefinitionGenerator(DecompilerTask& task, ControlFlowGraph& cfg, DominatorTree& dom)
+        : task_(task), cfg_(cfg), dom_(dom) {}
+
+    void run() {
+        bool applied = true;
+        while (applied) {
+            applied = false;
+
+            auto usage_map = collect_usage_map();
+            auto candidates = sorted_candidates(usage_map);
+
+            for (const std::string& fp : candidates) {
+                auto it = usage_map.find(fp);
+                if (it == usage_map.end()) continue;
+
+                if (apply_candidate(fp, it->second)) {
+                    applied = true;
+                    break;
+                }
+            }
+        }
+    }
+
+private:
+    std::unordered_map<std::string, SubexpressionStats> collect_usage_map() {
+        std::unordered_map<std::string, SubexpressionStats> usage_map;
+
+        for (BasicBlock* block : cfg_.blocks()) {
+            const auto& insts = block->instructions();
+            for (std::size_t idx = 0; idx < insts.size(); ++idx) {
+                Instruction* inst = insts[idx];
+                if (!inst) continue;
+
+                std::vector<Expression*> subexprs = instruction_subexpressions(inst);
+                for (Expression* expr : subexprs) {
+                    if (!expr) continue;
+                    std::string fp = expression_fingerprint(expr);
+                    auto& stats = usage_map[fp];
+                    if (!stats.exemplar) {
+                        stats.exemplar = expr;
+                        stats.complexity = expression_complexity(expr);
+                    }
+                    stats.usages.push_back({expr, inst, block, idx});
+                }
+            }
+        }
+
+        return usage_map;
+    }
+
+    std::vector<std::string> sorted_candidates(const std::unordered_map<std::string, SubexpressionStats>& usage_map) {
+        std::vector<std::pair<std::string, const SubexpressionStats*>> rows;
+        rows.reserve(usage_map.size());
+
+        for (const auto& [fp, stats] : usage_map) {
+            if (!is_candidate(stats)) continue;
+            rows.push_back({fp, &stats});
+        }
+
+        std::sort(rows.begin(), rows.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.second->complexity != rhs.second->complexity) {
+                return lhs.second->complexity > rhs.second->complexity;
+            }
+            if (lhs.second->usages.size() != rhs.second->usages.size()) {
+                return lhs.second->usages.size() > rhs.second->usages.size();
+            }
+            return lhs.first < rhs.first;
+        });
+
+        std::vector<std::string> out;
+        out.reserve(rows.size());
+        for (auto& [fp, _] : rows) {
+            (void)_;
+            out.push_back(fp);
+        }
+        return out;
+    }
+
+    bool is_candidate(const SubexpressionStats& stats) const {
+        if (!stats.exemplar) return false;
+        if (stats.complexity < 2) return false;
+        if (stats.usages.size() < 2) return false;
+        if (dynamic_cast<ListOperation*>(stats.exemplar)) return false;
+        if (contains_dereference(stats.exemplar)) return false;
+        if (contains_call_expression(stats.exemplar)) return false;
+        return true;
+    }
+
+    static bool replace_in_expression(Expression*& expr,
+                                      const std::string& target_fp,
+                                      Variable* replacement) {
+        if (!expr) return false;
+
+        if (expression_fingerprint(expr) == target_fp) {
+            expr = replacement;
+            return true;
+        }
+
+        bool changed = false;
+        if (auto* op = dynamic_cast<Operation*>(expr)) {
+            for (Expression*& child : op->mutable_operands()) {
+                changed = replace_in_expression(child, target_fp, replacement) || changed;
+            }
+        } else if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+            for (Expression*& child : list->mutable_operands()) {
+                changed = replace_in_expression(child, target_fp, replacement) || changed;
+            }
+        }
+
+        return changed;
+    }
+
+    static bool rewrite_instruction(Instruction* inst,
+                                    const std::string& target_fp,
+                                    Variable* replacement) {
+        bool changed = false;
+
+        if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+            Expression* value = assign->value();
+            if (replace_in_expression(value, target_fp, replacement)) {
+                assign->set_value(value);
+                changed = true;
+            }
+
+            if (assign->destination() && !dynamic_cast<Variable*>(assign->destination())) {
+                Expression* dest = assign->destination();
+                if (replace_in_expression(dest, target_fp, replacement)) {
+                    assign->set_destination(dest);
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        if (auto* branch = dynamic_cast<Branch*>(inst)) {
+            if (auto* cond = branch->condition()) {
+                for (Expression*& child : cond->mutable_operands()) {
+                    changed = replace_in_expression(child, target_fp, replacement) || changed;
+                }
+            }
+            return changed;
+        }
+
+        if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+            Expression* before = ib->expression();
+            Expression* after = before;
+            if (replace_in_expression(after, target_fp, replacement)) {
+                if (after != before) {
+                    ib->substitute(before, after);
+                }
+                changed = true;
+            }
+            return changed;
+        }
+
+        if (auto* ret = dynamic_cast<Return*>(inst)) {
+            for (Expression* value : ret->values()) {
+                Expression* rewritten = value;
+                if (replace_in_expression(rewritten, target_fp, replacement)) {
+                    if (rewritten != value) {
+                        ret->substitute(value, rewritten);
+                    }
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        return false;
+    }
+
+    BasicBlock* common_dominator_of(const std::vector<BasicBlock*>& blocks) const {
+        if (blocks.empty()) return nullptr;
+
+        BasicBlock* candidate = blocks.front();
+        for (std::size_t i = 1; i < blocks.size(); ++i) {
+            BasicBlock* target = blocks[i];
+            while (candidate && !dom_.dominates(candidate, target)) {
+                candidate = dom_.idom(candidate);
+            }
+            if (!candidate) return nullptr;
+        }
+
+        for (BasicBlock* target : blocks) {
+            if (!dom_.dominates(candidate, target)) {
+                return nullptr;
+            }
+        }
+
+        return candidate;
+    }
+
+    static std::size_t insertion_index_for(BasicBlock* block, const std::vector<SubexpressionUsage>& usages) {
+        std::size_t min_idx = static_cast<std::size_t>(-1);
+        for (const auto& usage : usages) {
+            if (usage.block == block) {
+                min_idx = std::min(min_idx, usage.index);
+            }
+        }
+
+        if (min_idx != static_cast<std::size_t>(-1)) {
+            return min_idx;
+        }
+
+        const auto& insts = block->instructions();
+        if (insts.empty()) return 0;
+        Instruction* last = insts.back();
+        if (is_branch(last) || is_return(last)) {
+            return insts.size() - 1;
+        }
+        return insts.size();
+    }
+
+    bool apply_candidate(const std::string& fp, const SubexpressionStats& stats) {
+        if (!stats.exemplar) return false;
+
+        std::unordered_set<BasicBlock*> uniq;
+        std::vector<BasicBlock*> usage_blocks;
+        for (const auto& usage : stats.usages) {
+            if (!usage.instruction || !usage.block) continue;
+            if (dynamic_cast<Phi*>(usage.instruction)) {
+                return false;
+            }
+            if (uniq.insert(usage.block).second) {
+                usage_blocks.push_back(usage.block);
+            }
+        }
+        if (usage_blocks.empty()) return false;
+
+        BasicBlock* insertion_block = common_dominator_of(usage_blocks);
+        if (!insertion_block) return false;
+
+        std::size_t insert_idx = insertion_index_for(insertion_block, stats.usages);
+
+        const std::size_t width = stats.exemplar->size_bytes > 0 ? stats.exemplar->size_bytes : 4;
+        auto* temp = task_.arena().create<Variable>("cse_" + std::to_string(temp_counter_++), width);
+        temp->set_ssa_version(0);
+        temp->set_ir_type(stats.exemplar->ir_type());
+
+        auto* def_value = stats.exemplar->copy(task_.arena());
+        auto* def_inst = task_.arena().create<Assignment>(temp, def_value);
+
+        auto insts = insertion_block->instructions();
+        if (insert_idx > insts.size()) insert_idx = insts.size();
+        insts.insert(insts.begin() + static_cast<std::ptrdiff_t>(insert_idx), def_inst);
+        insertion_block->set_instructions(std::move(insts));
+
+        bool any_rewrite = false;
+        std::unordered_set<Instruction*> touched;
+        for (const auto& usage : stats.usages) {
+            if (!usage.instruction || usage.instruction == def_inst) continue;
+            if (!touched.insert(usage.instruction).second) continue;
+            any_rewrite = rewrite_instruction(usage.instruction, fp, temp) || any_rewrite;
+        }
+
+        if (!any_rewrite) {
+            // Roll back: remove inserted temp definition if no usage changed.
+            auto rollback = insertion_block->instructions();
+            rollback.erase(std::remove(rollback.begin(), rollback.end(), def_inst), rollback.end());
+            insertion_block->set_instructions(std::move(rollback));
+            return false;
+        }
+
+        return true;
+    }
+
+private:
+    DecompilerTask& task_;
+    ControlFlowGraph& cfg_;
+    DominatorTree& dom_;
+    int temp_counter_ = 0;
+};
+
 } // namespace
 
 void TypePropagationStage::execute(DecompilerTask& task) {}
@@ -1435,6 +1723,9 @@ void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {
     DominatorTree dom(*task.cfg());
     ExistingSubexpressionReplacer replacer(*task.cfg(), dom);
     replacer.run();
+
+    DefinitionGenerator generator(task, *task.cfg(), dom);
+    generator.run();
 }
 
 } // namespace dewolf
