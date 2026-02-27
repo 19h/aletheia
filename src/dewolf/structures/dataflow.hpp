@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <optional>
 
 namespace dewolf {
 
@@ -287,6 +288,13 @@ enum class OperationType {
     unknown
 };
 
+struct ArrayAccessInfo {
+    Variable* base = nullptr;
+    Expression* index = nullptr;
+    std::size_t element_size = 0;
+    bool confidence = false;
+};
+
 // =============================================================================
 // Operation -- Expression node for arithmetic, bitwise, comparison, etc.
 // =============================================================================
@@ -316,6 +324,9 @@ public:
         }
         auto* o = arena.create<Operation>(type_, std::move(new_ops), size_bytes);
         o->set_ir_type(ir_type());
+        if (array_access_.has_value()) {
+            o->set_array_access(*array_access_);
+        }
         return o;
     }
 
@@ -328,16 +339,30 @@ public:
         for (auto& op : operands_) {
             if (op == replacee) op = replacement;
         }
+        if (array_access_.has_value()) {
+            if (array_access_->base == replacee) {
+                if (auto* replacement_var = dynamic_cast<Variable*>(replacement)) {
+                    array_access_->base = replacement_var;
+                }
+            }
+            if (array_access_->index == replacee) {
+                array_access_->index = replacement;
+            }
+        }
     }
 
     OperationType type() const { return type_; }
     void set_type(OperationType t) { type_ = t; }
     const std::vector<Expression*>& operands() const { return operands_; }
     std::vector<Expression*>& mutable_operands() { return operands_; }
+    const std::optional<ArrayAccessInfo>& array_access() const { return array_access_; }
+    void set_array_access(ArrayAccessInfo info) { array_access_ = std::move(info); }
+    void clear_array_access() { array_access_.reset(); }
 
 private:
     OperationType type_;
     std::vector<Expression*> operands_;
+    std::optional<ArrayAccessInfo> array_access_;
 };
 
 // =============================================================================

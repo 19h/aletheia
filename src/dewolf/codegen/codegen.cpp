@@ -1,10 +1,235 @@
 #include "codegen.hpp"
 #include "local_declarations.hpp"
 #include <ida/lines.hpp>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
 
 namespace dewolf {
 
 namespace {
+
+bool expressions_equivalent(Expression* lhs, Expression* rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+    auto* lvar = dynamic_cast<Variable*>(lhs);
+    auto* rvar = dynamic_cast<Variable*>(rhs);
+    if (lvar && rvar) {
+        return lvar->name() == rvar->name() && lvar->ssa_version() == rvar->ssa_version();
+    }
+    return false;
+}
+
+bool is_commutative_for_compound(OperationType type) {
+    switch (type) {
+        case OperationType::add:
+        case OperationType::add_float:
+        case OperationType::mul:
+        case OperationType::mul_us:
+        case OperationType::mul_float:
+        case OperationType::bit_and:
+        case OperationType::bit_or:
+        case OperationType::bit_xor:
+            return true;
+        default:
+            return false;
+    }
+}
+
+const char* compound_operator_symbol(OperationType type) {
+    switch (type) {
+        case OperationType::add:
+        case OperationType::add_float:
+            return "+";
+        case OperationType::sub:
+        case OperationType::sub_float:
+            return "-";
+        case OperationType::mul:
+        case OperationType::mul_us:
+        case OperationType::mul_float:
+            return "*";
+        case OperationType::div:
+        case OperationType::div_us:
+        case OperationType::div_float:
+            return "/";
+        case OperationType::mod:
+        case OperationType::mod_us:
+            return "%";
+        case OperationType::bit_and:
+            return "&";
+        case OperationType::bit_or:
+            return "|";
+        case OperationType::bit_xor:
+            return "^";
+        case OperationType::shl:
+            return "<<";
+        case OperationType::shr:
+        case OperationType::shr_us:
+        case OperationType::sar:
+            return ">>";
+        default:
+            return nullptr;
+    }
+}
+
+std::int64_t sign_extend_to_i64(std::uint64_t value, std::size_t bytes) {
+    if (bytes == 0 || bytes >= 8) {
+        return static_cast<std::int64_t>(value);
+    }
+    const std::size_t bits = bytes * 8;
+    const std::uint64_t mask = (std::uint64_t{1} << bits) - 1;
+    const std::uint64_t truncated = value & mask;
+    const std::uint64_t sign_bit = std::uint64_t{1} << (bits - 1);
+    if ((truncated & sign_bit) == 0) {
+        return static_cast<std::int64_t>(truncated);
+    }
+    const std::uint64_t extended = truncated | (~mask);
+    return static_cast<std::int64_t>(extended);
+}
+
+bool constant_is_plus_minus_one(Expression* expr, int& sign) {
+    auto* c = dynamic_cast<Constant*>(expr);
+    if (!c) {
+        return false;
+    }
+    const std::size_t width = c->size_bytes == 0 ? sizeof(std::uint64_t) : c->size_bytes;
+    const std::int64_t signed_value = sign_extend_to_i64(c->value(), width);
+    if (signed_value == 1) {
+        sign = 1;
+        return true;
+    }
+    if (signed_value == -1) {
+        sign = -1;
+        return true;
+    }
+    return false;
+}
+
+std::size_t configured_hex_threshold() {
+    const char* value = std::getenv("DEWOLF_INT_HEX_THRESHOLD");
+    if (!value || *value == '\0') {
+        return 0;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (end == value) {
+        return 0;
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
+char nibble_to_hex(unsigned value) {
+    return static_cast<char>(value < 10 ? ('0' + value) : ('a' + (value - 10)));
+}
+
+std::string hex_u64(std::uint64_t value) {
+    if (value == 0) {
+        return "0";
+    }
+    std::string out;
+    while (value != 0) {
+        out.push_back(nibble_to_hex(static_cast<unsigned>(value & 0xF)));
+        value >>= 4;
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+bool is_printable_ascii(std::uint8_t byte) {
+    return byte >= 32 && byte <= 126;
+}
+
+std::string escape_char_literal(std::uint8_t byte) {
+    switch (byte) {
+        case '\\': return "'\\\\'";
+        case '\'': return "'\\\''";
+        case '\n': return "'\\n'";
+        case '\r': return "'\\r'";
+        case '\t': return "'\\t'";
+        case '\0': return "'\\0'";
+        default:
+            return std::string("'") + static_cast<char>(byte) + "'";
+    }
+}
+
+std::string escape_string_literal(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (unsigned char byte : value) {
+        switch (byte) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\0': out += "\\0"; break;
+            default:
+                if (is_printable_ascii(byte)) {
+                    out.push_back(static_cast<char>(byte));
+                } else {
+                    out += "\\x";
+                    out.push_back(nibble_to_hex((byte >> 4) & 0xF));
+                    out.push_back(nibble_to_hex(byte & 0xF));
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+bool try_format_string_array(Constant* c, std::string& out) {
+    if (!c || !c->ir_type()) {
+        return false;
+    }
+    auto* arr = dynamic_cast<const ArrayType*>(c->ir_type().get());
+    if (!arr || arr->count() == 0 || arr->count() > 8) {
+        return false;
+    }
+    auto* elem = dynamic_cast<const Integer*>(arr->element().get());
+    if (!elem || elem->size() != 8) {
+        return false;
+    }
+
+    std::string decoded;
+    decoded.reserve(arr->count());
+    const std::uint64_t packed = c->value();
+    for (std::size_t i = 0; i < arr->count(); ++i) {
+        const std::uint8_t byte = static_cast<std::uint8_t>((packed >> (i * 8)) & 0xFF);
+        if (byte == 0) {
+            break;
+        }
+        decoded.push_back(static_cast<char>(byte));
+    }
+
+    if (decoded.empty()) {
+        return false;
+    }
+
+    out = escape_string_literal(decoded);
+    return true;
+}
+
+std::string integer_suffix(Constant* c) {
+    if (!c || !c->ir_type()) {
+        return "";
+    }
+    auto* integer = dynamic_cast<const Integer*>(c->ir_type().get());
+    if (!integer) {
+        return "";
+    }
+
+    std::string suffix;
+    if (!integer->is_signed()) {
+        suffix += 'U';
+    }
+    if (integer->size() >= 64) {
+        suffix += 'L';
+    }
+    return suffix;
+}
 
 int precedence_for_operation(OperationType type) {
     switch (type) {
@@ -136,9 +361,33 @@ std::string CExpressionGenerator::generate(DataflowObject* obj) {
 }
 
 void CExpressionGenerator::visit(Constant* c) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)c->value());
-    result_ = buf;
+    std::string formatted;
+
+    if (try_format_string_array(c, formatted)) {
+        result_ = formatted;
+        return;
+    }
+
+    if (c->size_bytes == 1) {
+        const std::uint8_t byte = static_cast<std::uint8_t>(c->value() & 0xFF);
+        if (is_printable_ascii(byte)) {
+            result_ = escape_char_literal(byte);
+            return;
+        }
+    }
+
+    const std::size_t threshold = configured_hex_threshold();
+    const std::uint64_t value = c->value();
+    const bool use_hex = threshold == 0 || value > threshold;
+
+    if (use_hex) {
+        formatted = "0x" + hex_u64(value);
+    } else {
+        formatted = std::to_string(value);
+    }
+
+    formatted += integer_suffix(c);
+    result_ = formatted;
 }
 
 void CExpressionGenerator::visit(Variable* v) {
@@ -233,7 +482,11 @@ void CExpressionGenerator::visit(Operation* o) {
                 result_ = "!(" + generate(ops[0]) + ")";
                 return;
             case OperationType::deref:
-                result_ = "*(" + generate(ops[0]) + ")";
+                if (o->array_access().has_value() && o->array_access()->base && o->array_access()->index) {
+                    result_ = generate(o->array_access()->base) + "[" + generate(o->array_access()->index) + "]";
+                } else {
+                    result_ = "*(" + generate(ops[0]) + ")";
+                }
                 return;
             case OperationType::address_of:
                 result_ = "&(" + generate(ops[0]) + ")";
@@ -352,6 +605,38 @@ void CExpressionGenerator::visit(Condition* c) {
 }
 
 void CExpressionGenerator::visit_assignment(Assignment* i) {
+    if (auto* rhs_op = dynamic_cast<Operation*>(i->value());
+        rhs_op != nullptr && rhs_op->operands().size() == 2) {
+        const OperationType op_type = rhs_op->type();
+        const char* op_symbol = compound_operator_symbol(op_type);
+        if (op_symbol != nullptr) {
+            Expression* left = rhs_op->operands()[0];
+            Expression* right = rhs_op->operands()[1];
+
+            Expression* target_operand = nullptr;
+            if (expressions_equivalent(i->destination(), left)) {
+                target_operand = right;
+            } else if (is_commutative_for_compound(op_type) && expressions_equivalent(i->destination(), right)) {
+                target_operand = left;
+            }
+
+            if (target_operand != nullptr) {
+                int unit_sign = 0;
+                if ((op_type == OperationType::add || op_type == OperationType::sub) &&
+                    constant_is_plus_minus_one(target_operand, unit_sign)) {
+                    const bool is_increment =
+                        (op_type == OperationType::add && unit_sign > 0) ||
+                        (op_type == OperationType::sub && unit_sign < 0);
+                    result_ = generate(i->destination()) + (is_increment ? "++" : "--");
+                    return;
+                }
+
+                result_ = generate(i->destination()) + " " + op_symbol + "= " + generate(target_operand);
+                return;
+            }
+        }
+    }
+
     std::string lhs = generate(i->destination());
     std::string rhs = generate(i->value());
     if (lhs.empty() || lhs == "unknown_op") {

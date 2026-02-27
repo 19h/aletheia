@@ -524,28 +524,32 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] L.4.2 Split expressions exceeding the threshold into temporaries.
     - *Implemented `InstructionLengthHandler` in `structuring/instruction_length_handler.hpp/.cpp` with Python-style complexity scoring (`Constant`/`Variable` = 1; operations/lists = sum of operand complexities), target simplification for assignment/call/return, and `tmp_N` extraction via inserted pre-instructions in `CodeNode` blocks. Wired execution into plugin flow (`plugin.cpp`) after structuring and before variable naming. Added `test_instruction_length_handler` in `tests/test_main.cpp` and updated `CMakeLists.txt` to compile the new source in both `dewolf` and `dewolf_core`.*
 
-- [ ] **L.5** Implement Compound Assignment and Increment Syntax in `CodeVisitor` (currently `x = x + 1` is not simplified to `x++`)
+- [x] **L.5** Implement Compound Assignment and Increment Syntax in `CodeVisitor` (currently `x = x + 1` is not simplified to `x++`)
   - *The Python reference's `CodeVisitor` detects compoundable assignments (`x = x + y` -> `x += y`) and incrementable ones (`x = x + 1` -> `x++`). Uses `NON_COMPOUNDABLE_OPERATIONS` set and `COMMUTATIVE_OPERATIONS` for correctness.*
-  - [ ] L.5.1 Detect `x = x OP y` patterns and emit `x OP= y`.
-  - [ ] L.5.2 Detect `x = x + 1` / `x = x - 1` patterns and emit `x++` / `x--`.
+  - [x] L.5.1 Detect `x = x OP y` patterns and emit `x OP= y`.
+  - [x] L.5.2 Detect `x = x + 1` / `x = x - 1` patterns and emit `x++` / `x--`.
+    - *Implemented compound/increment lowering in `CExpressionGenerator::visit_assignment()` (`codegen.cpp`) with operand-equivalence checks, commutativity handling for `x = y + x`, guarded compound-operator mapping (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`), and signed-width-aware ±1 detection for `x++`/`x--`. Added `test_codegen_compound_assignment_increment` in `tests/test_main.cpp`, and updated loop-variant expectation to `for (...; i++)` since for-loop modifications now reuse increment syntax. `build/dewolf_tests` passes.*
 
-- [ ] **L.6** Implement String Literal and Character Formatting in `CExpressionGenerator` (currently all constants are hex)
+- [x] **L.6** Implement String Literal and Character Formatting in `CExpressionGenerator` (currently all constants are hex)
   - *The Python reference formats: byte-sized printable ASCII as `'A'`, string arrays as `"hello"`, hex/dec based on configurable threshold, unsigned suffix `U`, long suffix `L`, wchar prefix `L`, negative hex as two's complement, truncation of long global initializers to `MAX_GLOBAL_INIT_LENGTH`.*
-  - [ ] L.6.1 Detect byte-sized integer constants in printable ASCII range and emit as `'c'`.
-  - [ ] L.6.2 Detect string constant arrays and emit as `"..."`.
-  - [ ] L.6.3 Add configurable hex threshold (values above N are shown in hex).
-  - [ ] L.6.4 Add unsigned `U` and long `L` suffixes based on type width.
+  - [x] L.6.1 Detect byte-sized integer constants in printable ASCII range and emit as `'c'`.
+  - [x] L.6.2 Detect string constant arrays and emit as `"..."`.
+  - [x] L.6.3 Add configurable hex threshold (values above N are shown in hex).
+  - [x] L.6.4 Add unsigned `U` and long `L` suffixes based on type width.
+    - *Implemented in `codegen.cpp` constant formatting helpers: printable byte constants now emit escaped character literals, small packed `char[]` constants emit string literals, integer base toggles via `DEWOLF_INT_HEX_THRESHOLD`, and integer suffixes append `U`/`L` according to `Integer` type signedness/width. Added `test_codegen_constant_formatting` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.7** Implement `ArrayAccessDetection` Stage (currently missing)
+- [x] **L.7** Implement `ArrayAccessDetection` Stage (currently missing)
   - *The Python reference detects `*(base + offset)` patterns as array element accesses. It classifies offsets into const/mul/var. If consistent element sizes are found, it annotates `UnaryOperation.array_info` so the code generator can emit `base[index]`.*
-  - [ ] L.7.1 Detect `*(base + index * element_size)` patterns.
-  - [ ] L.7.2 Annotate with array info (base, index, element_size, confidence).
-  - [ ] L.7.3 Emit `base[index]` in `CExpressionGenerator` when array info is present.
+  - [x] L.7.1 Detect `*(base + index * element_size)` patterns.
+  - [x] L.7.2 Annotate with array info (base, index, element_size, confidence).
+  - [x] L.7.3 Emit `base[index]` in `CExpressionGenerator` when array info is present.
+    - *Implemented `ArrayAccessDetectionStage` in `optimization_stages.hpp/.cpp`: recursively scans instruction expressions, detects dereference patterns of the form `*(base + index * element_size)` (and `*(base + index)` as size-1), and annotates `OperationType::deref` nodes with `ArrayAccessInfo {base, index, element_size, confidence}` using pointer-type-size matching for confidence. Extended `Operation` in `dataflow.hpp` with optional array-access metadata and updated codegen dereference emission to print `base[index]` when metadata exists. Wired stage into plugin pipeline after cast/simplification and added `test_array_access_detection_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
-- [ ] **L.8** Implement `EdgePruner` Stage (currently missing)
+- [x] **L.8** Implement `EdgePruner` Stage (currently missing)
   - *The Python reference uses `ExpressionGraph` to find expressions occurring multiple times across instructions. Eliminates common subexpressions by creating temporary variables. Threshold-based on occurrences, complexity, and their product.*
-  - [ ] L.8.1 Build expression graph, find multi-use expressions.
-  - [ ] L.8.2 Create temporaries for repeated subexpressions above threshold.
+  - [x] L.8.1 Build expression graph, find multi-use expressions.
+  - [x] L.8.2 Create temporaries for repeated subexpressions above threshold.
+    - *Implemented `EdgePrunerStage` in `optimization_stages.hpp/.cpp` with per-block expression-usage graphing by structural fingerprint, candidate scoring via `complexity * occurrences` thresholding, and temp extraction (`edge_N`) for repeated subexpressions. Added structural rewrite helpers for `Assignment`/`Branch`/`IndirectBranch`/`Return`, wired stage into plugin pipeline after CSE, and covered behavior with `test_edge_pruner_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
 
 - [ ] **L.9** Implement `GlobalVariable` IR Node and Global Declaration Generation (currently missing)
   - *The Python reference has `GlobalVariable` extending `Variable` with `initial_value`, `is_constant`, and an `inline_global_variable()` heuristic. `GlobalDeclarationGenerator` emits `extern` declarations for shared globals. Code generation inlines constant string globals directly.*

@@ -1110,7 +1110,7 @@ void test_codegen_loop_variants() {
     ASSERT_TRUE(has_substr("while (i < 0xa) {"));
     ASSERT_TRUE(has_substr("do {"));
     ASSERT_TRUE(has_substr("} while (i < 0xa);"));
-    ASSERT_TRUE(has_substr("for (i = 0x0; i < 0xa; i = i + 0x1) {"));
+    ASSERT_TRUE(has_substr("for (i = 0x0; i < 0xa; i++) {"));
 
     std::cout << "[+] test_codegen_loop_variants passed.\n";
 }
@@ -1177,6 +1177,174 @@ void test_codegen_operator_precedence() {
     ASSERT_TRUE(has_substr("p3 = a - (b - c);"));
 
     std::cout << "[+] test_codegen_operator_precedence passed.\n";
+}
+
+void test_codegen_compound_assignment_increment() {
+    dewolf::DecompilerArena arena;
+
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* y = arena.create<dewolf::Variable>("y", 4);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(171);
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{x, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::sub,
+            std::vector<dewolf::Expression*>{x, arena.create<dewolf::Constant>(1, 4)},
+            4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{x, y},
+            4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::add,
+            std::vector<dewolf::Expression*>{y, x},
+            4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::sub,
+            std::vector<dewolf::Expression*>{y, x},
+            4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::bit_and,
+            std::vector<dewolf::Expression*>{x, y},
+            4)));
+    bb->add_instruction(arena.create<dewolf::Assignment>(
+        x,
+        arena.create<dewolf::Operation>(
+            dewolf::OperationType::logical_and,
+            std::vector<dewolf::Expression*>{x, y},
+            4)));
+
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+
+    dewolf::CodeVisitor visitor;
+    auto lines = visitor.generate_code(forest);
+
+    auto has_substr = [&](const std::string& needle) {
+        for (const auto& line : lines) {
+            if (line.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    ASSERT_TRUE(has_substr("x++;"));
+    ASSERT_TRUE(has_substr("x--;"));
+    ASSERT_TRUE(has_substr("x += y;"));
+    ASSERT_TRUE(has_substr("x = y - x;"));
+    ASSERT_TRUE(has_substr("x &= y;"));
+    ASSERT_TRUE(has_substr("x = x && y;"));
+
+    std::cout << "[+] test_codegen_compound_assignment_increment passed.\n";
+}
+
+void test_codegen_constant_formatting() {
+    dewolf::DecompilerArena arena;
+    dewolf::CExpressionGenerator gen;
+
+    auto* char_const = arena.create<dewolf::Constant>(static_cast<std::uint64_t>('A'), 1);
+    ASSERT_EQ(gen.generate(char_const), "'A'");
+
+    auto* str_const = arena.create<dewolf::Constant>(0x006968, 3);
+    str_const->set_ir_type(std::make_shared<const dewolf::ArrayType>(dewolf::Integer::char_type(), 3));
+    ASSERT_EQ(gen.generate(str_const), "\"hi\"");
+
+    const char* previous_threshold = std::getenv("DEWOLF_INT_HEX_THRESHOLD");
+    std::string previous_threshold_value = previous_threshold ? previous_threshold : "";
+    setenv("DEWOLF_INT_HEX_THRESHOLD", "16", 1);
+
+    auto* dec_const = arena.create<dewolf::Constant>(10, 4);
+    auto* hex_const = arena.create<dewolf::Constant>(32, 4);
+    ASSERT_EQ(gen.generate(dec_const), "10");
+    ASSERT_EQ(gen.generate(hex_const), "0x20");
+
+    if (previous_threshold) {
+        setenv("DEWOLF_INT_HEX_THRESHOLD", previous_threshold_value.c_str(), 1);
+    } else {
+        unsetenv("DEWOLF_INT_HEX_THRESHOLD");
+    }
+
+    auto* u32 = arena.create<dewolf::Constant>(1, 4);
+    u32->set_ir_type(dewolf::Integer::uint32_t());
+    auto* u64 = arena.create<dewolf::Constant>(1, 8);
+    u64->set_ir_type(dewolf::Integer::uint64_t());
+    auto* s64 = arena.create<dewolf::Constant>(1, 8);
+    s64->set_ir_type(dewolf::Integer::int64_t());
+
+    ASSERT_EQ(gen.generate(u32), "0x1U");
+    ASSERT_EQ(gen.generate(u64), "0x1UL");
+    ASSERT_EQ(gen.generate(s64), "0x1L");
+
+    std::cout << "[+] test_codegen_constant_formatting passed.\n";
+}
+
+void test_array_access_detection_stage() {
+    DecompilerTask task(0x7b00);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(78);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* arr = task.arena().create<Variable>("arr", 8);
+    arr->set_ir_type(std::make_shared<const Pointer>(Integer::int32_t()));
+    auto* idx = task.arena().create<Variable>("i", 4);
+    auto* out = task.arena().create<Variable>("out", 4);
+
+    auto* scaled = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{idx, task.arena().create<Constant>(4, 4)},
+        4);
+    auto* addr = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{arr, scaled},
+        8);
+    auto* deref = task.arena().create<Operation>(
+        OperationType::deref,
+        std::vector<Expression*>{addr},
+        4);
+
+    bb->add_instruction(task.arena().create<Assignment>(out, deref));
+
+    ArrayAccessDetectionStage stage;
+    stage.execute(task);
+
+    ASSERT_TRUE(deref->array_access().has_value());
+    ASSERT_TRUE(deref->array_access()->base == arr);
+    ASSERT_TRUE(deref->array_access()->index == idx);
+    ASSERT_EQ(deref->array_access()->element_size, 4);
+    ASSERT_TRUE(deref->array_access()->confidence);
+
+    auto* forest = task.arena().create<AbstractSyntaxForest>();
+    forest->set_root(task.arena().create<CodeNode>(bb));
+
+    CodeVisitor visitor;
+    auto lines = visitor.generate_code(forest);
+    bool found = false;
+    for (const auto& line : lines) {
+        if (line.find("out = arr[i];") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+
+    std::cout << "[+] test_array_access_detection_stage passed.\n";
 }
 
 void test_variable_name_generation_default() {
@@ -2764,6 +2932,74 @@ void test_dead_component_pruner_stage() {
     std::cout << "[+] test_dead_component_pruner_stage passed.\n";
 }
 
+void test_edge_pruner_stage() {
+    DecompilerTask task(0x7c00);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(79);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    auto* y = task.arena().create<Variable>("y", 4);
+    auto* z = task.arena().create<Variable>("z", 4);
+    auto* a = task.arena().create<Variable>("a", 4);
+    auto* b = task.arena().create<Variable>("b", 4);
+
+    auto* expr1 = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{
+            task.arena().create<Operation>(
+                OperationType::add,
+                std::vector<Expression*>{x, y},
+                4),
+            z},
+        4);
+    auto* expr2 = task.arena().create<Operation>(
+        OperationType::mul,
+        std::vector<Expression*>{
+            task.arena().create<Operation>(
+                OperationType::add,
+                std::vector<Expression*>{x, y},
+                4),
+            z},
+        4);
+
+    auto* i1 = task.arena().create<Assignment>(a, expr1);
+    auto* i2 = task.arena().create<Assignment>(b, expr2);
+    auto* ret = task.arena().create<Return>(std::vector<Expression*>{b});
+    bb->add_instruction(i1);
+    bb->add_instruction(i2);
+    bb->add_instruction(ret);
+
+    EdgePrunerStage stage;
+    stage.execute(task);
+
+    const auto& insts = bb->instructions();
+    ASSERT_EQ(insts.size(), 4);
+
+    auto* tmp_def = dynamic_cast<Assignment*>(insts[0]);
+    ASSERT_TRUE(tmp_def != nullptr);
+    auto* tmp_var = dynamic_cast<Variable*>(tmp_def->destination());
+    ASSERT_TRUE(tmp_var != nullptr);
+    ASSERT_TRUE(tmp_var->name().starts_with("edge_"));
+
+    auto* a_assign = dynamic_cast<Assignment*>(insts[1]);
+    auto* b_assign = dynamic_cast<Assignment*>(insts[2]);
+    ASSERT_TRUE(a_assign != nullptr);
+    ASSERT_TRUE(b_assign != nullptr);
+
+    auto* a_value = dynamic_cast<Variable*>(a_assign->value());
+    auto* b_value = dynamic_cast<Variable*>(b_assign->value());
+    ASSERT_TRUE(a_value != nullptr);
+    ASSERT_TRUE(b_value != nullptr);
+    ASSERT_EQ(a_value->name(), tmp_var->name());
+    ASSERT_EQ(b_value->name(), tmp_var->name());
+
+    std::cout << "[+] test_edge_pruner_stage passed.\n";
+}
+
 void test_redundant_casts_elimination_stage() {
     DecompilerTask task(0x7900);
 
@@ -2860,6 +3096,9 @@ int main() {
     test_codegen_switch_case();
     test_codegen_loop_variants();
     test_codegen_operator_precedence();
+    test_codegen_compound_assignment_increment();
+    test_codegen_constant_formatting();
+    test_array_access_detection_stage();
     test_variable_name_generation_default();
     test_variable_name_generation_system_hungarian();
     test_loop_name_generator_for_counters();
@@ -2893,6 +3132,7 @@ int main() {
     test_identity_elimination_stage();
     test_common_subexpression_existing_replacer_stage();
     test_common_subexpression_definition_generator_stage();
+    test_edge_pruner_stage();
     test_expression_simplification_collapse_constants();
     test_expression_simplification_trivial_arithmetic();
     test_expression_simplification_trivial_bit_arithmetic();

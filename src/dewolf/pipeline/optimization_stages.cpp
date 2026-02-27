@@ -2289,6 +2289,129 @@ std::unordered_set<Instruction*> compute_live_component(const ExpressionGraph& g
     return live;
 }
 
+bool extract_scaled_index(Expression* expr, Expression*& index, std::size_t& element_size) {
+    if (!expr) return false;
+
+    if (auto* mul = dynamic_cast<Operation*>(expr);
+        mul && (mul->type() == OperationType::mul || mul->type() == OperationType::mul_us) &&
+        mul->operands().size() == 2) {
+        Expression* lhs = mul->operands()[0];
+        Expression* rhs = mul->operands()[1];
+
+        auto* lhs_const = dynamic_cast<Constant*>(lhs);
+        auto* rhs_const = dynamic_cast<Constant*>(rhs);
+
+        if (lhs_const && !rhs_const) {
+            const std::uint64_t scale = lhs_const->value();
+            if (scale == 0 || scale > std::numeric_limits<std::size_t>::max()) return false;
+            index = rhs;
+            element_size = static_cast<std::size_t>(scale);
+            return true;
+        }
+        if (rhs_const && !lhs_const) {
+            const std::uint64_t scale = rhs_const->value();
+            if (scale == 0 || scale > std::numeric_limits<std::size_t>::max()) return false;
+            index = lhs;
+            element_size = static_cast<std::size_t>(scale);
+            return true;
+        }
+        return false;
+    }
+
+    // Treat base + idx as element_size = 1.
+    index = expr;
+    element_size = 1;
+    return true;
+}
+
+bool extract_base_index(Expression* expr, Variable*& base, Expression*& index, std::size_t& element_size) {
+    auto* add = dynamic_cast<Operation*>(expr);
+    if (!add || add->type() != OperationType::add || add->operands().size() != 2) {
+        return false;
+    }
+
+    auto try_form = [&](Expression* base_expr, Expression* index_expr) -> bool {
+        auto* base_var = dynamic_cast<Variable*>(base_expr);
+        if (!base_var) return false;
+
+        Expression* idx = nullptr;
+        std::size_t elem = 0;
+        if (!extract_scaled_index(index_expr, idx, elem)) return false;
+
+        base = base_var;
+        index = idx;
+        element_size = elem;
+        return true;
+    };
+
+    return try_form(add->operands()[0], add->operands()[1]) ||
+           try_form(add->operands()[1], add->operands()[0]);
+}
+
+bool infer_array_confidence(const Variable* base, std::size_t element_size) {
+    if (!base || !base->ir_type()) return false;
+    auto* ptr = dynamic_cast<const Pointer*>(base->ir_type().get());
+    if (!ptr || !ptr->pointee()) return false;
+    return ptr->pointee()->size_bytes() == element_size;
+}
+
+void annotate_array_access_expr(Expression* expr) {
+    if (!expr) return;
+
+    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression* child : list->operands()) {
+            annotate_array_access_expr(child);
+        }
+        return;
+    }
+
+    auto* op = dynamic_cast<Operation*>(expr);
+    if (!op) return;
+
+    for (Expression* child : op->operands()) {
+        annotate_array_access_expr(child);
+    }
+
+    if (op->type() != OperationType::deref || op->operands().size() != 1) {
+        return;
+    }
+
+    Variable* base = nullptr;
+    Expression* index = nullptr;
+    std::size_t element_size = 0;
+    if (!extract_base_index(op->operands()[0], base, index, element_size)) {
+        return;
+    }
+
+    op->set_array_access(ArrayAccessInfo{
+        .base = base,
+        .index = index,
+        .element_size = element_size,
+        .confidence = infer_array_confidence(base, element_size),
+    });
+}
+
+void annotate_array_access_inst(Instruction* inst) {
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        annotate_array_access_expr(assign->destination());
+        annotate_array_access_expr(assign->value());
+        return;
+    }
+    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        annotate_array_access_expr(branch->condition());
+        return;
+    }
+    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+        annotate_array_access_expr(ib->expression());
+        return;
+    }
+    if (auto* ret = dynamic_cast<Return*>(inst)) {
+        for (Expression* value : ret->values()) {
+            annotate_array_access_expr(value);
+        }
+    }
+}
+
 } // namespace
 
 void TypePropagationStage::execute(DecompilerTask& task) {}
@@ -2307,6 +2430,15 @@ void RedundantCastsEliminationStage::execute(DecompilerTask& task) {
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
             simplify_instruction_casts(task, inst);
+        }
+    }
+}
+
+void ArrayAccessDetectionStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            annotate_array_access_inst(inst);
         }
     }
 }
@@ -2340,6 +2472,199 @@ void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {
 
     DefinitionGenerator generator(task, *task.cfg(), dom);
     generator.run();
+}
+
+namespace {
+
+struct EdgePrunerCandidate {
+    std::string fingerprint;
+    Expression* exemplar = nullptr;
+    std::size_t complexity = 0;
+    std::vector<std::size_t> instruction_indices;
+};
+
+bool edge_replace_in_expression(Expression*& expr, const std::string& fingerprint, Variable* replacement) {
+    if (!expr) return false;
+
+    if (expression_fingerprint(expr) == fingerprint) {
+        expr = replacement;
+        return true;
+    }
+
+    bool changed = false;
+    if (auto* op = dynamic_cast<Operation*>(expr)) {
+        for (Expression*& child : op->mutable_operands()) {
+            changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
+        }
+    } else if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        for (Expression*& child : list->mutable_operands()) {
+            changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
+        }
+    }
+    return changed;
+}
+
+bool edge_rewrite_instruction(Instruction* inst, const std::string& fingerprint, Variable* replacement) {
+    if (!inst) return false;
+
+    bool changed = false;
+    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        Expression* value = assign->value();
+        if (edge_replace_in_expression(value, fingerprint, replacement)) {
+            assign->set_value(value);
+            changed = true;
+        }
+
+        if (assign->destination() && !dynamic_cast<Variable*>(assign->destination())) {
+            Expression* dest = assign->destination();
+            if (edge_replace_in_expression(dest, fingerprint, replacement)) {
+                assign->set_destination(dest);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        if (auto* cond = branch->condition()) {
+            for (Expression*& child : cond->mutable_operands()) {
+                changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
+            }
+        }
+        return changed;
+    }
+
+    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+        Expression* before = ib->expression();
+        Expression* after = before;
+        if (edge_replace_in_expression(after, fingerprint, replacement)) {
+            if (after != before) {
+                ib->substitute(before, after);
+            }
+            changed = true;
+        }
+        return changed;
+    }
+
+    if (auto* ret = dynamic_cast<Return*>(inst)) {
+        for (Expression* value : ret->values()) {
+            Expression* rewritten = value;
+            if (edge_replace_in_expression(rewritten, fingerprint, replacement)) {
+                if (rewritten != value) {
+                    ret->substitute(value, rewritten);
+                }
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    return false;
+}
+
+std::optional<EdgePrunerCandidate> select_edge_pruner_candidate(BasicBlock* block) {
+    if (!block) return std::nullopt;
+
+    std::unordered_map<std::string, EdgePrunerCandidate> candidates;
+
+    const auto& insts = block->instructions();
+    for (std::size_t idx = 0; idx < insts.size(); ++idx) {
+        Instruction* inst = insts[idx];
+        if (!inst || dynamic_cast<Phi*>(inst)) continue;
+
+        std::vector<Expression*> subexprs = instruction_subexpressions(inst);
+        for (Expression* expr : subexprs) {
+            if (!expr) continue;
+            if (dynamic_cast<Variable*>(expr) || dynamic_cast<Constant*>(expr) || dynamic_cast<ListOperation*>(expr)) {
+                continue;
+            }
+            if (contains_dereference(expr) || contains_call_expression(expr)) {
+                continue;
+            }
+
+            const std::size_t complexity = expression_complexity(expr);
+            if (complexity < 2) continue;
+
+            const std::string fp = expression_fingerprint(expr);
+            auto& candidate = candidates[fp];
+            candidate.fingerprint = fp;
+            candidate.exemplar = expr;
+            candidate.complexity = complexity;
+            candidate.instruction_indices.push_back(idx);
+        }
+    }
+
+    std::optional<EdgePrunerCandidate> best;
+    std::size_t best_score = 0;
+    constexpr std::size_t kScoreThreshold = 6; // complexity * occurrences
+
+    for (auto& [_, candidate] : candidates) {
+        const std::size_t occurrences = candidate.instruction_indices.size();
+        if (occurrences < 2) continue;
+        const std::size_t score = candidate.complexity * occurrences;
+        if (score < kScoreThreshold) continue;
+
+        if (!best || score > best_score ||
+            (score == best_score && candidate.complexity > best->complexity)) {
+            best = candidate;
+            best_score = score;
+        }
+    }
+
+    return best;
+}
+
+bool apply_edge_pruner_candidate(
+    DecompilerTask& task,
+    BasicBlock* block,
+    const EdgePrunerCandidate& candidate,
+    int& temp_counter) {
+    if (!block || !candidate.exemplar || candidate.instruction_indices.empty()) {
+        return false;
+    }
+
+    auto insts = block->instructions();
+    const std::size_t insert_idx = *std::min_element(
+        candidate.instruction_indices.begin(), candidate.instruction_indices.end());
+
+    const std::size_t width = candidate.exemplar->size_bytes > 0 ? candidate.exemplar->size_bytes : 4;
+    auto* temp = task.arena().create<Variable>("edge_" + std::to_string(temp_counter++), width);
+    temp->set_ssa_version(0);
+    temp->set_ir_type(candidate.exemplar->ir_type());
+
+    auto* def_inst = task.arena().create<Assignment>(temp, candidate.exemplar->copy(task.arena()));
+    insts.insert(insts.begin() + static_cast<std::ptrdiff_t>(insert_idx), def_inst);
+
+    bool any_rewrite = false;
+    for (std::size_t i = insert_idx + 1; i < insts.size(); ++i) {
+        any_rewrite = edge_rewrite_instruction(insts[i], candidate.fingerprint, temp) || any_rewrite;
+    }
+
+    if (!any_rewrite) {
+        return false;
+    }
+
+    block->set_instructions(std::move(insts));
+    return true;
+}
+
+} // namespace
+
+void EdgePrunerStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+
+    int temp_counter = 0;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            auto candidate = select_edge_pruner_candidate(block);
+            if (!candidate.has_value()) {
+                break;
+            }
+            changed = apply_edge_pruner_candidate(task, block, *candidate, temp_counter);
+        }
+    }
 }
 
 } // namespace dewolf

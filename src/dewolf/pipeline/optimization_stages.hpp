@@ -69,6 +69,18 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class ArrayAccessDetectionStage : public PipelineStage {
+public:
+    const char* name() const override { return "ArrayAccessDetection"; }
+    void execute(DecompilerTask& task) override;
+};
+
+class EdgePrunerStage : public PipelineStage {
+public:
+    const char* name() const override { return "EdgePruner"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class CommonSubexpressionEliminationStage : public PipelineStage {
 public:
     const char* name() const override { return "CommonSubexpressionElimination"; }
