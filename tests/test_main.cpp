@@ -1396,6 +1396,40 @@ void test_codegen_constant_formatting() {
     std::cout << "[+] test_codegen_constant_formatting passed.\n";
 }
 
+void test_codegen_unknown_operation_placeholder() {
+    dewolf::DecompilerArena arena;
+
+    auto* out = arena.create<dewolf::Variable>("out", 4);
+    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* y = arena.create<dewolf::Variable>("y", 4);
+
+    auto* unknown_expr = arena.create<dewolf::Operation>(
+        dewolf::OperationType::unknown,
+        std::vector<dewolf::Expression*>{x, y},
+        4);
+
+    auto* bb = arena.create<dewolf::BasicBlock>(172);
+    bb->add_instruction(arena.create<dewolf::Assignment>(out, unknown_expr));
+
+    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+
+    dewolf::CodeVisitor visitor;
+    auto lines = visitor.generate_code(forest);
+
+    bool found_placeholder = false;
+    for (const auto& line : lines) {
+        if (line.find("__dewolf_unknown_op(") != std::string::npos) {
+            found_placeholder = true;
+            break;
+        }
+    }
+
+    ASSERT_TRUE(found_placeholder);
+
+    std::cout << "[+] test_codegen_unknown_operation_placeholder passed.\n";
+}
+
 void test_codegen_if_branch_swapping() {
     dewolf::DecompilerArena arena;
 
@@ -3845,6 +3879,7 @@ int main() {
     test_codegen_operator_precedence();
     test_codegen_compound_assignment_increment();
     test_codegen_constant_formatting();
+    test_codegen_unknown_operation_placeholder();
     test_codegen_if_branch_swapping();
     test_array_access_detection_stage();
     test_global_variable_declarations();

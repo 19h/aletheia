@@ -448,6 +448,27 @@ bool needs_parentheses_for_equal_precedence_rhs(OperationType parent_type) {
     }
 }
 
+bool is_unknown_placeholder(std::string_view text) {
+    return text == "unknown_op" ||
+           text.starts_with("__dewolf_unknown_op") ||
+           text.starts_with("__dewolf_unhandled_op");
+}
+
+std::string format_unknown_operation(Operation* o, CExpressionGenerator& gen, std::string_view placeholder_name) {
+    std::string rendered = std::string(placeholder_name) + "(";
+    if (o != nullptr) {
+        const auto& ops = o->operands();
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            if (i > 0) {
+                rendered += ", ";
+            }
+            rendered += gen.generate(ops[i]);
+        }
+    }
+    rendered += ")";
+    return rendered;
+}
+
 } // namespace
 
 std::string CExpressionGenerator::generate(DataflowObject* obj) {
@@ -670,15 +691,14 @@ void CExpressionGenerator::visit(Operation* o) {
         return;
     }
 
-    // --- Unknown with operands (likely a function call from lifter) ---
-    if (type == OperationType::unknown && !ops.empty()) {
-        std::string func = generate(ops[0]);
-        result_ = func + "()";
+    // --- Unknown operation ---
+    if (type == OperationType::unknown) {
+        result_ = format_unknown_operation(o, *this, "__dewolf_unknown_op");
         return;
     }
 
     // --- Fallback ---
-    result_ = "unknown_op";
+    result_ = format_unknown_operation(o, *this, "__dewolf_unhandled_op");
 }
 
 void CExpressionGenerator::visit(Call* c) {
@@ -744,7 +764,7 @@ void CExpressionGenerator::visit_assignment(Assignment* i) {
 
     std::string lhs = generate(i->destination());
     std::string rhs = generate(i->value());
-    if (lhs.empty() || lhs == "unknown_op") {
+    if (lhs.empty() || is_unknown_placeholder(lhs)) {
         // Void call assignment: just print the RHS
         result_ = rhs;
     } else {
@@ -879,7 +899,7 @@ void CodeVisitor::visit_node(AstNode* node) {
             for (Instruction* inst : block->instructions()) {
                 indent();
                 std::string expr = expr_gen_.generate(inst);
-                if (!expr.empty() && expr != "unknown_op") {
+                if (!expr.empty()) {
                     current_line_ += expr + ";";
                     lines_.push_back(current_line_);
                     current_line_.clear();
