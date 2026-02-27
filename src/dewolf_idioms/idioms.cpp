@@ -19,7 +19,37 @@ struct AnonymizationState {
     int reg_counter = 0;
     int const_counter = 0;
     int loc_counter = 0;
+
+    AnonymizationState() {
+        reg_map.reserve(16);
+        const_map.reserve(16);
+        loc_map.reserve(16);
+    }
+
+    void reset() {
+        reg_map.clear();
+        const_map.clear();
+        loc_map.clear();
+        reg_counter = 0;
+        const_counter = 0;
+        loc_counter = 0;
+    }
 };
+
+const std::unordered_map<std::string, std::vector<const IdiomPattern*>>& patterns_by_first_opcode() {
+    static const std::unordered_map<std::string, std::vector<const IdiomPattern*>> index = [] {
+        std::unordered_map<std::string, std::vector<const IdiomPattern*>> by_opcode;
+        by_opcode.reserve(128);
+        for (const auto& pattern : PATTERNS) {
+            if (pattern.sequence.empty()) {
+                continue;
+            }
+            by_opcode[pattern.sequence.front().opcode].push_back(&pattern);
+        }
+        return by_opcode;
+    }();
+    return index;
+}
 
 std::string lower_ascii(std::string text) {
     for (char& c : text) {
@@ -273,17 +303,53 @@ void IdiomMatcher::match_magic_division(const ida::graph::BasicBlock& block, std
         current_addr += insn.size();
     }
 
+    AnonymizationState state;
+    const auto& patterns_index = patterns_by_first_opcode();
+
     for (size_t i = 0; i < local_insns.size(); ++i) {
-        for (const auto& pat : PATTERNS) {
-            if (i + pat.sequence.size() > local_insns.size()) {
+        const auto candidates_it = patterns_index.find(local_insns[i].mnemonic);
+        if (candidates_it == patterns_index.end()) {
+            continue;
+        }
+
+        for (const IdiomPattern* pat : candidates_it->second) {
+            if (pat == nullptr) {
+                continue;
+            }
+
+            if (pat->sequence.empty()) {
+                continue;
+            }
+
+            if (i + pat->sequence.size() > local_insns.size()) {
+                continue;
+            }
+
+            if (pat->sequence[0].operands.size() != local_insns[i].operands.size()) {
+                continue;
+            }
+
+            if (pat->sequence.size() >= 2 &&
+                local_insns[i + 1].mnemonic != pat->sequence[1].opcode) {
+                continue;
+            }
+
+            bool operand_arity_matches = true;
+            for (size_t j = 1; j < pat->sequence.size(); ++j) {
+                if (pat->sequence[j].operands.size() != local_insns[i + j].operands.size()) {
+                    operand_arity_matches = false;
+                    break;
+                }
+            }
+            if (!operand_arity_matches) {
                 continue;
             }
 
             bool match = true;
-            AnonymizationState state;
+            state.reset();
 
-            for (size_t j = 0; j < pat.sequence.size() && match; ++j) {
-                const auto& pat_insn = pat.sequence[j];
+            for (size_t j = 0; j < pat->sequence.size() && match; ++j) {
+                const auto& pat_insn = pat->sequence[j];
                 const auto& real_insn = local_insns[i + j];
 
                 if (pat_insn.opcode != real_insn.mnemonic) {
@@ -313,25 +379,25 @@ void IdiomMatcher::match_magic_division(const ida::graph::BasicBlock& block, std
             }
 
             std::vector<LocalInsn> matched_seq(local_insns.begin() + static_cast<ptrdiff_t>(i),
-                                               local_insns.begin() + static_cast<ptrdiff_t>(i + pat.sequence.size()));
+                                               local_insns.begin() + static_cast<ptrdiff_t>(i + pat->sequence.size()));
             SequenceResolver resolver(matched_seq, state.const_map, state.reg_map);
 
             int64_t constant = 0;
             std::string operation;
 
-            if (pat.type == "divs" || pat.type == "divs-long-long") {
+            if (pat->type == "divs" || pat->type == "divs-long-long") {
                 constant = resolver.resolve_divs();
                 operation = "division";
-            } else if (pat.type == "divu" || pat.type == "divu-long-long") {
+            } else if (pat->type == "divu" || pat->type == "divu-long-long") {
                 constant = resolver.resolve_divu();
                 operation = "division unsigned";
-            } else if (pat.type == "mods" || pat.type == "mods-long-long") {
+            } else if (pat->type == "mods" || pat->type == "mods-long-long") {
                 constant = resolver.resolve_mods();
                 operation = "modulo";
-            } else if (pat.type == "modu" || pat.type == "modu-long-long") {
+            } else if (pat->type == "modu" || pat->type == "modu-long-long") {
                 constant = resolver.resolve_modu();
                 operation = "modulo unsigned";
-            } else if (pat.type == "mul") {
+            } else if (pat->type == "mul") {
                 constant = resolver.resolve_mul();
                 operation = "multiplication";
             }
@@ -339,7 +405,7 @@ void IdiomMatcher::match_magic_division(const ida::graph::BasicBlock& block, std
             if (constant != 0) {
                 IdiomTag tag;
                 tag.address = local_insns[i].addr;
-                tag.length = pat.sequence.size();
+                tag.length = pat->sequence.size();
                 tag.operation = std::move(operation);
                 tag.operand = resolver.get_reg("reg_1");
                 if (tag.operand.empty()) {
@@ -349,7 +415,7 @@ void IdiomMatcher::match_magic_division(const ida::graph::BasicBlock& block, std
                 tags.push_back(std::move(tag));
             }
 
-            i += pat.sequence.size() - 1;
+            i += pat->sequence.size() - 1;
             break;
         }
     }

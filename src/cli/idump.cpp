@@ -132,7 +132,9 @@ dewolf::DecompilerPipeline build_pipeline() {
     pipeline.add_stage(std::make_unique<dewolf::EdgePrunerStage>());
     pipeline.add_stage(std::make_unique<dewolf::PhiFunctionFixerStage>());
     pipeline.add_stage(std::make_unique<dewolf::SsaDestructor>());
-    pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
+    if (env_flag_enabled("DEWOLF_IDUMP_ENABLE_STRUCTURING")) {
+        pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
+    }
     return pipeline;
 }
 
@@ -163,6 +165,18 @@ std::vector<std::string> decompile_function(
 
     auto pipeline = build_pipeline();
     pipeline.run(task);
+
+    if (!task.ast() || !task.ast()->root()) {
+        auto fallback_ast = std::make_unique<dewolf::AbstractSyntaxForest>();
+        auto* seq = task.arena().create<dewolf::SeqNode>();
+        if (task.cfg()) {
+            for (dewolf::BasicBlock* block : task.cfg()->blocks()) {
+                seq->add_node(task.arena().create<dewolf::CodeNode>(block));
+            }
+        }
+        fallback_ast->set_root(seq);
+        task.set_ast(std::move(fallback_ast));
+    }
 
     dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
     apply_variable_naming(task);

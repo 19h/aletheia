@@ -305,7 +305,23 @@ AstNode* ConditionBasedRefinement::refine(
                             AstNode* next_node = nodes[i];
                             TransitionBlock* matching_tb = nullptr;
                             for (const auto& [tb, cond] : reaching_conditions) {
-                                if (tb->ast_node() == next_node || tb->ast_node()->get_original_block() == next_node->get_original_block()) {
+                                if (tb == nullptr || next_node == nullptr) {
+                                    continue;
+                                }
+
+                                AstNode* tb_node = tb->ast_node();
+                                if (tb_node == nullptr) {
+                                    continue;
+                                }
+
+                                if (tb_node == next_node) {
+                                    matching_tb = tb;
+                                    break;
+                                }
+
+                                BasicBlock* tb_orig = tb_node->get_original_block();
+                                BasicBlock* next_orig = next_node->get_original_block();
+                                if (tb_orig != nullptr && next_orig != nullptr && tb_orig == next_orig) {
                                     matching_tb = tb;
                                     break;
                                 }

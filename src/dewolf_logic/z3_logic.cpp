@@ -1,7 +1,27 @@
 #include "z3_logic.hpp"
 #include <iostream>
+#include <limits>
 
 namespace dewolf_logic {
+
+namespace {
+
+unsigned normalized_bit_width(std::size_t size_bytes) {
+    constexpr unsigned kDefaultBits = 64;
+    if (size_bytes == 0) {
+        return kDefaultBits;
+    }
+    const std::size_t bits = size_bytes * 8;
+    if (bits == 0) {
+        return kDefaultBits;
+    }
+    if (bits > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+        return kDefaultBits;
+    }
+    return static_cast<unsigned>(bits);
+}
+
+} // namespace
 
 z3::expr Z3Converter::convert(dewolf::DataflowObject* obj) {
     if (!obj) {
@@ -20,11 +40,11 @@ z3::expr Z3Converter::convert(dewolf::DataflowObject* obj) {
 }
 
 z3::expr Z3Converter::convert_constant(dewolf::Constant* c) {
-    return ctx_.bv_val(c->value(), c->size_bytes * 8);
+    return ctx_.bv_val(c->value(), normalized_bit_width(c->size_bytes));
 }
 
 z3::expr Z3Converter::convert_variable(dewolf::Variable* v) {
-    return ctx_.bv_const(v->name().c_str(), v->size_bytes * 8);
+    return ctx_.bv_const(v->name().c_str(), normalized_bit_width(v->size_bytes));
 }
 
 z3::expr Z3Converter::convert_operation(dewolf::Operation* o) {
