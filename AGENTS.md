@@ -339,6 +339,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.17.6 Port `SignedModuloInstructionSequence` and `UnsignedModuloInstructionSequence` with remainder-register heuristic and two-IMUL cheating.
   - [x] H.17.7 Port `SignedMultiplicationInstructionSequence` with YAML pattern loading and `safe_eval` constant expressions.
   - [x] H.17.8 Bundle JSON/YAML pattern files into the C++ build (embed as resources or load from disk).
+  - *Note: 2026-02-27 hardening pass added `SequenceResolver` with signed/unsigned magic-table divisor reconstruction, corner-case fallback probes, tokenized operand anonymization using `ida::instruction::operand_text`, generated `magic_maps.hpp`, and a dedicated `test_idiom_resolver` target covering div/divu reconstruction paths.*
 
 - [x] **H.18** Implement Type Lifting from IDA (currently no type information is extracted)
   - *The Python reference lifts types from Binary Ninja: `IntegerType -> Integer`, `FloatType -> Float`, `PointerType -> Pointer`, `ArrayType -> ArrayType`, `StructureType -> Struct`, `EnumerationType -> Enum`, `FunctionType -> FunctionTypeDef`, etc. For the C++ port, types should be extracted from IDA's type information system via idax APIs (function prototypes, local variable types from Hex-Rays if available, or from IDA's type libraries).*

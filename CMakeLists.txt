@@ -27,7 +27,7 @@ get_target_property(IDAX_INC_DIRS idax::idax INTERFACE_INCLUDE_DIRECTORIES)
 add_library(dewolf_logic STATIC src/dewolf_logic/logic.cpp src/dewolf_logic/dag.cpp src/dewolf_logic/world.cpp src/dewolf_logic/range_simplifier.cpp src/dewolf_logic/bitwise_simplifier.cpp src/dewolf_logic/z3_logic.cpp)
 target_include_directories(dewolf_logic PUBLIC src/dewolf_logic ${Z3_INCLUDE_DIR} ${IDAX_INC_DIRS})
 
-add_library(dewolf_idioms STATIC src/dewolf_idioms/idioms.cpp)
+add_library(dewolf_idioms STATIC src/dewolf_idioms/idioms.cpp src/dewolf_idioms/idiom_resolver.cpp)
 target_link_libraries(dewolf_idioms PUBLIC idax::idax)
 target_include_directories(dewolf_idioms PUBLIC src/dewolf_idioms)
 
@@ -80,3 +80,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 
 
+
+add_executable(test_idiom_resolver tests/test_idiom_resolver.cpp)
+target_link_libraries(test_idiom_resolver dewolf_idioms idax::idax)

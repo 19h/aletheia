@@ -4,13 +4,16 @@
 #include <ida/graph.hpp>
 #include <vector>
 #include <string>
+#include <cstdint>
 
 namespace dewolf_idioms {
 
 struct IdiomTag {
     ida::Address address;
-    std::string tag_name;
-    std::string metadata;
+    size_t length;
+    std::string operation; // "division", "division unsigned", "modulo", "modulo unsigned", "multiplication"
+    std::string operand;
+    int64_t constant;
 };
 
 class IdiomMatcher {
