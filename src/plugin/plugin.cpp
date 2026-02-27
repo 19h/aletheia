@@ -5,6 +5,7 @@
 #include "../dewolf/lifter.hpp"
 #include "../dewolf/ssa/ssa_constructor.hpp"
 #include "../dewolf/ssa/ssa_destructor.hpp"
+#include "../dewolf/pipeline/preprocessing_stages.hpp"
 #include "../dewolf/pipeline/optimization_stages.hpp"
 #include "../dewolf/pipeline/expressions/graph_expression_folding.hpp"
 #include "../dewolf/pipeline/dataflow_analysis/dead_code_elimination.hpp"
@@ -48,18 +49,21 @@ struct DeWolfPlugin : ida::plugin::Plugin {
         dewolf::DecompilerTask task(ea);
         dewolf_idioms::IdiomMatcher matcher;
         dewolf::Lifter lifter(task.arena(), matcher);
+        std::vector<dewolf_idioms::IdiomTag> idiom_tags;
 
         lifter.populate_task_signature(task);
 
-        auto cfg_res = lifter.lift_function(ea);
+        auto cfg_res = lifter.lift_function(ea, &idiom_tags);
         if (!cfg_res) {
             ida::ui::warning("Failed to lift function.");
             return std::unexpected(cfg_res.error());
         }
         
         task.set_cfg(std::move(*cfg_res));
+        task.set_idiom_tags(std::move(idiom_tags));
 
         dewolf::DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<dewolf::CompilerIdiomHandlingStage>());
         pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
         pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationStage>());
         pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
@@ -98,4 +102,3 @@ struct DeWolfPlugin : ida::plugin::Plugin {
 };
 
 IDAX_PLUGIN(DeWolfPlugin)
-

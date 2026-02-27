@@ -15,7 +15,9 @@ public:
     Lifter(DecompilerArena& arena, dewolf_idioms::IdiomMatcher& idiom_matcher)
         : arena_(arena), idiom_matcher_(idiom_matcher) {}
 
-    ida::Result<std::unique_ptr<ControlFlowGraph>> lift_function(ida::Address function_address);
+    ida::Result<std::unique_ptr<ControlFlowGraph>> lift_function(
+        ida::Address function_address,
+        std::vector<dewolf_idioms::IdiomTag>* idiom_tags_out = nullptr);
     void populate_task_signature(class DecompilerTask& task);
 
 private:

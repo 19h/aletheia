@@ -3,6 +3,7 @@
 #include "../structures/cfg.hpp"
 #include "../structuring/ast.hpp"
 #include "../structures/types.hpp"
+#include "../../dewolf_idioms/idioms.hpp"
 #include <memory>
 #include <string>
 #include <ida/idax.hpp>
@@ -34,6 +35,10 @@ public:
     TypePtr function_type() const { return function_type_; }
     void set_function_type(TypePtr type) { function_type_ = std::move(type); }
 
+    const std::vector<dewolf_idioms::IdiomTag>& idiom_tags() const { return idiom_tags_; }
+    std::vector<dewolf_idioms::IdiomTag>& mutable_idiom_tags() { return idiom_tags_; }
+    void set_idiom_tags(std::vector<dewolf_idioms::IdiomTag> tags) { idiom_tags_ = std::move(tags); }
+
 private:
     ida::Address function_address_;
     DecompilerArena arena_;
@@ -42,6 +47,7 @@ private:
     std::unique_ptr<AbstractSyntaxForest> ast_;
     std::string function_name_;
     TypePtr function_type_;
+    std::vector<dewolf_idioms::IdiomTag> idiom_tags_;
 };
 
 class PipelineStage {

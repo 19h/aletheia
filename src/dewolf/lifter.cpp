@@ -2,6 +2,7 @@
 #include <ida/lines.hpp>
 #include <ida/function.hpp>
 #include <ida/type.hpp>
+#include <iterator>
 #include "pipeline/pipeline.hpp"
 #include "structures/types.hpp"
 
@@ -52,7 +53,9 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
     }
 }
 
-ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(ida::Address function_address) {
+ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
+    ida::Address function_address,
+    std::vector<dewolf_idioms::IdiomTag>* idiom_tags_out) {
     auto flowchart_res = ida::graph::flowchart(function_address);
     if (!flowchart_res) {
         return std::unexpected(flowchart_res.error());
@@ -76,6 +79,14 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(ida::Addres
     id = 0;
     for (const auto& ida_block : *flowchart_res) {
         BasicBlock* block = block_map[id];
+
+        if (idiom_tags_out != nullptr) {
+            auto block_tags = idiom_matcher_.match_block(ida_block);
+            idiom_tags_out->insert(
+                idiom_tags_out->end(),
+                std::make_move_iterator(block_tags.begin()),
+                std::make_move_iterator(block_tags.end()));
+        }
 
         // Lift instructions
         for (ida::Address addr = ida_block.start; addr < ida_block.end; ) {

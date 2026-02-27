@@ -431,7 +431,8 @@ You are not allowed from finishing two or more tasks at once, even if that means
 
 - [ ] **M.13** Implement the 5 Preprocessing Stages for Real (currently all empty stubs)
   - *`CompilerIdiomHandling`: traverse CFG and replace tagged idiom sequences with high-level operations (depends on H.17). `RegisterPairHandling`: combine `edx:eax` 64-bit register pairs into single variables with bitwise decomposition. `SwitchVariableDetection`: trace switch variables backward via def-use chains to find clean predecessors. `RemoveGoPrologue`: pattern-match and remove Go runtime `runtime_morestack` prologues. `RemoveStackCanary`: detect and remove `__stack_chk_fail` patterns.*
-  - [ ] M.13.1 `CompilerIdiomHandlingStage`: consume `IdiomTag` results from the idiom matcher and replace matched instruction sequences with the recovered high-level operation.
+  - [x] M.13.1 `CompilerIdiomHandlingStage`: consume `IdiomTag` results from the idiom matcher and replace matched instruction sequences with the recovered high-level operation.
+    - *Implemented end-to-end idiom handoff: `Lifter::lift_function(..., idiom_tags_out)` now collects matcher tags per IDA block into `DecompilerTask::idiom_tags`; `CompilerIdiomHandlingStage` consumes tags, synthesizes replacement `Assignment(Operation)` IR (`div/div_us/mod/mod_us/mul`), rewrites matching windows by instruction address/length, and is wired into plugin pipeline before SSA. Added `test_idiom_resolver` target to validate reconstruction inputs used by this stage.*
   - [ ] M.13.2 `RegisterPairHandlingStage`: detect `RegisterPair` patterns and combine into single wider variables.
   - [ ] M.13.3 `SwitchVariableDetectionStage`: backward-slice analysis to find clean switch variables.
   - [ ] M.13.4 `RemoveGoPrologueStage`: pattern-match `r14`, `gsbase`/`fsbase` offset patterns and make morestack path unreachable.

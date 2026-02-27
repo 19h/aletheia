@@ -11,6 +11,7 @@
 #include "../src/dewolf/ssa/ssa_constructor.hpp"
 
 #include "../src/dewolf/pipeline/pipeline.hpp"
+#include "../src/dewolf/pipeline/preprocessing_stages.hpp"
 #include "../src/dewolf_logic/range_simplifier.hpp"
 
 
@@ -675,6 +676,69 @@ void test_codegen_dump() {
     std::cout << "-------------------------\n\n";
 }
 
+void test_compiler_idiom_handling_stage() {
+    DecompilerTask task(0x1000);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* block = task.arena().create<BasicBlock>(1);
+    cfg->set_entry_block(block);
+    cfg->add_block(block);
+    task.set_cfg(std::move(cfg));
+
+    auto* eax = task.arena().create<Variable>("eax", 4);
+    auto* c3 = task.arena().create<Constant>(3, 4);
+    auto* c7 = task.arena().create<Constant>(7, 4);
+    auto* c9 = task.arena().create<Constant>(9, 4);
+
+    auto* inst1_rhs = task.arena().create<Operation>(OperationType::mul, std::vector<Expression*>{eax, c3}, 4);
+    auto* inst1 = task.arena().create<Assignment>(eax, inst1_rhs);
+    inst1->set_address(0x1000);
+
+    auto* inst2_rhs = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{eax, c7}, 4);
+    auto* inst2 = task.arena().create<Assignment>(eax, inst2_rhs);
+    inst2->set_address(0x1002);
+
+    auto* inst3_rhs = task.arena().create<Operation>(OperationType::sub, std::vector<Expression*>{eax, c9}, 4);
+    auto* inst3 = task.arena().create<Assignment>(eax, inst3_rhs);
+    inst3->set_address(0x1004);
+
+    block->add_instruction(inst1);
+    block->add_instruction(inst2);
+    block->add_instruction(inst3);
+
+    dewolf_idioms::IdiomTag tag;
+    tag.address = 0x1000;
+    tag.length = 3;
+    tag.operation = "division unsigned";
+    tag.operand = "eax";
+    tag.constant = 5;
+    task.set_idiom_tags(std::vector<dewolf_idioms::IdiomTag>{tag});
+
+    CompilerIdiomHandlingStage stage;
+    stage.execute(task);
+
+    const auto& rewritten = block->instructions();
+    ASSERT_EQ(rewritten.size(), 1);
+
+    auto* assign = dynamic_cast<Assignment*>(rewritten[0]);
+    ASSERT_TRUE(assign != nullptr);
+
+    auto* lhs = dynamic_cast<Variable*>(assign->destination());
+    ASSERT_TRUE(lhs != nullptr);
+    ASSERT_EQ(lhs->name(), "eax");
+
+    auto* op = dynamic_cast<Operation*>(assign->value());
+    ASSERT_TRUE(op != nullptr);
+    ASSERT_EQ(op->type(), OperationType::div_us);
+    ASSERT_EQ(op->operands().size(), 2);
+
+    auto* divisor = dynamic_cast<Constant*>(op->operands()[1]);
+    ASSERT_TRUE(divisor != nullptr);
+    ASSERT_EQ(divisor->value(), 5);
+
+    std::cout << "[+] test_compiler_idiom_handling_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -683,6 +747,7 @@ int main() {
     test_dominators();
     test_ssa_phi_insertion();
     test_instruction_hierarchy();
+    test_compiler_idiom_handling_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
