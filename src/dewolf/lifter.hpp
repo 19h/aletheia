@@ -16,6 +16,7 @@ public:
         : arena_(arena), idiom_matcher_(idiom_matcher) {}
 
     ida::Result<std::unique_ptr<ControlFlowGraph>> lift_function(ida::Address function_address);
+    void populate_task_signature(class DecompilerTask& task);
 
 private:
     DecompilerArena& arena_;

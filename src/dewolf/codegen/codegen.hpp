@@ -1,6 +1,7 @@
 #pragma once
 #include "../structuring/ast.hpp"
 #include "../structures/dataflow.hpp"
+#include "../pipeline/pipeline.hpp"
 #include <string>
 #include <vector>
 
@@ -34,6 +35,9 @@ class CodeVisitor {
 public:
     CodeVisitor() = default;
 
+    std::vector<std::string> generate_code(DecompilerTask& task);
+    
+    // For backwards compatibility or simpler tests
     std::vector<std::string> generate_code(AbstractSyntaxForest* forest);
 
 private:

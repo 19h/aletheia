@@ -261,6 +261,53 @@ void CExpressionGenerator::visit_comment(Comment* i) {
     result_ = "/* " + i->message() + " */";
 }
 
+std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
+    lines_.clear();
+    current_line_.clear();
+    indent_level_ = 0;
+
+    // Generate function signature
+    std::string sig = "void "; // default
+    if (task.function_type()) {
+        if (auto* func_type = dynamic_cast<const FunctionTypeDef*>(task.function_type().get())) {
+            sig = func_type->return_type()->to_string() + " ";
+        } else {
+            sig = task.function_type()->to_string() + " ";
+        }
+    }
+
+    std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : task.function_name();
+    sig += name + "(";
+
+    if (task.function_type()) {
+        if (auto* func_type = dynamic_cast<const FunctionTypeDef*>(task.function_type().get())) {
+            const auto& params = func_type->parameters();
+            for (size_t i = 0; i < params.size(); ++i) {
+                if (i > 0) sig += ", ";
+                sig += params[i]->to_string() + " a" + std::to_string(i + 1); // a1, a2, ...
+            }
+        }
+    }
+    sig += ") {";
+
+    lines_.push_back(sig);
+    indent_level_++;
+
+    if (task.ast() && task.ast()->root()) {
+        visit_node(task.ast()->root());
+    }
+
+    if (!current_line_.empty()) {
+        lines_.push_back(current_line_);
+        current_line_.clear();
+    }
+
+    indent_level_--;
+    lines_.push_back("}");
+
+    return lines_;
+}
+
 std::vector<std::string> CodeVisitor::generate_code(AbstractSyntaxForest* forest) {
     lines_.clear();
     current_line_.clear();

@@ -63,7 +63,7 @@ void test_function(const std::string& func_name) {
     if (task.ast() && task.ast()->root()) {
         std::cout << "[+] Structuring successful. Generated AST.\n";
         CodeVisitor visitor;
-        auto lines = visitor.generate_code(task.ast());
+        auto lines = visitor.generate_code(task);
         std::cout << "\n[Decompiled C Code]\n";
         for (const auto& line : lines) {
             std::cout << line << "\n";

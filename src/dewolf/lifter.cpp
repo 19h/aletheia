@@ -1,7 +1,56 @@
 #include "lifter.hpp"
 #include <ida/lines.hpp>
+#include <ida/function.hpp>
+#include <ida/type.hpp>
+#include "pipeline/pipeline.hpp"
+#include "structures/types.hpp"
 
 namespace dewolf {
+
+void Lifter::populate_task_signature(DecompilerTask& task) {
+    auto ea = task.function_address();
+    
+    // Default name
+    std::string name = "sub_" + std::to_string(ea);
+    
+    auto name_res = ida::function::name_at(ea);
+    if (name_res) {
+        name = *name_res;
+    }
+    task.set_function_name(name);
+
+    auto type_res = ida::type::retrieve(ea);
+    if (type_res) {
+        auto& type_info = *type_res;
+        TypeParser parser;
+        
+        if (type_info.is_function()) {
+            auto ret_res = type_info.function_return_type();
+            auto args_res = type_info.function_argument_types();
+            
+            TypePtr ret_type = CustomType::void_type();
+            if (ret_res) {
+                auto ret_str = ret_res->to_string();
+                if (ret_str) ret_type = parser.parse(*ret_str);
+            }
+
+            std::vector<TypePtr> params;
+            if (args_res) {
+                for (const auto& arg_type : *args_res) {
+                    auto arg_str = arg_type.to_string();
+                    if (arg_str) params.push_back(parser.parse(*arg_str));
+                }
+            }
+            
+            task.set_function_type(std::make_shared<const FunctionTypeDef>(ret_type, params));
+        } else {
+            auto type_str = type_info.to_string();
+            if (type_str) {
+                task.set_function_type(parser.parse(*type_str));
+            }
+        }
+    }
+}
 
 ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(ida::Address function_address) {
     auto flowchart_res = ida::graph::flowchart(function_address);

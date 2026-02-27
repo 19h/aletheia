@@ -2,6 +2,13 @@
 #include <dewolf.hpp>
 #include "../dewolf/pipeline/pipeline.hpp"
 #include "../dewolf/codegen/codegen.hpp"
+#include "../dewolf/lifter.hpp"
+#include "../dewolf/ssa/ssa_constructor.hpp"
+#include "../dewolf/ssa/ssa_destructor.hpp"
+#include "../dewolf/pipeline/optimization_stages.hpp"
+#include "../dewolf/pipeline/expressions/graph_expression_folding.hpp"
+#include "../dewolf/pipeline/dataflow_analysis/dead_code_elimination.hpp"
+#include "../dewolf/structuring/structuring_stage.hpp"
 #include <ida/ui.hpp>
 #include <ida/database.hpp>
 #include <ida/event.hpp>
@@ -36,15 +43,45 @@ struct DeWolfPlugin : ida::plugin::Plugin {
 
         ida::Address ea = *screen_ea_res;
 
-        // Stub out full pipeline run
         ida::ui::message("DeWolf: Decompiling function at " + std::to_string(ea) + "...\n");
+
+        dewolf::DecompilerTask task(ea);
+        dewolf_idioms::IdiomMatcher matcher;
+        dewolf::Lifter lifter(task.arena(), matcher);
+
+        lifter.populate_task_signature(task);
+
+        auto cfg_res = lifter.lift_function(ea);
+        if (!cfg_res) {
+            ida::ui::warning("Failed to lift function.");
+            return std::unexpected(cfg_res.error());
+        }
+        
+        task.set_cfg(std::move(*cfg_res));
+
+        dewolf::DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
+        pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationStage>());
+        pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
+        pipeline.add_stage(std::make_unique<dewolf::DeadCodeEliminationStage>());
+        pipeline.add_stage(std::make_unique<dewolf::SsaDestructor>());
+        pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
+        
+        pipeline.run(task);
 
         std::vector<std::string> lines;
         lines.push_back(ida::lines::colstr("// DeWolf Decompiled Output", ida::lines::Color::RegularComment));
-        lines.push_back(ida::lines::colstr(std::string("// Function: ") + std::to_string(ea), ida::lines::Color::RegularComment));
-        lines.push_back(ida::lines::colstr("void ", ida::lines::Color::Keyword) + ida::lines::colstr("func", ida::lines::Color::CodeName) + ida::lines::colstr("() {", ida::lines::Color::Symbol));
-        lines.push_back(ida::lines::colstr("    // TODO: Connect pipeline and codegen here", ida::lines::Color::RegularComment));
-        lines.push_back(ida::lines::colstr("}", ida::lines::Color::Symbol));
+        
+        if (task.ast() && task.ast()->root()) {
+            dewolf::CodeVisitor visitor;
+            auto code_lines = visitor.generate_code(task);
+            for (const auto& line : code_lines) {
+                // TODO: proper syntax highlighting
+                lines.push_back(line);
+            }
+        } else {
+            lines.push_back(ida::lines::colstr("// Structuring failed to generate AST.", ida::lines::Color::Error));
+        }
 
         // UI Integration
         auto viewer_res = ida::ui::create_custom_viewer(
