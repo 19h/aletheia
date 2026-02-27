@@ -832,6 +832,157 @@ void remove_unreachable_blocks(ControlFlowGraph* cfg) {
     }
 }
 
+bool block_exists(ControlFlowGraph* cfg, BasicBlock* block) {
+    if (cfg == nullptr || block == nullptr) {
+        return false;
+    }
+    const auto& blocks = cfg->blocks();
+    return std::find(blocks.begin(), blocks.end(), block) != blocks.end();
+}
+
+void remove_block(ControlFlowGraph* cfg, BasicBlock* block) {
+    if (!block_exists(cfg, block)) {
+        return;
+    }
+    cfg->remove_nodes_from(std::unordered_set<BasicBlock*>{block});
+}
+
+bool expression_matches_stack_canary_operand(Expression* expr) {
+    if (expr == nullptr) {
+        return false;
+    }
+    const bool has_tls_base = expression_has_variable_prefix(expr, "fsbase")
+        || expression_has_variable_prefix(expr, "gsbase");
+    return has_tls_base && expression_has_constant(expr, 0x28);
+}
+
+bool is_failed_stack_canary_in_edge(Edge* in_edge) {
+    if (in_edge == nullptr || in_edge->source() == nullptr) {
+        return false;
+    }
+
+    BasicBlock* pred = in_edge->source();
+    if (pred->instructions().empty()) {
+        return false;
+    }
+
+    auto* branch = dynamic_cast<Branch*>(pred->instructions().back());
+    if (branch == nullptr || branch->condition() == nullptr) {
+        return false;
+    }
+
+    const OperationType op = branch->condition()->type();
+    const bool failed_edge = (op == OperationType::eq && in_edge->type() == EdgeType::False)
+        || (op == OperationType::neq && in_edge->type() == EdgeType::True);
+    if (!failed_edge) {
+        return false;
+    }
+
+    return expression_matches_stack_canary_operand(branch->condition()->lhs())
+        || expression_matches_stack_canary_operand(branch->condition()->rhs());
+}
+
+bool reached_by_failed_canary_check(BasicBlock* node) {
+    if (node == nullptr) {
+        return false;
+    }
+    for (Edge* in_edge : node->predecessors()) {
+        if (is_failed_stack_canary_in_edge(in_edge)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool block_contains_stack_chk_fail(BasicBlock* node) {
+    if (node == nullptr) {
+        return false;
+    }
+    for (Instruction* inst : node->instructions()) {
+        auto* assign = dynamic_cast<Assignment*>(inst);
+        if (assign == nullptr) {
+            continue;
+        }
+
+        Expression* rhs = assign->value();
+        auto* call = dynamic_cast<Call*>(rhs);
+        if (call != nullptr) {
+            if (auto* target_var = dynamic_cast<Variable*>(call->target())) {
+                if (to_lower_ascii(target_var->name()).find("stack_chk_fail") != std::string::npos) {
+                    return true;
+                }
+            }
+            continue;
+        }
+
+        auto* op = dynamic_cast<Operation*>(rhs);
+        if (op != nullptr && op->type() == OperationType::call && !op->operands().empty()) {
+            if (auto* target_var = dynamic_cast<Variable*>(op->operands()[0])) {
+                if (to_lower_ascii(target_var->name()).find("stack_chk_fail") != std::string::npos) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool is_stack_chk_fail_leaf(BasicBlock* node) {
+    if (node == nullptr || !node->successors().empty()) {
+        return false;
+    }
+    return block_contains_stack_chk_fail(node) || reached_by_failed_canary_check(node);
+}
+
+void patch_branch_condition_if_needed(BasicBlock* node) {
+    if (node == nullptr || node->instructions().empty()) {
+        return;
+    }
+    auto& insts = node->mutable_instructions();
+    if (!insts.empty() && dynamic_cast<Branch*>(insts.back()) != nullptr) {
+        insts.pop_back();
+    }
+}
+
+void remove_empty_nodes_before_fail(ControlFlowGraph* cfg,
+                                    BasicBlock* node,
+                                    std::unordered_set<BasicBlock*>& visited) {
+    if (cfg == nullptr || node == nullptr || visited.contains(node) || !block_exists(cfg, node)) {
+        return;
+    }
+    visited.insert(node);
+
+    if (!node->instructions().empty()) {
+        patch_branch_condition_if_needed(node);
+        return;
+    }
+
+    auto in_edges = node->predecessors();
+    for (Edge* in_edge : in_edges) {
+        if (in_edge != nullptr && in_edge->source() != nullptr) {
+            remove_empty_nodes_before_fail(cfg, in_edge->source(), visited);
+        }
+    }
+
+    remove_block(cfg, node);
+}
+
+void patch_stack_canary_fail_path(ControlFlowGraph* cfg, BasicBlock* fail_node) {
+    if (cfg == nullptr || fail_node == nullptr || !block_exists(cfg, fail_node)) {
+        return;
+    }
+
+    std::unordered_set<BasicBlock*> visited;
+    auto in_edges = fail_node->predecessors();
+    for (Edge* in_edge : in_edges) {
+        if (in_edge != nullptr && in_edge->source() != nullptr) {
+            remove_empty_nodes_before_fail(cfg, in_edge->source(), visited);
+        }
+    }
+
+    remove_block(cfg, fail_node);
+}
+
 } // namespace
 
 void CompilerIdiomHandlingStage::execute(DecompilerTask& task) {
@@ -1027,7 +1178,26 @@ void RemoveGoPrologueStage::execute(DecompilerTask& task) {
 }
 
 void RemoveStackCanaryStage::execute(DecompilerTask& task) {
-    // Identify and remove stack canary setup and check sequences
+    if (!task.cfg() || task.cfg()->blocks().size() <= 1) {
+        return;
+    }
+
+    ControlFlowGraph* cfg = task.cfg();
+
+    std::vector<BasicBlock*> fail_nodes;
+    for (BasicBlock* block : cfg->blocks()) {
+        if (is_stack_chk_fail_leaf(block)) {
+            fail_nodes.push_back(block);
+        }
+    }
+
+    for (BasicBlock* fail_node : fail_nodes) {
+        if (block_exists(cfg, fail_node)) {
+            patch_stack_canary_fail_path(cfg, fail_node);
+        }
+    }
+
+    remove_unreachable_blocks(cfg);
 }
 
 } // namespace dewolf

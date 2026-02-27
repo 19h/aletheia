@@ -894,6 +894,64 @@ void test_remove_go_prologue_stage() {
     std::cout << "[+] test_remove_go_prologue_stage passed.\n";
 }
 
+void test_remove_stack_canary_stage() {
+    DecompilerTask task(0x5000);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* root = task.arena().create<BasicBlock>(20);
+    auto* ok = task.arena().create<BasicBlock>(21);
+    auto* mid = task.arena().create<BasicBlock>(22);   // empty relay block on fail path
+    auto* fail = task.arena().create<BasicBlock>(23);
+
+    cfg->set_entry_block(root);
+    cfg->add_block(root);
+    cfg->add_block(ok);
+    cfg->add_block(mid);
+    cfg->add_block(fail);
+    task.set_cfg(std::move(cfg));
+
+    auto* fsbase = task.arena().create<Variable>("fsbase", 8);
+    auto* off = task.arena().create<Constant>(0x28, 8);
+    auto* guard_addr = task.arena().create<Operation>(OperationType::add, std::vector<Expression*>{fsbase, off}, 8);
+    auto* guard = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{guard_addr}, 8);
+    auto* zero = task.arena().create<Constant>(0, 8);
+    auto* cond = task.arena().create<Condition>(OperationType::eq, guard, zero);
+    auto* branch = task.arena().create<Branch>(cond);
+    branch->set_address(0x5000);
+    root->add_instruction(branch);
+
+    auto* ok_ret = task.arena().create<Return>(std::vector<Expression*>{task.arena().create<Constant>(1, 8)});
+    ok_ret->set_address(0x5002);
+    ok->add_instruction(ok_ret);
+
+    auto* call_target = task.arena().create<Variable>("__stack_chk_fail", 8);
+    auto* call_expr = task.arena().create<Call>(call_target, std::vector<Expression*>{}, 8);
+    auto* call_dst = task.arena().create<Variable>("tmp_canary", 8);
+    auto* call_assign = task.arena().create<Assignment>(call_dst, call_expr);
+    call_assign->set_address(0x5010);
+    fail->add_instruction(call_assign);
+
+    auto* e_true = task.arena().create<Edge>(root, ok, EdgeType::True);
+    auto* e_false = task.arena().create<Edge>(root, mid, EdgeType::False);
+    auto* e_mid_fail = task.arena().create<Edge>(mid, fail, EdgeType::Unconditional);
+    root->add_successor(e_true);
+    root->add_successor(e_false);
+    ok->add_predecessor(e_true);
+    mid->add_predecessor(e_false);
+    mid->add_successor(e_mid_fail);
+    fail->add_predecessor(e_mid_fail);
+
+    RemoveStackCanaryStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(task.cfg()->blocks().size(), 2);
+    ASSERT_EQ(root->successors().size(), 1);
+    ASSERT_EQ(root->successors()[0]->target(), ok);
+    ASSERT_TRUE(root->instructions().empty() || dynamic_cast<Branch*>(root->instructions().back()) == nullptr);
+
+    std::cout << "[+] test_remove_stack_canary_stage passed.\n";
+}
+
 int main() {
     test_codegen_dump();
     test_phi_dependency();
@@ -906,6 +964,7 @@ int main() {
     test_register_pair_handling_stage();
     test_switch_variable_detection_stage();
     test_remove_go_prologue_stage();
+    test_remove_stack_canary_stage();
     test_type_system();
     test_loop_structurer();
     test_range_simplifier();
