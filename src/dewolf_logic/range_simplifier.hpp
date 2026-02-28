@@ -169,16 +169,13 @@ public:
     dewolf::Expression* simplify(dewolf::Expression* condition, dewolf::DecompilerArena& arena);
 
     /// Legacy DAG interface (delegates to expression-based implementation).
-    bool is_unfulfillable(DagNode* condition) {
-        // DAG-based: for now, still returns false for the legacy interface.
-        // The new Expression*-based interface above is the primary API.
-        (void)condition;
-        return false;
-    }
+    bool is_unfulfillable(DagNode* condition);
 
-    DagNode* simplify(DagNode* condition) {
-        return condition;
-    }
+    DagNode* simplify(DagNode* condition);
+
+private:
+    // Storage for any DAG nodes created through the legacy API.
+    LogicDag legacy_dag_;
 };
 
 } // namespace dewolf_logic

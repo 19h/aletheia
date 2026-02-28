@@ -13,7 +13,7 @@
 
 namespace dewolf_logic {
 
-enum class BoundRelation {
+enum class DagBoundRelation {
     Overlap,
     Disjoint,
     Subset,
@@ -21,9 +21,9 @@ enum class BoundRelation {
     Equal
 };
 
-class ExpressionValues {
+class DagExpressionValues {
 public:
-    ExpressionValues() = default;
+    DagExpressionValues() = default;
 
     void add_equal(std::int64_t value);
     void add_not_equal(std::int64_t value);
@@ -53,9 +53,9 @@ private:
     std::unordered_set<std::int64_t> not_equal_;
 };
 
-class BitwiseAndRangeSimplifier {
+class DagBitwiseAndRangeSimplifier {
 public:
-    explicit BitwiseAndRangeSimplifier(LogicDag* dag = nullptr) : dag_(dag) {}
+    explicit DagBitwiseAndRangeSimplifier(LogicDag* dag = nullptr) : dag_(dag) {}
 
     /// Simplify conjunctions of comparison relations over constants.
     ///

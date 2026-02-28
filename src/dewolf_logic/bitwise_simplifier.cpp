@@ -17,7 +17,7 @@ struct ParsedRelation {
 
 struct ConstraintBucket {
     DagNode* expression = nullptr;
-    ExpressionValues values;
+    DagExpressionValues values;
 };
 
 std::int64_t saturating_increment(std::int64_t value) {
@@ -95,7 +95,7 @@ void collect_and_terms(DagNode* node, std::vector<DagNode*>& out) {
 
 } // namespace
 
-void ExpressionValues::add_equal(std::int64_t value) {
+void DagExpressionValues::add_equal(std::int64_t value) {
     if (equal_.has_value() && *equal_ != value) {
         contradiction_ = true;
         return;
@@ -103,25 +103,25 @@ void ExpressionValues::add_equal(std::int64_t value) {
     equal_ = value;
 }
 
-void ExpressionValues::add_not_equal(std::int64_t value) {
+void DagExpressionValues::add_not_equal(std::int64_t value) {
     not_equal_.insert(value);
 }
 
-void ExpressionValues::add_lower_bound(std::int64_t value) {
+void DagExpressionValues::add_lower_bound(std::int64_t value) {
     if (!has_lower_ || value > lower_) {
         lower_ = value;
         has_lower_ = true;
     }
 }
 
-void ExpressionValues::add_upper_bound(std::int64_t value) {
+void DagExpressionValues::add_upper_bound(std::int64_t value) {
     if (!has_upper_ || value < upper_) {
         upper_ = value;
         has_upper_ = true;
     }
 }
 
-void ExpressionValues::normalize() {
+void DagExpressionValues::normalize() {
     if (contradiction_) {
         return;
     }
@@ -163,18 +163,18 @@ void ExpressionValues::normalize() {
     }
 }
 
-bool ExpressionValues::is_unfulfillable() const {
+bool DagExpressionValues::is_unfulfillable() const {
     return contradiction_;
 }
 
-DagOperation* BitwiseAndRangeSimplifier::make_relation(LogicOp op, DagNode* lhs, DagNode* rhs) {
+DagOperation* DagBitwiseAndRangeSimplifier::make_relation(LogicOp op, DagNode* lhs, DagNode* rhs) {
     auto* rel = make_node<DagOperation>(op);
     rel->add_child(lhs);
     rel->add_child(rhs);
     return rel;
 }
 
-DagNode* BitwiseAndRangeSimplifier::simplify(DagNode* condition) {
+DagNode* DagBitwiseAndRangeSimplifier::simplify(DagNode* condition) {
     if (condition == nullptr) {
         return nullptr;
     }

@@ -1,4 +1,5 @@
 #include "range_simplifier.hpp"
+#include "bitwise_simplifier.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1079,6 +1080,49 @@ dewolf::Expression* RangeSimplifier::simplify(
     }
 
     return condition;
+}
+
+bool RangeSimplifier::is_unfulfillable(DagNode* condition) {
+    DagNode* simplified = simplify(condition);
+    auto* c = dynamic_cast<DagConstant*>(simplified);
+    return c != nullptr && c->value() == 0;
+}
+
+DagNode* RangeSimplifier::simplify(DagNode* condition) {
+    if (!condition) {
+        return nullptr;
+    }
+
+    auto* op = dynamic_cast<DagOperation*>(condition);
+    if (!op) {
+        return condition;
+    }
+
+    if (op->op() == LogicOp::And) {
+        DagBitwiseAndRangeSimplifier and_simplifier(&legacy_dag_);
+        return and_simplifier.simplify(condition);
+    }
+
+    bool changed = false;
+    std::vector<DagNode*> simplified_children;
+    simplified_children.reserve(op->children().size());
+    for (DagNode* child : op->children()) {
+        DagNode* simplified_child = simplify(child);
+        if (simplified_child != child) {
+            changed = true;
+        }
+        simplified_children.push_back(simplified_child);
+    }
+
+    if (!changed) {
+        return condition;
+    }
+
+    auto* rebuilt = legacy_dag_.create_node<DagOperation>(op->op());
+    for (DagNode* child : simplified_children) {
+        rebuilt->add_child(child);
+    }
+    return rebuilt;
 }
 
 } // namespace dewolf_logic

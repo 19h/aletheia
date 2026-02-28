@@ -948,6 +948,67 @@ void test_world_map_condition_no_simplification() {
     std::cout << "[+] test_world_map_condition_no_simplification passed.\n";
 }
 
+void test_range_simplifier_legacy_dag_path() {
+    using namespace dewolf_logic;
+
+    {
+        LogicDag dag;
+        auto* x = dag.create_node<DagVariable>("x");
+        auto* c10 = dag.create_node<DagConstant>(10);
+
+        auto* ge = dag.create_node<DagOperation>(LogicOp::Ge);
+        ge->add_child(x);
+        ge->add_child(c10);
+
+        auto* lt = dag.create_node<DagOperation>(LogicOp::Lt);
+        lt->add_child(x);
+        lt->add_child(c10);
+
+        auto* root = dag.create_node<DagOperation>(LogicOp::And);
+        root->add_child(ge);
+        root->add_child(lt);
+
+        RangeSimplifier rs;
+        ASSERT_TRUE(rs.is_unfulfillable(root));
+
+        DagNode* simplified = rs.simplify(root);
+        auto* c = dynamic_cast<DagConstant*>(simplified);
+        ASSERT_TRUE(c != nullptr);
+        ASSERT_EQ(c->value(), 0ULL);
+    }
+
+    {
+        LogicDag dag;
+        auto* x = dag.create_node<DagVariable>("x");
+        auto* c2 = dag.create_node<DagConstant>(2);
+        auto* c5 = dag.create_node<DagConstant>(5);
+
+        auto* ge2 = dag.create_node<DagOperation>(LogicOp::Ge);
+        ge2->add_child(x);
+        ge2->add_child(c2);
+
+        auto* ge5 = dag.create_node<DagOperation>(LogicOp::Ge);
+        ge5->add_child(x);
+        ge5->add_child(c5);
+
+        auto* root = dag.create_node<DagOperation>(LogicOp::And);
+        root->add_child(ge2);
+        root->add_child(ge5);
+
+        RangeSimplifier rs;
+        DagNode* simplified = rs.simplify(root);
+        auto* rel = dynamic_cast<DagOperation*>(simplified);
+        ASSERT_TRUE(rel != nullptr);
+        ASSERT_EQ(rel->op(), LogicOp::Ge);
+        ASSERT_EQ(rel->children().size(), 2);
+        auto* rhs = dynamic_cast<DagConstant*>(rel->children()[1]);
+        ASSERT_TRUE(rhs != nullptr);
+        ASSERT_EQ(rhs->value(), 5ULL);
+    }
+
+    std::cout << "[+] test_range_simplifier_legacy_dag_path passed.\n";
+}
+
 void test_z3_converter_no_hard_false_fallback() {
     z3::context ctx;
     dewolf_logic::Z3Converter converter(ctx);
@@ -4147,6 +4208,7 @@ int main() {
     test_logic_operation_simplifier();
     test_logic_normal_form_conversion();
     test_world_map_condition_no_simplification();
+    test_range_simplifier_legacy_dag_path();
     test_z3_converter_no_hard_false_fallback();
     std::cout << "All tests passed successfully.\n";
     return 0;
