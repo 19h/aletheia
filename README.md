@@ -118,8 +118,9 @@ Every IR node is allocated via `DecompilerArena`. Objects use the `ArenaAllocate
 - CMake 3.27+
 - C++23 Compiler (Clang 16+ / GCC 13+)
 - IDA Pro 9.3 (idalib/idasdk)
-- `idax` SDK (automatically fetched via CMake from GitHub)
-- Microsoft Z3 (`brew install z3`)
+- `idax` SDK (automatically fetched via CMake)
+- `z3` 4.13.4 (automatically fetched and built via CMake)
+- Microsoft Z3 (automatically fetched and statically built via CMake)
 
 ### IDA Plugin
 

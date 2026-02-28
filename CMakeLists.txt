@@ -5,6 +5,28 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ── Aggressive Optimizations ────────────────────────────────────────────
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(
+        $<$<CONFIG:Release>:-O3>
+        $<$<CONFIG:Release>:-march=native>
+        $<$<CONFIG:Release>:-funroll-loops>
+        $<$<CONFIG:Release>:-fomit-frame-pointer>
+        $<$<CONFIG:Release>:-ftree-vectorize>
+        $<$<CONFIG:Release>:-fvisibility=hidden>
+        $<$<CONFIG:Release>:-fvisibility-inlines-hidden>
+    )
+endif()
+
+# Enable LTO/IPO for release builds globally
+cmake_policy(SET CMP0069 NEW)
+include(CheckIPOSupported)
+check_ipo_supported(RESULT lto_supported)
+if(lto_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
+
+
 include(FetchContent)
 
 # ── idax dependency ─────────────────────────────────────────────────────
@@ -16,13 +38,21 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(idax)
 
-# ── Z3 dependency ───────────────────────────────────────────────────────
-find_path(Z3_INCLUDE_DIR z3++.h
-    PATHS /opt/homebrew/include /usr/local/include /usr/include
-          "$ENV{Z3_ROOT}/include" "$ENV{PROGRAMFILES}/Z3/include")
-if(NOT Z3_INCLUDE_DIR)
-    message(FATAL_ERROR "Z3 headers not found. Install z3 or set Z3_ROOT.")
-endif()
+# ── Z3 dependency (Built from source) ───────────────────────────────────
+FetchContent_Declare(
+    z3
+    GIT_REPOSITORY https://github.com/Z3Prover/z3.git
+    GIT_TAG        z3-4.13.4
+)
+
+set(Z3_BUILD_LIBZ3_SHARED OFF CACHE BOOL "Build static Z3" FORCE)
+set(Z3_BUILD_EXECUTABLE OFF CACHE BOOL "Skip Z3 executable" FORCE)
+set(Z3_BUILD_TEST_EXECUTABLES OFF CACHE BOOL "Skip Z3 tests" FORCE)
+set(Z3_ENABLE_EXAMPLE_TARGETS OFF CACHE BOOL "Skip Z3 examples" FORCE)
+set(Z3_BUILD_DOCUMENTATION OFF CACHE BOOL "Skip Z3 docs" FORCE)
+set(WARNINGS_AS_ERRORS OFF CACHE BOOL "Disable warnings as errors" FORCE)
+
+FetchContent_MakeAvailable(z3)
 
 # ── IDA installation (optional — needed for plugin, idalib tests, idump) ─
 # Resolve IDA_INSTALL_DIR from explicit setting, IDADIR env, or well-known
@@ -51,29 +81,18 @@ endif()
 if(WIN32)
     set(ALETHEIA_IDALIB_NAME "idalib.lib")
     set(ALETHEIA_IDA_NAME    "ida.lib")
-    set(ALETHEIA_Z3_NAME     "libz3.lib")
+
 elseif(APPLE)
     set(ALETHEIA_IDALIB_NAME "libidalib.dylib")
     set(ALETHEIA_IDA_NAME    "libida.dylib")
-    set(ALETHEIA_Z3_NAME     "libz3.dylib")
+
 else()
     set(ALETHEIA_IDALIB_NAME "libidalib.so")
     set(ALETHEIA_IDA_NAME    "libida.so")
-    set(ALETHEIA_Z3_NAME     "libz3.so")
+
 endif()
 
-# ── Find Z3 library ─────────────────────────────────────────────────────
-# Prefer the Z3 shipped with IDA (if available), then system locations.
-set(_z3_search_paths /opt/homebrew/lib /usr/local/lib /usr/lib
-    "$ENV{Z3_ROOT}/lib" "$ENV{Z3_ROOT}/bin" "$ENV{PROGRAMFILES}/Z3/lib")
-if(IDA_INSTALL_DIR)
-    list(INSERT _z3_search_paths 0 "${IDA_INSTALL_DIR}")
-endif()
-find_library(Z3_LIBRARY NAMES z3 libz3 PATHS ${_z3_search_paths})
-if(NOT Z3_LIBRARY)
-    message(FATAL_ERROR "Z3 library not found. Install z3 or set Z3_ROOT.")
-endif()
-message(STATUS "Z3 library: ${Z3_LIBRARY}")
+
 
 # ── Configure targets ───────────────────────────────────────────────────
 #   logos    — constraint/range/logic engine
@@ -93,7 +112,8 @@ add_library(logos STATIC
     src/logos/operation_simplifier.cpp
     src/logos/normal_form.cpp
 )
-target_include_directories(logos PUBLIC src/logos ${Z3_INCLUDE_DIR} ${IDAX_INC_DIRS})
+target_link_libraries(logos PUBLIC libz3)
+target_include_directories(logos PUBLIC src/logos ${IDAX_INC_DIRS} ${z3_SOURCE_DIR}/src/api ${z3_SOURCE_DIR}/src/api/c++)
 
 add_library(idiomata STATIC
     src/idiomata/idioms.cpp
@@ -134,13 +154,13 @@ add_library(aletheia STATIC
     src/aletheia/pipeline/dataflow_analysis/dead_code_elimination.cpp
 )
 target_link_libraries(aletheia PUBLIC idax::idax logos idiomata)
-target_include_directories(aletheia PUBLIC src/aletheia src/common ${Z3_INCLUDE_DIR})
+target_include_directories(aletheia PUBLIC src/aletheia src/common ${z3_SOURCE_DIR}/src/api ${z3_SOURCE_DIR}/src/api/c++)
 
 # ── IDA Plugin target (requires IDA installation) ───────────────────────
 if(IDA_INSTALL_DIR AND COMMAND ida_add_plugin)
     ida_add_plugin(aletheia_ida
         SOURCES src/plugin/plugin.cpp
-        LIBRARIES aletheia logos idiomata idax::idax "${IDA_INSTALL_DIR}/${ALETHEIA_Z3_NAME}"
+        LIBRARIES aletheia logos idiomata idax::idax
     )
 endif()
 
@@ -178,7 +198,7 @@ add_library(aletheia_core STATIC
     src/aletheia/pipeline/dataflow_analysis/dead_code_elimination.cpp
 )
 target_link_libraries(aletheia_core PUBLIC logos)
-target_include_directories(aletheia_core PUBLIC src/aletheia src/common ${Z3_INCLUDE_DIR})
+target_include_directories(aletheia_core PUBLIC src/aletheia src/common ${z3_SOURCE_DIR}/src/api ${z3_SOURCE_DIR}/src/api/c++)
 # Provide idax include directories (for headers only) without linking the idax
 # static library (which pulls in IDA kernel symbols like _callui).
 target_include_directories(aletheia_core PUBLIC ${IDAX_INC_DIRS})
@@ -188,7 +208,7 @@ enable_testing()
 
 # Headless unit tests (uses aletheia_core, no IDA runtime)
 add_executable(aletheia_tests tests/test_main.cpp)
-target_link_libraries(aletheia_tests aletheia_core logos "${Z3_LIBRARY}")
+target_link_libraries(aletheia_tests aletheia_core logos)
 if(APPLE)
     set_target_properties(aletheia_tests PROPERTIES LINK_FLAGS "-Wl,-undefined,dynamic_lookup")
 endif()
@@ -208,7 +228,7 @@ if(IDA_INSTALL_DIR)
             aletheia logos idiomata idax::idax
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDALIB_NAME}"
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDA_NAME}"
-            "${IDA_INSTALL_DIR}/${ALETHEIA_Z3_NAME}"
+            
     )
     target_compile_definitions(aletheia_idalib_test PRIVATE __EA64__ IDALIB_IMPL)
     target_include_directories(aletheia_idalib_test PRIVATE "${IDASDK}/include")
@@ -240,7 +260,7 @@ if(IDA_INSTALL_DIR)
             aletheia logos idiomata idax::idax
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDALIB_NAME}"
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDA_NAME}"
-            "${IDA_INSTALL_DIR}/${ALETHEIA_Z3_NAME}"
+            
     )
     target_compile_definitions(idump PRIVATE __EA64__ IDALIB_IMPL)
     target_include_directories(idump PRIVATE "${IDASDK}/include")
