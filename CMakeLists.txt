@@ -11,7 +11,7 @@ include(FetchContent)
 FetchContent_Declare(
     idax
     GIT_REPOSITORY https://github.com/19h/idax.git
-    GIT_TAG        main
+    GIT_TAG        master
 )
 
 FetchContent_MakeAvailable(idax)

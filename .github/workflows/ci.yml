@@ -1,0 +1,316 @@
+name: Aletheia CI
+
+on:
+  push:
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IDA_SDK_REPO: HexRaysSA/ida-sdk
+  IDAX_REPO: 19h/idax
+  BUILD_TYPE: RelWithDebInfo
+
+jobs:
+  # ── Unit tests (no IDA runtime needed) ─────────────────────────────────
+  # Builds aletheia_core + logos + idiomata and runs the headless test suite
+  # and idiom resolver tests. Requires only the IDA SDK (for idax headers)
+  # and Z3 (for the logic engine).
+  unit:
+    name: unit - ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            cc: gcc
+            cxx: g++
+
+          - os: macos-14
+            name: macos-arm64
+
+          - os: windows-latest
+            name: windows-x64
+            msvc_arch: x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout idax
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.IDAX_REPO }}
+          path: idax
+          submodules: recursive
+
+      - name: Checkout IDA SDK
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.IDA_SDK_REPO }}
+          path: idax/ida-sdk
+          submodules: recursive
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libz3-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install z3
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install z3 -y
+          Z3_DIR=$(find "C:/tools" "/c/tools" "C:/ProgramData/chocolatey/lib" -name "z3++.h" -exec dirname {} \; 2>/dev/null | head -n 1 || true)
+          if [[ -n "$Z3_DIR" ]]; then
+            echo "Z3_ROOT=$(dirname "$Z3_DIR")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Select GCC toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+          echo "CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        shell: bash
+        run: |
+          IDAX_SRC="${GITHUB_WORKSPACE}/idax"
+          SDK_ROOT="${IDAX_SRC}/ida-sdk"
+
+          # Point idax's IDASDK at the SDK checkout
+          if [[ -f "${SDK_ROOT}/ida-cmake/bootstrap.cmake" ]]; then
+            export IDASDK="${SDK_ROOT}"
+          elif [[ -f "${SDK_ROOT}/src/cmake/bootstrap.cmake" ]]; then
+            export IDASDK="${SDK_ROOT}/src"
+          elif [[ -f "${SDK_ROOT}/src/ida-cmake/bootstrap.cmake" ]]; then
+            export IDASDK="${SDK_ROOT}/src"
+          elif [[ -f "${SDK_ROOT}/cmake/bootstrap.cmake" ]]; then
+            export IDASDK="${SDK_ROOT}"
+          else
+            echo "error: unable to locate SDK bootstrap.cmake"
+            exit 1
+          fi
+
+          CMAKE_EXTRA_ARGS=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            CMAKE_EXTRA_ARGS="-G Ninja"
+          fi
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DALETHEIA_IDAX_SOURCE_DIR="${IDAX_SRC}" \
+            ${CMAKE_EXTRA_ARGS}
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build build --config ${{ env.BUILD_TYPE }} -j2
+
+      - name: Run unit tests
+        shell: bash
+        run: |
+          ctest --test-dir build --output-on-failure -C ${{ env.BUILD_TYPE }} \
+            -R "aletheia_unit_tests|idiom_resolver_tests"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-logs-${{ matrix.name }}
+          path: |
+            build/CMakeCache.txt
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
+
+  # ── Integration tests (requires real IDA installation) ─────────────────
+  # Builds the full aletheia stack (including lifter, plugin, idump) and
+  # runs the idalib end-to-end test against the test_binary fixture using
+  # the real IDA runtime.
+  integration:
+    name: integration - ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            cc: gcc
+            cxx: g++
+
+          - os: macos-14
+            name: macos-arm64
+
+          - os: windows-latest
+            name: windows-x64
+            msvc_arch: x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout idax
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.IDAX_REPO }}
+          path: idax
+          submodules: recursive
+
+      - name: Checkout IDA SDK
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.IDA_SDK_REPO }}
+          path: idax/ida-sdk
+          submodules: recursive
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install IDA Pro
+        env:
+          HCLI_API_KEY: ${{ secrets.HCLI_KEY }}
+        shell: bash
+        run: |
+          LICENSE_ID=$(uvx --from ida-hcli hcli --disable-updates license list | grep -oE "[0-9A-F]{2}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{2}" | head -n 1)
+          echo "Using license ID: $LICENSE_ID"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            ASSET_KEY="release/9.3/ida-pro/ida-pro_93_x64win.exe"
+          elif [[ "$RUNNER_OS" == "Linux" ]]; then
+            ASSET_KEY="release/9.3/ida-pro/ida-pro_93_x64linux.run"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            if [[ "$(uname -m)" == "arm64" ]]; then
+              ASSET_KEY="release/9.3/ida-pro/ida-pro_93_armmac.app.zip"
+            else
+              ASSET_KEY="release/9.3/ida-pro/ida-pro_93_x64mac.app.zip"
+            fi
+          fi
+
+          mkdir -p ./ida-installer
+          uvx --from ida-hcli hcli --disable-updates download --output-dir ./ida-installer "$ASSET_KEY"
+
+          INSTALLER_FILE=$(python3 -c "import glob; files=sorted(glob.glob('ida-installer/*')); print(files[0] if files else '')")
+          if [[ -z "$INSTALLER_FILE" ]]; then
+            echo "error: no installer file found in ./ida-installer"
+            ls -la ./ida-installer
+            exit 1
+          fi
+          echo "Using installer file: $INSTALLER_FILE"
+          uvx --from ida-hcli hcli --disable-updates ida install --set-default --accept-eula --yes --license-id "$LICENSE_ID" "$INSTALLER_FILE"
+
+      - name: Resolve IDASDK and IDADIR paths
+        shell: bash
+        run: |
+          IDAX_SRC="${GITHUB_WORKSPACE}/idax"
+          SDK_ROOT="${IDAX_SRC}/ida-sdk"
+          if [[ -f "${SDK_ROOT}/ida-cmake/bootstrap.cmake" ]]; then
+            echo "IDASDK=${SDK_ROOT}" >> "$GITHUB_ENV"
+          elif [[ -f "${SDK_ROOT}/src/cmake/bootstrap.cmake" ]]; then
+            echo "IDASDK=${SDK_ROOT}/src" >> "$GITHUB_ENV"
+          elif [[ -f "${SDK_ROOT}/src/ida-cmake/bootstrap.cmake" ]]; then
+            echo "IDASDK=${SDK_ROOT}/src" >> "$GITHUB_ENV"
+          elif [[ -f "${SDK_ROOT}/cmake/bootstrap.cmake" ]]; then
+            echo "IDASDK=${SDK_ROOT}" >> "$GITHUB_ENV"
+          else
+            echo "error: unable to locate SDK bootstrap.cmake"
+            exit 1
+          fi
+
+          IDADIR=$(python3 -c "import json, os; p = os.path.expanduser('~/.idapro/ida-config.json') if os.name != 'nt' else os.path.expandvars('%APPDATA%/Hex-Rays/IDA Pro/ida-config.json'); print(json.loads(open(p).read())['Paths']['ida-install-dir']) if os.path.exists(p) else print('')")
+          if [[ "$RUNNER_OS" == "macOS" && -f "$IDADIR/Contents/MacOS/libida.dylib" ]]; then
+            IDADIR="$IDADIR/Contents/MacOS"
+          fi
+          echo "IDADIR=$IDADIR" >> "$GITHUB_ENV"
+          echo "Resolved IDADIR: $IDADIR"
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install z3
+
+      - name: Select GCC toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+          echo "CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+
+      - name: Setup library paths
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo "$IDADIR" >> "$GITHUB_PATH"
+          elif [[ "$RUNNER_OS" == "Linux" ]]; then
+            echo "LD_LIBRARY_PATH=$IDADIR:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            echo "DYLD_LIBRARY_PATH=$IDADIR:${DYLD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$IDADIR:${DYLD_FALLBACK_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        shell: bash
+        run: |
+          IDAX_SRC="${GITHUB_WORKSPACE}/idax"
+          CMAKE_EXTRA_ARGS=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            CMAKE_EXTRA_ARGS="-G Ninja"
+          fi
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DALETHEIA_IDAX_SOURCE_DIR="${IDAX_SRC}" \
+            -DIDA_INSTALL_DIR="${IDADIR}" \
+            ${CMAKE_EXTRA_ARGS}
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build build --config ${{ env.BUILD_TYPE }} -j2
+
+      - name: Run all tests
+        shell: bash
+        run: |
+          ctest --test-dir build --output-on-failure -C ${{ env.BUILD_TYPE }}
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs-${{ matrix.name }}
+          path: |
+            build/CMakeCache.txt
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
