@@ -6,6 +6,7 @@
 #include <ida/xref.hpp>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <iterator>
 #include <optional>
 #include <sstream>
@@ -68,6 +69,105 @@ std::string to_lower_ascii(std::string text) {
         return static_cast<char>(std::tolower(c));
     });
     return text;
+}
+
+std::optional<std::int64_t> parse_signed_displacement(std::string_view text) {
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '+' && text[i] != '-') {
+            continue;
+        }
+
+        const bool negative = text[i] == '-';
+        std::size_t j = i + 1;
+        while (j < text.size() && (text[j] == ' ' || text[j] == '\t' || text[j] == '#' || text[j] == ',')) {
+            ++j;
+        }
+        if (j >= text.size()) {
+            continue;
+        }
+
+        int base = 10;
+        if (j + 1 < text.size() && text[j] == '0' && text[j + 1] == 'x') {
+            base = 16;
+            j += 2;
+        }
+
+        std::size_t start = j;
+        while (j < text.size()) {
+            const unsigned char ch = static_cast<unsigned char>(text[j]);
+            const bool ok = (base == 16)
+                ? std::isxdigit(ch)
+                : std::isdigit(ch);
+            if (!ok) {
+                break;
+            }
+            ++j;
+        }
+        if (j == start) {
+            continue;
+        }
+
+        std::int64_t value = 0;
+        for (std::size_t k = start; k < j; ++k) {
+            const char c = text[k];
+            int digit = 0;
+            if (c >= '0' && c <= '9') {
+                digit = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                digit = 10 + (c - 'a');
+            } else if (c >= 'A' && c <= 'F') {
+                digit = 10 + (c - 'A');
+            } else {
+                break;
+            }
+            value = value * base + digit;
+        }
+
+        return negative ? -value : value;
+    }
+
+    return std::nullopt;
+}
+
+std::optional<std::string> stack_slot_name_from_operand_text(std::string operand_text) {
+    std::string t = to_lower_ascii(std::move(operand_text));
+    if (t.find('[') == std::string::npos && t.find(']') == std::string::npos) {
+        return std::nullopt;
+    }
+
+    const bool frame_based =
+        t.find("rbp") != std::string::npos ||
+        t.find("ebp") != std::string::npos ||
+        t.find(" bp") != std::string::npos ||
+        t.find("x29") != std::string::npos ||
+        t.find("fp") != std::string::npos;
+
+    const bool sp_based =
+        t.find("rsp") != std::string::npos ||
+        t.find("esp") != std::string::npos ||
+        t.find(" sp") != std::string::npos;
+
+    if (!frame_based && !sp_based) {
+        return std::nullopt;
+    }
+
+    const std::int64_t disp = parse_signed_displacement(t).value_or(0);
+    const auto abs_disp = static_cast<std::uint64_t>(disp < 0 ? -disp : disp);
+
+    if (frame_based) {
+        if (disp < 0) {
+            return "local_" + std::to_string(abs_disp);
+        }
+        if (disp > 0) {
+            return "arg_" + std::to_string(abs_disp);
+        }
+        return "local_0";
+    }
+
+    if (disp < 0) {
+        return "stack_m" + std::to_string(abs_disp);
+    }
+    return "stack_" + std::to_string(abs_disp);
 }
 
 bool is_conditional_branch_mnemonic(std::string_view mnemonic) {
@@ -398,8 +498,19 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
                 std::vector<Expression*>{global},
                 width);
         } else {
-            auto base = arena_.create<Variable>("mem_" + std::to_string(op.value()), width);
-            expr = arena_.create<Operation>(OperationType::deref, std::vector<Expression*>{base}, width);
+            auto op_text = ida::instruction::operand_text(insn_addr, op.index());
+            if (op_text) {
+                if (auto stack_name = stack_slot_name_from_operand_text(*op_text)) {
+                    auto* slot = arena_.create<Variable>(*stack_name, width);
+                    slot->set_aliased(true);
+                    expr = slot;
+                }
+            }
+
+            if (!expr) {
+                auto base = arena_.create<Variable>("mem_" + std::to_string(op.value()), width);
+                expr = arena_.create<Operation>(OperationType::deref, std::vector<Expression*>{base}, width);
+            }
         }
     } else {
         auto txt_res = ida::instruction::operand_text(insn_addr, op.index());

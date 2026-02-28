@@ -3,6 +3,7 @@
 
 #include "../dewolf/pipeline/pipeline.hpp"
 #include "../dewolf/codegen/codegen.hpp"
+#include "../dewolf/codegen/local_declarations.hpp"
 #include "../dewolf/lifter.hpp"
 #include "../dewolf/ssa/ssa_constructor.hpp"
 #include "../dewolf/ssa/ssa_destructor.hpp"
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -101,6 +103,203 @@ void apply_variable_naming(dewolf::DecompilerTask& task) {
     dewolf::LoopNameGenerator::apply_while_loop_counters(task.ast());
 }
 
+std::string block_label(const dewolf::BasicBlock* block) {
+    return "bb_" + std::to_string(block ? block->id() : 0);
+}
+
+std::pair<dewolf::Edge*, dewolf::Edge*> pick_true_false_edges(dewolf::BasicBlock* block) {
+    dewolf::Edge* true_edge = nullptr;
+    dewolf::Edge* false_edge = nullptr;
+    if (!block) {
+        return {nullptr, nullptr};
+    }
+
+    for (dewolf::Edge* edge : block->successors()) {
+        if (!edge) {
+            continue;
+        }
+        if (edge->type() == dewolf::EdgeType::True && true_edge == nullptr) {
+            true_edge = edge;
+        } else if (edge->type() == dewolf::EdgeType::False && false_edge == nullptr) {
+            false_edge = edge;
+        }
+    }
+
+    if (!true_edge && !block->successors().empty()) {
+        true_edge = block->successors().front();
+    }
+    if (!false_edge) {
+        for (dewolf::Edge* edge : block->successors()) {
+            if (edge != true_edge) {
+                false_edge = edge;
+                break;
+            }
+        }
+    }
+
+    return {true_edge, false_edge};
+}
+
+std::string indent_of(int level) {
+    return std::string(static_cast<std::size_t>(level) * 4, ' ');
+}
+
+void emit_inline_branch_snapshot(
+    dewolf::BasicBlock* block,
+    dewolf::CExpressionGenerator& expr_gen,
+    std::vector<std::string>& lines,
+    int indent_level,
+    int depth,
+    std::unordered_set<dewolf::BasicBlock*>& path,
+    std::unordered_set<dewolf::BasicBlock*>& inlined_blocks) {
+    if (!block) {
+        lines.push_back(indent_of(indent_level) + "/* unknown target */");
+        return;
+    }
+    if (depth > 3) {
+        lines.push_back(indent_of(indent_level) + "/* ... -> " + block_label(block) + " */");
+        return;
+    }
+    if (path.contains(block)) {
+        lines.push_back(indent_of(indent_level) + "/* loop -> " + block_label(block) + " */");
+        return;
+    }
+
+    path.insert(block);
+    inlined_blocks.insert(block);
+
+    const auto& insts = block->instructions();
+    dewolf::Instruction* tail = insts.empty() ? nullptr : insts.back();
+    const bool tail_is_branch = dynamic_cast<dewolf::Branch*>(tail) != nullptr;
+    const bool tail_is_indirect = dynamic_cast<dewolf::IndirectBranch*>(tail) != nullptr;
+
+    std::size_t limit = insts.size();
+    if ((tail_is_branch || tail_is_indirect) && limit > 0) {
+        --limit;
+    }
+
+    for (std::size_t j = 0; j < limit; ++j) {
+        std::string stmt = expr_gen.generate(insts[j]);
+        if (!stmt.empty()) {
+            lines.push_back(indent_of(indent_level) + stmt + ";");
+        }
+    }
+
+    if (auto* branch = dynamic_cast<dewolf::Branch*>(tail)) {
+        auto [true_edge, false_edge] = pick_true_false_edges(block);
+        const std::string cond = expr_gen.generate(branch->condition());
+        lines.push_back(indent_of(indent_level) + "if (" + cond + ") {");
+        emit_inline_branch_snapshot(
+            true_edge ? true_edge->target() : nullptr,
+            expr_gen,
+            lines,
+            indent_level + 1,
+            depth + 1,
+            path,
+            inlined_blocks);
+        lines.push_back(indent_of(indent_level) + "} else {");
+        emit_inline_branch_snapshot(
+            false_edge ? false_edge->target() : nullptr,
+            expr_gen,
+            lines,
+            indent_level + 1,
+            depth + 1,
+            path,
+            inlined_blocks);
+        lines.push_back(indent_of(indent_level) + "}");
+    } else if (auto* indirect = dynamic_cast<dewolf::IndirectBranch*>(tail)) {
+        lines.push_back(indent_of(indent_level) + "/* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
+        for (dewolf::Edge* edge : block->successors()) {
+            emit_inline_branch_snapshot(
+                edge ? edge->target() : nullptr,
+                expr_gen,
+                lines,
+                indent_level,
+                depth + 1,
+                path,
+                inlined_blocks);
+        }
+    } else if (block->successors().size() == 1) {
+        dewolf::BasicBlock* next = block->successors()[0] ? block->successors()[0]->target() : nullptr;
+        if (next) {
+            emit_inline_branch_snapshot(next, expr_gen, lines, indent_level, depth + 1, path, inlined_blocks);
+        }
+    }
+
+    path.erase(block);
+}
+
+std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task) {
+    std::vector<std::string> lines;
+    dewolf::CExpressionGenerator expr_gen;
+
+    auto global_decls = dewolf::GlobalDeclarationGenerator::generate(task);
+    for (const auto& decl : global_decls) {
+        lines.push_back(decl);
+    }
+    if (!global_decls.empty()) {
+        lines.push_back("");
+    }
+
+    std::string sig = "void ";
+    if (task.function_type()) {
+        if (auto* func_type = dynamic_cast<const dewolf::FunctionTypeDef*>(task.function_type().get())) {
+            sig = func_type->return_type()->to_string() + " ";
+        } else {
+            sig = task.function_type()->to_string() + " ";
+        }
+    }
+
+    std::string name = task.function_name().empty()
+        ? "sub_" + std::to_string(task.function_address())
+        : task.function_name();
+    sig += name + "(";
+
+    if (task.function_type()) {
+        if (auto* func_type = dynamic_cast<const dewolf::FunctionTypeDef*>(task.function_type().get())) {
+            const auto& params = func_type->parameters();
+            for (std::size_t i = 0; i < params.size(); ++i) {
+                if (i > 0) sig += ", ";
+                sig += params[i]->to_string() + " a" + std::to_string(i + 1);
+            }
+        }
+    }
+    sig += ") {";
+    lines.push_back(sig);
+
+    auto decls = dewolf::LocalDeclarationGenerator::generate(task, expr_gen);
+    for (const auto& decl : decls) {
+        lines.push_back("    " + decl);
+    }
+    if (!decls.empty()) {
+        lines.push_back("");
+    }
+
+    if (task.cfg()) {
+        const auto blocks = task.cfg()->blocks();
+        std::unordered_set<dewolf::BasicBlock*> inlined_blocks;
+        dewolf::BasicBlock* entry = task.cfg()->entry_block();
+
+        if (entry) {
+            std::unordered_set<dewolf::BasicBlock*> path;
+            emit_inline_branch_snapshot(entry, expr_gen, lines, 1, 0, path, inlined_blocks);
+        }
+
+        std::size_t omitted = 0;
+        for (dewolf::BasicBlock* block : blocks) {
+            if (block && !inlined_blocks.contains(block)) {
+                ++omitted;
+            }
+        }
+        if (omitted > 0) {
+            lines.push_back("    /* omitted " + std::to_string(omitted) + " detached blocks */");
+        }
+    }
+
+    lines.push_back("}");
+    return lines;
+}
+
 dewolf::DecompilerPipeline build_pipeline() {
     dewolf::DecompilerPipeline pipeline;
     pipeline.add_stage(std::make_unique<dewolf::CompilerIdiomHandlingStage>());
@@ -175,7 +374,9 @@ std::vector<std::string> decompile_function(
         std::cerr << "\n";
     }
 
+    bool using_cfg_fallback = false;
     if (!task.ast() || !task.ast()->root()) {
+        using_cfg_fallback = true;
         auto fallback_ast = std::make_unique<dewolf::AbstractSyntaxForest>();
         auto* seq = task.arena().create<dewolf::SeqNode>();
         if (task.cfg()) {
@@ -189,6 +390,11 @@ std::vector<std::string> decompile_function(
 
     dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
     apply_variable_naming(task);
+
+    if (using_cfg_fallback) {
+        ok = true;
+        return generate_cfg_fallback_code(task);
+    }
 
     dewolf::CodeVisitor visitor;
     ok = true;

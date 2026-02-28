@@ -280,17 +280,25 @@ AstNode* ConditionBasedRefinement::refine(
             
             AstNode* branch_cond = nullptr;
             if (CodeNode* cnode = dynamic_cast<CodeNode*>(node)) {
-                if (!cnode->block()->instructions().empty()) {
-                    Instruction* last_inst = cnode->block()->instructions().back();
+                BasicBlock* block = cnode->block();
+                if (!block) {
+                    new_seq->add_node(node);
+                    i++;
+                    continue;
+                }
+
+                if (!block->instructions().empty()) {
+                    Instruction* last_inst = block->instructions().back();
                     
                     // Check if the last instruction is a Branch (conditional)
                     if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
                         branch_cond = arena.create<ExprAstNode>(branch->condition());
+                        Instruction* removed_branch = last_inst;
                         
                         // Remove the branch instruction from the block
-                        auto insts = cnode->block()->instructions();
+                        auto insts = block->instructions();
                         insts.pop_back();
-                        cnode->block()->set_instructions(std::move(insts));
+                        block->set_instructions(std::move(insts));
                         
                         dewolf_logic::Z3Converter conv(ctx);
                         dewolf_logic::LogicCondition extracted_cond = conv.convert_to_condition(branch->condition());
@@ -349,6 +357,10 @@ AstNode* ConditionBasedRefinement::refine(
                             IfNode* if_node = arena.create<IfNode>(branch_cond, true_branch, false_branch->nodes().empty() ? nullptr : false_branch);
                             new_seq->add_node(if_node);
                         } else {
+                            // Keep CFG semantics intact when we fail to synthesize an IfNode.
+                            auto restored = block->instructions();
+                            restored.push_back(removed_branch);
+                            block->set_instructions(std::move(restored));
                             std::cerr << "[CBR Debug] IfNode was empty, dropped!" << std::endl;
                         }
                         
