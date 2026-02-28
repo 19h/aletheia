@@ -1,7 +1,7 @@
 #include "arena.hpp"
 #include <algorithm>
 
-namespace dewolf {
+namespace aletheia {
 
 DecompilerArena::DecompilerArena(std::size_t block_size)
     : block_size_(block_size) {
@@ -52,4 +52,4 @@ void DecompilerArena::add_block(std::size_t min_size) {
     current_block_ = blocks_.size() - 1;
 }
 
-} // namespace dewolf
+} // namespace aletheia

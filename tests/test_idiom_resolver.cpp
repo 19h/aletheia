@@ -1,8 +1,8 @@
-#include "../src/dewolf_idioms/idiom_resolver.hpp"
+#include "../src/idiomata/idiom_resolver.hpp"
 #include <cassert>
 #include <iostream>
 
-using namespace dewolf_idioms;
+using namespace idiomata;
 
 int main() {
     // 32-bit division by 3: magic = 1431655766 (0x55555556), extra shift = 0.

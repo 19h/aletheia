@@ -1,25 +1,26 @@
 #include <ida/database.hpp>
 #include <ida/function.hpp>
 
-#include "../dewolf/pipeline/pipeline.hpp"
-#include "../dewolf/codegen/codegen.hpp"
-#include "../dewolf/codegen/local_declarations.hpp"
-#include "../dewolf/lifter.hpp"
-#include "../dewolf/ssa/ssa_constructor.hpp"
-#include "../dewolf/ssa/ssa_destructor.hpp"
-#include "../dewolf/pipeline/preprocessing_stages.hpp"
-#include "../dewolf/pipeline/optimization_stages.hpp"
-#include "../dewolf/pipeline/expressions/graph_expression_folding.hpp"
-#include "../dewolf/pipeline/dataflow_analysis/dead_code_elimination.hpp"
-#include "../dewolf/structuring/structuring_stage.hpp"
-#include "../dewolf/structuring/instruction_length_handler.hpp"
-#include "../dewolf/structuring/variable_name_generation.hpp"
-#include "../dewolf/structuring/loop_name_generator.hpp"
+#include "../aletheia/pipeline/pipeline.hpp"
+#include "../aletheia/codegen/codegen.hpp"
+#include "../aletheia/codegen/local_declarations.hpp"
+#include "../aletheia/lifter.hpp"
+#include "../aletheia/ssa/ssa_constructor.hpp"
+#include "../aletheia/ssa/ssa_destructor.hpp"
+#include "../aletheia/pipeline/preprocessing_stages.hpp"
+#include "../aletheia/pipeline/optimization_stages.hpp"
+#include "../aletheia/pipeline/expressions/graph_expression_folding.hpp"
+#include "../aletheia/pipeline/dataflow_analysis/dead_code_elimination.hpp"
+#include "../aletheia/structuring/structuring_stage.hpp"
+#include "../aletheia/structuring/instruction_length_handler.hpp"
+#include "../aletheia/structuring/variable_name_generation.hpp"
+#include "../aletheia/structuring/loop_name_generator.hpp"
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -38,6 +39,148 @@ bool env_flag_enabled(const char* name) {
     if (!value) return false;
     std::string_view v{value};
     return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES";
+}
+
+bool env_var_present(const char* name) {
+    return std::getenv(name) != nullptr;
+}
+
+bool should_enable_structuring() {
+    if (env_flag_enabled("ALETHEIA_IDUMP_DISABLE_STRUCTURING")) {
+        return false;
+    }
+    if (env_var_present("ALETHEIA_IDUMP_ENABLE_STRUCTURING")) {
+        return env_flag_enabled("ALETHEIA_IDUMP_ENABLE_STRUCTURING");
+    }
+    return true;
+}
+
+bool ast_has_executable_content(aletheia::AstNode* node) {
+    if (!node) {
+        return false;
+    }
+
+    if (dynamic_cast<aletheia::ExprAstNode*>(node) != nullptr) {
+        return false;
+    }
+
+    if (auto* code = dynamic_cast<aletheia::CodeNode*>(node)) {
+        if (!code->block()) {
+            return false;
+        }
+        for (aletheia::Instruction* inst : code->block()->instructions()) {
+            if (dynamic_cast<aletheia::Branch*>(inst) == nullptr
+                && dynamic_cast<aletheia::IndirectBranch*>(inst) == nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* seq = dynamic_cast<aletheia::SeqNode*>(node)) {
+        for (aletheia::AstNode* child : seq->nodes()) {
+            if (ast_has_executable_content(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* if_node = dynamic_cast<aletheia::IfNode*>(node)) {
+        return if_node->condition_expr() != nullptr
+            || ast_has_executable_content(if_node->true_branch())
+            || ast_has_executable_content(if_node->false_branch());
+    }
+
+    if (auto* loop = dynamic_cast<aletheia::LoopNode*>(node)) {
+        return loop->condition() != nullptr || ast_has_executable_content(loop->body());
+    }
+
+    if (auto* sw = dynamic_cast<aletheia::SwitchNode*>(node)) {
+        for (aletheia::CaseNode* case_node : sw->cases()) {
+            if (ast_has_executable_content(case_node)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* case_node = dynamic_cast<aletheia::CaseNode*>(node)) {
+        return ast_has_executable_content(case_node->body());
+    }
+
+    // Conservative default for unknown AST node subclasses.
+    return true;
+}
+
+std::string_view trim_ascii(std::string_view text) {
+    std::size_t first = 0;
+    while (first < text.size() && (text[first] == ' ' || text[first] == '\t' || text[first] == '\r' || text[first] == '\n')) {
+        ++first;
+    }
+    std::size_t last = text.size();
+    while (last > first && (text[last - 1] == ' ' || text[last - 1] == '\t' || text[last - 1] == '\r' || text[last - 1] == '\n')) {
+        --last;
+    }
+    return text.substr(first, last - first);
+}
+
+std::size_t count_emitted_executable_lines(const std::vector<std::string>& lines) {
+    std::size_t count = 0;
+    for (const std::string& line : lines) {
+        std::string_view view = trim_ascii(line);
+        if (view.empty()) {
+            continue;
+        }
+        if (view == "{" || view == "}" || view == "} else {") {
+            continue;
+        }
+        if (view.starts_with("/*")) {
+            continue;
+        }
+        if (view.ends_with(':')) {
+            continue;
+        }
+        if (view.starts_with("if (") || view.starts_with("while (") || view.starts_with("for (")
+            || view.starts_with("switch (") || view.starts_with("do {") || view.starts_with("else if (")) {
+            ++count;
+            continue;
+        }
+        if (view.find(';') != std::string_view::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool generated_output_too_lossy(std::size_t lifted_non_control_count, const std::vector<std::string>& lines) {
+    if (lifted_non_control_count < 6) {
+        return false;
+    }
+    const std::size_t emitted = count_emitted_executable_lines(lines);
+    if (emitted == 0) {
+        return true;
+    }
+    return emitted * 2 < lifted_non_control_count;
+}
+
+std::size_t count_cfg_non_control_instructions(const aletheia::ControlFlowGraph* cfg) {
+    if (!cfg) {
+        return 0;
+    }
+    std::size_t count = 0;
+    for (aletheia::BasicBlock* block : cfg->blocks()) {
+        if (!block) {
+            continue;
+        }
+        for (aletheia::Instruction* inst : block->instructions()) {
+            if (dynamic_cast<aletheia::Branch*>(inst) == nullptr
+                && dynamic_cast<aletheia::IndirectBranch*>(inst) == nullptr) {
+                ++count;
+            }
+        }
+    }
+    return count;
 }
 
 void print_usage() {
@@ -75,52 +218,52 @@ bool parse_args(int argc, char** argv, CliOptions& options) {
 
 bool detect_headless(const CliOptions& options) {
     if (options.explicit_headless) return true;
-    if (env_flag_enabled("DEWOLF_HEADLESS")) return true;
+    if (env_flag_enabled("ALETHEIA_HEADLESS")) return true;
     return false;
 }
 
-void configure_out_of_ssa_mode(dewolf::DecompilerTask& task) {
-    if (const char* mode_env = std::getenv("DEWOLF_OUT_OF_SSA_MODE"); mode_env != nullptr) {
-        auto parsed = dewolf::SsaDestructor::parse_mode(mode_env);
+void configure_out_of_ssa_mode(aletheia::DecompilerTask& task) {
+    if (const char* mode_env = std::getenv("ALETHEIA_OUT_OF_SSA_MODE"); mode_env != nullptr) {
+        auto parsed = aletheia::SsaDestructor::parse_mode(mode_env);
         if (parsed.has_value()) {
             task.set_out_of_ssa_mode(*parsed);
         }
     }
 }
 
-void apply_variable_naming(dewolf::DecompilerTask& task) {
-    if (const char* naming_env = std::getenv("DEWOLF_VARIABLE_NAMING"); naming_env != nullptr) {
+void apply_variable_naming(aletheia::DecompilerTask& task) {
+    if (const char* naming_env = std::getenv("ALETHEIA_VARIABLE_NAMING"); naming_env != nullptr) {
         std::string_view scheme{naming_env};
         if (scheme == "system_hungarian") {
-            dewolf::VariableNameGeneration::apply_system_hungarian(task.ast());
+            aletheia::VariableNameGeneration::apply_system_hungarian(task.ast());
         } else {
-            dewolf::VariableNameGeneration::apply_default(task.ast());
+            aletheia::VariableNameGeneration::apply_default(task.ast());
         }
     } else {
-        dewolf::VariableNameGeneration::apply_default(task.ast());
+        aletheia::VariableNameGeneration::apply_default(task.ast());
     }
-    dewolf::LoopNameGenerator::apply_for_loop_counters(task.ast());
-    dewolf::LoopNameGenerator::apply_while_loop_counters(task.ast());
+    aletheia::LoopNameGenerator::apply_for_loop_counters(task.ast());
+    aletheia::LoopNameGenerator::apply_while_loop_counters(task.ast());
 }
 
-std::string block_label(const dewolf::BasicBlock* block) {
+std::string block_label(const aletheia::BasicBlock* block) {
     return "bb_" + std::to_string(block ? block->id() : 0);
 }
 
-std::pair<dewolf::Edge*, dewolf::Edge*> pick_true_false_edges(dewolf::BasicBlock* block) {
-    dewolf::Edge* true_edge = nullptr;
-    dewolf::Edge* false_edge = nullptr;
+std::pair<aletheia::Edge*, aletheia::Edge*> pick_true_false_edges(aletheia::BasicBlock* block) {
+    aletheia::Edge* true_edge = nullptr;
+    aletheia::Edge* false_edge = nullptr;
     if (!block) {
         return {nullptr, nullptr};
     }
 
-    for (dewolf::Edge* edge : block->successors()) {
+    for (aletheia::Edge* edge : block->successors()) {
         if (!edge) {
             continue;
         }
-        if (edge->type() == dewolf::EdgeType::True && true_edge == nullptr) {
+        if (edge->type() == aletheia::EdgeType::True && true_edge == nullptr) {
             true_edge = edge;
-        } else if (edge->type() == dewolf::EdgeType::False && false_edge == nullptr) {
+        } else if (edge->type() == aletheia::EdgeType::False && false_edge == nullptr) {
             false_edge = edge;
         }
     }
@@ -129,7 +272,7 @@ std::pair<dewolf::Edge*, dewolf::Edge*> pick_true_false_edges(dewolf::BasicBlock
         true_edge = block->successors().front();
     }
     if (!false_edge) {
-        for (dewolf::Edge* edge : block->successors()) {
+        for (aletheia::Edge* edge : block->successors()) {
             if (edge != true_edge) {
                 false_edge = edge;
                 break;
@@ -145,13 +288,13 @@ std::string indent_of(int level) {
 }
 
 void emit_inline_branch_snapshot(
-    dewolf::BasicBlock* block,
-    dewolf::CExpressionGenerator& expr_gen,
+    aletheia::BasicBlock* block,
+    aletheia::CExpressionGenerator& expr_gen,
     std::vector<std::string>& lines,
     int indent_level,
     int depth,
-    std::unordered_set<dewolf::BasicBlock*>& path,
-    std::unordered_set<dewolf::BasicBlock*>& inlined_blocks) {
+    std::unordered_set<aletheia::BasicBlock*>& path,
+    std::unordered_set<aletheia::BasicBlock*>& inlined_blocks) {
     if (!block) {
         lines.push_back(indent_of(indent_level) + "/* unknown target */");
         return;
@@ -169,9 +312,9 @@ void emit_inline_branch_snapshot(
     inlined_blocks.insert(block);
 
     const auto& insts = block->instructions();
-    dewolf::Instruction* tail = insts.empty() ? nullptr : insts.back();
-    const bool tail_is_branch = dynamic_cast<dewolf::Branch*>(tail) != nullptr;
-    const bool tail_is_indirect = dynamic_cast<dewolf::IndirectBranch*>(tail) != nullptr;
+    aletheia::Instruction* tail = insts.empty() ? nullptr : insts.back();
+    const bool tail_is_branch = dynamic_cast<aletheia::Branch*>(tail) != nullptr;
+    const bool tail_is_indirect = dynamic_cast<aletheia::IndirectBranch*>(tail) != nullptr;
 
     std::size_t limit = insts.size();
     if ((tail_is_branch || tail_is_indirect) && limit > 0) {
@@ -185,7 +328,7 @@ void emit_inline_branch_snapshot(
         }
     }
 
-    if (auto* branch = dynamic_cast<dewolf::Branch*>(tail)) {
+    if (auto* branch = dynamic_cast<aletheia::Branch*>(tail)) {
         auto [true_edge, false_edge] = pick_true_false_edges(block);
         const std::string cond = expr_gen.generate(branch->condition());
         lines.push_back(indent_of(indent_level) + "if (" + cond + ") {");
@@ -207,13 +350,13 @@ void emit_inline_branch_snapshot(
             path,
             inlined_blocks);
         lines.push_back(indent_of(indent_level) + "}");
-    } else if (auto* indirect = dynamic_cast<dewolf::IndirectBranch*>(tail)) {
-        const bool constant_target = dynamic_cast<dewolf::Constant*>(indirect->expression()) != nullptr;
+    } else if (auto* indirect = dynamic_cast<aletheia::IndirectBranch*>(tail)) {
+        const bool constant_target = dynamic_cast<aletheia::Constant*>(indirect->expression()) != nullptr;
         const bool single_successor = block->successors().size() == 1;
         if (!(constant_target && single_successor)) {
             lines.push_back(indent_of(indent_level) + "/* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
         }
-        for (dewolf::Edge* edge : block->successors()) {
+        for (aletheia::Edge* edge : block->successors()) {
             emit_inline_branch_snapshot(
                 edge ? edge->target() : nullptr,
                 expr_gen,
@@ -224,7 +367,7 @@ void emit_inline_branch_snapshot(
                 inlined_blocks);
         }
     } else if (block->successors().size() == 1) {
-        dewolf::BasicBlock* next = block->successors()[0] ? block->successors()[0]->target() : nullptr;
+        aletheia::BasicBlock* next = block->successors()[0] ? block->successors()[0]->target() : nullptr;
         if (next) {
             emit_inline_branch_snapshot(next, expr_gen, lines, indent_level, depth + 1, path, inlined_blocks);
         }
@@ -233,11 +376,11 @@ void emit_inline_branch_snapshot(
     path.erase(block);
 }
 
-std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task) {
+std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& task) {
     std::vector<std::string> lines;
-    dewolf::CExpressionGenerator expr_gen;
+    aletheia::CExpressionGenerator expr_gen;
 
-    auto global_decls = dewolf::GlobalDeclarationGenerator::generate(task);
+    auto global_decls = aletheia::GlobalDeclarationGenerator::generate(task);
     for (const auto& decl : global_decls) {
         lines.push_back(decl);
     }
@@ -247,7 +390,7 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
 
     std::string sig = "void ";
     if (task.function_type()) {
-        if (auto* func_type = dynamic_cast<const dewolf::FunctionTypeDef*>(task.function_type().get())) {
+        if (auto* func_type = dynamic_cast<const aletheia::FunctionTypeDef*>(task.function_type().get())) {
             sig = func_type->return_type()->to_string() + " ";
         } else {
             sig = task.function_type()->to_string() + " ";
@@ -260,7 +403,7 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
     sig += name + "(";
 
     if (task.function_type()) {
-        if (auto* func_type = dynamic_cast<const dewolf::FunctionTypeDef*>(task.function_type().get())) {
+        if (auto* func_type = dynamic_cast<const aletheia::FunctionTypeDef*>(task.function_type().get())) {
             const auto& params = func_type->parameters();
             for (std::size_t i = 0; i < params.size(); ++i) {
                 if (i > 0) sig += ", ";
@@ -271,7 +414,7 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
     sig += ") {";
     lines.push_back(sig);
 
-    auto decls = dewolf::LocalDeclarationGenerator::generate(task, expr_gen);
+    auto decls = aletheia::LocalDeclarationGenerator::generate(task, expr_gen);
     for (const auto& decl : decls) {
         lines.push_back("    " + decl);
     }
@@ -281,16 +424,16 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
 
     if (task.cfg()) {
         const auto blocks = task.cfg()->blocks();
-        std::unordered_set<dewolf::BasicBlock*> inlined_blocks;
-        dewolf::BasicBlock* entry = task.cfg()->entry_block();
+        std::unordered_set<aletheia::BasicBlock*> inlined_blocks;
+        aletheia::BasicBlock* entry = task.cfg()->entry_block();
 
         if (entry) {
-            std::unordered_set<dewolf::BasicBlock*> path;
+            std::unordered_set<aletheia::BasicBlock*> path;
             emit_inline_branch_snapshot(entry, expr_gen, lines, 1, 0, path, inlined_blocks);
         }
 
         std::size_t omitted = 0;
-        for (dewolf::BasicBlock* block : blocks) {
+        for (aletheia::BasicBlock* block : blocks) {
             if (block && !inlined_blocks.contains(block)) {
                 ++omitted;
             }
@@ -299,7 +442,7 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
             lines.push_back("    /* detached blocks: " + std::to_string(omitted) + " */");
             lines.push_back("");
 
-            for (dewolf::BasicBlock* block : blocks) {
+            for (aletheia::BasicBlock* block : blocks) {
                 if (!block || inlined_blocks.contains(block)) {
                     continue;
                 }
@@ -307,9 +450,9 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
                 lines.push_back("    /* detached " + block_label(block) + " */");
 
                 const auto& insts = block->instructions();
-                dewolf::Instruction* tail = insts.empty() ? nullptr : insts.back();
-                const bool tail_is_branch = dynamic_cast<dewolf::Branch*>(tail) != nullptr;
-                const bool tail_is_indirect = dynamic_cast<dewolf::IndirectBranch*>(tail) != nullptr;
+                aletheia::Instruction* tail = insts.empty() ? nullptr : insts.back();
+                const bool tail_is_branch = dynamic_cast<aletheia::Branch*>(tail) != nullptr;
+                const bool tail_is_indirect = dynamic_cast<aletheia::IndirectBranch*>(tail) != nullptr;
 
                 std::size_t limit = insts.size();
                 if ((tail_is_branch || tail_is_indirect) && limit > 0) {
@@ -323,7 +466,7 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
                     }
                 }
 
-                if (auto* branch = dynamic_cast<dewolf::Branch*>(tail)) {
+                if (auto* branch = dynamic_cast<aletheia::Branch*>(tail)) {
                     auto [true_edge, false_edge] = pick_true_false_edges(block);
                     const std::string cond = expr_gen.generate(branch->condition());
                     lines.push_back("        if (" + cond + ") {");
@@ -331,8 +474,8 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
                     lines.push_back("        } else {");
                     lines.push_back("            /* else -> " + block_label(false_edge ? false_edge->target() : nullptr) + " */");
                     lines.push_back("        }");
-                } else if (auto* indirect = dynamic_cast<dewolf::IndirectBranch*>(tail)) {
-                    const bool constant_target = dynamic_cast<dewolf::Constant*>(indirect->expression()) != nullptr;
+                } else if (auto* indirect = dynamic_cast<aletheia::IndirectBranch*>(tail)) {
+                    const bool constant_target = dynamic_cast<aletheia::Constant*>(indirect->expression()) != nullptr;
                     const bool single_successor = block->successors().size() == 1;
                     if (!(constant_target && single_successor)) {
                         lines.push_back("        /* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
@@ -348,62 +491,101 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
     return lines;
 }
 
-dewolf::DecompilerPipeline build_pipeline(bool enable_structuring) {
-    dewolf::DecompilerPipeline pipeline;
-    pipeline.add_stage(std::make_unique<dewolf::CompilerIdiomHandlingStage>());
-    pipeline.add_stage(std::make_unique<dewolf::RegisterPairHandlingStage>());
-    pipeline.add_stage(std::make_unique<dewolf::RemoveGoPrologueStage>());
-    pipeline.add_stage(std::make_unique<dewolf::RemoveStackCanaryStage>());
-    pipeline.add_stage(std::make_unique<dewolf::RemoveNoreturnBoilerplateStage>());
-    pipeline.add_stage(std::make_unique<dewolf::SwitchVariableDetectionStage>());
-    pipeline.add_stage(std::make_unique<dewolf::CoherenceStage>());
+aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
+    aletheia::DecompilerPipeline pipeline;
+    pipeline.add_stage(std::make_unique<aletheia::CompilerIdiomHandlingStage>());
+    pipeline.add_stage(std::make_unique<aletheia::RegisterPairHandlingStage>());
+    pipeline.add_stage(std::make_unique<aletheia::RemoveGoPrologueStage>());
+    pipeline.add_stage(std::make_unique<aletheia::RemoveStackCanaryStage>());
+    pipeline.add_stage(std::make_unique<aletheia::RemoveNoreturnBoilerplateStage>());
+    pipeline.add_stage(std::make_unique<aletheia::SwitchVariableDetectionStage>());
+    pipeline.add_stage(std::make_unique<aletheia::CoherenceStage>());
 
     if (!enable_structuring) {
-        pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
-        pipeline.add_stage(std::make_unique<dewolf::ExpressionSimplificationStage>());
+        pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
+        pipeline.add_stage(std::make_unique<aletheia::ExpressionSimplificationStage>());
         return pipeline;
     }
 
-    pipeline.add_stage(std::make_unique<dewolf::InsertMissingDefinitionsStage>());
-    pipeline.add_stage(std::make_unique<dewolf::MemPhiConverterStage>());
-    pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
-    pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
-    pipeline.add_stage(std::make_unique<dewolf::DeadComponentPrunerStage>());
-    pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::BitFieldComparisonUnrollingStage>());
-    pipeline.add_stage(std::make_unique<dewolf::TypePropagationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::DeadPathEliminationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::DeadLoopEliminationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationMemoryStage>());
-    pipeline.add_stage(std::make_unique<dewolf::ExpressionPropagationFunctionCallStage>());
-    pipeline.add_stage(std::make_unique<dewolf::DeadCodeEliminationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::RedundantCastsEliminationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::IdentityEliminationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::CommonSubexpressionEliminationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::ArrayAccessDetectionStage>());
-    pipeline.add_stage(std::make_unique<dewolf::ExpressionSimplificationStage>());
-    pipeline.add_stage(std::make_unique<dewolf::DeadComponentPrunerStage>());
-    pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
-    pipeline.add_stage(std::make_unique<dewolf::EdgePrunerStage>());
-    pipeline.add_stage(std::make_unique<dewolf::PhiFunctionFixerStage>());
-    pipeline.add_stage(std::make_unique<dewolf::SsaDestructor>());
-    pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
+    pipeline.add_stage(std::make_unique<aletheia::InsertMissingDefinitionsStage>());
+    pipeline.add_stage(std::make_unique<aletheia::MemPhiConverterStage>());
+    pipeline.add_stage(std::make_unique<aletheia::SsaConstructor>());
+    pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
+    pipeline.add_stage(std::make_unique<aletheia::DeadComponentPrunerStage>());
+    pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::BitFieldComparisonUnrollingStage>());
+    pipeline.add_stage(std::make_unique<aletheia::TypePropagationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::DeadPathEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::DeadLoopEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationMemoryStage>());
+    pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationFunctionCallStage>());
+    pipeline.add_stage(std::make_unique<aletheia::DeadCodeEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::RedundantCastsEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::IdentityEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::CommonSubexpressionEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::ArrayAccessDetectionStage>());
+    pipeline.add_stage(std::make_unique<aletheia::ExpressionSimplificationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::DeadComponentPrunerStage>());
+    pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
+    pipeline.add_stage(std::make_unique<aletheia::EdgePrunerStage>());
+    pipeline.add_stage(std::make_unique<aletheia::PhiFunctionFixerStage>());
+    pipeline.add_stage(std::make_unique<aletheia::SsaDestructor>());
+    pipeline.add_stage(std::make_unique<aletheia::PatternIndependentRestructuringStage>());
     return pipeline;
+}
+
+std::optional<std::vector<std::string>> regenerate_conservative_fallback(
+    ida::Address ea,
+    idiomata::IdiomMatcher& matcher) {
+    aletheia::DecompilerTask fallback_task(ea);
+    configure_out_of_ssa_mode(fallback_task);
+
+    aletheia::Lifter fallback_lifter(fallback_task.arena(), matcher);
+    std::vector<idiomata::IdiomTag> idiom_tags;
+
+    fallback_lifter.populate_task_signature(fallback_task);
+    auto cfg_res = fallback_lifter.lift_function(ea, &idiom_tags);
+    if (!cfg_res) {
+        return std::nullopt;
+    }
+
+    fallback_task.set_cfg(std::move(*cfg_res));
+    fallback_task.set_idiom_tags(std::move(idiom_tags));
+
+    auto fallback_pipeline = build_pipeline(false);
+    fallback_pipeline.run(fallback_task);
+
+    auto fallback_ast = std::make_unique<aletheia::AbstractSyntaxForest>();
+    auto* seq = fallback_task.arena().create<aletheia::SeqNode>();
+    if (fallback_task.cfg()) {
+        for (aletheia::BasicBlock* block : fallback_task.cfg()->blocks()) {
+            seq->add_node(fallback_task.arena().create<aletheia::CodeNode>(block));
+        }
+    }
+    fallback_ast->set_root(seq);
+    fallback_task.set_ast(std::move(fallback_ast));
+
+    aletheia::InstructionLengthHandler::apply(fallback_task.ast(), fallback_task.arena());
+    if (env_flag_enabled("ALETHEIA_IDUMP_RENAME_FALLBACK")) {
+        apply_variable_naming(fallback_task);
+    }
+
+    return generate_cfg_fallback_code(fallback_task);
 }
 
 std::vector<std::string> decompile_function(
     ida::Address ea,
-    dewolf_idioms::IdiomMatcher& matcher,
+    idiomata::IdiomMatcher& matcher,
     bool& ok,
     std::string& error_message) {
     ok = false;
     error_message.clear();
 
-    dewolf::DecompilerTask task(ea);
+    aletheia::DecompilerTask task(ea);
     configure_out_of_ssa_mode(task);
 
-    dewolf::Lifter lifter(task.arena(), matcher);
-    std::vector<dewolf_idioms::IdiomTag> idiom_tags;
+    aletheia::Lifter lifter(task.arena(), matcher);
+    std::vector<idiomata::IdiomTag> idiom_tags;
 
     lifter.populate_task_signature(task);
 
@@ -413,10 +595,13 @@ std::vector<std::string> decompile_function(
         return {};
     }
 
+    const std::size_t lifted_non_control_count = count_cfg_non_control_instructions((*cfg_res).get());
+
     task.set_cfg(std::move(*cfg_res));
     task.set_idiom_tags(std::move(idiom_tags));
 
-    const bool enable_structuring = env_flag_enabled("DEWOLF_IDUMP_ENABLE_STRUCTURING");
+    const bool enable_structuring = should_enable_structuring();
+    const bool force_structured_output = env_flag_enabled("ALETHEIA_IDUMP_FORCE_STRUCTURED_OUTPUT");
     auto pipeline = build_pipeline(enable_structuring);
     pipeline.run(task);
 
@@ -428,14 +613,17 @@ std::vector<std::string> decompile_function(
         std::cerr << "\n";
     }
 
-    bool using_cfg_fallback = false;
-    if (!task.ast() || !task.ast()->root()) {
+    bool using_cfg_fallback = !task.ast() || !task.ast()->root();
+    if (!using_cfg_fallback && enable_structuring && !ast_has_executable_content(task.ast()->root())) {
         using_cfg_fallback = true;
-        auto fallback_ast = std::make_unique<dewolf::AbstractSyntaxForest>();
-        auto* seq = task.arena().create<dewolf::SeqNode>();
+    }
+
+    if (using_cfg_fallback) {
+        auto fallback_ast = std::make_unique<aletheia::AbstractSyntaxForest>();
+        auto* seq = task.arena().create<aletheia::SeqNode>();
         if (task.cfg()) {
-            for (dewolf::BasicBlock* block : task.cfg()->blocks()) {
-                seq->add_node(task.arena().create<dewolf::CodeNode>(block));
+            for (aletheia::BasicBlock* block : task.cfg()->blocks()) {
+                seq->add_node(task.arena().create<aletheia::CodeNode>(block));
             }
         }
         fallback_ast->set_root(seq);
@@ -443,20 +631,37 @@ std::vector<std::string> decompile_function(
     }
 
     if (using_cfg_fallback) {
-        dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
-        if (env_flag_enabled("DEWOLF_IDUMP_RENAME_FALLBACK")) {
+        if (enable_structuring && !force_structured_output) {
+            if (auto rebuilt = regenerate_conservative_fallback(ea, matcher); rebuilt.has_value()) {
+                ok = true;
+                return *rebuilt;
+            }
+        }
+
+        aletheia::InstructionLengthHandler::apply(task.ast(), task.arena());
+        if (env_flag_enabled("ALETHEIA_IDUMP_RENAME_FALLBACK")) {
             apply_variable_naming(task);
         }
         ok = true;
         return generate_cfg_fallback_code(task);
     }
 
-    dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
+    aletheia::InstructionLengthHandler::apply(task.ast(), task.arena());
     apply_variable_naming(task);
 
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
+    auto structured_lines = visitor.generate_code(task);
+
+    if (enable_structuring && !force_structured_output
+        && generated_output_too_lossy(lifted_non_control_count, structured_lines)) {
+        if (auto rebuilt = regenerate_conservative_fallback(ea, matcher); rebuilt.has_value()) {
+            ok = true;
+            return *rebuilt;
+        }
+    }
+
     ok = true;
-    return visitor.generate_code(task);
+    return structured_lines;
 }
 
 } // namespace
@@ -469,7 +674,7 @@ int main(int argc, char** argv) {
     }
 
     if (!detect_headless(options)) {
-        std::cerr << "idump: headless mode not explicit; proceeding (set --headless or DEWOLF_HEADLESS=1).\n";
+        std::cerr << "idump: headless mode not explicit; proceeding (set --headless or ALETHEIA_HEADLESS=1).\n";
     }
 
     ida::database::RuntimeOptions runtime_options;
@@ -497,7 +702,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    dewolf_idioms::IdiomMatcher matcher;
+    idiomata::IdiomMatcher matcher;
 
     std::size_t total_functions = 0;
     std::size_t decompiled_functions = 0;

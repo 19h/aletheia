@@ -2,7 +2,7 @@
 #include "arena.hpp"
 #include <new>
 
-namespace dewolf {
+namespace aletheia {
 
 class ArenaAllocated {
 public:
@@ -22,4 +22,4 @@ public:
     }
 };
 
-} // namespace dewolf
+} // namespace aletheia

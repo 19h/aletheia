@@ -5,7 +5,7 @@
 #include <memory>
 #include <type_traits>
 
-namespace dewolf {
+namespace aletheia {
 
 class DecompilerArena {
 public:
@@ -53,4 +53,4 @@ private:
     void add_block(std::size_t min_size);
 };
 
-} // namespace dewolf
+} // namespace aletheia

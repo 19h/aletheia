@@ -5,32 +5,32 @@
 #include <utility>
 #include <unordered_set>
 #include "../src/common/arena.hpp"
-#include "../src/dewolf/structures/cfg.hpp"
-#include "../src/dewolf/structures/dataflow.hpp"
-#include "../src/dewolf/structures/types.hpp"
-#include "../src/dewolf/structuring/ast.hpp"
-#include "../src/dewolf/structuring/condition_handler.hpp"
-#include "../src/dewolf/structuring/loop_structurer.hpp"
-#include "../src/dewolf/structuring/cbr/cbr.hpp"
-#include "../src/dewolf/structuring/car/car.hpp"
-#include "../src/dewolf/structuring/reachability.hpp"
-#include "../src/dewolf/structuring/structuring_stage.hpp"
-#include "../src/dewolf/structuring/instruction_length_handler.hpp"
-#include "../src/dewolf/structuring/variable_name_generation.hpp"
-#include "../src/dewolf/structuring/loop_name_generator.hpp"
-#include "../src/dewolf/ssa/dominators.hpp"
-#include "../src/dewolf/ssa/ssa_constructor.hpp"
-#include "../src/dewolf/ssa/ssa_destructor.hpp"
-#include "../src/dewolf/ssa/minimal_variable_renamer.hpp"
-#include "../src/dewolf/ssa/conditional_variable_renamer.hpp"
+#include "../src/aletheia/structures/cfg.hpp"
+#include "../src/aletheia/structures/dataflow.hpp"
+#include "../src/aletheia/structures/types.hpp"
+#include "../src/aletheia/structuring/ast.hpp"
+#include "../src/aletheia/structuring/condition_handler.hpp"
+#include "../src/aletheia/structuring/loop_structurer.hpp"
+#include "../src/aletheia/structuring/cbr/cbr.hpp"
+#include "../src/aletheia/structuring/car/car.hpp"
+#include "../src/aletheia/structuring/reachability.hpp"
+#include "../src/aletheia/structuring/structuring_stage.hpp"
+#include "../src/aletheia/structuring/instruction_length_handler.hpp"
+#include "../src/aletheia/structuring/variable_name_generation.hpp"
+#include "../src/aletheia/structuring/loop_name_generator.hpp"
+#include "../src/aletheia/ssa/dominators.hpp"
+#include "../src/aletheia/ssa/ssa_constructor.hpp"
+#include "../src/aletheia/ssa/ssa_destructor.hpp"
+#include "../src/aletheia/ssa/minimal_variable_renamer.hpp"
+#include "../src/aletheia/ssa/conditional_variable_renamer.hpp"
 
-#include "../src/dewolf/pipeline/pipeline.hpp"
-#include "../src/dewolf/pipeline/preprocessing_stages.hpp"
-#include "../src/dewolf/pipeline/optimization_stages.hpp"
-#include "../src/dewolf_logic/range_simplifier.hpp"
-#include "../src/dewolf_logic/operation_simplifier.hpp"
-#include "../src/dewolf_logic/normal_form.hpp"
-#include "../src/dewolf_logic/world.hpp"
+#include "../src/aletheia/pipeline/pipeline.hpp"
+#include "../src/aletheia/pipeline/preprocessing_stages.hpp"
+#include "../src/aletheia/pipeline/optimization_stages.hpp"
+#include "../src/logos/range_simplifier.hpp"
+#include "../src/logos/operation_simplifier.hpp"
+#include "../src/logos/normal_form.hpp"
+#include "../src/logos/world.hpp"
 
 
 
@@ -40,7 +40,7 @@
 }
 #define ASSERT_EQ(a, b) ASSERT_TRUE((a) == (b))
 
-using namespace dewolf;
+using namespace aletheia;
 
 class PipelineTestStage final : public PipelineStage {
 public:
@@ -643,7 +643,7 @@ void test_type_system() {
 }
 
 void test_range_simplifier() {
-    using namespace dewolf_logic;
+    using namespace logos;
     DecompilerArena arena;
 
     // --- Test 1: Contradictory must-values are unfulfillable ---
@@ -769,7 +769,7 @@ void test_range_simplifier() {
 }
 
 void test_logic_operation_simplifier() {
-    using namespace dewolf_logic;
+    using namespace logos;
 
     LogicDag dag;
 
@@ -828,7 +828,7 @@ void test_logic_operation_simplifier() {
 }
 
 void test_logic_normal_form_conversion() {
-    using namespace dewolf_logic;
+    using namespace logos;
 
     {
         LogicDag dag;
@@ -890,7 +890,7 @@ void test_logic_normal_form_conversion() {
 }
 
 void test_world_map_condition_no_simplification() {
-    using namespace dewolf_logic;
+    using namespace logos;
 
     LogicDag source;
     auto* a = source.create_node<DagVariable>("a");
@@ -949,7 +949,7 @@ void test_world_map_condition_no_simplification() {
 }
 
 void test_range_simplifier_legacy_dag_path() {
-    using namespace dewolf_logic;
+    using namespace logos;
 
     {
         LogicDag dag;
@@ -1011,37 +1011,37 @@ void test_range_simplifier_legacy_dag_path() {
 
 void test_z3_converter_no_hard_false_fallback() {
     z3::context ctx;
-    dewolf_logic::Z3Converter converter(ctx);
-    dewolf::DecompilerArena arena;
+    logos::Z3Converter converter(ctx);
+    aletheia::DecompilerArena arena;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
-    auto* y = arena.create<dewolf::Variable>("y", 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
+    auto* y = arena.create<aletheia::Variable>("y", 4);
 
-    auto* unknown_op = arena.create<dewolf::Operation>(
-        dewolf::OperationType::unknown,
-        std::vector<dewolf::Expression*>{x},
+    auto* unknown_op = arena.create<aletheia::Operation>(
+        aletheia::OperationType::unknown,
+        std::vector<aletheia::Expression*>{x},
         4);
 
     auto unknown_cond = converter.convert_to_condition(unknown_op);
     ASSERT_TRUE(unknown_cond.is_satisfiable());
     ASSERT_TRUE(unknown_cond.negate().is_satisfiable());
 
-    auto* power_op = arena.create<dewolf::Operation>(
-        dewolf::OperationType::power,
-        std::vector<dewolf::Expression*>{x, y},
+    auto* power_op = arena.create<aletheia::Operation>(
+        aletheia::OperationType::power,
+        std::vector<aletheia::Expression*>{x, y},
         4);
     auto power_cond = converter.convert_to_condition(power_op);
     ASSERT_TRUE(power_cond.is_satisfiable());
     ASSERT_TRUE(power_cond.negate().is_satisfiable());
 
-    auto* add_expr = arena.create<dewolf::Operation>(
-        dewolf::OperationType::add,
-        std::vector<dewolf::Expression*>{x, arena.create<dewolf::Constant>(1, 4)},
+    auto* add_expr = arena.create<aletheia::Operation>(
+        aletheia::OperationType::add,
+        std::vector<aletheia::Expression*>{x, arena.create<aletheia::Constant>(1, 4)},
         4);
-    auto* cmp_expr = arena.create<dewolf::Condition>(
-        dewolf::OperationType::gt,
+    auto* cmp_expr = arena.create<aletheia::Condition>(
+        aletheia::OperationType::gt,
         add_expr,
-        arena.create<dewolf::Constant>(0, 4),
+        arena.create<aletheia::Constant>(0, 4),
         1);
     auto cmp_cond = converter.convert_to_condition(cmp_expr);
     ASSERT_TRUE(cmp_cond.is_satisfiable());
@@ -1050,34 +1050,34 @@ void test_z3_converter_no_hard_false_fallback() {
 }
 
 
-#include "../src/dewolf/ssa/phi_dependency_resolver.hpp"
+#include "../src/aletheia/ssa/phi_dependency_resolver.hpp"
 
 void test_phi_dependency() {
-    dewolf::DecompilerArena arena;
-    dewolf::ControlFlowGraph cfg;
+    aletheia::DecompilerArena arena;
+    aletheia::ControlFlowGraph cfg;
     
-    auto* bb = arena.create<dewolf::BasicBlock>(0x1000);
+    auto* bb = arena.create<aletheia::BasicBlock>(0x1000);
     cfg.add_block(bb);
     
-    auto* var_a = arena.create<dewolf::Variable>("a", 4); var_a->set_ssa_version(1);
-    auto* var_b = arena.create<dewolf::Variable>("b", 4); var_b->set_ssa_version(1);
+    auto* var_a = arena.create<aletheia::Variable>("a", 4); var_a->set_ssa_version(1);
+    auto* var_b = arena.create<aletheia::Variable>("b", 4); var_b->set_ssa_version(1);
     
-    auto* var_a0 = arena.create<dewolf::Variable>("a", 4); var_a0->set_ssa_version(0);
-    auto* var_b0 = arena.create<dewolf::Variable>("b", 4); var_b0->set_ssa_version(0);
+    auto* var_a0 = arena.create<aletheia::Variable>("a", 4); var_a0->set_ssa_version(0);
+    auto* var_b0 = arena.create<aletheia::Variable>("b", 4); var_b0->set_ssa_version(0);
 
     // Phi1: a_1 = phi(a_0, b_1)
-    auto* phi1_ops = arena.create<dewolf::ListOperation>(std::vector<dewolf::Expression*>{var_a0, var_b});
-    auto* phi1 = arena.create<dewolf::Phi>(var_a, phi1_ops);
+    auto* phi1_ops = arena.create<aletheia::ListOperation>(std::vector<aletheia::Expression*>{var_a0, var_b});
+    auto* phi1 = arena.create<aletheia::Phi>(var_a, phi1_ops);
 
     // Phi2: b_1 = phi(b_0, a_1)
-    auto* phi2_ops = arena.create<dewolf::ListOperation>(std::vector<dewolf::Expression*>{var_b0, var_a});
-    auto* phi2 = arena.create<dewolf::Phi>(var_b, phi2_ops);
+    auto* phi2_ops = arena.create<aletheia::ListOperation>(std::vector<aletheia::Expression*>{var_b0, var_a});
+    auto* phi2 = arena.create<aletheia::Phi>(var_b, phi2_ops);
     
     // Add in reverse topological order or arbitrary order
     bb->add_instruction(phi1);
     bb->add_instruction(phi2);
     
-    dewolf::PhiDependencyResolver::resolve(arena, cfg);
+    aletheia::PhiDependencyResolver::resolve(arena, cfg);
     
     auto insts = bb->instructions();
     // We expect the cycle to be broken. One of the Phis should have its definition renamed.
@@ -1085,16 +1085,16 @@ void test_phi_dependency() {
     bool found_copy = false;
     bool found_renamed_phi = false;
     for (auto* inst : insts) {
-        if (auto* assign = dynamic_cast<dewolf::Assignment*>(inst)) {
-            if (!dynamic_cast<dewolf::Phi*>(inst)) {
-                if (auto* dest = dynamic_cast<dewolf::Variable*>(assign->destination())) {
+        if (auto* assign = dynamic_cast<aletheia::Assignment*>(inst)) {
+            if (!dynamic_cast<aletheia::Phi*>(inst)) {
+                if (auto* dest = dynamic_cast<aletheia::Variable*>(assign->destination())) {
                     if (dest->name() == "a" || dest->name() == "b") {
                         found_copy = true;
                     }
                 }
             }
         }
-        if (auto* phi = dynamic_cast<dewolf::Phi*>(inst)) {
+        if (auto* phi = dynamic_cast<aletheia::Phi*>(inst)) {
             if (phi->dest_var()->name().find("copy_") != std::string::npos) {
                 found_renamed_phi = true;
             }
@@ -1292,54 +1292,54 @@ void test_out_of_ssa_mode_config() {
 }
 
 
-#include "../src/dewolf/codegen/codegen.hpp"
+#include "../src/aletheia/codegen/codegen.hpp"
 
 
 
-#include "../src/dewolf/codegen/codegen.hpp"
+#include "../src/aletheia/codegen/codegen.hpp"
 void test_codegen_dump() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     
     // x = y + 10
-    auto* var_x = arena.create<dewolf::Variable>("x", 4);
-    auto* var_y = arena.create<dewolf::Variable>("y", 4);
-    auto* const_10 = arena.create<dewolf::Constant>(10, 4);
-    auto* add_op = arena.create<dewolf::Operation>(dewolf::OperationType::add, std::vector<dewolf::Expression*>{var_y, const_10}, 4);
-    auto* assign1 = arena.create<dewolf::Assignment>(var_x, add_op);
+    auto* var_x = arena.create<aletheia::Variable>("x", 4);
+    auto* var_y = arena.create<aletheia::Variable>("y", 4);
+    auto* const_10 = arena.create<aletheia::Constant>(10, 4);
+    auto* add_op = arena.create<aletheia::Operation>(aletheia::OperationType::add, std::vector<aletheia::Expression*>{var_y, const_10}, 4);
+    auto* assign1 = arena.create<aletheia::Assignment>(var_x, add_op);
     
     // if (x > 5) { z = 1; } else { z = 0; }
-    auto* const_5 = arena.create<dewolf::Constant>(5, 4);
-    auto* cond = arena.create<dewolf::Condition>(dewolf::OperationType::gt, var_x, const_5);
+    auto* const_5 = arena.create<aletheia::Constant>(5, 4);
+    auto* cond = arena.create<aletheia::Condition>(aletheia::OperationType::gt, var_x, const_5);
     
-    auto* var_z = arena.create<dewolf::Variable>("z", 4);
-    auto* const_1 = arena.create<dewolf::Constant>(1, 4);
-    auto* assign_true = arena.create<dewolf::Assignment>(var_z, const_1);
+    auto* var_z = arena.create<aletheia::Variable>("z", 4);
+    auto* const_1 = arena.create<aletheia::Constant>(1, 4);
+    auto* assign_true = arena.create<aletheia::Assignment>(var_z, const_1);
     
-    auto* const_0 = arena.create<dewolf::Constant>(0, 4);
-    auto* assign_false = arena.create<dewolf::Assignment>(var_z, const_0);
+    auto* const_0 = arena.create<aletheia::Constant>(0, 4);
+    auto* assign_false = arena.create<aletheia::Assignment>(var_z, const_0);
     
-    auto* bb1 = arena.create<dewolf::BasicBlock>(100);
+    auto* bb1 = arena.create<aletheia::BasicBlock>(100);
     bb1->add_instruction(assign1);
-    auto* node1 = arena.create<dewolf::CodeNode>(bb1);
+    auto* node1 = arena.create<aletheia::CodeNode>(bb1);
     
-    auto* bb_true = arena.create<dewolf::BasicBlock>(101);
+    auto* bb_true = arena.create<aletheia::BasicBlock>(101);
     bb_true->add_instruction(assign_true);
-    auto* node_true = arena.create<dewolf::CodeNode>(bb_true);
+    auto* node_true = arena.create<aletheia::CodeNode>(bb_true);
     
-    auto* bb_false = arena.create<dewolf::BasicBlock>(102);
+    auto* bb_false = arena.create<aletheia::BasicBlock>(102);
     bb_false->add_instruction(assign_false);
-    auto* node_false = arena.create<dewolf::CodeNode>(bb_false);
+    auto* node_false = arena.create<aletheia::CodeNode>(bb_false);
     
-    auto* cond_ast = arena.create<dewolf::ExprAstNode>(cond);
-    auto* if_node = arena.create<dewolf::IfNode>(cond_ast, node_true, node_false);
+    auto* cond_ast = arena.create<aletheia::ExprAstNode>(cond);
+    auto* if_node = arena.create<aletheia::IfNode>(cond_ast, node_true, node_false);
     
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(node1);
     seq->add_node(if_node);
     
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
     
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(seq);
     auto lines = visitor.generate_code(forest);
     
@@ -1351,30 +1351,30 @@ void test_codegen_dump() {
 }
 
 void test_codegen_switch_case() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* sel = arena.create<dewolf::Variable>("sel", 4);
-    auto* z = arena.create<dewolf::Variable>("z", 4);
+    auto* sel = arena.create<aletheia::Variable>("sel", 4);
+    auto* z = arena.create<aletheia::Variable>("z", 4);
 
-    auto* bb_case0 = arena.create<dewolf::BasicBlock>(110);
-    bb_case0->add_instruction(arena.create<dewolf::Assignment>(z, arena.create<dewolf::Constant>(1, 4)));
-    auto* node_case0 = arena.create<dewolf::CodeNode>(bb_case0);
+    auto* bb_case0 = arena.create<aletheia::BasicBlock>(110);
+    bb_case0->add_instruction(arena.create<aletheia::Assignment>(z, arena.create<aletheia::Constant>(1, 4)));
+    auto* node_case0 = arena.create<aletheia::CodeNode>(bb_case0);
 
-    auto* bb_default = arena.create<dewolf::BasicBlock>(111);
-    bb_default->add_instruction(arena.create<dewolf::Assignment>(z, arena.create<dewolf::Constant>(0, 4)));
-    auto* node_default = arena.create<dewolf::CodeNode>(bb_default);
+    auto* bb_default = arena.create<aletheia::BasicBlock>(111);
+    bb_default->add_instruction(arena.create<aletheia::Assignment>(z, arena.create<aletheia::Constant>(0, 4)));
+    auto* node_default = arena.create<aletheia::CodeNode>(bb_default);
 
-    auto* case0 = arena.create<dewolf::CaseNode>(0, node_case0, false, true);
-    auto* def = arena.create<dewolf::CaseNode>(0, node_default, true, true);
+    auto* case0 = arena.create<aletheia::CaseNode>(0, node_case0, false, true);
+    auto* def = arena.create<aletheia::CaseNode>(0, node_default, true, true);
 
-    auto* sw = arena.create<dewolf::SwitchNode>(arena.create<dewolf::ExprAstNode>(sel));
+    auto* sw = arena.create<aletheia::SwitchNode>(arena.create<aletheia::ExprAstNode>(sel));
     sw->add_case(case0);
     sw->add_case(def);
 
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(sw);
 
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
     auto lines = visitor.generate_code(forest);
 
     auto has_substr = [&](const std::string& needle) {
@@ -1393,46 +1393,46 @@ void test_codegen_switch_case() {
 }
 
 void test_codegen_loop_variants() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* i = arena.create<dewolf::Variable>("i", 4);
-    auto* ten = arena.create<dewolf::Constant>(10, 4);
+    auto* i = arena.create<aletheia::Variable>("i", 4);
+    auto* ten = arena.create<aletheia::Constant>(10, 4);
 
-    auto* while_cond = arena.create<dewolf::Condition>(dewolf::OperationType::lt, i, ten, 1);
-    auto* do_cond = arena.create<dewolf::Condition>(dewolf::OperationType::lt, i, ten, 1);
-    auto* for_cond = arena.create<dewolf::Condition>(dewolf::OperationType::lt, i, ten, 1);
+    auto* while_cond = arena.create<aletheia::Condition>(aletheia::OperationType::lt, i, ten, 1);
+    auto* do_cond = arena.create<aletheia::Condition>(aletheia::OperationType::lt, i, ten, 1);
+    auto* for_cond = arena.create<aletheia::Condition>(aletheia::OperationType::lt, i, ten, 1);
 
-    auto* bb_while = arena.create<dewolf::BasicBlock>(120);
-    bb_while->add_instruction(arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(1, 4)));
-    auto* while_body = arena.create<dewolf::CodeNode>(bb_while);
-    auto* while_node = arena.create<dewolf::WhileLoopNode>(while_body, while_cond);
+    auto* bb_while = arena.create<aletheia::BasicBlock>(120);
+    bb_while->add_instruction(arena.create<aletheia::Assignment>(i, arena.create<aletheia::Constant>(1, 4)));
+    auto* while_body = arena.create<aletheia::CodeNode>(bb_while);
+    auto* while_node = arena.create<aletheia::WhileLoopNode>(while_body, while_cond);
 
-    auto* bb_do = arena.create<dewolf::BasicBlock>(121);
-    bb_do->add_instruction(arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(2, 4)));
-    auto* do_body = arena.create<dewolf::CodeNode>(bb_do);
-    auto* do_node = arena.create<dewolf::DoWhileLoopNode>(do_body, do_cond);
+    auto* bb_do = arena.create<aletheia::BasicBlock>(121);
+    bb_do->add_instruction(arena.create<aletheia::Assignment>(i, arena.create<aletheia::Constant>(2, 4)));
+    auto* do_body = arena.create<aletheia::CodeNode>(bb_do);
+    auto* do_node = arena.create<aletheia::DoWhileLoopNode>(do_body, do_cond);
 
-    auto* bb_for = arena.create<dewolf::BasicBlock>(122);
-    bb_for->add_instruction(arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(3, 4)));
-    auto* for_body = arena.create<dewolf::CodeNode>(bb_for);
-    auto* for_decl = arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(0, 4));
-    auto* for_mod = arena.create<dewolf::Assignment>(
+    auto* bb_for = arena.create<aletheia::BasicBlock>(122);
+    bb_for->add_instruction(arena.create<aletheia::Assignment>(i, arena.create<aletheia::Constant>(3, 4)));
+    auto* for_body = arena.create<aletheia::CodeNode>(bb_for);
+    auto* for_decl = arena.create<aletheia::Assignment>(i, arena.create<aletheia::Constant>(0, 4));
+    auto* for_mod = arena.create<aletheia::Assignment>(
         i,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{i, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{i, arena.create<aletheia::Constant>(1, 4)},
             4));
-    auto* for_node = arena.create<dewolf::ForLoopNode>(for_body, for_cond, for_decl, for_mod);
+    auto* for_node = arena.create<aletheia::ForLoopNode>(for_body, for_cond, for_decl, for_mod);
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(while_node);
     seq->add_node(do_node);
     seq->add_node(for_node);
 
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(seq);
 
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
     auto lines = visitor.generate_code(forest);
 
     auto has_substr = [&](const std::string& needle) {
@@ -1451,53 +1451,53 @@ void test_codegen_loop_variants() {
 }
 
 void test_codegen_operator_precedence() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* a = arena.create<dewolf::Variable>("a", 4);
-    auto* b = arena.create<dewolf::Variable>("b", 4);
-    auto* c = arena.create<dewolf::Variable>("c", 4);
+    auto* a = arena.create<aletheia::Variable>("a", 4);
+    auto* b = arena.create<aletheia::Variable>("b", 4);
+    auto* c = arena.create<aletheia::Variable>("c", 4);
 
-    auto* out1 = arena.create<dewolf::Variable>("p1", 4);
-    auto* out2 = arena.create<dewolf::Variable>("p2", 4);
-    auto* out3 = arena.create<dewolf::Variable>("p3", 4);
+    auto* out1 = arena.create<aletheia::Variable>("p1", 4);
+    auto* out2 = arena.create<aletheia::Variable>("p2", 4);
+    auto* out3 = arena.create<aletheia::Variable>("p3", 4);
 
-    auto* expr1 = arena.create<dewolf::Operation>(
-        dewolf::OperationType::mul,
-        std::vector<dewolf::Expression*>{
-            arena.create<dewolf::Operation>(
-                dewolf::OperationType::add,
-                std::vector<dewolf::Expression*>{a, b},
+    auto* expr1 = arena.create<aletheia::Operation>(
+        aletheia::OperationType::mul,
+        std::vector<aletheia::Expression*>{
+            arena.create<aletheia::Operation>(
+                aletheia::OperationType::add,
+                std::vector<aletheia::Expression*>{a, b},
                 4),
             c},
         4);
-    auto* expr2 = arena.create<dewolf::Operation>(
-        dewolf::OperationType::add,
-        std::vector<dewolf::Expression*>{
+    auto* expr2 = arena.create<aletheia::Operation>(
+        aletheia::OperationType::add,
+        std::vector<aletheia::Expression*>{
             a,
-            arena.create<dewolf::Operation>(
-                dewolf::OperationType::mul,
-                std::vector<dewolf::Expression*>{b, c},
+            arena.create<aletheia::Operation>(
+                aletheia::OperationType::mul,
+                std::vector<aletheia::Expression*>{b, c},
                 4)},
         4);
-    auto* expr3 = arena.create<dewolf::Operation>(
-        dewolf::OperationType::sub,
-        std::vector<dewolf::Expression*>{
+    auto* expr3 = arena.create<aletheia::Operation>(
+        aletheia::OperationType::sub,
+        std::vector<aletheia::Expression*>{
             a,
-            arena.create<dewolf::Operation>(
-                dewolf::OperationType::sub,
-                std::vector<dewolf::Expression*>{b, c},
+            arena.create<aletheia::Operation>(
+                aletheia::OperationType::sub,
+                std::vector<aletheia::Expression*>{b, c},
                 4)},
         4);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(160);
-    bb->add_instruction(arena.create<dewolf::Assignment>(out1, expr1));
-    bb->add_instruction(arena.create<dewolf::Assignment>(out2, expr2));
-    bb->add_instruction(arena.create<dewolf::Assignment>(out3, expr3));
+    auto* bb = arena.create<aletheia::BasicBlock>(160);
+    bb->add_instruction(arena.create<aletheia::Assignment>(out1, expr1));
+    bb->add_instruction(arena.create<aletheia::Assignment>(out2, expr2));
+    bb->add_instruction(arena.create<aletheia::Assignment>(out3, expr3));
 
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
-    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
+    forest->set_root(arena.create<aletheia::CodeNode>(bb));
 
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
     auto lines = visitor.generate_code(forest);
 
     auto has_substr = [&](const std::string& needle) {
@@ -1515,59 +1515,59 @@ void test_codegen_operator_precedence() {
 }
 
 void test_codegen_compound_assignment_increment() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
-    auto* y = arena.create<dewolf::Variable>("y", 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
+    auto* y = arena.create<aletheia::Variable>("y", 4);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(171);
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    auto* bb = arena.create<aletheia::BasicBlock>(171);
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{x, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{x, arena.create<aletheia::Constant>(1, 4)},
             4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::sub,
-            std::vector<dewolf::Expression*>{x, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::sub,
+            std::vector<aletheia::Expression*>{x, arena.create<aletheia::Constant>(1, 4)},
             4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{x, y},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{x, y},
             4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{y, x},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{y, x},
             4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::sub,
-            std::vector<dewolf::Expression*>{y, x},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::sub,
+            std::vector<aletheia::Expression*>{y, x},
             4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::bit_and,
-            std::vector<dewolf::Expression*>{x, y},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::bit_and,
+            std::vector<aletheia::Expression*>{x, y},
             4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::logical_and,
-            std::vector<dewolf::Expression*>{x, y},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::logical_and,
+            std::vector<aletheia::Expression*>{x, y},
             4)));
 
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
-    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
+    forest->set_root(arena.create<aletheia::CodeNode>(bb));
 
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
     auto lines = visitor.generate_code(forest);
 
     auto has_substr = [&](const std::string& needle) {
@@ -1588,37 +1588,37 @@ void test_codegen_compound_assignment_increment() {
 }
 
 void test_codegen_constant_formatting() {
-    dewolf::DecompilerArena arena;
-    dewolf::CExpressionGenerator gen;
+    aletheia::DecompilerArena arena;
+    aletheia::CExpressionGenerator gen;
 
-    auto* char_const = arena.create<dewolf::Constant>(static_cast<std::uint64_t>('A'), 1);
+    auto* char_const = arena.create<aletheia::Constant>(static_cast<std::uint64_t>('A'), 1);
     ASSERT_EQ(gen.generate(char_const), "'A'");
 
-    auto* str_const = arena.create<dewolf::Constant>(0x006968, 3);
-    str_const->set_ir_type(std::make_shared<const dewolf::ArrayType>(dewolf::Integer::char_type(), 3));
+    auto* str_const = arena.create<aletheia::Constant>(0x006968, 3);
+    str_const->set_ir_type(std::make_shared<const aletheia::ArrayType>(aletheia::Integer::char_type(), 3));
     ASSERT_EQ(gen.generate(str_const), "\"hi\"");
 
-    const char* previous_threshold = std::getenv("DEWOLF_INT_HEX_THRESHOLD");
+    const char* previous_threshold = std::getenv("ALETHEIA_INT_HEX_THRESHOLD");
     std::string previous_threshold_value = previous_threshold ? previous_threshold : "";
-    setenv("DEWOLF_INT_HEX_THRESHOLD", "16", 1);
+    setenv("ALETHEIA_INT_HEX_THRESHOLD", "16", 1);
 
-    auto* dec_const = arena.create<dewolf::Constant>(10, 4);
-    auto* hex_const = arena.create<dewolf::Constant>(32, 4);
+    auto* dec_const = arena.create<aletheia::Constant>(10, 4);
+    auto* hex_const = arena.create<aletheia::Constant>(32, 4);
     ASSERT_EQ(gen.generate(dec_const), "10");
     ASSERT_EQ(gen.generate(hex_const), "0x20");
 
     if (previous_threshold) {
-        setenv("DEWOLF_INT_HEX_THRESHOLD", previous_threshold_value.c_str(), 1);
+        setenv("ALETHEIA_INT_HEX_THRESHOLD", previous_threshold_value.c_str(), 1);
     } else {
-        unsetenv("DEWOLF_INT_HEX_THRESHOLD");
+        unsetenv("ALETHEIA_INT_HEX_THRESHOLD");
     }
 
-    auto* u32 = arena.create<dewolf::Constant>(1, 4);
-    u32->set_ir_type(dewolf::Integer::uint32_t());
-    auto* u64 = arena.create<dewolf::Constant>(1, 8);
-    u64->set_ir_type(dewolf::Integer::uint64_t());
-    auto* s64 = arena.create<dewolf::Constant>(1, 8);
-    s64->set_ir_type(dewolf::Integer::int64_t());
+    auto* u32 = arena.create<aletheia::Constant>(1, 4);
+    u32->set_ir_type(aletheia::Integer::uint32_t());
+    auto* u64 = arena.create<aletheia::Constant>(1, 8);
+    u64->set_ir_type(aletheia::Integer::uint64_t());
+    auto* s64 = arena.create<aletheia::Constant>(1, 8);
+    s64->set_ir_type(aletheia::Integer::int64_t());
 
     ASSERT_EQ(gen.generate(u32), "0x1U");
     ASSERT_EQ(gen.generate(u64), "0x1UL");
@@ -1628,29 +1628,29 @@ void test_codegen_constant_formatting() {
 }
 
 void test_codegen_unknown_operation_placeholder() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* out = arena.create<dewolf::Variable>("out", 4);
-    auto* x = arena.create<dewolf::Variable>("x", 4);
-    auto* y = arena.create<dewolf::Variable>("y", 4);
+    auto* out = arena.create<aletheia::Variable>("out", 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
+    auto* y = arena.create<aletheia::Variable>("y", 4);
 
-    auto* unknown_expr = arena.create<dewolf::Operation>(
-        dewolf::OperationType::unknown,
-        std::vector<dewolf::Expression*>{x, y},
+    auto* unknown_expr = arena.create<aletheia::Operation>(
+        aletheia::OperationType::unknown,
+        std::vector<aletheia::Expression*>{x, y},
         4);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(172);
-    bb->add_instruction(arena.create<dewolf::Assignment>(out, unknown_expr));
+    auto* bb = arena.create<aletheia::BasicBlock>(172);
+    bb->add_instruction(arena.create<aletheia::Assignment>(out, unknown_expr));
 
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
-    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
+    forest->set_root(arena.create<aletheia::CodeNode>(bb));
 
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
     auto lines = visitor.generate_code(forest);
 
     bool found_placeholder = false;
     for (const auto& line : lines) {
-        if (line.find("__dewolf_unknown_op(") != std::string::npos) {
+        if (line.find("__aletheia_unknown_op(") != std::string::npos) {
             found_placeholder = true;
             break;
         }
@@ -1662,22 +1662,22 @@ void test_codegen_unknown_operation_placeholder() {
 }
 
 void test_codegen_fallback_branch_marker() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
-    auto* cond = arena.create<dewolf::Condition>(
-        dewolf::OperationType::neq,
+    auto* x = arena.create<aletheia::Variable>("x", 4);
+    auto* cond = arena.create<aletheia::Condition>(
+        aletheia::OperationType::neq,
         x,
-        arena.create<dewolf::Constant>(0, 4),
+        arena.create<aletheia::Constant>(0, 4),
         1);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(173);
-    bb->add_instruction(arena.create<dewolf::Branch>(cond));
+    auto* bb = arena.create<aletheia::BasicBlock>(173);
+    bb->add_instruction(arena.create<aletheia::Branch>(cond));
 
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
-    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
+    forest->set_root(arena.create<aletheia::CodeNode>(bb));
 
-    dewolf::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor;
     auto lines = visitor.generate_code(forest);
 
     bool has_comment_marker = false;
@@ -1698,7 +1698,7 @@ void test_codegen_fallback_branch_marker() {
 }
 
 void test_codegen_if_branch_swapping() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
     auto has_substr = [](const std::vector<std::string>& lines, const std::string& needle) {
         for (const auto& line : lines) {
@@ -1711,78 +1711,78 @@ void test_codegen_if_branch_swapping() {
 
     // Else-if chain heuristic: if exactly one branch is an IfNode, move it to false branch.
     {
-        auto* x = arena.create<dewolf::Variable>("x", 1);
-        auto* y = arena.create<dewolf::Variable>("y", 1);
+        auto* x = arena.create<aletheia::Variable>("x", 1);
+        auto* y = arena.create<aletheia::Variable>("y", 1);
 
-        auto* tb = arena.create<dewolf::BasicBlock>(910);
-        tb->add_instruction(arena.create<dewolf::Assignment>(
-            arena.create<dewolf::Variable>("a", 4),
-            arena.create<dewolf::Constant>(1, 4)));
-        auto* fb = arena.create<dewolf::BasicBlock>(911);
-        fb->add_instruction(arena.create<dewolf::Assignment>(
-            arena.create<dewolf::Variable>("b", 4),
-            arena.create<dewolf::Constant>(2, 4)));
-        auto* else_block = arena.create<dewolf::BasicBlock>(912);
-        else_block->add_instruction(arena.create<dewolf::Assignment>(
-            arena.create<dewolf::Variable>("c", 4),
-            arena.create<dewolf::Constant>(3, 4)));
+        auto* tb = arena.create<aletheia::BasicBlock>(910);
+        tb->add_instruction(arena.create<aletheia::Assignment>(
+            arena.create<aletheia::Variable>("a", 4),
+            arena.create<aletheia::Constant>(1, 4)));
+        auto* fb = arena.create<aletheia::BasicBlock>(911);
+        fb->add_instruction(arena.create<aletheia::Assignment>(
+            arena.create<aletheia::Variable>("b", 4),
+            arena.create<aletheia::Constant>(2, 4)));
+        auto* else_block = arena.create<aletheia::BasicBlock>(912);
+        else_block->add_instruction(arena.create<aletheia::Assignment>(
+            arena.create<aletheia::Variable>("c", 4),
+            arena.create<aletheia::Constant>(3, 4)));
 
-        auto* nested_if = arena.create<dewolf::IfNode>(
-            arena.create<dewolf::ExprAstNode>(y),
-            arena.create<dewolf::CodeNode>(tb),
-            arena.create<dewolf::CodeNode>(fb));
-        auto* outer_if = arena.create<dewolf::IfNode>(
-            arena.create<dewolf::ExprAstNode>(x),
+        auto* nested_if = arena.create<aletheia::IfNode>(
+            arena.create<aletheia::ExprAstNode>(y),
+            arena.create<aletheia::CodeNode>(tb),
+            arena.create<aletheia::CodeNode>(fb));
+        auto* outer_if = arena.create<aletheia::IfNode>(
+            arena.create<aletheia::ExprAstNode>(x),
             nested_if,
-            arena.create<dewolf::CodeNode>(else_block));
+            arena.create<aletheia::CodeNode>(else_block));
 
-        auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+        auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
         forest->set_root(outer_if);
 
-        dewolf::CodeVisitor visitor;
+        aletheia::CodeVisitor visitor;
         auto lines = visitor.generate_code(forest);
         ASSERT_TRUE(has_substr(lines, "if (!(x)) {"));
         ASSERT_TRUE(has_substr(lines, "} else if (y) {"));
     }
 
     // Configurable preference: `smallest` puts smaller branch on true side.
-    const char* previous_pref = std::getenv("DEWOLF_IF_BRANCH_PREFERENCE");
+    const char* previous_pref = std::getenv("ALETHEIA_IF_BRANCH_PREFERENCE");
     std::string previous_pref_value = previous_pref ? previous_pref : "";
-    setenv("DEWOLF_IF_BRANCH_PREFERENCE", "smallest", 1);
+    setenv("ALETHEIA_IF_BRANCH_PREFERENCE", "smallest", 1);
 
     {
-        auto* x = arena.create<dewolf::Variable>("x", 1);
+        auto* x = arena.create<aletheia::Variable>("x", 1);
 
-        auto* heavy = arena.create<dewolf::BasicBlock>(913);
-        heavy->add_instruction(arena.create<dewolf::Assignment>(
-            arena.create<dewolf::Variable>("h1", 4),
-            arena.create<dewolf::Constant>(11, 4)));
-        heavy->add_instruction(arena.create<dewolf::Assignment>(
-            arena.create<dewolf::Variable>("h2", 4),
-            arena.create<dewolf::Constant>(12, 4)));
+        auto* heavy = arena.create<aletheia::BasicBlock>(913);
+        heavy->add_instruction(arena.create<aletheia::Assignment>(
+            arena.create<aletheia::Variable>("h1", 4),
+            arena.create<aletheia::Constant>(11, 4)));
+        heavy->add_instruction(arena.create<aletheia::Assignment>(
+            arena.create<aletheia::Variable>("h2", 4),
+            arena.create<aletheia::Constant>(12, 4)));
 
-        auto* light = arena.create<dewolf::BasicBlock>(914);
-        light->add_instruction(arena.create<dewolf::Assignment>(
-            arena.create<dewolf::Variable>("l1", 4),
-            arena.create<dewolf::Constant>(21, 4)));
+        auto* light = arena.create<aletheia::BasicBlock>(914);
+        light->add_instruction(arena.create<aletheia::Assignment>(
+            arena.create<aletheia::Variable>("l1", 4),
+            arena.create<aletheia::Constant>(21, 4)));
 
-        auto* root_if = arena.create<dewolf::IfNode>(
-            arena.create<dewolf::ExprAstNode>(x),
-            arena.create<dewolf::CodeNode>(heavy),
-            arena.create<dewolf::CodeNode>(light));
+        auto* root_if = arena.create<aletheia::IfNode>(
+            arena.create<aletheia::ExprAstNode>(x),
+            arena.create<aletheia::CodeNode>(heavy),
+            arena.create<aletheia::CodeNode>(light));
 
-        auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+        auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
         forest->set_root(root_if);
 
-        dewolf::CodeVisitor visitor;
+        aletheia::CodeVisitor visitor;
         auto lines = visitor.generate_code(forest);
         ASSERT_TRUE(has_substr(lines, "if (!(x)) {"));
     }
 
     if (previous_pref) {
-        setenv("DEWOLF_IF_BRANCH_PREFERENCE", previous_pref_value.c_str(), 1);
+        setenv("ALETHEIA_IF_BRANCH_PREFERENCE", previous_pref_value.c_str(), 1);
     } else {
-        unsetenv("DEWOLF_IF_BRANCH_PREFERENCE");
+        unsetenv("ALETHEIA_IF_BRANCH_PREFERENCE");
     }
 
     std::cout << "[+] test_codegen_if_branch_swapping passed.\n";
@@ -1899,35 +1899,35 @@ void test_global_variable_declarations() {
 }
 
 void test_variable_name_generation_default() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* eax = arena.create<dewolf::Variable>("eax", 4);
+    auto* eax = arena.create<aletheia::Variable>("eax", 4);
     eax->set_ssa_version(3);
-    auto* ebx = arena.create<dewolf::Variable>("ebx", 4);
+    auto* ebx = arena.create<aletheia::Variable>("ebx", 4);
     ebx->set_ssa_version(5);
-    auto* ecx = arena.create<dewolf::Variable>("ecx", 4);
+    auto* ecx = arena.create<aletheia::Variable>("ecx", 4);
     ecx->set_ssa_version(1);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(164);
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    auto* bb = arena.create<aletheia::BasicBlock>(164);
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         eax,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{ebx, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{ebx, arena.create<aletheia::Constant>(1, 4)},
             4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         ecx,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{eax, ebx},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{eax, ebx},
             4)));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
-    seq->add_node(arena.create<dewolf::CodeNode>(bb));
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* seq = arena.create<aletheia::SeqNode>();
+    seq->add_node(arena.create<aletheia::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(seq);
 
-    dewolf::VariableNameGeneration::apply_default(forest);
+    aletheia::VariableNameGeneration::apply_default(forest);
 
     ASSERT_TRUE(eax->name().starts_with("var_"));
     ASSERT_TRUE(ebx->name().starts_with("var_"));
@@ -1943,31 +1943,31 @@ void test_variable_name_generation_default() {
 }
 
 void test_variable_name_generation_system_hungarian() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* int_var = arena.create<dewolf::Variable>("x", 4);
-    int_var->set_ir_type(dewolf::Integer::int32_t());
+    auto* int_var = arena.create<aletheia::Variable>("x", 4);
+    int_var->set_ir_type(aletheia::Integer::int32_t());
     int_var->set_ssa_version(2);
 
-    auto* ptr_var = arena.create<dewolf::Variable>("p", 8);
-    ptr_var->set_ir_type(std::make_shared<const dewolf::Pointer>(dewolf::Integer::int32_t()));
+    auto* ptr_var = arena.create<aletheia::Variable>("p", 8);
+    ptr_var->set_ir_type(std::make_shared<const aletheia::Pointer>(aletheia::Integer::int32_t()));
     ptr_var->set_ssa_version(4);
 
-    auto* float_var = arena.create<dewolf::Variable>("f", 4);
-    float_var->set_ir_type(dewolf::Float::float32());
+    auto* float_var = arena.create<aletheia::Variable>("f", 4);
+    float_var->set_ir_type(aletheia::Float::float32());
     float_var->set_ssa_version(1);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(165);
-    bb->add_instruction(arena.create<dewolf::Assignment>(int_var, arena.create<dewolf::Constant>(1, 4)));
-    bb->add_instruction(arena.create<dewolf::Assignment>(ptr_var, int_var));
-    bb->add_instruction(arena.create<dewolf::Assignment>(float_var, int_var));
+    auto* bb = arena.create<aletheia::BasicBlock>(165);
+    bb->add_instruction(arena.create<aletheia::Assignment>(int_var, arena.create<aletheia::Constant>(1, 4)));
+    bb->add_instruction(arena.create<aletheia::Assignment>(ptr_var, int_var));
+    bb->add_instruction(arena.create<aletheia::Assignment>(float_var, int_var));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
-    seq->add_node(arena.create<dewolf::CodeNode>(bb));
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* seq = arena.create<aletheia::SeqNode>();
+    seq->add_node(arena.create<aletheia::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(seq);
 
-    dewolf::VariableNameGeneration::apply_system_hungarian(forest);
+    aletheia::VariableNameGeneration::apply_system_hungarian(forest);
 
     ASSERT_TRUE(int_var->name().starts_with("iVar"));
     ASSERT_TRUE(ptr_var->name().starts_with("pVar"));
@@ -1980,30 +1980,30 @@ void test_variable_name_generation_system_hungarian() {
 }
 
 void test_variable_name_generation_skips_globals() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* g_value = arena.create<dewolf::GlobalVariable>(
+    auto* g_value = arena.create<aletheia::GlobalVariable>(
         "g_value",
         4,
-        arena.create<dewolf::Constant>(0, 4),
+        arena.create<aletheia::Constant>(0, 4),
         false);
-    g_value->set_ir_type(dewolf::Integer::int32_t());
+    g_value->set_ir_type(aletheia::Integer::int32_t());
 
-    auto* x = arena.create<dewolf::Variable>("eax", 4);
+    auto* x = arena.create<aletheia::Variable>("eax", 4);
     x->set_ssa_version(2);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(172);
-    bb->add_instruction(arena.create<dewolf::Assignment>(
+    auto* bb = arena.create<aletheia::BasicBlock>(172);
+    bb->add_instruction(arena.create<aletheia::Assignment>(
         x,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::deref,
-            std::vector<dewolf::Expression*>{g_value},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::deref,
+            std::vector<aletheia::Expression*>{g_value},
             4)));
 
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
-    forest->set_root(arena.create<dewolf::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
+    forest->set_root(arena.create<aletheia::CodeNode>(bb));
 
-    dewolf::VariableNameGeneration::apply_default(forest);
+    aletheia::VariableNameGeneration::apply_default(forest);
 
     ASSERT_EQ(g_value->name(), "g_value");
     ASSERT_TRUE(x->name().starts_with("var_"));
@@ -2012,56 +2012,56 @@ void test_variable_name_generation_skips_globals() {
 }
 
 void test_loop_name_generator_for_counters() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* idx_a = arena.create<dewolf::Variable>("var_10", 4);
-    auto* idx_b = arena.create<dewolf::Variable>("var_11", 4);
+    auto* idx_a = arena.create<aletheia::Variable>("var_10", 4);
+    auto* idx_b = arena.create<aletheia::Variable>("var_11", 4);
 
-    auto* body_a_block = arena.create<dewolf::BasicBlock>(166);
-    body_a_block->add_instruction(arena.create<dewolf::Assignment>(
+    auto* body_a_block = arena.create<aletheia::BasicBlock>(166);
+    body_a_block->add_instruction(arena.create<aletheia::Assignment>(
         idx_a,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{idx_a, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{idx_a, arena.create<aletheia::Constant>(1, 4)},
             4)));
 
-    auto* body_b_block = arena.create<dewolf::BasicBlock>(167);
-    body_b_block->add_instruction(arena.create<dewolf::Assignment>(
+    auto* body_b_block = arena.create<aletheia::BasicBlock>(167);
+    body_b_block->add_instruction(arena.create<aletheia::Assignment>(
         idx_b,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{idx_b, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{idx_b, arena.create<aletheia::Constant>(1, 4)},
             4)));
 
-    auto* for_a = arena.create<dewolf::ForLoopNode>(
-        arena.create<dewolf::CodeNode>(body_a_block),
-        arena.create<dewolf::Condition>(dewolf::OperationType::lt, idx_a, arena.create<dewolf::Constant>(5, 4), 1),
-        arena.create<dewolf::Assignment>(idx_a, arena.create<dewolf::Constant>(0, 4)),
-        arena.create<dewolf::Assignment>(
+    auto* for_a = arena.create<aletheia::ForLoopNode>(
+        arena.create<aletheia::CodeNode>(body_a_block),
+        arena.create<aletheia::Condition>(aletheia::OperationType::lt, idx_a, arena.create<aletheia::Constant>(5, 4), 1),
+        arena.create<aletheia::Assignment>(idx_a, arena.create<aletheia::Constant>(0, 4)),
+        arena.create<aletheia::Assignment>(
             idx_a,
-            arena.create<dewolf::Operation>(
-                dewolf::OperationType::add,
-                std::vector<dewolf::Expression*>{idx_a, arena.create<dewolf::Constant>(1, 4)},
+            arena.create<aletheia::Operation>(
+                aletheia::OperationType::add,
+                std::vector<aletheia::Expression*>{idx_a, arena.create<aletheia::Constant>(1, 4)},
                 4)));
 
-    auto* for_b = arena.create<dewolf::ForLoopNode>(
-        arena.create<dewolf::CodeNode>(body_b_block),
-        arena.create<dewolf::Condition>(dewolf::OperationType::lt, idx_b, arena.create<dewolf::Constant>(3, 4), 1),
-        arena.create<dewolf::Assignment>(idx_b, arena.create<dewolf::Constant>(0, 4)),
-        arena.create<dewolf::Assignment>(
+    auto* for_b = arena.create<aletheia::ForLoopNode>(
+        arena.create<aletheia::CodeNode>(body_b_block),
+        arena.create<aletheia::Condition>(aletheia::OperationType::lt, idx_b, arena.create<aletheia::Constant>(3, 4), 1),
+        arena.create<aletheia::Assignment>(idx_b, arena.create<aletheia::Constant>(0, 4)),
+        arena.create<aletheia::Assignment>(
             idx_b,
-            arena.create<dewolf::Operation>(
-                dewolf::OperationType::add,
-                std::vector<dewolf::Expression*>{idx_b, arena.create<dewolf::Constant>(1, 4)},
+            arena.create<aletheia::Operation>(
+                aletheia::OperationType::add,
+                std::vector<aletheia::Expression*>{idx_b, arena.create<aletheia::Constant>(1, 4)},
                 4)));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(for_a);
     seq->add_node(for_b);
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(seq);
 
-    dewolf::LoopNameGenerator::apply_for_loop_counters(forest);
+    aletheia::LoopNameGenerator::apply_for_loop_counters(forest);
 
     ASSERT_EQ(idx_a->name(), "i");
     ASSERT_EQ(idx_b->name(), "j");
@@ -2072,41 +2072,41 @@ void test_loop_name_generator_for_counters() {
 }
 
 void test_loop_name_generator_while_counters() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* w0 = arena.create<dewolf::Variable>("var_20", 4);
-    auto* w1 = arena.create<dewolf::Variable>("var_21", 4);
+    auto* w0 = arena.create<aletheia::Variable>("var_20", 4);
+    auto* w1 = arena.create<aletheia::Variable>("var_21", 4);
 
-    auto* body0 = arena.create<dewolf::BasicBlock>(168);
-    body0->add_instruction(arena.create<dewolf::Assignment>(
+    auto* body0 = arena.create<aletheia::BasicBlock>(168);
+    body0->add_instruction(arena.create<aletheia::Assignment>(
         w0,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{w0, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{w0, arena.create<aletheia::Constant>(1, 4)},
             4)));
 
-    auto* body1 = arena.create<dewolf::BasicBlock>(169);
-    body1->add_instruction(arena.create<dewolf::Assignment>(
+    auto* body1 = arena.create<aletheia::BasicBlock>(169);
+    body1->add_instruction(arena.create<aletheia::Assignment>(
         w1,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{w1, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{w1, arena.create<aletheia::Constant>(1, 4)},
             4)));
 
-    auto* while0 = arena.create<dewolf::WhileLoopNode>(
-        arena.create<dewolf::CodeNode>(body0),
-        arena.create<dewolf::Condition>(dewolf::OperationType::lt, w0, arena.create<dewolf::Constant>(10, 4), 1));
-    auto* while1 = arena.create<dewolf::WhileLoopNode>(
-        arena.create<dewolf::CodeNode>(body1),
-        arena.create<dewolf::Condition>(dewolf::OperationType::lt, w1, arena.create<dewolf::Constant>(5, 4), 1));
+    auto* while0 = arena.create<aletheia::WhileLoopNode>(
+        arena.create<aletheia::CodeNode>(body0),
+        arena.create<aletheia::Condition>(aletheia::OperationType::lt, w0, arena.create<aletheia::Constant>(10, 4), 1));
+    auto* while1 = arena.create<aletheia::WhileLoopNode>(
+        arena.create<aletheia::CodeNode>(body1),
+        arena.create<aletheia::Condition>(aletheia::OperationType::lt, w1, arena.create<aletheia::Constant>(5, 4), 1));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(while0);
     seq->add_node(while1);
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(seq);
 
-    dewolf::LoopNameGenerator::apply_while_loop_counters(forest);
+    aletheia::LoopNameGenerator::apply_while_loop_counters(forest);
 
     ASSERT_EQ(w0->name(), "counter");
     ASSERT_EQ(w1->name(), "counter1");
@@ -2117,83 +2117,83 @@ void test_loop_name_generator_while_counters() {
 }
 
 void test_instruction_length_handler() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* a = arena.create<dewolf::Variable>("a", 4);
-    auto* b = arena.create<dewolf::Variable>("b", 4);
-    auto* c = arena.create<dewolf::Variable>("c", 4);
-    auto* d = arena.create<dewolf::Variable>("d", 4);
-    auto* out = arena.create<dewolf::Variable>("out", 4);
+    auto* a = arena.create<aletheia::Variable>("a", 4);
+    auto* b = arena.create<aletheia::Variable>("b", 4);
+    auto* c = arena.create<aletheia::Variable>("c", 4);
+    auto* d = arena.create<aletheia::Variable>("d", 4);
+    auto* out = arena.create<aletheia::Variable>("out", 4);
 
-    auto* mul_ab = arena.create<dewolf::Operation>(
-        dewolf::OperationType::mul,
-        std::vector<dewolf::Expression*>{a, b},
+    auto* mul_ab = arena.create<aletheia::Operation>(
+        aletheia::OperationType::mul,
+        std::vector<aletheia::Expression*>{a, b},
         4);
-    auto* mul_cd = arena.create<dewolf::Operation>(
-        dewolf::OperationType::mul,
-        std::vector<dewolf::Expression*>{c, d},
+    auto* mul_cd = arena.create<aletheia::Operation>(
+        aletheia::OperationType::mul,
+        std::vector<aletheia::Expression*>{c, d},
         4);
-    auto* add_expr = arena.create<dewolf::Operation>(
-        dewolf::OperationType::add,
-        std::vector<dewolf::Expression*>{mul_ab, mul_cd},
-        4);
-
-    auto* mul_ab_ret = arena.create<dewolf::Operation>(
-        dewolf::OperationType::mul,
-        std::vector<dewolf::Expression*>{a, b},
-        4);
-    auto* mul_cd_ret = arena.create<dewolf::Operation>(
-        dewolf::OperationType::mul,
-        std::vector<dewolf::Expression*>{c, d},
-        4);
-    auto* add_expr_ret = arena.create<dewolf::Operation>(
-        dewolf::OperationType::add,
-        std::vector<dewolf::Expression*>{mul_ab_ret, mul_cd_ret},
+    auto* add_expr = arena.create<aletheia::Operation>(
+        aletheia::OperationType::add,
+        std::vector<aletheia::Expression*>{mul_ab, mul_cd},
         4);
 
-    auto* bb = arena.create<dewolf::BasicBlock>(170);
-    auto* assign = arena.create<dewolf::Assignment>(out, add_expr);
-    auto* ret = arena.create<dewolf::Return>(std::vector<dewolf::Expression*>{add_expr_ret});
+    auto* mul_ab_ret = arena.create<aletheia::Operation>(
+        aletheia::OperationType::mul,
+        std::vector<aletheia::Expression*>{a, b},
+        4);
+    auto* mul_cd_ret = arena.create<aletheia::Operation>(
+        aletheia::OperationType::mul,
+        std::vector<aletheia::Expression*>{c, d},
+        4);
+    auto* add_expr_ret = arena.create<aletheia::Operation>(
+        aletheia::OperationType::add,
+        std::vector<aletheia::Expression*>{mul_ab_ret, mul_cd_ret},
+        4);
+
+    auto* bb = arena.create<aletheia::BasicBlock>(170);
+    auto* assign = arena.create<aletheia::Assignment>(out, add_expr);
+    auto* ret = arena.create<aletheia::Return>(std::vector<aletheia::Expression*>{add_expr_ret});
     bb->add_instruction(assign);
     bb->add_instruction(ret);
 
-    auto* seq = arena.create<dewolf::SeqNode>();
-    seq->add_node(arena.create<dewolf::CodeNode>(bb));
-    auto* forest = arena.create<dewolf::AbstractSyntaxForest>();
+    auto* seq = arena.create<aletheia::SeqNode>();
+    seq->add_node(arena.create<aletheia::CodeNode>(bb));
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(seq);
 
-    dewolf::InstructionLengthBounds bounds;
+    aletheia::InstructionLengthBounds bounds;
     bounds.assignment_instr = 2;
     bounds.call_operation = 1;
     bounds.return_instr = 2;
-    dewolf::InstructionLengthHandler::apply(forest, arena, bounds);
+    aletheia::InstructionLengthHandler::apply(forest, arena, bounds);
 
     const auto& instrs = bb->instructions();
     ASSERT_TRUE(instrs.size() >= 4);
-    ASSERT_TRUE(dynamic_cast<dewolf::Assignment*>(instrs[0]) != nullptr);
-    ASSERT_TRUE(dynamic_cast<dewolf::Assignment*>(instrs[1]) != nullptr);
-    ASSERT_TRUE(dynamic_cast<dewolf::Assignment*>(instrs[instrs.size() - 2]) != nullptr);
-    ASSERT_TRUE(dynamic_cast<dewolf::Return*>(instrs.back()) != nullptr);
+    ASSERT_TRUE(dynamic_cast<aletheia::Assignment*>(instrs[0]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<aletheia::Assignment*>(instrs[1]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<aletheia::Assignment*>(instrs[instrs.size() - 2]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<aletheia::Return*>(instrs.back()) != nullptr);
 
-    auto* final_assign = dynamic_cast<dewolf::Assignment*>(instrs[instrs.size() - 2]);
+    auto* final_assign = dynamic_cast<aletheia::Assignment*>(instrs[instrs.size() - 2]);
     ASSERT_TRUE(final_assign != nullptr);
-    auto* final_add = dynamic_cast<dewolf::Operation*>(final_assign->value());
+    auto* final_add = dynamic_cast<aletheia::Operation*>(final_assign->value());
     ASSERT_TRUE(final_add != nullptr);
-    ASSERT_TRUE(dynamic_cast<dewolf::Variable*>(final_add->operands()[0]) != nullptr);
-    ASSERT_TRUE(dynamic_cast<dewolf::Variable*>(final_add->operands()[1]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<aletheia::Variable*>(final_add->operands()[0]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<aletheia::Variable*>(final_add->operands()[1]) != nullptr);
 
-    auto* final_ret = dynamic_cast<dewolf::Return*>(instrs.back());
+    auto* final_ret = dynamic_cast<aletheia::Return*>(instrs.back());
     ASSERT_TRUE(final_ret != nullptr);
     ASSERT_EQ(final_ret->values().size(), 1);
     auto* ret_expr = final_ret->values()[0];
-    auto* ret_var = dynamic_cast<dewolf::Variable*>(ret_expr);
-    auto* ret_op = dynamic_cast<dewolf::Operation*>(ret_expr);
+    auto* ret_var = dynamic_cast<aletheia::Variable*>(ret_expr);
+    auto* ret_op = dynamic_cast<aletheia::Operation*>(ret_expr);
     ASSERT_TRUE(ret_var != nullptr || ret_op != nullptr);
     if (ret_op != nullptr) {
         ASSERT_TRUE(ret_op->operands().size() <= 2);
         for (auto* operand : ret_op->operands()) {
-            ASSERT_TRUE(dynamic_cast<dewolf::Variable*>(operand) != nullptr ||
-                        dynamic_cast<dewolf::Constant*>(operand) != nullptr);
+            ASSERT_TRUE(dynamic_cast<aletheia::Variable*>(operand) != nullptr ||
+                        dynamic_cast<aletheia::Constant*>(operand) != nullptr);
         }
     }
 
@@ -2203,13 +2203,13 @@ void test_instruction_length_handler() {
 void test_condition_handler() {
     z3::context ctx;
     ConditionHandler handler(ctx);
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
-    auto* c0 = arena.create<dewolf::Constant>(0, 4);
-    auto* c1 = arena.create<dewolf::Constant>(1, 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
+    auto* c0 = arena.create<aletheia::Constant>(0, 4);
+    auto* c1 = arena.create<aletheia::Constant>(1, 4);
 
-    auto* eq = arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, c0, 1);
+    auto* eq = arena.create<aletheia::Condition>(aletheia::OperationType::eq, x, c0, 1);
     auto eq_symbol = handler.add_condition(eq);
     auto eq_name = handler.symbol_for_condition(eq);
     ASSERT_TRUE(eq_name.has_value());
@@ -2221,7 +2221,7 @@ void test_condition_handler() {
     ASSERT_TRUE(eq_props->constant == c0);
     ASSERT_TRUE(!eq_props->negated);
 
-    auto* neq = arena.create<dewolf::Condition>(dewolf::OperationType::neq, x, c1, 1);
+    auto* neq = arena.create<aletheia::Condition>(aletheia::OperationType::neq, x, c1, 1);
     auto neq_symbol = handler.add_condition(neq);
     auto neq_name = handler.symbol_for_condition(neq);
     ASSERT_TRUE(neq_name.has_value());
@@ -2241,13 +2241,13 @@ void test_condition_handler() {
 }
 
 void test_transition_cfg_switch_tags() {
-    dewolf::DecompilerTask task(0x7f00);
+    aletheia::DecompilerTask task(0x7f00);
 
-    auto cfg = std::make_unique<dewolf::ControlFlowGraph>();
-    auto* dispatch = task.arena().create<dewolf::BasicBlock>(150);
-    auto* case_a = task.arena().create<dewolf::BasicBlock>(151);
-    auto* case_b = task.arena().create<dewolf::BasicBlock>(152);
-    auto* case_default = task.arena().create<dewolf::BasicBlock>(153);
+    auto cfg = std::make_unique<aletheia::ControlFlowGraph>();
+    auto* dispatch = task.arena().create<aletheia::BasicBlock>(150);
+    auto* case_a = task.arena().create<aletheia::BasicBlock>(151);
+    auto* case_b = task.arena().create<aletheia::BasicBlock>(152);
+    auto* case_default = task.arena().create<aletheia::BasicBlock>(153);
 
     cfg->set_entry_block(dispatch);
     cfg->add_block(dispatch);
@@ -2255,18 +2255,18 @@ void test_transition_cfg_switch_tags() {
     cfg->add_block(case_b);
     cfg->add_block(case_default);
 
-    auto* selector = task.arena().create<dewolf::Variable>("sel", 4);
-    dispatch->add_instruction(task.arena().create<dewolf::IndirectBranch>(selector));
+    auto* selector = task.arena().create<aletheia::Variable>("sel", 4);
+    dispatch->add_instruction(task.arena().create<aletheia::IndirectBranch>(selector));
 
-    auto* edge_a = task.arena().create<dewolf::SwitchEdge>(
+    auto* edge_a = task.arena().create<aletheia::SwitchEdge>(
         dispatch,
         case_a,
         std::vector<std::int64_t>{1, 3});
-    auto* edge_b = task.arena().create<dewolf::SwitchEdge>(
+    auto* edge_b = task.arena().create<aletheia::SwitchEdge>(
         dispatch,
         case_b,
         std::vector<std::int64_t>{2});
-    auto* edge_default = task.arena().create<dewolf::SwitchEdge>(
+    auto* edge_default = task.arena().create<aletheia::SwitchEdge>(
         dispatch,
         case_default,
         std::vector<std::int64_t>{},
@@ -2281,15 +2281,15 @@ void test_transition_cfg_switch_tags() {
 
     task.set_cfg(std::move(cfg));
 
-    dewolf::PatternIndependentRestructuringStage stage;
-    dewolf::TransitionCFG tcfg(task.arena());
+    aletheia::PatternIndependentRestructuringStage stage;
+    aletheia::TransitionCFG tcfg(task.arena());
     stage.build_initial_transition_cfg(task, tcfg);
 
     ASSERT_TRUE(tcfg.entry() != nullptr);
 
-    std::optional<dewolf_logic::LogicCondition> tag_a;
-    std::optional<dewolf_logic::LogicCondition> tag_b;
-    std::optional<dewolf_logic::LogicCondition> tag_default;
+    std::optional<logos::LogicCondition> tag_a;
+    std::optional<logos::LogicCondition> tag_b;
+    std::optional<logos::LogicCondition> tag_default;
 
     for (auto* tedge : tcfg.entry()->successors()) {
         auto* sink_block = tedge->sink()->ast_node()->get_original_block();
@@ -2308,7 +2308,7 @@ void test_transition_cfg_switch_tags() {
 
     ASSERT_TRUE(tag_a->expression().is_or());
 
-    dewolf_logic::LogicCondition all_cases(tag_a->expression() || tag_b->expression());
+    logos::LogicCondition all_cases(tag_a->expression() || tag_b->expression());
     ASSERT_TRUE(tag_default->is_complementary_to(all_cases));
     ASSERT_TRUE(tag_a->does_imply(all_cases));
     ASSERT_TRUE(tag_b->does_imply(all_cases));
@@ -2317,39 +2317,39 @@ void test_transition_cfg_switch_tags() {
 }
 
 void test_cbr_complementary_conditions() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
-    auto* c0 = arena.create<dewolf::Constant>(0, 4);
-    auto* cond_eq = arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, c0, 1);
-    auto* cond_neq = arena.create<dewolf::Condition>(dewolf::OperationType::neq, x, c0, 1);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
+    auto* c0 = arena.create<aletheia::Constant>(0, 4);
+    auto* cond_eq = arena.create<aletheia::Condition>(aletheia::OperationType::eq, x, c0, 1);
+    auto* cond_neq = arena.create<aletheia::Condition>(aletheia::OperationType::neq, x, c0, 1);
 
-    auto* y = arena.create<dewolf::Variable>("y", 4);
+    auto* y = arena.create<aletheia::Variable>("y", 4);
 
-    auto* bb_true = arena.create<dewolf::BasicBlock>(140);
-    bb_true->add_instruction(arena.create<dewolf::Assignment>(y, arena.create<dewolf::Constant>(1, 4)));
-    auto* bb_false = arena.create<dewolf::BasicBlock>(141);
-    bb_false->add_instruction(arena.create<dewolf::Assignment>(y, arena.create<dewolf::Constant>(2, 4)));
+    auto* bb_true = arena.create<aletheia::BasicBlock>(140);
+    bb_true->add_instruction(arena.create<aletheia::Assignment>(y, arena.create<aletheia::Constant>(1, 4)));
+    auto* bb_false = arena.create<aletheia::BasicBlock>(141);
+    bb_false->add_instruction(arena.create<aletheia::Assignment>(y, arena.create<aletheia::Constant>(2, 4)));
 
-    auto* if_true = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(cond_eq), arena.create<dewolf::CodeNode>(bb_true));
-    auto* if_false = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(cond_neq), arena.create<dewolf::CodeNode>(bb_false));
+    auto* if_true = arena.create<aletheia::IfNode>(arena.create<aletheia::ExprAstNode>(cond_eq), arena.create<aletheia::CodeNode>(bb_true));
+    auto* if_false = arena.create<aletheia::IfNode>(arena.create<aletheia::ExprAstNode>(cond_neq), arena.create<aletheia::CodeNode>(bb_false));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(if_true);
     seq->add_node(if_false);
 
-    auto refined = dewolf::ConditionBasedRefinement::refine(
+    auto refined = aletheia::ConditionBasedRefinement::refine(
         arena,
         ctx,
         seq,
-        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+        std::unordered_map<aletheia::TransitionBlock*, logos::LogicCondition>{});
 
-    auto* refined_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    auto* refined_seq = dynamic_cast<aletheia::SeqNode*>(refined);
     ASSERT_TRUE(refined_seq != nullptr);
     ASSERT_EQ(refined_seq->nodes().size(), 1);
 
-    auto* merged = dynamic_cast<dewolf::IfNode*>(refined_seq->nodes()[0]);
+    auto* merged = dynamic_cast<aletheia::IfNode*>(refined_seq->nodes()[0]);
     ASSERT_TRUE(merged != nullptr);
     ASSERT_TRUE(merged->false_branch() != nullptr);
 
@@ -2357,77 +2357,77 @@ void test_cbr_complementary_conditions() {
 }
 
 void test_cbr_cnf_subexpression_grouping() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
-    auto* y = arena.create<dewolf::Variable>("y", 4);
-    auto* z = arena.create<dewolf::Variable>("z", 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
+    auto* y = arena.create<aletheia::Variable>("y", 4);
+    auto* z = arena.create<aletheia::Variable>("z", 4);
 
-    auto* cond_a = arena.create<dewolf::Condition>(
-        dewolf::OperationType::eq,
+    auto* cond_a = arena.create<aletheia::Condition>(
+        aletheia::OperationType::eq,
         x,
-        arena.create<dewolf::Constant>(0, 4),
+        arena.create<aletheia::Constant>(0, 4),
         1);
-    auto* cond_b = arena.create<dewolf::Condition>(
-        dewolf::OperationType::gt,
+    auto* cond_b = arena.create<aletheia::Condition>(
+        aletheia::OperationType::gt,
         y,
-        arena.create<dewolf::Constant>(1, 4),
+        arena.create<aletheia::Constant>(1, 4),
         1);
-    auto* cond_c = arena.create<dewolf::Condition>(
-        dewolf::OperationType::lt,
+    auto* cond_c = arena.create<aletheia::Condition>(
+        aletheia::OperationType::lt,
         z,
-        arena.create<dewolf::Constant>(5, 4),
+        arena.create<aletheia::Constant>(5, 4),
         1);
 
-    auto* and1 = arena.create<dewolf::Operation>(
-        dewolf::OperationType::logical_and,
-        std::vector<dewolf::Expression*>{cond_a, cond_b},
+    auto* and1 = arena.create<aletheia::Operation>(
+        aletheia::OperationType::logical_and,
+        std::vector<aletheia::Expression*>{cond_a, cond_b},
         1);
-    auto* and2 = arena.create<dewolf::Operation>(
-        dewolf::OperationType::logical_and,
-        std::vector<dewolf::Expression*>{cond_a, cond_c},
+    auto* and2 = arena.create<aletheia::Operation>(
+        aletheia::OperationType::logical_and,
+        std::vector<aletheia::Expression*>{cond_a, cond_c},
         1);
 
-    auto* out = arena.create<dewolf::Variable>("out", 4);
-    auto* bb1 = arena.create<dewolf::BasicBlock>(142);
-    bb1->add_instruction(arena.create<dewolf::Assignment>(out, arena.create<dewolf::Constant>(1, 4)));
-    auto* bb2 = arena.create<dewolf::BasicBlock>(143);
-    bb2->add_instruction(arena.create<dewolf::Assignment>(out, arena.create<dewolf::Constant>(2, 4)));
+    auto* out = arena.create<aletheia::Variable>("out", 4);
+    auto* bb1 = arena.create<aletheia::BasicBlock>(142);
+    bb1->add_instruction(arena.create<aletheia::Assignment>(out, arena.create<aletheia::Constant>(1, 4)));
+    auto* bb2 = arena.create<aletheia::BasicBlock>(143);
+    bb2->add_instruction(arena.create<aletheia::Assignment>(out, arena.create<aletheia::Constant>(2, 4)));
 
-    auto* if1 = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(and1), arena.create<dewolf::CodeNode>(bb1));
-    auto* if2 = arena.create<dewolf::IfNode>(arena.create<dewolf::ExprAstNode>(and2), arena.create<dewolf::CodeNode>(bb2));
+    auto* if1 = arena.create<aletheia::IfNode>(arena.create<aletheia::ExprAstNode>(and1), arena.create<aletheia::CodeNode>(bb1));
+    auto* if2 = arena.create<aletheia::IfNode>(arena.create<aletheia::ExprAstNode>(and2), arena.create<aletheia::CodeNode>(bb2));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(if1);
     seq->add_node(if2);
 
-    auto refined = dewolf::ConditionBasedRefinement::refine(
+    auto refined = aletheia::ConditionBasedRefinement::refine(
         arena,
         ctx,
         seq,
-        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+        std::unordered_map<aletheia::TransitionBlock*, logos::LogicCondition>{});
 
-    auto* refined_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    auto* refined_seq = dynamic_cast<aletheia::SeqNode*>(refined);
     ASSERT_TRUE(refined_seq != nullptr);
     ASSERT_EQ(refined_seq->nodes().size(), 1);
 
-    auto* outer_if = dynamic_cast<dewolf::IfNode*>(refined_seq->nodes()[0]);
+    auto* outer_if = dynamic_cast<aletheia::IfNode*>(refined_seq->nodes()[0]);
     ASSERT_TRUE(outer_if != nullptr);
-    auto* outer_cond_ast = dynamic_cast<dewolf::ExprAstNode*>(outer_if->cond());
+    auto* outer_cond_ast = dynamic_cast<aletheia::ExprAstNode*>(outer_if->cond());
     ASSERT_TRUE(outer_cond_ast != nullptr);
     ASSERT_TRUE(outer_cond_ast->expr() == cond_a);
 
-    auto* grouped_seq = dynamic_cast<dewolf::SeqNode*>(outer_if->true_branch());
+    auto* grouped_seq = dynamic_cast<aletheia::SeqNode*>(outer_if->true_branch());
     ASSERT_TRUE(grouped_seq != nullptr);
     ASSERT_EQ(grouped_seq->nodes().size(), 2);
 
-    auto* grouped_if1 = dynamic_cast<dewolf::IfNode*>(grouped_seq->nodes()[0]);
-    auto* grouped_if2 = dynamic_cast<dewolf::IfNode*>(grouped_seq->nodes()[1]);
+    auto* grouped_if1 = dynamic_cast<aletheia::IfNode*>(grouped_seq->nodes()[0]);
+    auto* grouped_if2 = dynamic_cast<aletheia::IfNode*>(grouped_seq->nodes()[1]);
     ASSERT_TRUE(grouped_if1 != nullptr && grouped_if2 != nullptr);
 
-    auto* grouped_cond1 = dynamic_cast<dewolf::ExprAstNode*>(grouped_if1->cond());
-    auto* grouped_cond2 = dynamic_cast<dewolf::ExprAstNode*>(grouped_if2->cond());
+    auto* grouped_cond1 = dynamic_cast<aletheia::ExprAstNode*>(grouped_if1->cond());
+    auto* grouped_cond2 = dynamic_cast<aletheia::ExprAstNode*>(grouped_if2->cond());
     ASSERT_TRUE(grouped_cond1 != nullptr && grouped_cond2 != nullptr);
     ASSERT_TRUE(grouped_cond1->expr() == cond_b);
     ASSERT_TRUE(grouped_cond2->expr() == cond_c);
@@ -2436,40 +2436,40 @@ void test_cbr_cnf_subexpression_grouping() {
 }
 
 void test_car_initial_switch_constructor() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
 
-    auto* bb1 = arena.create<dewolf::BasicBlock>(150);
-    bb1->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("v1", 4), arena.create<dewolf::Constant>(1, 4)));
-    auto* bb2 = arena.create<dewolf::BasicBlock>(151);
-    bb2->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("v2", 4), arena.create<dewolf::Constant>(2, 4)));
-    auto* bb_def = arena.create<dewolf::BasicBlock>(152);
-    bb_def->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("vd", 4), arena.create<dewolf::Constant>(3, 4)));
+    auto* bb1 = arena.create<aletheia::BasicBlock>(150);
+    bb1->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("v1", 4), arena.create<aletheia::Constant>(1, 4)));
+    auto* bb2 = arena.create<aletheia::BasicBlock>(151);
+    bb2->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("v2", 4), arena.create<aletheia::Constant>(2, 4)));
+    auto* bb_def = arena.create<aletheia::BasicBlock>(152);
+    bb_def->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("vd", 4), arena.create<aletheia::Constant>(3, 4)));
 
-    auto* if2 = arena.create<dewolf::IfNode>(
-        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(2, 4), 1)),
-        arena.create<dewolf::CodeNode>(bb2),
-        arena.create<dewolf::CodeNode>(bb_def));
-    auto* if1 = arena.create<dewolf::IfNode>(
-        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(1, 4), 1)),
-        arena.create<dewolf::CodeNode>(bb1),
+    auto* if2 = arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(arena.create<aletheia::Condition>(aletheia::OperationType::eq, x, arena.create<aletheia::Constant>(2, 4), 1)),
+        arena.create<aletheia::CodeNode>(bb2),
+        arena.create<aletheia::CodeNode>(bb_def));
+    auto* if1 = arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(arena.create<aletheia::Condition>(aletheia::OperationType::eq, x, arena.create<aletheia::Constant>(1, 4), 1)),
+        arena.create<aletheia::CodeNode>(bb1),
         if2);
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(if1);
 
-    auto* refined = dewolf::ConditionAwareRefinement::refine(
+    auto* refined = aletheia::ConditionAwareRefinement::refine(
         arena,
         ctx,
         seq,
-        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+        std::unordered_map<aletheia::TransitionBlock*, logos::LogicCondition>{});
 
-    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    auto* out_seq = dynamic_cast<aletheia::SeqNode*>(refined);
     ASSERT_TRUE(out_seq != nullptr);
     ASSERT_EQ(out_seq->nodes().size(), 1);
-    auto* sw = dynamic_cast<dewolf::SwitchNode*>(out_seq->nodes()[0]);
+    auto* sw = dynamic_cast<aletheia::SwitchNode*>(out_seq->nodes()[0]);
     ASSERT_TRUE(sw != nullptr);
     ASSERT_EQ(sw->cases().size(), 3);
 
@@ -2477,47 +2477,47 @@ void test_car_initial_switch_constructor() {
 }
 
 void test_car_switch_extractor_and_missing_case_sequence() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
 
-    auto* bb_case1 = arena.create<dewolf::BasicBlock>(153);
-    bb_case1->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("a", 4), arena.create<dewolf::Constant>(11, 4)));
-    auto* bb_case2 = arena.create<dewolf::BasicBlock>(154);
-    bb_case2->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("b", 4), arena.create<dewolf::Constant>(22, 4)));
-    auto* bb_case3 = arena.create<dewolf::BasicBlock>(155);
-    bb_case3->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("c", 4), arena.create<dewolf::Constant>(33, 4)));
-    auto* bb_default = arena.create<dewolf::BasicBlock>(156);
-    bb_default->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("d", 4), arena.create<dewolf::Constant>(44, 4)));
+    auto* bb_case1 = arena.create<aletheia::BasicBlock>(153);
+    bb_case1->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("a", 4), arena.create<aletheia::Constant>(11, 4)));
+    auto* bb_case2 = arena.create<aletheia::BasicBlock>(154);
+    bb_case2->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("b", 4), arena.create<aletheia::Constant>(22, 4)));
+    auto* bb_case3 = arena.create<aletheia::BasicBlock>(155);
+    bb_case3->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("c", 4), arena.create<aletheia::Constant>(33, 4)));
+    auto* bb_default = arena.create<aletheia::BasicBlock>(156);
+    bb_default->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("d", 4), arena.create<aletheia::Constant>(44, 4)));
 
-    auto* inner_switch = arena.create<dewolf::SwitchNode>(arena.create<dewolf::ExprAstNode>(x));
-    inner_switch->add_case(arena.create<dewolf::CaseNode>(2, arena.create<dewolf::CodeNode>(bb_case2)));
+    auto* inner_switch = arena.create<aletheia::SwitchNode>(arena.create<aletheia::ExprAstNode>(x));
+    inner_switch->add_case(arena.create<aletheia::CaseNode>(2, arena.create<aletheia::CodeNode>(bb_case2)));
 
-    auto* wrapper_if = arena.create<dewolf::IfNode>(
-        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(1, 4), 1)),
-        arena.create<dewolf::CodeNode>(bb_case1),
+    auto* wrapper_if = arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(arena.create<aletheia::Condition>(aletheia::OperationType::eq, x, arena.create<aletheia::Constant>(1, 4), 1)),
+        arena.create<aletheia::CodeNode>(bb_case1),
         inner_switch);
 
-    auto* sibling_if = arena.create<dewolf::IfNode>(
-        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(3, 4), 1)),
-        arena.create<dewolf::CodeNode>(bb_case3),
-        arena.create<dewolf::CodeNode>(bb_default));
+    auto* sibling_if = arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(arena.create<aletheia::Condition>(aletheia::OperationType::eq, x, arena.create<aletheia::Constant>(3, 4), 1)),
+        arena.create<aletheia::CodeNode>(bb_case3),
+        arena.create<aletheia::CodeNode>(bb_default));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(wrapper_if);
     seq->add_node(sibling_if);
 
-    auto* refined = dewolf::ConditionAwareRefinement::refine(
+    auto* refined = aletheia::ConditionAwareRefinement::refine(
         arena,
         ctx,
         seq,
-        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+        std::unordered_map<aletheia::TransitionBlock*, logos::LogicCondition>{});
 
-    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    auto* out_seq = dynamic_cast<aletheia::SeqNode*>(refined);
     ASSERT_TRUE(out_seq != nullptr);
     ASSERT_EQ(out_seq->nodes().size(), 1);
-    auto* sw = dynamic_cast<dewolf::SwitchNode*>(out_seq->nodes()[0]);
+    auto* sw = dynamic_cast<aletheia::SwitchNode*>(out_seq->nodes()[0]);
     ASSERT_TRUE(sw != nullptr);
 
     bool has1 = false, has2 = false, has3 = false, has_default = false;
@@ -2533,36 +2533,36 @@ void test_car_switch_extractor_and_missing_case_sequence() {
 }
 
 void test_car_missing_case_finder_condition() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* x = arena.create<dewolf::Variable>("x", 4);
+    auto* x = arena.create<aletheia::Variable>("x", 4);
 
-    auto* bb_nested = arena.create<dewolf::BasicBlock>(157);
-    bb_nested->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("m", 4), arena.create<dewolf::Constant>(55, 4)));
-    auto* bb_rest = arena.create<dewolf::BasicBlock>(158);
-    bb_rest->add_instruction(arena.create<dewolf::Assignment>(arena.create<dewolf::Variable>("n", 4), arena.create<dewolf::Constant>(66, 4)));
+    auto* bb_nested = arena.create<aletheia::BasicBlock>(157);
+    bb_nested->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("m", 4), arena.create<aletheia::Constant>(55, 4)));
+    auto* bb_rest = arena.create<aletheia::BasicBlock>(158);
+    bb_rest->add_instruction(arena.create<aletheia::Assignment>(arena.create<aletheia::Variable>("n", 4), arena.create<aletheia::Constant>(66, 4)));
 
-    auto* nested_if = arena.create<dewolf::IfNode>(
-        arena.create<dewolf::ExprAstNode>(arena.create<dewolf::Condition>(dewolf::OperationType::eq, x, arena.create<dewolf::Constant>(4, 4), 1)),
-        arena.create<dewolf::CodeNode>(bb_nested),
-        arena.create<dewolf::CodeNode>(bb_rest));
+    auto* nested_if = arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(arena.create<aletheia::Condition>(aletheia::OperationType::eq, x, arena.create<aletheia::Constant>(4, 4), 1)),
+        arena.create<aletheia::CodeNode>(bb_nested),
+        arena.create<aletheia::CodeNode>(bb_rest));
 
-    auto* sw = arena.create<dewolf::SwitchNode>(arena.create<dewolf::ExprAstNode>(x));
-    sw->add_case(arena.create<dewolf::CaseNode>(1, nested_if));
+    auto* sw = arena.create<aletheia::SwitchNode>(arena.create<aletheia::ExprAstNode>(x));
+    sw->add_case(arena.create<aletheia::CaseNode>(1, nested_if));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(sw);
 
-    auto* refined = dewolf::ConditionAwareRefinement::refine(
+    auto* refined = aletheia::ConditionAwareRefinement::refine(
         arena,
         ctx,
         seq,
-        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+        std::unordered_map<aletheia::TransitionBlock*, logos::LogicCondition>{});
 
-    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    auto* out_seq = dynamic_cast<aletheia::SeqNode*>(refined);
     ASSERT_TRUE(out_seq != nullptr);
-    auto* out_sw = dynamic_cast<dewolf::SwitchNode*>(out_seq->nodes()[0]);
+    auto* out_sw = dynamic_cast<aletheia::SwitchNode*>(out_seq->nodes()[0]);
     ASSERT_TRUE(out_sw != nullptr);
 
     bool has_case1 = false;
@@ -2577,104 +2577,104 @@ void test_car_missing_case_finder_condition() {
 }
 
 void test_guarded_do_while_rewrite() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* i = arena.create<dewolf::Variable>("i", 4);
-    auto* cond = arena.create<dewolf::Condition>(
-        dewolf::OperationType::lt,
+    auto* i = arena.create<aletheia::Variable>("i", 4);
+    auto* cond = arena.create<aletheia::Condition>(
+        aletheia::OperationType::lt,
         i,
-        arena.create<dewolf::Constant>(10, 4),
+        arena.create<aletheia::Constant>(10, 4),
         1);
 
-    auto* bb_body = arena.create<dewolf::BasicBlock>(159);
-    bb_body->add_instruction(arena.create<dewolf::Assignment>(
+    auto* bb_body = arena.create<aletheia::BasicBlock>(159);
+    bb_body->add_instruction(arena.create<aletheia::Assignment>(
         i,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{i, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{i, arena.create<aletheia::Constant>(1, 4)},
             4)));
 
-    auto* guarded = arena.create<dewolf::IfNode>(
-        arena.create<dewolf::ExprAstNode>(cond),
-        arena.create<dewolf::DoWhileLoopNode>(arena.create<dewolf::CodeNode>(bb_body), cond));
+    auto* guarded = arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(cond),
+        arena.create<aletheia::DoWhileLoopNode>(arena.create<aletheia::CodeNode>(bb_body), cond));
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(guarded);
 
-    auto* refined = dewolf::ConditionAwareRefinement::refine(
+    auto* refined = aletheia::ConditionAwareRefinement::refine(
         arena,
         ctx,
         seq,
-        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+        std::unordered_map<aletheia::TransitionBlock*, logos::LogicCondition>{});
 
-    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    auto* out_seq = dynamic_cast<aletheia::SeqNode*>(refined);
     ASSERT_TRUE(out_seq != nullptr);
     ASSERT_EQ(out_seq->nodes().size(), 1);
 
-    auto* while_node = dynamic_cast<dewolf::WhileLoopNode*>(out_seq->nodes()[0]);
+    auto* while_node = dynamic_cast<aletheia::WhileLoopNode*>(out_seq->nodes()[0]);
     ASSERT_TRUE(while_node != nullptr);
     ASSERT_TRUE(while_node->condition() != nullptr);
-    ASSERT_TRUE(dynamic_cast<dewolf::CodeNode*>(while_node->body()) != nullptr);
+    ASSERT_TRUE(dynamic_cast<aletheia::CodeNode*>(while_node->body()) != nullptr);
 
     std::cout << "[+] test_guarded_do_while_rewrite passed.\n";
 }
 
 void test_while_loop_replacer() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* i = arena.create<dewolf::Variable>("i", 4);
-    auto* sum = arena.create<dewolf::Variable>("sum", 4);
+    auto* i = arena.create<aletheia::Variable>("i", 4);
+    auto* sum = arena.create<aletheia::Variable>("sum", 4);
 
-    auto* init_block = arena.create<dewolf::BasicBlock>(161);
-    auto* init_assign = arena.create<dewolf::Assignment>(i, arena.create<dewolf::Constant>(0, 4));
+    auto* init_block = arena.create<aletheia::BasicBlock>(161);
+    auto* init_assign = arena.create<aletheia::Assignment>(i, arena.create<aletheia::Constant>(0, 4));
     init_block->add_instruction(init_assign);
-    auto* init_node = arena.create<dewolf::CodeNode>(init_block);
+    auto* init_node = arena.create<aletheia::CodeNode>(init_block);
 
-    auto* body_work_block = arena.create<dewolf::BasicBlock>(162);
-    body_work_block->add_instruction(arena.create<dewolf::Assignment>(
+    auto* body_work_block = arena.create<aletheia::BasicBlock>(162);
+    body_work_block->add_instruction(arena.create<aletheia::Assignment>(
         sum,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{sum, i},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{sum, i},
             4)));
 
-    auto* body_update_block = arena.create<dewolf::BasicBlock>(163);
-    auto* mod_assign = arena.create<dewolf::Assignment>(
+    auto* body_update_block = arena.create<aletheia::BasicBlock>(163);
+    auto* mod_assign = arena.create<aletheia::Assignment>(
         i,
-        arena.create<dewolf::Operation>(
-            dewolf::OperationType::add,
-            std::vector<dewolf::Expression*>{i, arena.create<dewolf::Constant>(1, 4)},
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{i, arena.create<aletheia::Constant>(1, 4)},
             4));
     body_update_block->add_instruction(mod_assign);
 
-    auto* body_seq = arena.create<dewolf::SeqNode>();
-    body_seq->add_node(arena.create<dewolf::CodeNode>(body_work_block));
-    body_seq->add_node(arena.create<dewolf::CodeNode>(body_update_block));
+    auto* body_seq = arena.create<aletheia::SeqNode>();
+    body_seq->add_node(arena.create<aletheia::CodeNode>(body_work_block));
+    body_seq->add_node(arena.create<aletheia::CodeNode>(body_update_block));
 
-    auto* cond = arena.create<dewolf::Condition>(
-        dewolf::OperationType::lt,
+    auto* cond = arena.create<aletheia::Condition>(
+        aletheia::OperationType::lt,
         i,
-        arena.create<dewolf::Constant>(10, 4),
+        arena.create<aletheia::Constant>(10, 4),
         1);
-    auto* while_node = arena.create<dewolf::WhileLoopNode>(body_seq, cond);
+    auto* while_node = arena.create<aletheia::WhileLoopNode>(body_seq, cond);
 
-    auto* seq = arena.create<dewolf::SeqNode>();
+    auto* seq = arena.create<aletheia::SeqNode>();
     seq->add_node(init_node);
     seq->add_node(while_node);
 
-    auto* refined = dewolf::ConditionAwareRefinement::refine(
+    auto* refined = aletheia::ConditionAwareRefinement::refine(
         arena,
         ctx,
         seq,
-        std::unordered_map<dewolf::TransitionBlock*, dewolf_logic::LogicCondition>{});
+        std::unordered_map<aletheia::TransitionBlock*, logos::LogicCondition>{});
 
-    auto* out_seq = dynamic_cast<dewolf::SeqNode*>(refined);
+    auto* out_seq = dynamic_cast<aletheia::SeqNode*>(refined);
     ASSERT_TRUE(out_seq != nullptr);
     ASSERT_EQ(out_seq->nodes().size(), 1);
 
-    auto* for_node = dynamic_cast<dewolf::ForLoopNode*>(out_seq->nodes()[0]);
+    auto* for_node = dynamic_cast<aletheia::ForLoopNode*>(out_seq->nodes()[0]);
     ASSERT_TRUE(for_node != nullptr);
     ASSERT_TRUE(for_node->declaration() == init_assign);
     ASSERT_TRUE(for_node->modification() == mod_assign);
@@ -2687,23 +2687,23 @@ void test_while_loop_replacer() {
 }
 
 void test_sibling_reachability() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
     z3::context ctx;
 
-    auto* b1 = arena.create<dewolf::TransitionBlock>(arena.create<dewolf::SeqNode>());
-    auto* b2 = arena.create<dewolf::TransitionBlock>(arena.create<dewolf::SeqNode>());
-    auto* b3 = arena.create<dewolf::TransitionBlock>(arena.create<dewolf::SeqNode>());
+    auto* b1 = arena.create<aletheia::TransitionBlock>(arena.create<aletheia::SeqNode>());
+    auto* b2 = arena.create<aletheia::TransitionBlock>(arena.create<aletheia::SeqNode>());
+    auto* b3 = arena.create<aletheia::TransitionBlock>(arena.create<aletheia::SeqNode>());
 
-    dewolf::TransitionCFG cfg(arena);
+    aletheia::TransitionCFG cfg(arena);
     cfg.set_entry(b1);
     // Intentionally non-topological insertion order
     cfg.add_block(b3);
     cfg.add_block(b2);
     cfg.add_block(b1);
-    cfg.add_edge(b1, b2, dewolf_logic::LogicCondition(ctx.bool_val(true)));
+    cfg.add_edge(b1, b2, logos::LogicCondition(ctx.bool_val(true)));
 
-    dewolf::ReachabilityGraph reach(&cfg);
-    dewolf::SiblingReachability siblings(reach);
+    aletheia::ReachabilityGraph reach(&cfg);
+    aletheia::SiblingReachability siblings(reach);
     auto ordered = siblings.order_blocks(cfg.blocks());
 
     std::size_t pos_b1 = 0;
@@ -2718,15 +2718,15 @@ void test_sibling_reachability() {
 }
 
 void test_case_dependency_graph_ordering() {
-    dewolf::DecompilerArena arena;
+    aletheia::DecompilerArena arena;
 
-    auto* empty = arena.create<dewolf::SeqNode>();
-    auto* c3 = arena.create<dewolf::CaseNode>(3, empty, false, true);
-    auto* def = arena.create<dewolf::CaseNode>(0, empty, true, true);
-    auto* c1 = arena.create<dewolf::CaseNode>(1, empty, false, true);
-    auto* c2 = arena.create<dewolf::CaseNode>(2, empty, false, true);
+    auto* empty = arena.create<aletheia::SeqNode>();
+    auto* c3 = arena.create<aletheia::CaseNode>(3, empty, false, true);
+    auto* def = arena.create<aletheia::CaseNode>(0, empty, true, true);
+    auto* c1 = arena.create<aletheia::CaseNode>(1, empty, false, true);
+    auto* c2 = arena.create<aletheia::CaseNode>(2, empty, false, true);
 
-    std::vector<dewolf::CaseNode*> ordered = dewolf::CaseDependencyGraph::order_cases({c3, def, c1, c2});
+    std::vector<aletheia::CaseNode*> ordered = aletheia::CaseDependencyGraph::order_cases({c3, def, c1, c2});
     ASSERT_EQ(ordered.size(), 4);
     ASSERT_TRUE(!ordered[0]->is_default() && ordered[0]->value() == 1);
     ASSERT_TRUE(!ordered[1]->is_default() && ordered[1]->value() == 2);
@@ -2766,13 +2766,13 @@ void test_compiler_idiom_handling_stage() {
     block->add_instruction(inst2);
     block->add_instruction(inst3);
 
-    dewolf_idioms::IdiomTag tag;
+    idiomata::IdiomTag tag;
     tag.address = 0x1000;
     tag.length = 3;
     tag.operation = "division unsigned";
     tag.operand = "eax";
     tag.constant = 5;
-    task.set_idiom_tags(std::vector<dewolf_idioms::IdiomTag>{tag});
+    task.set_idiom_tags(std::vector<idiomata::IdiomTag>{tag});
 
     CompilerIdiomHandlingStage stage;
     stage.execute(task);
@@ -4169,7 +4169,7 @@ int main() {
     test_sibling_reachability();
     test_case_dependency_graph_ordering();
     test_phi_dependency();
-    std::cout << "Running DeWolf tests...\n";
+    std::cout << "Running Aletheia tests...\n";
     test_arena();
     test_pipeline_stage_tracking();
     test_dominators();

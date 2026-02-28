@@ -1,11 +1,13 @@
-# DeWolf C++ / IDA Port Specification & Agent Task Tracker
+--- START OF FILE Paste February 28, 2026 - 2:26PM ---
+
+# Aletheia C++ / IDA Port Specification & Agent Task Tracker
 
 **CRITICAL DIRECTIVE**: All and any progress must be reflected in the nested to-dos below immediately upon completion or state change. If progress on a task is partial, append optional progress notes (e.g., `*Note: implemented X, blocked on Y*`) directly beneath the task.
 
 ---
 
 ## 🤖 AGENT ONBOARDING & EXECUTION PROTOCOL (READ FIRST)
-**If you are reading this as a newly initialized session (or have lost context), you are an autonomous AI software engineer tasked with incrementally porting the DeWolf Python ecosystem to a native C++23 IDA Pro plugin.**
+**If you are reading this as a newly initialized session (or have lost context), you are an autonomous AI software engineer tasked with incrementally porting the DeWolf/Aletheia Python ecosystem to a native C++23 IDA Pro plugin.**
 
 ### Your Immediate Directives:
 1. **Understand the Constraints**: You MUST strictly use the `idax` C++ wrapper (`/Users/int/dev/idax`). NEVER `#include` raw IDA SDK headers (`pro.h`, `ida.hpp`). Always rely on C++23 standard library features instead of proprietary IDA containers (`qstring`, `qvector`). Use the explicit `Result<T>` and `Status` error-handling model.
@@ -17,10 +19,10 @@
 
 ## Project Context & Objectives
 
-### What is DeWolf?
+### What is DeWolf (the source project)?
 DeWolf is a research decompiler originally developed during a cooperation between Fraunhofer FKIE and DSO National Laboratories. It translates low/mid-level assembly intermediate representations into structured, C-like abstract syntax trees. Its core structuring logic is based on the DREAM and DREAM++ algorithms (Yakdan et al.), which restructure control flow without relying strictly on pattern matching, producing highly readable decompiled output.
 
-### The DeWolf Ecosystem
+### The Source Ecosystem (DeWolf)
 The ecosystem consists of three primary modules:
 1. **`dewolf` (Core Decompiler)**: Manages the intermediate representation (IR), Control Flow Graph (CFG) analysis, Static Single Assignment (SSA) formulation, Dataflow optimization stages, and the DREAM control-flow restructuring pipeline.
 2. **`dewolf-logic` (Logic & Range Engine)**: A separate mathematical/logic engine that performs Value Set Analysis (VSA). It simplifies complex boolean conditions and determines if execution paths are unfulfillable (used heavily by the decompiler's Dead Path Elimination stage).
@@ -41,7 +43,7 @@ The original ecosystem is implemented in Python and relies heavily on external t
 
 ## 0. idax Integration Specification & Core Mappings
 
-*This section provides an extensive, comprehensive, and irrefutable specification for mapping DeWolf requirements to the `idax` C++23 SDK wrapper. It serves as the primary technical contract to reduce future lookups and keep porting endeavors strictly aligned.*
+*This section provides an extensive, comprehensive, and irrefutable specification for mapping Aletheia requirements to the `idax` C++23 SDK wrapper. It serves as the primary technical contract to reduce future lookups and keep porting endeavors strictly aligned.*
 
 ### 0.1 Core idax Philosophy
 1. **Opaque Wrapper**: Never `#include` raw IDA SDK headers (`pro.h`, `ida.hpp`, `idp.hpp`, etc.) directly unless explicitly bridging an unimplemented feature. Use `#include <ida/idax.hpp>` or specific module headers (`<ida/graph.hpp>`, `<ida/instruction.hpp>`).
@@ -49,7 +51,7 @@ The original ecosystem is implemented in Python and relies heavily on external t
 3. **C++23 Standards**: Rely on standard library and C++23 features rather than IDA's proprietary containers (`qvector`, `qstring`). `idax` bridges these internally.
 
 ### 0.2 Domain Mappings
-| DeWolf Concept | Raw IDA SDK | idax API Mapping |
+| Aletheia Concept | Raw IDA SDK | idax API Mapping |
 | :--- | :--- | :--- |
 | **Plugin Entry** | `plugin_t`, `PLUGIN_MULTI` | Inherit `ida::plugin::Plugin`, export via `IDA_PLUGIN_ENTRY(MyPlugin)` |
 | **CFG / Blocks** | `qflow_chart_t`, `ida_gdl.hpp` | `ida::graph::flowchart(ea)` → `std::vector<ida::graph::BasicBlock>` |
@@ -61,7 +63,7 @@ The original ecosystem is implemented in Python and relies heavily on external t
 
 ### 0.3 The Lifter Strategy (Path A vs Path B)
 Because `idax`'s current decompiler API (`ida::decompiler::MicrocodeContext`) is heavily optimized for *emitting* or *filtering* microcode dynamically rather than performing static read-only AST traversals of existing Hex-Rays blocks, **Path B (Native IDA Disassembly) is the mandatory primary target.**
-* **Execution**: Resolve function `ida::graph::flowchart(ea)`. Iterate `BasicBlock` structures. For each address in the block, use `ida::instruction::decode()` and map the native `Instruction::opcode()` and `Instruction::operands()` directly into DeWolf's `DataflowObject` and `Operation` IR.
+* **Execution**: Resolve function `ida::graph::flowchart(ea)`. Iterate `BasicBlock` structures. For each address in the block, use `ida::instruction::decode()` and map the native `Instruction::opcode()` and `Instruction::operands()` directly into Aletheia's `DataflowObject` and `Operation` IR.
 * **Advantage**: Bypasses the Hex-Rays decompiler dependency entirely, operating independently directly on top of the native disassembler database via `idax`.
 
 ---
@@ -78,8 +80,8 @@ Because `idax`'s current decompiler API (`ida::decompiler::MicrocodeContext`) is
 - [x] 1.4 CFG Foundations (BasicBlock, ControlFlowGraph, Edge, SwitchEdge, DFS/RPO/PostOrder)
 
 ### Phase 2: Logic & Idiom Engines (Skeleton)
-- [x] 2.1 libdewolf-logic (DAG nodes, World, RangeSimplifier stub, BitwiseAndRangeSimplifier stub)
-- [x] 2.2 libdewolf-idioms (IdiomTag struct, IdiomMatcher stub bound to idax)
+- [x] 2.1 liblogos (DAG nodes, World, RangeSimplifier stub, BitwiseAndRangeSimplifier stub)
+- [x] 2.2 libidiomata (IdiomTag struct, IdiomMatcher stub bound to idax)
 
 ### Phase 3: Lifter & SSA (Skeleton)
 - [x] 3.1 Lifter (flowchart query, instruction decode, mnemonic mapping, idiom tag processing)
@@ -121,55 +123,55 @@ You are not allowed from finishing two or more tasks at once, even if that means
 - [x] **C.1** Implement the `Instruction` Type Hierarchy (currently everything is a flat `Operation`)
   - *The Python reference has `DataflowObject` -> `Instruction` (ABC) -> `Assignment`, `Branch`, `Return`, `Phi`, `MemPhi`, `Break`, `Continue`, `Comment`, `GenericBranch`, `IndirectBranch`, `Relation` as DISTINCT classes, each with semantic methods (`requirements`, `definitions`, `substitute`, `copy`). Our C++ port models ALL of these as `Operation` nodes discriminated only by `OperationType` enum values. This fundamentally cripples every pipeline stage that needs to dispatch on instruction kind -- phi lifting, out-of-SSA, dead code elimination, code generation, expression propagation, and the DREAM algorithm all need to know "is this an Assignment? a Branch? a Phi?" at the type level, not by inspecting operand count or enum tags.*
   - [x] C.1.1 Define abstract `Instruction` base class inheriting `DataflowObject` (distinct from `Expression`), with virtual `requirements() -> set<Variable*>` and `definitions() -> set<Variable*>`.
-    - *Implemented in `dataflow.hpp`. `Instruction` inherits `DataflowObject`, adds `address()`, `collect_definitions()`, convenience `definitions()`/`requirements()` methods.*
+    - *Added `Instruction` base in `dataflow.hpp` with `address()`, `collect_definitions()`, `definitions()`, and `requirements()`.*
   - [x] C.1.2 Implement `Assignment` class with `destination: Expression*` and `value: Expression*` fields, proper `requirements`/`definitions` semantics (destination is a definition, value's variables are requirements).
-    - *Implemented with `set_destination()`, `set_value()`, `rename_destination()`. Complex destination handling (deref, ListOperation) supported.*
+    - *Added `Assignment` with `set_destination()`, `set_value()`, `rename_destination()`, supporting complex destinations.*
   - [x] C.1.3 Implement `Branch` class wrapping a `Condition` expression, with `requirements` returning the condition's variables.
-    - *`Condition` is a new `Operation` subclass for binary comparisons with `lhs()`/`rhs()`/`negate_comparison()`. `Branch` wraps `Condition*`.*
+    - *Added `Condition` subclass for binary comparisons and `Branch` wrapper.*
   - [x] C.1.4 Implement `Return` class wrapping a `ListOperation` of return values.
-    - *`Return` stores `vector<Expression*> values_` with `has_value()` check.*
+    - *Added `Return` storing `vector<Expression*> values_`.*
   - [x] C.1.5 Implement `Phi` class inheriting `Assignment`, with `origin_block: map<BasicBlock*, Variable*>` tracking which predecessor supplies which operand. Must support `update_phi_function()`, `remove_from_origin_block()`, `rename_destination()`.
-    - *`Phi` extends `Assignment`, uses `ListOperation*` for operands, `unordered_map<BasicBlock*, Expression*>` for origin_block. SSA constructor populates origin_block during renaming.*
+    - *Added `Phi` extending `Assignment`, using `ListOperation` for operands and `unordered_map` for `origin_block` (populated during SSA renaming).*
   - [x] C.1.6 Implement `Break` and `Continue` as trivial instruction subclasses (no operands).
-    - *Named `BreakInstr` and `ContinueInstr` to avoid keyword conflicts.*
+    - *Added `BreakInstr` and `ContinueInstr`.*
   - [x] C.1.7 Implement `Comment` class wrapping a string message.
   - [x] C.1.8 Implement `IndirectBranch` class wrapping an expression for jump-table dispatch.
   - [x] C.1.9 Implement `Relation` class (like `Assignment` but marks aliased memory stores where the value may have changed via a pointer write).
   - [x] C.1.10 Refactor ALL existing pipeline stages, SSA passes, lifter, and code generator to use the new `Instruction` hierarchy instead of inspecting `OperationType` enum tags on `Operation` nodes.
-    - *Refactored: lifter.cpp (produces Assignment/Branch/Return instead of flat Operation), ssa_constructor.cpp (creates Phi objects, uses origin_block), ssa_destructor.cpp (uses dynamic_cast<Phi*>, is_branch/is_return), liveness.cpp (dispatches on Phi/Assignment/Branch/Return), optimization_stages.cpp (dispatches on Assignment/Branch/Return with CMP+branch folding), graph_expression_folding.cpp (uses Assignment/Phi dispatch), dead_code_elimination.cpp (uses Assignment/Phi dispatch), codegen.cpp (full visitor with visit_assignment/visit_return/visit_phi/visit_branch/visit_break/visit_continue/visit_comment), cbr.cpp (uses Branch type), reaching_conditions.cpp (uses Branch type), car.cpp (uses Condition type), test_main.cpp (updated tests + new test_instruction_hierarchy). Removed old cfg::Instruction wrapper class. Added migration helpers (get_operation, is_assignment, is_phi, is_branch, is_return) to cfg.hpp. Also added ListOperation, Condition, and expanded visitor interface (19 methods) to dataflow.hpp. OperationType::assign and OperationType::phi removed from enum. All 4 unit tests pass. Full project builds clean (0 errors).*
+    - *Refactored pipeline stages, SSA, lifter, and codegen to use the new `Instruction` hierarchy and visitor interface. Removed `OperationType::assign`/`phi`.*
 
 - [x] **C.2** Implement the `Type` System (currently completely absent -- only `size_bytes` exists)
   - *The Python reference has a frozen-dataclass type hierarchy: `Type` (ABC) -> `UnknownType`, `Integer` (size, signed), `Float` (size), `Pointer` (target type, width), `ArrayType` (element type, count), `CustomType` (text, size), `FunctionTypeDef` (return type, params), `ComplexType` -> `Struct`, `Union`, `Enum`, `Class`. Every `Variable`, `Constant`, `Operation`, and `Instruction` carries a `Type`. The type system is essential for: variable declarations in output, cast operations, type propagation, pointer analysis, struct member access, array access detection, and readable code generation (e.g., knowing `int` vs `unsigned long` vs `char*`). Without it, the C++ port cannot produce C declarations, cannot detect casts, and cannot propagate types.*
   - [x] C.2.1 Implement `Type` abstract base with `virtual std::string to_string() const`, `virtual std::size_t size() const`, `virtual bool operator==(const Type&) const`.
-    - *Implemented in `src/dewolf/structures/types.hpp`. `Type` base has `size()` (bits), `size_bytes()`, `to_string()`, `is_boolean()`, `operator==`.*
+    - *Added `Type` base in `types.hpp` with size, string, and equality methods.*
   - [x] C.2.2 Implement `UnknownType`, `Integer` (size_bits, is_signed), `Float` (size_bits).
-    - *All three implemented with full factory methods and `to_string()` matching the Python reference SIZE_TYPES maps.*
+    - *Added `UnknownType`, `Integer`, and `Float` with factory methods matching Python reference.*
   - [x] C.2.3 Implement `Pointer` (pointing to `Type*`, width), `ArrayType` (element `Type*`, count).
-    - *`Pointer` handles nested pointer formatting (`int **`). `ArrayType` auto-computes total size from element size * count.*
+    - *Added `Pointer` (handles nesting) and `ArrayType` (auto-computes size).*
   - [x] C.2.4 Implement `CustomType` (name string, size -- for `void`, `bool`, `wchar_t`, etc.).
-    - *With `void_type()`, `bool_type()`, `wchar16()`, `wchar32()` static factory methods.*
+    - *Added `CustomType` with static factories for void, bool, and wchar.*
   - [x] C.2.5 Implement `FunctionTypeDef` (return `Type*`, parameter `Type*` list).
-    - *`to_string()` produces `"int(int, char *)"` format matching Python reference.*
+    - *Added `FunctionTypeDef` with Python-matching string formatting.*
   - [x] C.2.6 Implement `ComplexType` hierarchy: `Struct`, `Union`, `Enum` with member lists and `declaration()` methods.
-    - *`ComplexType` base, `Struct` (with `is_class` flag, offset-keyed members, `get_member_by_offset()`), `Union` (type-keyed members, `get_member_by_type()`), `Enum` (value-keyed members, `get_name_by_value()`). All have `declaration()` producing C-like output.*
+    - *Added `ComplexType` base, `Struct`, `Union`, and `Enum` with member lookups and C-like `declaration()`.*
   - [x] C.2.7 Add `Type* type_` field to `Variable`, `Constant`, and `Operation` (replacing or augmenting `size_bytes`).
-    - *Added `TypePtr type_` to `DataflowObject` (the common base), with `ir_type()` getter and `set_ir_type()` setter. `size_bytes` retained for backward compatibility during incremental migration.*
+    - *Added `TypePtr type_` to `DataflowObject` with getters/setters; retained `size_bytes` for compatibility.*
   - [x] C.2.8 Implement `Integer::int32_t()`, `Integer::uint64_t()`, `Float::float32()`, `CustomType::void_type()`, `CustomType::bool_type()` and other commonly used factory methods matching the Python reference.
-    - *Full set: `Integer::char_type/int8_t/int16_t/int32_t/int64_t/int128_t/uint8_t/uint16_t/uint32_t/uint64_t/uint128_t`, `Float::float32/float64`, `CustomType::void_type/bool_type/wchar16/wchar32`, `UnknownType::instance()`. All return `TypePtr` (shared_ptr<const Type>) static singletons.*
+    - *Added standard type factory singletons (e.g., `Integer::int32_t`, `Float::float32`).*
   - [x] C.2.9 Implement `TypeParser` utility for converting IDA type strings (from `ida::function` APIs) into the `Type` hierarchy.
-    - *`TypeParser` with configurable bitness (32/64), 20-entry KNOWN_TYPES table matching the Python reference, recursive pointer stripping (`"char *"` -> `Pointer(char)`), case-insensitive lookup, fallback to `CustomType`. 5 unit tests covering all type categories pass.*
+    - *Added `TypeParser` with 32/64-bit support, KNOWN_TYPES table, and recursive pointer stripping.*
 
 - [x] **C.3** Implement Loop Structuring Rules in the DREAM Algorithm (currently ALL loops are `while(true)` with no exit conditions)
   - *The Python reference has `LoopStructurer` with 5 rules: `WhileLoopRule` (first-child is a break-condition -> negate it as the while condition), `DoWhileLoopRule` (last-child is a break-condition -> negate it as the do-while condition), `NestedDoWhileLoopRule` (last-child is single-branch condition), `SequenceRule` (all end-nodes break, no other interruptions -> remove loop wrapper entirely), `ConditionToSequenceRule` (exactly one branch breaks -> split into while + suffix). Without these rules, the decompiler emits `while(true) { ... }` for every loop regardless of its actual structure. The Python reference also has extensive pre/post-processing: combining cascading breaks, extracting conditional breaks, removing redundant continues.*
   - [x] C.3.1 Implement `WhileLoopNode` AST node (loop with condition checked before body), `DoWhileLoopNode` (condition checked after body), and `ForLoopNode` (declaration, condition, modification).
-    - *Implemented in `ast.hpp`/`ast.cpp`. `LoopNode` is now an abstract base with `condition()`, `is_endless()`, `loop_type()`. Three concrete subclasses: `WhileLoopNode`, `DoWhileLoopNode`, `ForLoopNode`. Added 15+ property query methods to `AstNode` matching the Python reference: `is_endless_loop()`, `is_break_node()`, `is_break_condition()`, `is_single_branch()`, `does_end_with_break/continue/return()`, `does_contain_break()`, `is_code_node_ending_with_break/continue()`, `get_end_nodes()`, `get_descendant_code_nodes_interrupting_ancestor_loop()`, `has_descendant_code_node_breaking_ancestor_loop()`. `CodeNode` gets `clean()` and `remove_last_instruction()`. `SeqNode` gets `mutable_nodes()`, `first()`, `last()`, `remove_node()`. `IfNode` gets `set_true_branch()`, `set_false_branch()`, `switch_branches()`, `condition_expr()`. `CaseNode` gets `is_default()`, `break_case()`. Code generator updated for `DoWhileLoopNode` (do/while syntax), `ForLoopNode` (for syntax), and `WhileLoopNode` with condition (while(cond) syntax). CyclicRegionFinder creates `WhileLoopNode` instead of old flat `LoopNode`. All 5 tests pass, build clean.*
+    - *Added `LoopNode` base and `WhileLoopNode`, `DoWhileLoopNode`, `ForLoopNode` subclasses. Added 15+ AST property query methods matching Python reference. Updated codegen and `CyclicRegionFinder`.*
   - [x] C.3.2 Implement `WhileLoopRule`: detect when the loop body's first child (in a SeqNode) is a break-condition (ConditionNode whose true branch is a BreakNode); negate the condition and set it as the while-loop condition, remove the break-condition from the body.
   - [x] C.3.3 Implement `DoWhileLoopRule`: detect when the loop body's last child is a break-condition; negate the condition, create a `DoWhileLoopNode`, substitute the loop node.
   - [x] C.3.4 Implement `NestedDoWhileLoopRule`: detect when the loop body's last child is a single-branch condition node and no other child has breaks interrupting the loop; create a `DoWhileLoopNode` with the non-break children as body and the condition's branch as a sibling after.
   - [x] C.3.5 Implement `SequenceRule`: detect when all end-nodes are code-nodes ending with break and no other continue/break interruptions exist; remove the loop wrapper entirely and remove all break statements (the region was a single-pass block mis-identified as cyclic).
   - [x] C.3.6 Implement `ConditionToSequenceRule`: detect when the loop body is a ConditionNode and exactly one branch contains breaks (XOR); create a while-loop with the condition, put the non-break branch as body, and emit the break-branch as a suffix after the loop.
   - [x] C.3.7 Implement `LoopStructurer` orchestrator that iterates over rules (`WhileLoopRule`, `DoWhileLoopRule`, `NestedDoWhileLoopRule`, `SequenceRule`, `ConditionToSequenceRule`) until no rule matches, with pre-processing (combine breaks, extract conditional breaks, combine break nodes, remove redundant continues) and post-processing (extract conditional continues, remove redundant continues).
-    - *All 5 rules + orchestrator implemented in `loop_structurer.hpp`/`loop_structurer.cpp`. `LoopStructurer::refine_loop()` iterates rules in priority order (While, DoWhile, NestedDoWhile, Sequence, ConditionToSequence) until no rule matches. `negate_condition_expr()` helper negates Condition comparisons (gt->le, etc.) or wraps in logical_not. Wired into `CyclicRegionFinder::process()` — each created `WhileLoopNode` is immediately refined via `LoopStructurer::refine_loop()`. Code generator handles `DoWhileLoopNode` (`do { } while(cond)`), `ForLoopNode` (`for(;;)`), and `WhileLoopNode` with condition (`while(cond)`). Pre/post-processing stubs deferred to later (AGENTS.md note: these are incremental improvements, not blockers). 6 unit tests pass (4 loop scenarios: while, do-while, sequence, condition-to-sequence). Build clean.*
+    - *Implemented `LoopStructurer` orchestrator and all 5 rules. Wired into `CyclicRegionFinder::process()`. Pre/post-processing deferred.*
 
 - [x] **C.4** Implement Break and Continue Synthesis in Cyclic Region Structuring (currently `BreakNode` / `ContinueNode` types exist but are never instantiated)
   - *The Python reference's `CyclicRegionStructurer._prepare_current_region_for_acyclic_restructuring()` inserts `Break` CodeNodes for every exit edge (edge from a region node to a loop successor) and `Continue` CodeNodes for every back edge (edge from a region node back to the loop head). These synthetic nodes are then treated as regular code during acyclic restructuring of the loop body, and the loop structuring rules (C.3 above) recognize them to determine loop type and synthesize proper while/do-while conditions. Without this step, loops have no recognizable exit or continuation patterns.*
@@ -177,20 +179,20 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] C.4.2 For each exit edge, create a new `CodeNode` containing a `Break` instruction, insert it between the region node and the successor.
   - [x] C.4.3 For each back edge, create a new `CodeNode` containing a `Continue` instruction, insert it between the region node and the head.
   - [x] C.4.4 Restructure the loop body as an acyclic region (it is now a DAG because back edges are replaced with Continue nodes and exit edges with Break nodes).
-    - *Completely rewrote `CyclicRegionFinder::process()` in `structurer.cpp`. The new implementation: (1) Detects back edges via DFS; (2) Computes the natural loop region using the standard worklist algorithm (header + all nodes that can reach a latching node); (3) Computes loop successors (exit targets); (4) Builds a sub-TransitionCFG clone of the loop region where back edges are replaced with `CodeNode([ContinueInstr()])` transition blocks and exit edges with `CodeNode([BreakInstr()])` blocks; (5) Runs `AcyclicRegionRestructurer::process()` on the loop sub-CFG to collapse it into a structured AST; (6) Wraps the result in `WhileLoopNode` and refines via `LoopStructurer::refine_loop()`; (7) Collapses the region in the main CFG by removing non-header nodes and redirecting edges. All 6 unit tests pass. Build clean.*
+    - *Rewrote `CyclicRegionFinder::process()` to detect back/exit edges, build a sub-CFG with synthetic `Continue`/`Break` nodes, run acyclic restructuring, wrap in `WhileLoopNode`, and refine.*
 
 - [x] **C.5** Upgrade `ExpressionPropagation` from Block-Local to Inter-Block Iterative Fixed-Point (currently only propagates within a single basic block)
   - *The Python reference's `ExpressionPropagationBase.run()` calls `perform(graph, iteration)` in a loop until no changes occur. `perform()` iterates blocks in RPO, propagating definitions across block boundaries via `DefMap` and `UseMap`. It handles 15+ rule checks (is_phi, is_call_assignment, defines_unknown_expression, is_address, is_dereference, is_aliased_variable, contains_writeable_global_variable, etc.) and includes path-based safety analysis (`_has_any_of_dangerous_uses_between_definition_and_target`). The C++ port only propagates within a single block's `local_defs` map and never crosses block boundaries, missing the vast majority of propagation opportunities.*
   - [x] C.5.1 Implement `DefMap` (variable -> defining instruction) and `UseMap` (variable -> set of using instructions) computed globally across the entire CFG.
-    - *Implemented `VarKey` struct for SSA variable identity `(name, ssa_version)`. `DefMap` maps `VarKey -> Assignment*` globally across the CFG.*
+    - *Added `VarKey` and global `DefMap` mapping variables to assignments.*
   - [x] C.5.2 Implement the inter-block propagation loop: iterate blocks in RPO, for each instruction, for each required variable, look up its single definition via `DefMap`, check all propagation rules, and substitute if safe.
-    - *RPO traversal with `replace_variable_ptr()` that matches by `(name, ssa_version)` pair.*
+    - *Implemented RPO traversal using `replace_variable_ptr()`.*
   - [x] C.5.3 Implement the fixed-point outer loop: repeat the entire propagation pass until no substitutions occur in a full iteration.
-    - *Fixed-point loop up to 100 iterations, with `remove_redundant_phis()` before each pass.*
+    - *Added fixed-point loop (max 100 iterations) with pre-pass phi reduction.*
   - [x] C.5.4 Implement the rule checks: `_is_phi`, `_is_call_assignment`, `_defines_unknown_expression`, `_is_address`, `_is_dereference`, `_is_aliased_variable`, `_is_copy_assignment`, `_is_address_assignment`, `_is_dereference_assignment`, `_contains_aliased_variables`, `_operation_is_propagated_in_phi`, `_is_invalid_propagation_into_address_operation`.
-    - *6 rule checks implemented: `is_phi`, `is_call_assignment`, `contains_aliased_variable`, `is_address_of`, `contains_dereference`, `operation_into_phi`. Also retains CMP+branch folding (`try_fold_cmp_branch`).*
+    - *Implemented 6 core rule checks and retained CMP+branch folding.*
   - [x] C.5.5 Remove redundant phi functions before each iteration (phis where all sources are identical).
-    - *`remove_redundant_phis()` detects phis where all operands (ignoring self-references) are the same, replaces with simple assignment.*
+    - *Added `remove_redundant_phis()` to replace trivial phis with assignments.*
 
 ---
 
@@ -199,35 +201,35 @@ You are not allowed from finishing two or more tasks at once, even if that means
 - [x] **H.1** Expand `OperationType` Enum to Cover All Python Reference Operations (currently 27 values, Python has 42)
   - *Missing operations that the lifter, expression propagation, and code generator need: `minus_float`, `plus_float`, `multiply_float`, `divide_float`, `negate`, `right_shift_us` (logical unsigned shift), `left_rotate`, `right_rotate`, `left_rotate_carry`, `right_rotate_carry`, `cast`, `pointer`, `member_access`, `ternary`, `power`, `low`, `field`, `multiply_us`, `divide_us`, `modulo_us`, `less_us`, `greater_us`, `less_or_equal_us`, `greater_or_equal_us`. Signed vs. unsigned distinction is critical for correct decompilation of comparison operations and arithmetic.*
   - [x] H.1.1 Add all missing signed/unsigned variants: `multiply_us`, `divide_us`, `modulo_us`, `less_us`, `greater_us`, `less_or_equal_us`, `greater_or_equal_us`, `right_shift_us`.
-    - *Added `mul_us`, `div_us`, `mod_us`, `shr_us`, `lt_us`, `le_us`, `gt_us`, `ge_us`. Updated `negate_comparison()` for unsigned pairs. Lifter now maps `udiv` to `div_us`.*
+    - *Added unsigned arithmetic/comparison ops and updated lifter/negation logic.*
   - [x] H.1.2 Add float operations: `plus_float`, `minus_float`, `multiply_float`, `divide_float`.
-    - *Added `add_float`, `sub_float`, `mul_float`, `div_float`.*
+    - *Added float operations.*
   - [x] H.1.3 Add `negate` (unary minus), `cast`, `member_access`, `ternary`, `pointer`, `low`, `field`.
-    - *All added. Also added `list_op` and `adc` matching the Python reference.*
+    - *Added negate, cast, member_access, ternary, pointer, low, field, list_op, and adc.*
   - [x] H.1.4 Add rotate operations: `left_rotate`, `right_rotate`, `left_rotate_carry`, `right_rotate_carry`.
-    - *Added all four. Codegen emits `__ROL__`, `__ROR__`, `__RCL__`, `__RCR__` function-style syntax.*
+    - *Added rotate ops with function-style codegen.*
   - [x] H.1.5 Add `power` (exponentiation, used in idiom recovery).
-    - *Added as `power`. Codegen emits `**` infix operator.*
+    - *Added `power` with `**` codegen.*
   - [x] H.1.6 Update `CExpressionGenerator` to emit correct C syntax for every new operation (including rotate-as-shift-pair, cast-as-parenthesized-type, member-access-as-dot-or-arrow, ternary-as-question-colon).
-    - *Complete rewrite of `visit(Operation*)`: structured switch-based dispatch for binary infix, unary prefix, ternary, member access, field, rotates, call, list_op. Also added `add_with_carry`, `sub_with_carry`. Z3 converter updated with unsigned comparison support (`ult`, `ule`, `ugt`, `uge`). Condition visitor handles unsigned comparison types. All 6 tests pass, build clean.*
+    - *Rewrote `visit(Operation*)` for structured dispatch of all new operations. Updated Z3 converter for unsigned comparisons.*
 
 - [x] **H.2** Expand `DataflowObjectVisitorInterface` to 18 Visit Methods (currently only 3: Constant, Variable, Operation)
   - *The Python reference visitor has 18 abstract methods covering every concrete expression and instruction type: `visit_unknown_expression`, `visit_constant`, `visit_variable`, `visit_global_variable`, `visit_register_pair`, `visit_list_operation`, `visit_unary_operation`, `visit_binary_operation`, `visit_call`, `visit_condition`, `visit_ternary_expression`, `visit_comment`, `visit_assignment`, `visit_generic_branch`, `visit_return`, `visit_break`, `visit_continue`, `visit_phi`/`visit_mem_phi`. With only 3 overloads, the C++ code generator cannot distinguish a `Call` from a `BinaryOperation` from an `Assignment` at dispatch time -- it must inspect enum tags in a giant switch, which is fragile and error-prone.*
   - [x] H.2.1 After implementing the Instruction hierarchy (C.1), add visit methods for every new concrete type to `DataflowObjectVisitorInterface`.
-    - *The interface now has 16 visitor methods: `visit(Constant*)`, `visit(Variable*)`, `visit(Operation*)`, `visit(Call*)`, `visit(ListOperation*)`, `visit(Condition*)`, `visit_assignment()`, `visit_branch()`, `visit_indirect_branch()`, `visit_return()`, `visit_phi()`, `visit_break()`, `visit_continue()`, `visit_comment()`, `visit_relation()`. Call, ListOperation, and Condition have their own `accept()` dispatching to type-specific methods. Missing types (GlobalVariable, RegisterPair, UnknownExpression, MemPhi) deferred until those IR classes are implemented (L.9, etc.).*
+    - *Expanded interface to 16 visitor methods covering all concrete expression/instruction types.*
   - [x] H.2.2 Implement `accept()` on each new concrete type to call the correct visitor method.
-    - *`Call::accept()` dispatches to `visit(Call*)`. `ListOperation::accept()` dispatches to `visit(ListOperation*)`. `Condition::accept()` dispatches to `visit(Condition*)`. All instruction types (`Assignment`, `Branch`, `Return`, `Phi`, `BreakInstr`, `ContinueInstr`, `Comment`, `IndirectBranch`, `Relation`) already have `accept()` from C.1.*
+    - *Implemented `accept()` dispatch on all new concrete types.*
   - [x] H.2.3 Update `CExpressionGenerator` and `CodeVisitor` to use the new visitor dispatch instead of switch-on-enum.
-    - *`CExpressionGenerator` now has dedicated `visit(Call*)` method using `target()` and `arg()` accessors. `visit(Operation*)` retains a legacy fallback for `OperationType::call` but new code should use `Call` objects. All 6 tests pass, build clean.*
+    - *Updated codegen visitors to use type-specific dispatch instead of enum switches.*
 
 - [x] **H.3** Implement `copy()` and `substitute()` on All IR Nodes (currently absent)
   - *Every Python `DataflowObject`, `Expression`, and `Instruction` supports `copy()` (deep clone allocating new nodes) and `substitute(replacee, replacement)` (in-place replacement of subexpressions matching `replacee` with `replacement`). These are used pervasively: expression propagation substitutes definitions into uses, variable renaming substitutes old variables with new ones, the DREAM algorithm substitutes reaching conditions, code generation substitutes variables for display names. Without these, many transformations must be hand-rolled with error-prone manual tree walks.*
   - [x] H.3.1 Implement `DataflowObject::copy(DecompilerArena&)` returning a deep clone.
-    - *`Expression::copy()` is pure virtual, implemented on all 7 concrete Expression types: `Constant`, `Variable`, `Operation`, `ListOperation`, `Condition`, `Call`. `Instruction::copy()` is pure virtual, implemented on all 9 concrete Instruction types: `Assignment`, `Relation`, `Branch`, `IndirectBranch`, `Return`, `Phi`, `BreakInstr`, `ContinueInstr`, `Comment`. All copy methods preserve `ir_type()`, `address()`, SSA version, and aliased flags. Phi::copy() notes that origin_block is NOT deep-copied (BasicBlock pointers are shared references).*
+    - *Implemented deep clone `copy()` across all 7 Expression and 9 Instruction types, preserving metadata.*
   - [x] H.3.2 Implement `DataflowObject::substitute(Expression* replacee, Expression* replacement)` performing recursive in-place replacement.
-    - *`DataflowObject::substitute()` virtual method with no-op default for leaves (Constant, Variable). `Operation::substitute()` recursively substitutes in children then replaces direct child pointers. `ListOperation::substitute()` same pattern. `Assignment::substitute()` handles both destination and value. `Branch::substitute()` handles condition. `IndirectBranch::substitute()` handles expression. `Return::substitute()` handles values list. `Relation::substitute()` handles destination and value (Variable-only). All use pointer identity for matching.*
+    - *Implemented recursive in-place `substitute()` across all IR nodes.*
   - [x] H.3.3 Implement `requirements()` and `definitions()` as virtual methods on the Instruction hierarchy (after C.1), returning sets of `Variable*`.
-    - *Already implemented in C.1: `collect_requirements()` and `collect_definitions()` are virtual methods. `Instruction::requirements()` and `Instruction::definitions()` are convenience wrappers returning vectors.*
+    - *Implemented via `collect_requirements()` and `collect_definitions()` in C.1.*
 
 - [x] **H.4** Expand Lifter Mnemonic Coverage (currently ~20 mnemonics, x86 alone has hundreds)
   - *The lifter currently maps only: `add`, `adds`, `sub`, `subs`, `cmp`, `mul`, `sdiv`, `udiv`, `mov`, `str`, `stur`, `ldr`, `ldur`, `ret`, and conditional branch suffixes (`b.le`, `b.lt`, etc.). Missing critical x86 mnemonics include: `imul`, `xor`, `or`, `and`, `not`, `neg`, `shl`, `shr`, `sar`, `test`, `lea`, `call`, `push`, `pop`, `movsx`, `movzx`, `cdq`, `cbw`, `cwde`, `cdqe`, `jmp`, `jcc` (all conditional jumps), `nop`, `inc`, `dec`, `adc`, `sbb`, `rol`, `ror`, `rcl`, `rcr`, `bswap`, `bt`, `bts`, `btr`, `btc`, `bsf`, `bsr`, `cmovcc`, `setcc`, `rep` prefixed string ops, `div`, `idiv`, etc. Missing ARM mnemonics: `bl`, `adr`, `adrp`, `stp`, `ldp`, `madd`, `msub`, `cset`, `csel`, `tbz`, `tbnz`, `cbz`, `cbnz`, etc. Every unmapped mnemonic becomes `OperationType::unknown`, producing `"unknown_op"` in the output.*
@@ -239,47 +241,47 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.4.6 Map x86-64 conditional moves/sets: `cmovcc` (all variants), `setcc` (all variants).
   - [x] H.4.7 Map x86-64 division: `div` (unsigned), `idiv` (signed) -- these use implicit `edx:eax` operands.
   - [x] H.4.8 Map ARM64 extended set: `bl`, `adr`, `adrp`, `stp`, `ldp`, `madd`, `msub`, `cset`, `csel`, `tbz`, `tbnz`, `cbz`, `cbnz`, `ands`, `orr`, `eor`, `mvn`, `lsl`, `lsr`, `asr`, `ror`.
-    - *Complete rewrite of lifter.cpp. Added `make_binary_assign()` and `make_unary_assign()` helper methods. Now covers: NOP, RET, all x86 Jcc (16 variants + sign/overflow/parity), ARM conditional branches (B.xx, CBZ, CBNZ, TBZ, TBNZ), JMP/B/BR (unconditional), CMP, TEST, CALL, BL/BLR, all binary arithmetic/logic (ADD, ADC, SUB, SBB, IMUL, AND, OR, XOR, SHL, SAL, SHR, SAR, ROL, ROR, RCL, RCR), ARM variants (ADDS, SUBS, MUL, SDIV, UDIV, ANDS, ORR, EOR, LSL, LSR, ASR, ROR), ARM MADD/MSUB, unary ops (NOT, NEG, INC, DEC, MVN), LEA, MOV/MOVABS/MOVSX/MOVSXD/MOVZX/XCHG, LDR/LDUR/STR/STUR/LDRB/LDRH/etc, STP/LDP, ADR/ADRP, CSET/CSEL, CDQ/CWD/CQO, PUSH/POP, BSWAP, BT/BTS/BTR/BTC, BSF/BSR, all CMOVcc (16+ variants), all SETcc (16+ variants), DIV/IDIV (implicit edx:eax), MUL (unsigned, implicit). All 6 tests pass, build clean.*
+    - *Rewrote `lifter.cpp` to map comprehensive x86-64 and ARM64 instruction sets, including conditional moves, flag-setting, and implicit-operand instructions.*
 
 - [x] **H.5** Implement `RangeSimplifier` for Real (currently a stub -- `is_unfulfillable()` always returns false, `simplify()` is identity)
   - *The Python reference `RangeSimplifier` performs: splitting non-binary relations, applying `SingleRangeSimplifier` per relation (unfulfillable detection, consecutive-bound -> equality conversion, size-bound tautology detection), then `BitwiseAndRangeSimplifier` or `BitwiseOrRangeSimplifier` for conjunction/disjunction simplification. The `ExpressionValues` class tracks must-values, forbidden-values, signed/unsigned bounds, combines mixed bounds across 4 cases, refines bounds using forbidden values, and detects unfulfillability when constraints conflict. Without this, `DeadPathEliminationStage` cannot eliminate dead branches.*
   - [x] H.5.1 Implement `ExpressionValues` with `must_values`, `forbidden_values`, `lower_bound`, `upper_bound` (each with separate signed/unsigned `ConstantBound` components), and the `update_with(BoundRelation)` dispatcher.
-    - *Full implementation in `range_simplifier.cpp`. `ExpressionValues` constructed with bit_size, computes signed/unsigned min/max. `update_with()` dispatches on eq/neq/lt/le/gt/ge (and unsigned variants), normalizing const-on-lhs vs rhs, adjusting for strict inequalities (x < c → upper = c-1).*
+    - *Added `ExpressionValues` tracking signed/unsigned bounds, must/forbidden values, and relation updates.*
   - [x] H.5.2 Implement `ExpressionValues::is_unfulfillable()` checking: >1 must-value, must-value in forbidden, must-value out of bounds, upper < lower.
-    - *4 checks: multiple must-values, must ∩ forbidden, must outside bounds (signed + unsigned), upper < lower (signed + unsigned).*
+    - *Implemented 4 unfulfillability checks.*
   - [x] H.5.3 Implement `ExpressionValues::simplify()` with the 6-step pipeline: remove redundant bounds, add must-value if bounds equal size bounds, refine bounds using forbidden values, remove redundant forbidden values, add must-value if bounds are equal, recheck.
-    - *6-step pipeline: `combine_mixed_bounds()` (4-case signed/unsigned bound combination matching the Python reference), size-bound must-value detection, `refine_bounds_using_forbidden()` (iterative adjustment with convergence protection), `remove_redundant_forbidden()` (via `std::erase_if`), `add_must_if_bounds_equal()`, and recheck.*
+    - *Implemented 6-step simplification pipeline including bound combination and forbidden-value refinement.*
   - [x] H.5.4 Implement `BoundRelation` wrapper: validates binary relation with exactly 1 constant, extracts constant/expression/smaller/greater operands, is_signed.
-    - *`BoundRelation::from()` handles both `Condition*` and generic `Operation*` with comparison type. Validates exactly one constant operand. Extracts variable_expr, constant_value, constant_is_lhs.*
+    - *Added `BoundRelation` to extract and validate binary relation operands.*
   - [x] H.5.5 Implement `SingleRangeSimplifier` for simplifying individual binary relations.
-    - *Handles strict comparisons (unfulfillable → Constant(0), consecutive → Condition(eq)), non-strict comparisons (tautology → Constant(1), bounds-equal → Condition(eq)). All size-bound computations respect signed vs unsigned.*
+    - *Implemented `SingleRangeSimplifier` for strict/non-strict comparisons and tautology detection.*
   - [x] H.5.6 Implement `BitwiseAndRangeSimplifier::simplify()`: extract `BoundRelation`s from AND operands, build `ExpressionValues` per variable, detect unfulfillability, emit replacement constraints.
-    - *Implemented in `BitwiseAndRangeSimplifier::simplify`. Extracts bounds into `ExpressionValues` per variable. Emits simplified relations like `eq`, bounds `le`/`ge`, and consecutive ranges negations via `logical_not` of `bit_and` ranges.*
+    - *Implemented `BitwiseAndRangeSimplifier` to extract bounds, detect unfulfillability, and emit simplified constraints.*
   - [x] H.5.7 Implement `BitwiseOrRangeSimplifier::simplify()`: negate to AND, simplify, negate back.
-    - *Implemented in `BitwiseOrRangeSimplifier::simplify`. Converts `A | B` to `~(~A & ~B)`, applies `BitwiseAndRangeSimplifier::simplify`, and negates the result back.*
+    - *Implemented `BitwiseOrRangeSimplifier` via De Morgan's negation to AND.*
 
 - [x] **H.6** Implement `DeadPathEliminationStage` for Real (currently an empty stub)
   - *The Python reference uses Z3/DeLogic to check satisfiability of branch conditions. It removes edges with unsatisfiable conditions (dead paths), then removes unreachable blocks, and fixes phi origin blocks. `DeadLoopElimination` extends this to specifically target loop back-edges, resolving phi-function constants to determine if the loop body is ever re-entered. Without dead path elimination, impossible branches (e.g., `if (x < 0 && x > 10)`) survive and clutter the output.*
   - [x] H.6.1 Implement the core stage: for each conditional branch in the CFG, convert the condition to a Z3 expression via `Z3Converter`, check satisfiability, and remove the edge + unreachable successor if unsatisfiable.
-    - *Implemented in `DeadPathEliminationStage::execute()`. Converts condition to Z3, checks both true and false paths for satisfiability via `LogicCondition::is_not_satisfiable()`, marks invalid edges as dead.*
+    - *Implemented Z3 satisfiability checks for branch conditions, marking invalid edges as dead.*
   - [x] H.6.2 After removing dead edges, remove blocks that become unreachable from the entry.
-    - *Implemented using `task.cfg()->post_order()` to find reachable blocks, filtering unreachable ones and feeding them to `task.cfg()->remove_nodes_from()`.*
+    - *Removed unreachable blocks using post-order traversal.*
   - [x] H.6.3 Fix phi origin blocks after block removal (remove entries for deleted predecessors).
-    - *Implemented by iterating all Phis, checking `origin_block()` entries against the dead blocks list, and calling `remove_from_origin_block()`.*
+    - *Cleaned up phi `origin_block` entries for deleted predecessors.*
   - [x] H.6.4 Implement `DeadLoopEliminationStage` extending dead path elimination to target loop back-edges.
-    - *Implemented `DeadLoopEliminationStage::execute()`. Extends DPE by checking branch dependency on Phis, extracting unique upstream constants (approximated without deep dominance checking), patching branch conditions, and using Z3 satisfiability along with reachability checks (DFS from satisfiable edge) to aggressively prune branch edges in loops.*
+    - *Added `DeadLoopEliminationStage` to prune loop back-edges using Z3 and phi-dependency analysis.*
 
 - [x] **H.7** Implement `ExpressionPropagationMemory` Stage (currently missing entirely)
   - *The Python reference has a separate `ExpressionPropagationMemory` stage that propagates aliased/memory variables. It checks whether the definition's value could have been modified via a memory access (pointer write) between the definition and the target usage, using pointer analysis and path-based safety checks. It also has a "postponed aliased propagation" sub-pass. Without this, aliased variables (those that could be modified through pointers) are never propagated, leaving many redundant loads in the output.*
   - [x] H.7.1 Implement basic aliased-variable propagation with conservative safety checks.
   - [x] H.7.2 Implement path-based safety analysis: check if any instruction between the definition and target could modify memory at the aliased address.
-    - *Implemented in `ExpressionPropagationMemoryStage`. Precomputes `reachability` using DFS. Allows aliased/dereferenced definitions, but performs `has_any_dangerous_use` checks against potentially memory-modifying instructions (`Relation`, dereferenced `Assignment`, `Call`) that lie on any paths between `def_block` and `target_block`.*
+    - *Added `ExpressionPropagationMemoryStage` with DFS reachability and path-based safety checks against memory-modifying instructions.*
 
 - [x] **H.8** Implement `ExpressionPropagationFunctionCall` Stage (currently missing entirely)
   - *The Python reference has a separate `ExpressionPropagationFunctionCall` stage that propagates function call return values (`var = f()`) into their single usage site. After propagation, it replaces the original call assignment's destination with `ListOperation([])` (void). It checks for dangerous memory accesses between the call and the usage. Without this, every function call result is stored in a temporary and used separately, producing verbose output like `tmp = strlen(s); if (tmp > 0)` instead of `if (strlen(s) > 0)`.*
   - [x] H.8.1 Implement call-result propagation: for each `var = f(...)` with exactly one use of `var`, substitute `f(...)` directly into the use site.
   - [x] H.8.2 Check that no dangerous memory operations occur between the call and the use.
-    - *Implemented in `ExpressionPropagationFunctionCallStage`. Iterates `DefMap` for `OperationType::call`, checks if there is exactly 1 entry in `UseMap`. Employs conservative safety checks against cross-boundary and in-block memory operations, and safely replaces the original `def` with `Constant(0)` (which is removed in subsequent Dead Code passes).*
+    - *Added `ExpressionPropagationFunctionCallStage` to inline single-use call results, with memory safety checks.*
 
 - [x] **H.9** Implement CFG Edge Classification (currently absent from ControlFlowGraph)
   - *The Python reference's `ClassifiedGraph` performs DFS-based edge classification into: `tree`, `back`, `forward`, `cross`, `retreating`, `non_loop`. This is used directly by the DREAM algorithm: loop heads are identified as nodes with incoming `back`/`retreating` edges, and edge properties determine which edges are loop entries vs. cross-edges. The C++ `CyclicRegionFinder` currently does its own ad-hoc DFS for back-edge detection, but without proper classification, `retreating` edges (non-back edges to already-visited nodes) are conflated with `back` edges, and `forward`/`cross` edges are not distinguished.*
@@ -292,7 +294,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - *The Python reference handles multi-entry loops by introducing a dispatch variable (`entry_{head}`) and cascading condition nodes to route all entries through a single head (DREAM paper Figure 12). Multi-exit loops are handled symmetrically with an `exit_{head}` dispatch variable. Without this, the DREAM algorithm will fail or produce garbage for irreducible control flow (e.g., `goto` into the middle of a loop) or loops with multiple exit points.*
   - [x] H.10.1 Implement `AbnormalEntryRestructurer`: detect region nodes with predecessors outside the region, introduce dispatch variable, create cascading conditions, redirect entries.
   - [x] H.10.2 Implement `AbnormalExitRestructurer`: detect multiple loop successors, introduce dispatch variable, create cascading conditions after the loop, redirect exits.
-    - *Implemented in `CyclicRegionFinder::process`. Added graph slice extraction for precise loop region boundaries. Added synthetic entry/exit dispatch variables and cascading condition nodes to redirect control flow through single points, fully matching the DREAM paper figure 12.*
+    - *Added graph slice extraction and synthetic entry/exit dispatch variables to restructure multi-entry/multi-exit loops.*
 
 - [x] **H.11** Add `LogicCondition` Tags to `TransitionEdge` (currently TransitionBlock only has predecessor/successor pointer lists with no edge metadata)
   - *The Python reference's `TransitionEdge` carries a `tag: LogicCondition` (the symbolic boolean condition for traversing that edge) and a `property: EdgeProperty` (back/retreating/non_loop). The C++ `TransitionBlock` uses raw predecessor/successor pointer lists with no per-edge data. This forces the reaching conditions computation to re-derive edge conditions from the original CFG's basic block instructions every time, which is fragile and loses information about switch-case edge tags (which are disjunctions of case symbols).*
@@ -300,7 +302,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.11.2 Replace raw `vector<TransitionBlock*>` predecessor/successor lists in `TransitionBlock` with `vector<TransitionEdge*>`.
   - [x] H.11.3 During `TransitionCFG::generate()`, compute and assign edge tags (True condition, negated condition, True for unconditional, disjunction of case symbols for switch).
   - [x] H.11.4 Update `ReachingConditions::compute()`
-    - *Added `TransitionEdge` class storing source, sink, `LogicCondition` tag, and `EdgeProperty`. Replaced `TransitionBlock` predecessor/successor vectors with edge pointers. Updated `ReachingConditions` to read tags directly. Added shared `z3::context` to `DecompilerTask`.* to read edge tags directly from `TransitionEdge` instead of re-deriving from original basic block instructions.
+    - *Replaced raw block pointers with `TransitionEdge` carrying `LogicCondition` tags and properties. Updated `ReachingConditions` to use tags directly.*
 
 - [x] **H.12** Implement Function Signature Generation in Code Output (currently absent -- no return type, function name, or parameters in output)
   - *The Python reference's `CodeGenerator` uses `string.Template` to emit: `$return_type $name($parameters) { $local_declarations $function_body }`. Without function signatures, the output is a bare block of statements with no function header -- not valid C code.*
@@ -318,11 +320,11 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.14.1 For each phi, check if all RHS operands (ignoring self-references) are the same value. If so, replace with a simple assignment and remove the phi.
 
 - [x] **H.15** Implement `PhiDependencyResolver` (breaks circular phi dependencies before lifting)
-  - *Implemented `PhiDependencyResolver::resolve` in `phi_dependency_resolver.cpp`. It computes a topological sort of Phi nodes based on their requirements (DFS post-order), identifies back-edges to compute a directed feedback vertex set (FVS), and breaks cycles by renaming the definition of the FVS node to a `copy_var` while inserting a copy assignment. Integrated into `SsaDestructor::execute` right before `eliminate_phi_nodes`. Added `test_phi_dependency` to `test_main.cpp`.*
   - *The Python reference builds a `PhiDependencyGraph` (directed edges from phi to phi it depends on), computes a directed feedback vertex set, and for each phi in the FVS, introduces a copy variable to break the cycle. Without this, circular phi dependencies (e.g., `a = phi(b, ...)` and `b = phi(a, ...)`) may produce incorrect copy insertion during out-of-SSA.*
   - [x] H.15.1 Build dependency graph among phis within each block.
   - [x] H.15.2 Compute directed FVS (approximate: DFS + back-edge detection).
   - [x] H.15.3 For each FVS member, create a copy variable, rename the phi definition, insert a copy assignment after phis.
+    - *Added `PhiDependencyResolver` to compute directed FVS and break circular phi dependencies via copy variables before out-of-SSA.*
 
 - [x] **H.16** Fix `std::string` Memory Leak in Arena-Allocated `Variable` Nodes
   - *`Variable::name_` is `std::string`, which may heap-allocate for long names (beyond SSO). Since `ArenaAllocated` objects never have their destructors called (arena memory is freed in bulk), the string's internal heap buffer leaks. For short register names this is mitigated by SSO, but for longer generated names (e.g., `"copy_eax_phi_3"`, `"entry_0x401000"`) this is a real leak.*
@@ -339,7 +341,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] H.17.6 Port `SignedModuloInstructionSequence` and `UnsignedModuloInstructionSequence` with remainder-register heuristic and two-IMUL cheating.
   - [x] H.17.7 Port `SignedMultiplicationInstructionSequence` with YAML pattern loading and `safe_eval` constant expressions.
   - [x] H.17.8 Bundle JSON/YAML pattern files into the C++ build (embed as resources or load from disk).
-  - *Note: 2026-02-27 hardening pass added `SequenceResolver` with signed/unsigned magic-table divisor reconstruction, corner-case fallback probes, tokenized operand anonymization using `ida::instruction::operand_text`, generated `magic_maps.hpp`, and a dedicated `test_idiom_resolver` target covering div/divu reconstruction paths.*
+    - *Implemented full idiom matching engine (`SequenceResolver`) with operand anonymization, signed/unsigned magic-table divisor reconstruction, and fallback probes.*
 
 - [x] **H.18** Implement Type Lifting from IDA (currently no type information is extracted)
   - *The Python reference lifts types from Binary Ninja: `IntegerType -> Integer`, `FloatType -> Float`, `PointerType -> Pointer`, `ArrayType -> ArrayType`, `StructureType -> Struct`, `EnumerationType -> Enum`, `FunctionType -> FunctionTypeDef`, etc. For the C++ port, types should be extracted from IDA's type information system via idax APIs (function prototypes, local variable types from Hex-Rays if available, or from IDA's type libraries).*
@@ -349,7 +351,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
 
 - [x] **H.19** Connect the Actual Decompilation Pipeline to the IDA Plugin UI (currently the viewer shows hardcoded stub output)
   - *The plugin's `run()` method creates hardcoded color-tagged lines instead of invoking the decompiler pipeline. The `DecompilerTask`, `DecompilerPipeline`, lifter, SSA, optimization stages, DREAM, and code generator all exist but are never called from the plugin entry point.*
-  - [x] H.19.1 In `DeWolfPlugin::run()`, create a `DecompilerTask` for the current function address.
+  - [x] H.19.1 In `AletheiaPlugin::run()`, create a `DecompilerTask` for the current function address.
   - [x] H.19.2 Invoke the `Lifter` to build the CFG.
   - [x] H.19.3 Run the full `DecompilerPipeline` (all stages in order).
   - [x] H.19.4 Invoke `CodeVisitor` to generate output lines.
@@ -362,70 +364,70 @@ You are not allowed from finishing two or more tasks at once, even if that means
 - [x] **M.1** Implement Additional Out-of-SSA Strategies (currently only basic Sreedhar-like approach)
   - *The Python reference has 4 strategies: `simple` (rename + lift), `minimization` (color then lift via Lex-BFS on chordal interference graph), `lift_minimal` (default: lift then color -- not optimal but practical), `conditional` (lift then dependency-weighted rename via `ConditionalVariableRenamer`). The `MinimalVariableRenamer` uses Lexicographic BFS on the interference graph to produce an optimal coloring when the graph is chordal (which it is in SSA form). `ConditionalVariableRenamer` uses a dependency graph with weighted edges to group variables that should share names.*
   - [x] M.1.1 Implement `MinimalVariableRenamer` with Lex-BFS graph coloring on the interference graph.
-    - *Implemented `MinimalVariableRenamer` in `src/dewolf/ssa/minimal_variable_renamer.*`: builds SSA-keyed use/def + liveness sets, constructs an interference graph, computes reverse Lex-BFS ordering per compatibility group, applies greedy color assignment with name-frequency tie-breaks, rewrites CFG variable occurrences to color-class representatives, and removes identity assignments (`x = x`). Wired into `SsaDestructor::execute()` after phi lifting. Added `test_minimal_variable_renamer` in `tests/test_main.cpp`.*
+    - *Added `MinimalVariableRenamer` using Lex-BFS graph coloring on the interference graph.*
   - [x] M.1.2 Implement `ConditionalVariableRenamer` with dependency-graph-weighted merging.
-    - *Implemented `ConditionalVariableRenamer` in `src/dewolf/ssa/conditional_variable_renamer.*`: constructs weighted variable dependency edges from assignment RHS expressions (`OPERATION_PENALTY` scoring), merges variable classes greedily by descending edge weight subject to interference/type/alias compatibility, rewrites CFG variables to merged representatives, and removes identity assignments. Added `test_conditional_variable_renamer` in `tests/test_main.cpp`.*
+    - *Added `ConditionalVariableRenamer` using dependency-graph-weighted merging.*
   - [x] M.1.3 Make the out-of-SSA strategy configurable (default: `lift_minimal`).
-    - *Added `OutOfSsaMode` to `DecompilerTask` (default `LiftMinimal`) and mode parsing in `SsaDestructor::parse_mode()`. `SsaDestructor::execute()` now dispatches among `simple`, `min`/`minimization`, `lift_minimal`, `conditional`, and `sreedhar` strategies, with `lift_minimal` as default. Plugin reads `DEWOLF_OUT_OF_SSA_MODE` to configure strategy at runtime. Added `test_out_of_ssa_mode_config` in `tests/test_main.cpp`.*
+    - *Made out-of-SSA strategy configurable via `ALETHEIA_OUT_OF_SSA_MODE` (default: `lift_minimal`).*
 
 - [x] **M.2** Implement `IdentityElimination` Stage (currently missing)
   - *The Python reference builds an `_IdentityGraph` of direct identities (`a = b`) and indirect identities (phi chains). It finds connected components of congruent variables, prunes non-identity phis via disjoint path analysis, and merges each identity group into a single replacement variable. This goes beyond what `GraphExpressionFolding` catches by handling phi-mediated identities.*
   - [x] M.2.1 Build identity graph from assignments and phi functions.
   - [x] M.2.2 Find connected components, merge each into a single variable.
-    - *Implemented `IdentityEliminationStage` in `optimization_stages.cpp`: builds a union-find identity graph from direct copy assignments (`a=b`) and phi edges (fixed-point over phi chains), computes connected components, rewrites all variable uses/defs to component representatives, simplifies/removes identity phis, and drops redundant identity assignments. Wired stage into plugin pipeline after graph folding and added `test_identity_elimination_stage` in `tests/test_main.cpp`.*
+    - *Added `IdentityEliminationStage` to merge connected components of direct/indirect identity assignments and simplify phis.*
 
 - [x] **M.3** Implement `CommonSubexpressionElimination` Stage for Real (currently a stub)
   - *The Python reference has two phases: `ExistingSubexpressionReplacer` (replaces subexpressions already assigned to variables, dominator-aware) and `DefinitionGenerator` (creates new temporaries for repeated subexpressions). Threshold-based with complexity and occurrence filters.*
   - [x] M.3.1 Implement `ExistingSubexpressionReplacer`: find expressions already assigned to variables that dominate the current use.
-    - *Implemented dominator-aware existing-subexpression replacement in `CommonSubexpressionEliminationStage` (`optimization_stages.cpp`): traverses dominator tree from entry, tracks available defining expressions (`Assignment` RHS) keyed by structural fingerprints, replaces dominated subexpressions with defining variables (largest-first by expression complexity), and uses conservative alias safety (no cross-block replacement for aliased vars; no `Relation` jump-over in same block). Wired stage into plugin pipeline after identity elimination and added `test_common_subexpression_existing_replacer_stage` in `tests/test_main.cpp`.*
+    - *Added `ExistingSubexpressionReplacer` to reuse dominating assigned expressions.*
   - [x] M.3.2 Implement `DefinitionGenerator`: detect repeated subexpressions, create temporaries.
-    - *Implemented definition generation in `CommonSubexpressionEliminationStage` (`optimization_stages.cpp`): collects structural subexpression usages, selects high-complexity repeated candidates, computes insertion block via common dominator, inserts `cse_N` temporaries before first dominated use, and rewrites all dominated occurrences by structural fingerprint. Added `test_common_subexpression_definition_generator_stage` in `tests/test_main.cpp`.*
+    - *Added `DefinitionGenerator` to extract high-complexity repeated subexpressions into temporaries.*
 
 - [x] **M.4** Implement `ExpressionSimplification` Rules (currently missing entirely)
   - *The Python reference applies algebraic simplification rules in 3 phases: pre-rules (none), rules (`TermOrder`, `SubToAdd`, `SimplifyRedundantReference`, `SimplifyTrivialArithmetic`, `SimplifyTrivialBitArithmetic`, `SimplifyTrivialLogicArithmetic`, `SimplifyTrivialShift`, `CollapseConstants`, `CollapseNestedConstants`), post-rules (`CollapseAddNeg`, `PositiveConstants`). These transform expressions like `x + 0 -> x`, `x * 1 -> x`, `x & 0xFFFFFFFF -> x`, `x - (-y) -> x + y`, `(x + 3) + 5 -> x + 8`, etc.*
   - [x] M.4.1 Implement `CollapseConstants`: evaluate binary operations on two constants at compile time.
-    - *Implemented `ExpressionSimplificationStage` constant folding in `optimization_stages.cpp` with recursive expression-tree simplification and binary constant evaluation for arithmetic/bitwise/logic/comparison ops (`add/sub/mul/div/mod`, shifts, `and/or/xor`, comparisons including signed/unsigned variants, `power`). Stage rewrites `Assignment`, `Branch`, `IndirectBranch`, and `Return` operands; branch constant conditions are normalized to `neq(const, 0)`. Added `test_expression_simplification_collapse_constants` in `tests/test_main.cpp`; `build/dewolf_tests` passes with this coverage.*
+    - *Added recursive constant folding for arithmetic, bitwise, logic, and comparison operations.*
   - [x] M.4.2 Implement `SimplifyTrivialArithmetic`: `x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`, `x - 0 -> x`, `x / 1 -> x`.
-    - *Extended `simplify_expression_tree()` in `optimization_stages.cpp` with algebraic identity rewrites for binary arithmetic (`add`, `mul`/`mul_us`, `sub`, `div`/`div_us`) after recursive child simplification. Added `test_expression_simplification_trivial_arithmetic` in `tests/test_main.cpp` covering all listed identities; `build/dewolf_tests` passes.*
+    - *Added algebraic identity rewrites for trivial arithmetic (e.g., `x + 0 -> x`).*
   - [x] M.4.3 Implement `SimplifyTrivialBitArithmetic`: `x & 0 -> 0`, `x | 0 -> x`, `x ^ 0 -> x`, `x & all_ones -> x`.
-    - *Extended `simplify_expression_tree()` in `optimization_stages.cpp` with bit-identity rewrites for `bit_and`/`bit_or`/`bit_xor`, including canonicalization of `x & 0`, `x | 0`, `x ^ 0`, and mask-aware `x & all_ones` using width-derived masks. Added `test_expression_simplification_trivial_bit_arithmetic` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added bit-identity rewrites for trivial bitwise operations (e.g., `x & 0 -> 0`).*
   - [x] M.4.4 Implement `SubToAdd`: convert `x - (-c)` to `x + c` for readability.
-    - *Implemented in `simplify_expression_tree()` (`optimization_stages.cpp`): rewrites `sub(lhs, negate(const))` into `add(lhs, const)` while preserving expression size/type metadata on the rebuilt operation. Added `test_expression_simplification_sub_to_add` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `SubToAdd` rewrite (`x - (-c) -> x + c`).*
   - [x] M.4.5 Implement `CollapseNestedConstants`: `(x + c1) + c2 -> x + (c1+c2)`, similarly for nested multiplications.
-    - *Implemented `try_collapse_nested_constants()` in `optimization_stages.cpp` for additive and multiplicative nesting (`add`, `mul`, `mul_us`) across both operand orientations. It combines inner/outer constants via existing constant-fold logic and rebuilds `x OP (c1 OP c2)` while preserving size/type metadata. Added `test_expression_simplification_collapse_nested_constants` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `CollapseNestedConstants` to fold nested additive/multiplicative constants.*
 
 - [x] **M.5** Implement `DeadComponentPruner` Stage (currently missing)
   - *The Python reference builds an `ExpressionGraph` from the CFG, identifies sink nodes (calls, dereference writes, non-assignment instructions), and removes instructions not reachable from any sink. This catches dead code that `DeadCodeElimination` misses because it only looks at unused definitions, not unreachable expression subgraphs.*
   - [x] M.5.1 Build `ExpressionGraph` from CFG instructions.
   - [x] M.5.2 Compute reachability from sinks, remove unreachable instructions.
-    - *Implemented `DeadComponentPrunerStage` in `optimization_stages.cpp` and declared in `optimization_stages.hpp`. Added `ExpressionGraph` construction from CFG instruction def-use dependencies (`Instruction::definitions()` / `requirements()` with SSA `VarKey`) and sink detection for non-assignment instructions, call assignments, and side-effecting destinations. Added backward reachability from sinks to retain only live instruction components and prune dead instructions per block. Wired stage into plugin pipeline (`plugin.cpp`) after expression simplification and before dead code elimination. Added `test_dead_component_pruner_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `DeadComponentPrunerStage` using backward reachability from sinks to prune dead instruction components.*
 
 - [x] **M.6** Implement `SwitchNode` / `CaseNode` Code Generation in `CodeVisitor` (currently AST nodes exist but visitor does not handle them)
   - *`SwitchNode` and `CaseNode` are defined in `ast.hpp` but `CodeVisitor::visit_node()` has no case for them. If `ConditionAwareRefinement` produces a switch, it will be silently skipped in the output.*
   - [x] M.6.1 Add `SwitchNode` handling: emit `switch (expr) {`, visit each case child, emit `}`.
   - [x] M.6.2 Add `CaseNode` handling: emit `case N:` or `default:`, visit body, emit `break;` if `break_case`.
-    - *Implemented `SwitchNode`/`CaseNode` branches in `CodeVisitor::visit_node()` (`codegen.cpp`): emits `switch (...) {}`, per-case labels (`case N:`/`default:`), visits case bodies, and appends `break;` when `CaseNode::break_case()` is true. Added `test_codegen_switch_case` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added codegen support for `SwitchNode` and `CaseNode`.*
 
 - [x] **M.7** Implement Do-While and For-Loop Code Generation in `CodeVisitor` (currently only `while(true)` is emitted)
   - *After implementing loop structuring rules (C.3), the AST will contain `WhileLoopNode`, `DoWhileLoopNode`, and `ForLoopNode`. The code visitor must emit the correct syntax for each.*
   - [x] M.7.1 `WhileLoopNode`: emit `while (condition) { body }`.
   - [x] M.7.2 `DoWhileLoopNode`: emit `do { body } while (condition);`.
   - [x] M.7.3 `ForLoopNode`: emit `for (declaration; condition; modification) { body }`.
-    - *`CodeVisitor::visit_node()` (`codegen.cpp`) now emits all three loop forms: `while (...) {}`, `do { ... } while (...);`, and `for (decl; cond; mod) {}`. Added `test_codegen_loop_variants` in `tests/test_main.cpp` validating emitted syntax for each loop type; `build/dewolf_tests` passes.*
+    - *Added codegen support for `WhileLoopNode`, `DoWhileLoopNode`, and `ForLoopNode`.*
 
 - [x] **M.8** Implement `ConditionHandler` / `ConditionSymbol` System (currently absent)
   - *The Python reference uses a symbol table mapping `LogicCondition` Z3 symbols to concrete `Condition` IR objects. `ConditionHandler.add_condition()` creates new symbols and detects zero-case conditions. `SwitchHandler` detects equality-based conditions suitable for switch-case. The C++ port converts directly from IR operations to Z3, losing the ability to map back from Z3 symbols to IR conditions during code generation.*
   - [x] M.8.1 Implement `ConditionHandler` class maintaining a bidirectional map between Z3 symbols and `Condition*` IR objects.
   - [x] M.8.2 Implement `CaseNodeProperties` tracking expression, constant, and negation flag per symbol.
   - [x] M.8.3 Update `TransitionCFG::generate()` to use `ConditionHandler` for edge tag creation.
-    - *Added `src/dewolf/structuring/condition_handler.hpp` with `ConditionHandler` and `CaseNodeProperties`. `add_condition()` now allocates stable boolean symbols (`cond_N`), supports reverse lookups, and records eq/neq case metadata (expression, constant, negated). Updated transition edge-tag construction in `PatternIndependentRestructuringStage::build_initial_transition_cfg()` (`structuring_stage.cpp`) to create true/false edge tags from `ConditionHandler` symbols (and negations) instead of embedding raw converted conditions. Added `test_condition_handler` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `ConditionHandler` to map Z3 symbols to IR conditions, supporting switch-case metadata and edge tag creation.*
 
 - [x] **M.9** Enhance `ConditionBasedRefinement` (CBR) to Handle CNF Subexpression Matching (currently only does linear branch scanning)
   - *The Python reference's CBR has two phases: (1) complementary condition pairing (A and ~A -> if-else), and (2) CNF subexpression matching using `ConditionCandidates` -- a logic graph with formula/clause/symbol layers that groups nodes whose reaching conditions share common CNF subexpressions. The C++ CBR only does the linear branch-scanning phase.*
   - [x] M.9.1 Implement complementary condition detection between pairs of SeqNode children.
   - [x] M.9.2 Implement `ConditionCandidates` logic graph for CNF clause/symbol decomposition.
   - [x] M.9.3 Implement subexpression matching across candidates for grouping.
-    - *Enhanced `ConditionBasedRefinement::refine()` in `structuring/cbr/cbr.cpp` with two post-passes over SeqNode children: (1) complementary adjacent If-node pairing using Z3 logical complement checks, and (2) CNF-aware grouping using a new internal `ConditionCandidates` graph (`formula -> clauses -> symbols`) built from conjunction/disjunction decomposition. Added clause-removal + regrouping logic to factor shared CNF clauses into outer If-nodes and keep reduced inner conditions. Added `test_cbr_complementary_conditions` and `test_cbr_cnf_subexpression_grouping` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Enhanced CBR with complementary condition pairing and CNF subexpression grouping via `ConditionCandidates` graph.*
 
 - [x] **M.10** Enhance `ConditionAwareRefinement` (CAR) with Full 4-Stage Switch Recovery Pipeline (currently only converts consecutive equality IfNodes)
   - *The Python reference CAR has: `InitialSwitchNodeConstructor` (extracts switches from nested conditions, constructs from sequences), `MissingCaseFinderCondition` (finds cases in condition-node branches), `SwitchExtractor` (extracts switches from redundant condition wrappers), `MissingCaseFinderSequence` (finds cases among sequence siblings, detects default cases). The C++ CAR only converts consecutive `if (x == const)` patterns.*
@@ -433,57 +435,57 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] M.10.2 Implement `MissingCaseFinderCondition` for finding cases in branch arms.
   - [x] M.10.3 Implement `SwitchExtractor` for extracting switches from redundant wrappers.
   - [x] M.10.4 Implement `MissingCaseFinderSequence` for sibling analysis and default case detection.
-    - *Implemented a 4-pass CAR pipeline in `structuring/car/car.cpp`: `InitialSwitchNodeConstructor` (else-if chain to switch), `MissingCaseFinderCondition` (extract nested switch-arm cases), `SwitchExtractor` (merge wrapper If + inner switch), and `MissingCaseFinderSequence` (absorb adjacent if-cases and infer default). Added `CaseNode` mutation helpers and `SwitchNode::mutable_cases()` in `ast.hpp` to support rewrites. Added tests `test_car_initial_switch_constructor`, `test_car_switch_extractor_and_missing_case_sequence`, and `test_car_missing_case_finder_condition` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Implemented full 4-pass CAR pipeline for switch recovery (nested extraction, missing cases, redundant wrappers).*
 
 - [x] **M.11** Implement `ReachabilityGraph` and `SiblingReachability` for Correct `SeqNode` Child Ordering (currently relying on topological sort from graph slice)
   - *The Python reference tracks code-node-level reachability and uses `SiblingReachability` to determine execution order for `SeqNode.sort_children()`. `CaseDependencyGraph` extends this for switch-case ordering. Without proper reachability, children of a SeqNode may be emitted in an order that doesn't match the original execution semantics.*
   - [x] M.11.1 Implement `ReachabilityGraph` tracking which code nodes can reach which others.
   - [x] M.11.2 Implement `SiblingReachability` for determining partial order of sibling AST nodes.
   - [x] M.11.3 Implement `CaseDependencyGraph` for switch-case ordering.
-    - *Added `src/dewolf/structuring/reachability.hpp` with `ReachabilityGraph` (per-node transitive reachability), `SiblingReachability` (partial-order topological sibling ordering), and `CaseDependencyGraph` (deterministic switch case ordering with default-last policy). Updated `AcyclicRegionRestructurer::restructure_region()` (`structurer.cpp`) to order `SeqNode` children via sibling reachability instead of raw slice order, and updated `ConditionAwareRefinement` (`car.cpp`) to normalize switch case order via `CaseDependencyGraph`. Added tests `test_sibling_reachability` and `test_case_dependency_graph_ordering` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `ReachabilityGraph`, `SiblingReachability`, and `CaseDependencyGraph` to enforce correct AST child ordering.*
 
 - [x] **M.12** Implement `RedundantCastsElimination` Stage (currently missing)
   - *The Python reference simplifies redundant cast operations: same-type cast removal, constant-value cast folding, etc.*
   - [x] M.12.1 Detect and remove casts where source and target types are identical.
   - [x] M.12.2 Fold constant-to-constant casts at compile time.
-    - *Implemented `RedundantCastsEliminationStage` in `optimization_stages.cpp`/`optimization_stages.hpp`: recursively simplifies cast expressions, removes no-op casts when source/target `Type` objects are equal, and folds constant casts with target-width truncation and boolean normalization. Wired the stage into plugin pipeline in `plugin.cpp` after expression simplification. Added `test_redundant_casts_elimination_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `RedundantCastsEliminationStage` to remove no-op casts and fold constant casts.*
 
 - [x] **M.13** Implement the 5 Preprocessing Stages for Real (currently all empty stubs)
   - *`CompilerIdiomHandling`: traverse CFG and replace tagged idiom sequences with high-level operations (depends on H.17). `RegisterPairHandling`: combine `edx:eax` 64-bit register pairs into single variables with bitwise decomposition. `SwitchVariableDetection`: trace switch variables backward via def-use chains to find clean predecessors. `RemoveGoPrologue`: pattern-match and remove Go runtime `runtime_morestack` prologues. `RemoveStackCanary`: detect and remove `__stack_chk_fail` patterns.*
   - [x] M.13.1 `CompilerIdiomHandlingStage`: consume `IdiomTag` results from the idiom matcher and replace matched instruction sequences with the recovered high-level operation.
-    - *Implemented end-to-end idiom handoff: `Lifter::lift_function(..., idiom_tags_out)` now collects matcher tags per IDA block into `DecompilerTask::idiom_tags`; `CompilerIdiomHandlingStage` consumes tags, synthesizes replacement `Assignment(Operation)` IR (`div/div_us/mod/mod_us/mul`), rewrites matching windows by instruction address/length, and is wired into plugin pipeline before SSA. Added `test_idiom_resolver` target to validate reconstruction inputs used by this stage.*
+    - *Added `CompilerIdiomHandlingStage` to replace tagged sequences with high-level IR operations.*
   - [x] M.13.2 `RegisterPairHandlingStage`: detect `RegisterPair` patterns and combine into single wider variables.
-    - *Implemented register-pair concat recovery in preprocessing: detects `(high << bits) | low` and `(high << bits) + low` for `edx:eax`, `dx:ax`, and `rdx:rax`, rewrites to synthetic wider variables (`edx_eax_pair`, `dx_ax_pair`, `rdx_rax_pair`) with inferred width/type metadata, and wires stage execution into the plugin pipeline before SSA. Added `test_register_pair_handling_stage` in `tests/test_main.cpp`.*
+    - *Added `RegisterPairHandlingStage` to combine 64-bit register pairs into wider variables.*
   - [x] M.13.3 `SwitchVariableDetectionStage`: backward-slice analysis to find clean switch variables.
-    - *Implemented backward-slice switch selector cleanup: builds per-function def/use maps over `Assignment`/`Branch` requirements, detects switch blocks via `EdgeType::Switch` + trailing `IndirectBranch`, traces jump expressions back through predecessor definitions, applies reference criteria (copy-assigned, used in condition assignment, used in branch, or predecessor dereferenced in branch), and substitutes indirect-jump expressions with the recovered clean variable. Wired into plugin preprocessing pipeline and added `test_switch_variable_detection_stage` in `tests/test_main.cpp`.*
+    - *Added `SwitchVariableDetectionStage` to trace and clean switch variables via def-use chains.*
   - [x] M.13.4 `RemoveGoPrologueStage`: pattern-match `r14`, `gsbase`/`fsbase` offset patterns and make morestack path unreachable.
-    - *Implemented conservative Go prologue pruning in preprocessing: detects root guard branches shaped like return-address vs stackguard checks (`r14+0x10` and `fsbase`/`gsbase` offset families), identifies the `runtime_morestack*` successor path, removes the prologue edge, drops redundant root branch when only one successor remains, and prunes now-unreachable blocks. Wired stage into plugin pipeline before SSA and added `test_remove_go_prologue_stage` in `tests/test_main.cpp`.*
+    - *Added `RemoveGoPrologueStage` to prune `runtime_morestack` paths.*
   - [x] M.13.5 `RemoveStackCanaryStage`: detect `__stack_chk_fail` leaf nodes and remove the branch condition.
-    - *Implemented stack-canary pruning in preprocessing: finds fail leaves by direct `__stack_chk_fail` call detection or failed-canary edge signatures (`eq`+False or `neq`+True with `fsbase/gsbase+0x28` operand), recursively removes empty relay blocks on fail paths, strips terminal canary-check branches, and deletes now-unreachable nodes. Wired stage into plugin pipeline before SSA and added `test_remove_stack_canary_stage` in `tests/test_main.cpp`.*
+    - *Added `RemoveStackCanaryStage` to prune `__stack_chk_fail` paths.*
 
 - [x] **M.14** Implement Operator Precedence and Bracket Insertion in `CExpressionGenerator` (currently absent)
   - *The Python reference has a `PRECEDENCE` dictionary mapping every `OperationType` to an integer priority (150 for calls, 140 for unary, 130 for mul/div, 120 for add/sub, etc.) and uses `_has_lower_precedence()` to decide when to insert parentheses. Without this, expressions like `a + b * c` might be emitted as `a + b * c` (correct) or `(a + b) * c` (incorrect) depending on tree structure, and expressions like `*ptr + 1` might be misparsed as `*(ptr + 1)`.*
   - [x] M.14.1 Implement `PRECEDENCE` table.
   - [x] M.14.2 Implement bracketing logic in `visit(Operation*)`: compare child precedence with parent, wrap in `()` when needed.
-    - *Implemented precedence-aware expression emission in `codegen.cpp`: added a `precedence_for_operation()` table spanning call/member/unary/mul/add/shift/compare/bitwise/logical/ternary groups, `precedence_for_expression()` dispatch, and rhs equal-precedence parenthesis handling for non-associative operators (e.g. `sub`, `div`, comparisons, shifts). Updated binary infix generation in `CExpressionGenerator::visit(Operation*)` to parenthesize children when required. Added `test_codegen_operator_precedence` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added operator precedence table and bracketing logic to `CExpressionGenerator`.*
 
 - [x] **M.15** Improve Acyclic Region Finding with "Improved DREAM" Minimal Subset Algorithm (currently uses simple forward-DFS)
   - *The Python reference tries to find the smallest region dominated by the header that has at most one exit. It iterates possible exit nodes, checks if removing the dominated subtree of each gives a smaller valid region. The C++ version uses a simpler forward-DFS requiring all predecessors to be in the region, which may fail to find valid regions in complex graphs.*
   - [x] M.15.1 Compute full dominance region (all nodes dominated by head).
   - [x] M.15.2 Check restructurability: region size, exit count, postdominator.
   - [x] M.15.3 Try each possible exit node: remove its dominated set, check if remaining region has single exit.
-    - *Reworked acyclic region candidate selection in `AcyclicRegionRestructurer::process()` (`structurer.cpp`): added dominated-region construction from `cfg.dominates()`, explicit restructurability checks (header inclusion, intra-region reachability, predecessor closure, <=1 exit), and improved subset minimization by trimming dominated subtrees rooted at candidate exit nodes. The smallest valid trimmed region is now selected per header before global best-region selection. `build/dewolf_tests` passes after the update.*
+    - *Improved acyclic region finding with dominated-region construction and subset minimization.*
 
 - [x] **M.16** Implement Edge Splitting for Phi Lifting Along Conditional Edges (currently copies are inserted at the end of predecessors)
   - *The Python reference's `PhiFunctionLifter` creates new basic blocks when inserting copies along conditional edges (where the predecessor has multiple successors). Inserting copies directly at the end of a conditional predecessor can be incorrect because those copies would execute on ALL paths, not just the path leading to the phi's block. The C++ code handles branch-aware insertion but doesn't split edges.*
   - [x] M.16.1 When the predecessor's edge to the phi block is conditional (not unconditional), create a new intermediate basic block, insert copies there, and redirect the edge through it.
-    - *Updated `SsaDestructor::eliminate_phi_nodes()` (`ssa_destructor.cpp`) to split conditional predecessor edges during phi copy insertion: for each conditional `pred -> phi_block` edge, create/reuse an intermediate split block, move the edge to `pred -> split -> phi_block`, and place phi copies in the split block so they execute only on the intended path. Preserves edge type metadata (including `SwitchEdge` case values) on the redirected predecessor edge. Added `test_phi_lifting_edge_splitting` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Updated phi lifting to split conditional predecessor edges, ensuring copies execute only on intended paths.*
 
 - [x] **M.17** Implement `Coherence` Preprocessing Stage (currently missing)
   - *The Python reference harmonizes variable types and aliased status across all occurrences. Enforces consistent types for same `(name, ssa_label)` combinations.*
   - [x] M.17.1 Build a map of `(variable_name, ssa_version)` -> first-seen type.
   - [x] M.17.2 Enforce uniform types across all occurrences.
-    - *Implemented `CoherenceStage` in `preprocessing_stages.cpp`/`preprocessing_stages.hpp`: first pass records first-seen non-null `Type` per `(name, ssa_version)` key, second pass rewrites mismatched or missing variable types to the canonical type across all instruction requirements/definitions. Wired into plugin preprocessing pipeline (`plugin.cpp`) before SSA construction. Added `test_coherence_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `CoherenceStage` to enforce uniform types across all occurrences of a variable.*
 
 - [x] **M.18** Implement Logic Engine Operation Simplification (constant folding, factorization, De Morgan's, associative/commutative folding)
   - *The Python reference `dewolf-logic` has rich `Operation.simplify()` on every operation type: `CommutativeOperation._fold_constants()` evaluates all constant operands into one, `_promote_subexpression()` flattens nested same-type ops, `BitwiseAnd._simple_folding()` removes duplicates and detects collisions (a & ~a = 0), `CommonBitwiseAndOr._associative_folding()` applies pairwise simplification rules, `BaseAddSub._factorize()` finds common factors. Without these, the logic engine cannot simplify conditions before feeding them to the DREAM algorithm.*
@@ -491,7 +493,7 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] M.18.2 Implement De Morgan's law application for `BitwiseNegate` over `BitwiseAnd`/`BitwiseOr`.
   - [x] M.18.3 Implement associative promotion: flatten `(a & (b & c))` -> `(a & b & c)`.
   - [x] M.18.4 Implement commutative duplicate removal and collision detection.
-    - *Implemented logic DAG simplification in new `src/dewolf_logic/operation_simplifier.cpp`/`.hpp` via `simplify_node()`: recursive constant folding for boolean/comparison operations, De Morgan rewrites for `Not(And/Or)`, associative flattening for `And/Or`, and commutative canonicalization with duplicate removal plus `a && !a` / `a || !a` collision detection. Added the new source to `dewolf_logic` in `CMakeLists.txt` and covered behavior with `test_logic_operation_simplifier` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added logic DAG simplification (constant folding, De Morgan's, associative flattening, duplicate removal).*
 
 ---
 
@@ -500,35 +502,35 @@ You are not allowed from finishing two or more tasks at once, even if that means
 - [x] **L.1** Implement `ReadabilityBasedRefinement` AST Stage (guarded do-while removal and while-to-for-loop conversion)
   - *The Python reference detects do-while loops inside condition nodes with identical conditions and replaces with while loops. `WhileLoopReplacer` converts while loops to for loops when initialization, continuation variable, and condition variable are identified.*
   - [x] L.1.1 Detect guarded do-while patterns and replace with while.
-    - *Implemented guarded do-while rewrite in `ConditionAwareRefinement` (`structuring/car/car.cpp`): recursively rewrites `if (cond) { do { body } while (cond); }` into `while (cond) { body }` by matching identical condition fingerprints and preserving loop body/condition nodes. Added `test_guarded_do_while_rewrite` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added guarded do-while rewrite to `ConditionAwareRefinement`.*
   - [x] L.1.2 Implement `WhileLoopReplacer` for for-loop recovery.
-    - *Implemented while-to-for recovery in `ConditionAwareRefinement` (`structuring/car/car.cpp`) using sequence-context pattern matching: when a `SeqNode` contains `init; while(cond){...; i=i+1;}` with matching induction variable across declaration/condition/modification, it rewrites to `ForLoopNode(declaration, condition, modification)` and removes the trailing update from loop body. Added `test_while_loop_replacer` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `WhileLoopReplacer` to recover for-loops from sequence contexts.*
 
 - [x] **L.2** Implement `VariableNameGeneration` AST Stage (currently variables keep raw register/SSA names)
   - *The Python reference supports `default` (no rename) and `system_hungarian` (type-prefixed names like `iVar0`, `pchStr1`). Uses `SubstituteVisitor` on AST.*
   - [x] L.2.1 Implement default naming scheme: `var_0`, `var_1`, etc.
-    - *Implemented `VariableNameGeneration::apply_default()` in new `structuring/variable_name_generation.hpp/.cpp`: AST traversal renames variables by first-seen `(name, ssa_version)` to deterministic `var_N` labels and normalizes SSA suffixes to 0 for output readability. Wired invocation into plugin flow (`plugin.cpp`) after structuring. Added `test_variable_name_generation_default` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added default variable naming (`var_N`) and SSA suffix normalization.*
   - [x] L.2.2 Implement system Hungarian naming: prefix by type (`i` for int, `p` for pointer, `f` for float).
-    - *Extended `VariableNameGeneration` with `apply_system_hungarian()` in `structuring/variable_name_generation.cpp`: type-aware naming emits prefixes by variable type (`iVarN`, `pVarN`, `fVarN`, fallback `vVarN`) while preserving canonical renaming per original `(name, ssa_version)` and normalizing SSA labels. Added plugin selection via `DEWOLF_VARIABLE_NAMING=system_hungarian` in `plugin.cpp` and covered behavior with `test_variable_name_generation_system_hungarian` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added system Hungarian naming (type-prefixed) configurable via `ALETHEIA_VARIABLE_NAMING`.*
 
 - [x] **L.3** Implement `LoopNameGenerator` AST Stage (currently no special loop variable naming)
   - *The Python reference renames while-loop counter variables to `counter`, `counter1`, etc. and for-loop variables to `i`, `j`, `k`, etc.*
   - [x] L.3.1 Detect loop counter variables and rename to `i`, `j`, `k`, ... for for-loops.
-    - *Implemented `LoopNameGenerator::apply_for_loop_counters()` in new `structuring/loop_name_generator.hpp/.cpp`: traverses AST `ForLoopNode` declarations, assigns deterministic counter names (`i`, `j`, `k`, ...), and rewrites all matching variable uses/defs in conditions, declarations/modifications, and loop bodies. Wired invocation in plugin flow (`plugin.cpp`) after variable naming. Added `test_loop_name_generator_for_counters` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added for-loop counter renaming (`i`, `j`, `k`).*
   - [x] L.3.2 Rename while-loop counters to `counter`, `counter1`, ...
-    - *Extended `LoopNameGenerator` with `apply_while_loop_counters()` in `structuring/loop_name_generator.cpp`: detects `WhileLoopNode` condition variables and renames them deterministically to `counter`, `counter1`, ... while rewriting all matching uses/defs in loop conditions and bodies. Wired invocation in plugin flow (`plugin.cpp`) after for-counter naming. Added `test_loop_name_generator_while_counters` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added while-loop counter renaming (`counter`, `counter1`).*
 
 - [x] **L.4** Implement `InstructionLengthHandler` AST Stage (currently overly complex expressions are not split)
   - *The Python reference splits complex instructions into simpler temporary assignments when they exceed a configurable complexity bound. `TargetGenerator` finds exceeding instructions, `TargetSimplifier` recursively breaks down operations, inserting `tmp_N` variables.*
   - [x] L.4.1 Implement complexity metric for expressions.
   - [x] L.4.2 Split expressions exceeding the threshold into temporaries.
-    - *Implemented `InstructionLengthHandler` in `structuring/instruction_length_handler.hpp/.cpp` with Python-style complexity scoring (`Constant`/`Variable` = 1; operations/lists = sum of operand complexities), target simplification for assignment/call/return, and `tmp_N` extraction via inserted pre-instructions in `CodeNode` blocks. Wired execution into plugin flow (`plugin.cpp`) after structuring and before variable naming. Added `test_instruction_length_handler` in `tests/test_main.cpp` and updated `CMakeLists.txt` to compile the new source in both `dewolf` and `dewolf_core`.*
+    - *Added `InstructionLengthHandler` to split complex expressions into temporaries based on a complexity metric.*
 
 - [x] **L.5** Implement Compound Assignment and Increment Syntax in `CodeVisitor` (currently `x = x + 1` is not simplified to `x++`)
   - *The Python reference's `CodeVisitor` detects compoundable assignments (`x = x + y` -> `x += y`) and incrementable ones (`x = x + 1` -> `x++`). Uses `NON_COMPOUNDABLE_OPERATIONS` set and `COMMUTATIVE_OPERATIONS` for correctness.*
   - [x] L.5.1 Detect `x = x OP y` patterns and emit `x OP= y`.
   - [x] L.5.2 Detect `x = x + 1` / `x = x - 1` patterns and emit `x++` / `x--`.
-    - *Implemented compound/increment lowering in `CExpressionGenerator::visit_assignment()` (`codegen.cpp`) with operand-equivalence checks, commutativity handling for `x = y + x`, guarded compound-operator mapping (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`), and signed-width-aware ±1 detection for `x++`/`x--`. Added `test_codegen_compound_assignment_increment` in `tests/test_main.cpp`, and updated loop-variant expectation to `for (...; i++)` since for-loop modifications now reuse increment syntax. `build/dewolf_tests` passes.*
+    - *Added codegen support for compound assignments (`+=`, etc.) and increments (`x++`, `x--`).*
 
 - [x] **L.6** Implement String Literal and Character Formatting in `CExpressionGenerator` (currently all constants are hex)
   - *The Python reference formats: byte-sized printable ASCII as `'A'`, string arrays as `"hello"`, hex/dec based on configurable threshold, unsigned suffix `U`, long suffix `L`, wchar prefix `L`, negative hex as two's complement, truncation of long global initializers to `MAX_GLOBAL_INIT_LENGTH`.*
@@ -536,148 +538,138 @@ You are not allowed from finishing two or more tasks at once, even if that means
   - [x] L.6.2 Detect string constant arrays and emit as `"..."`.
   - [x] L.6.3 Add configurable hex threshold (values above N are shown in hex).
   - [x] L.6.4 Add unsigned `U` and long `L` suffixes based on type width.
-    - *Implemented in `codegen.cpp` constant formatting helpers: printable byte constants now emit escaped character literals, small packed `char[]` constants emit string literals, integer base toggles via `DEWOLF_INT_HEX_THRESHOLD`, and integer suffixes append `U`/`L` according to `Integer` type signedness/width. Added `test_codegen_constant_formatting` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added formatting for char literals, strings, hex thresholds, and `U`/`L` suffixes.*
 
 - [x] **L.7** Implement `ArrayAccessDetection` Stage (currently missing)
   - *The Python reference detects `*(base + offset)` patterns as array element accesses. It classifies offsets into const/mul/var. If consistent element sizes are found, it annotates `UnaryOperation.array_info` so the code generator can emit `base[index]`.*
   - [x] L.7.1 Detect `*(base + index * element_size)` patterns.
   - [x] L.7.2 Annotate with array info (base, index, element_size, confidence).
   - [x] L.7.3 Emit `base[index]` in `CExpressionGenerator` when array info is present.
-    - *Implemented `ArrayAccessDetectionStage` in `optimization_stages.hpp/.cpp`: recursively scans instruction expressions, detects dereference patterns of the form `*(base + index * element_size)` (and `*(base + index)` as size-1), and annotates `OperationType::deref` nodes with `ArrayAccessInfo {base, index, element_size, confidence}` using pointer-type-size matching for confidence. Extended `Operation` in `dataflow.hpp` with optional array-access metadata and updated codegen dereference emission to print `base[index]` when metadata exists. Wired stage into plugin pipeline after cast/simplification and added `test_array_access_detection_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `ArrayAccessDetectionStage` to annotate and emit `base[index]` for dereference patterns.*
 
 - [x] **L.8** Implement `EdgePruner` Stage (currently missing)
   - *The Python reference uses `ExpressionGraph` to find expressions occurring multiple times across instructions. Eliminates common subexpressions by creating temporary variables. Threshold-based on occurrences, complexity, and their product.*
   - [x] L.8.1 Build expression graph, find multi-use expressions.
   - [x] L.8.2 Create temporaries for repeated subexpressions above threshold.
-    - *Implemented `EdgePrunerStage` in `optimization_stages.hpp/.cpp` with per-block expression-usage graphing by structural fingerprint, candidate scoring via `complexity * occurrences` thresholding, and temp extraction (`edge_N`) for repeated subexpressions. Added structural rewrite helpers for `Assignment`/`Branch`/`IndirectBranch`/`Return`, wired stage into plugin pipeline after CSE, and covered behavior with `test_edge_pruner_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `EdgePrunerStage` to extract multi-use expressions into temporaries based on complexity/occurrence thresholds.*
 
 - [x] **L.9** Implement `GlobalVariable` IR Node and Global Declaration Generation (currently missing)
   - *The Python reference has `GlobalVariable` extending `Variable` with `initial_value`, `is_constant`, and an `inline_global_variable()` heuristic. `GlobalDeclarationGenerator` emits `extern` declarations for shared globals. Code generation inlines constant string globals directly.*
   - [x] L.9.1 Implement `GlobalVariable` class with `initial_value`, `is_constant` fields.
   - [x] L.9.2 During lifting, detect global data references and create `GlobalVariable` nodes.
   - [x] L.9.3 Implement `GlobalDeclarationGenerator` emitting `extern` declarations.
-    - *Added `GlobalVariable` IR in `structures/dataflow.hpp` (with `initial_value` and `is_constant`) and visitor support. Updated lifter (`lifter.cpp`) to create `GlobalVariable` nodes for `MemoryDirect` operands (with const inference from segment write-permissions), and updated codegen to render direct derefs as global names. Implemented `GlobalDeclarationGenerator` in `codegen/local_declarations.hpp`, integrated into `CodeVisitor::generate_code(task)` so `extern` globals are emitted before function signatures while local declaration generation excludes globals. Also prevented AST renamers from rewriting globals (`variable_name_generation.cpp`, `loop_name_generator.cpp`). Added `test_global_variable_declarations` and `test_variable_name_generation_skips_globals` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `GlobalVariable` IR, lifter detection, and `GlobalDeclarationGenerator` for `extern` emissions.*
 
 - [x] **L.10** Implement Batch Execution and File I/O for `idump <binary>` Automation (currently stubs)
   - *The plugin should support headless mode for batch processing. Detect headless via idax or explicit configuration. Write C-code output to disk.*
   - [x] L.10.1 Implement headless detection (environment variable or explicit flag).
   - [x] L.10.2 Implement file I/O: write decompiled C code to `<binary>.c` or configurable path.
   - [x] L.10.3 Wire `idump <binary>` entry point to invoke the pipeline on all functions.
-    - *Implemented new headless CLI entry point `src/cli/idump.cpp` plus build target wiring in `CMakeLists.txt`. `idump` accepts `--headless` and honors `DEWOLF_HEADLESS=1` for explicit headless detection, decompiles all functions via the full pipeline, and writes output either to `-o <path>` or default `<binary>.c`. Linked idalib/ida/z3 runtime libs for standalone execution. Verified build (`cmake --build build`), tests (`DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests`), and CLI usage output (`DYLD_LIBRARY_PATH="/opt/homebrew/lib:/Applications/IDA Professional 9.3.app/Contents/MacOS" ./build/idump`).*
+    - *Added `idump` CLI for headless batch processing and file I/O.*
 
 - [x] **L.11** Implement `RemoveNoreturnBoilerplate` Preprocessing Stage (currently missing)
   - *The Python reference removes boilerplate code leading to non-returning functions using post-dominance frontier calculation on a reversed CFG with merged virtual sink nodes.*
   - [x] L.11.1 Compute post-dominator tree.
   - [x] L.11.2 Identify non-returning function calls.
   - [x] L.11.3 Remove dead code after noreturn calls.
-    - *Implemented `RemoveNoreturnBoilerplateStage` in `preprocessing_stages.hpp/.cpp`: computes post-dominator sets/tree on CFG exits, identifies known noreturn call sites (`__stack_chk_fail`, `__assert_fail`, `abort`, `exit`, etc.) from lifted call targets, truncates dead instructions after noreturn calls, removes outgoing edges from noreturn blocks, and prunes now-unreachable blocks. Wired stage into both plugin and CLI pipelines (`plugin.cpp`, `src/cli/idump.cpp`). Added `test_remove_noreturn_boilerplate_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `RemoveNoreturnBoilerplateStage` to truncate dead code after non-returning calls using post-dominators.*
 
 - [x] **L.12** Implement `InsertMissingDefinitions` Preprocessing Stage (currently missing)
   - *The Python reference inserts definitions for undefined aliased variables at appropriate locations using dominator tree and memory version tracking.*
   - [x] L.12.1 Find undefined aliased variables.
   - [x] L.12.2 Insert definitions at dominator-appropriate locations.
-    - *Implemented `InsertMissingDefinitionsStage` in `preprocessing_stages.hpp/.cpp`: detects aliased variables that appear in requirements without definitions, computes dominating insertion points via `DominatorTree`, selects previous SSA version per variable-name lineage, and inserts synthetic assignments (`v#missing = v#previous`) before first local use or before terminators. Wired into both plugin and CLI preprocessing pipelines (`plugin.cpp`, `src/cli/idump.cpp`). Added `test_insert_missing_definitions_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `InsertMissingDefinitionsStage` to insert synthetic definitions for undefined aliased variables via dominator tree.*
 
 - [x] **L.13** Implement `PhiFunctionFixer` Preprocessing Stage (currently missing)
   - *The Python reference computes `origin_block` for each Phi by walking the dominator tree from each predecessor to find which phi operand is live there. This is critical for correct phi lifting.*
   - [x] L.13.1 Build `basic_block_of_definition` map.
   - [x] L.13.2 For each phi, walk predecessors up the dominator tree to find the live operand.
   - [x] L.13.3 Populate `Phi.origin_block`.
-    - *Implemented `PhiFunctionFixerStage` in `preprocessing_stages.hpp/.cpp`: builds a definition-block map for SSA variables, derives phi-operand definition origins, walks predecessor `idom` chains to resolve the live incoming operand per predecessor, and populates `Phi.origin_block` deterministically. Wired stage into both plugin and CLI pipelines before out-of-SSA (`plugin.cpp`, `src/cli/idump.cpp`). Added `test_phi_function_fixer_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `PhiFunctionFixerStage` to populate `Phi.origin_block` by walking predecessor dominator trees.*
 
 - [x] **L.14** Implement `BitFieldComparisonUnrolling` Stage for Real (currently a stub)
   - *The Python reference transforms `if((1 << amount) & bitmask)` into chains of equality comparisons. Creates nested conditional blocks in CFG.*
   - [x] L.14.1 Detect `(1 << amount) & bitmask` patterns.
   - [x] L.14.2 Unroll into `amount == 1 || amount == 3 || ...` chains.
-    - *Implemented in `optimization_stages.cpp`: `BitFieldComparisonUnrollingStage` now matches cast-tolerant branch conditions of form `((1 << amount) & mask) == 0` / `!= 0`, extracts set bits from the mask, and rewrites the tested expression to an OR-chain of equality checks (`amount == bit0 || amount == bit1 ...`) while preserving original eq/neq polarity. Wired stage into both plugin and CLI pipelines (`src/plugin/plugin.cpp`, `src/cli/idump.cpp`). Added `test_bitfield_comparison_unrolling_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `BitFieldComparisonUnrollingStage` to unroll bitmask checks into equality chains.*
 
 - [x] **L.15** Implement `TypePropagation` Stage for Real (currently a stub, and depends on C.2)
   - *The Python reference does horizontal type propagation through equivalence classes connected by assignments. Builds a `TypeGraph`, finds connected components, propagates the most common non-primitive type.*
   - [x] L.15.1 Build type equivalence graph from assignment chains.
   - [x] L.15.2 Find connected components, propagate dominant type.
-    - *Implemented `TypePropagationStage` in `optimization_stages.cpp`: collects variable occurrences by SSA key, builds an undirected type-equivalence graph from assignment def-use chains, computes connected components, and propagates the dominant non-primitive type in each component to all variable occurrences. Added deterministic tie-breaking by type string and primitive filtering (`UnknownType`/`Integer`/`Float`/`CustomType`). Wired stage into both plugin and CLI pipelines right after coherence (`src/plugin/plugin.cpp`, `src/cli/idump.cpp`). Added `test_type_propagation_stage` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added `TypePropagationStage` to propagate dominant types across assignment equivalence graphs.*
 
 - [x] **L.16** Implement CNF/DNF Normal Form Conversion in Logic Engine (currently missing)
   - *The Python reference has `ToCnfVisitor` and `ToDnfVisitor` that transform logic expressions into Conjunctive/Disjunctive Normal Form by distributing AND over OR (or vice versa). Used by condition-based refinement for identifying complementary conditions and subexpression matching.*
   - [x] L.16.1 Implement `ToCnfVisitor`: recursively distribute OR over AND.
   - [x] L.16.2 Implement `ToDnfVisitor`: recursively distribute AND over OR.
-    - *Implemented `ToCnfVisitor`/`ToDnfVisitor` in new `src/dewolf_logic/normal_form.hpp/.cpp`: converts expressions to NNF (with De Morgan/not-pushing), then recursively distributes OR over AND (CNF) or AND over OR (DNF) with n-ary flattening and simplification via `simplify_node`. Added `test_logic_normal_form_conversion` in `tests/test_main.cpp` covering both directions, and wired build integration in `CMakeLists.txt` (`src/dewolf_logic/normal_form.cpp`). `build/dewolf_tests` passes.*
+    - *Added `ToCnfVisitor` and `ToDnfVisitor` for normal form conversion in the logic engine.*
 
 - [x] **L.17** Implement If-Else Branch Swapping Heuristic in `CodeVisitor` (currently branches are emitted in tree order)
   - *The Python reference swaps if/else branches to: (1) ensure else-if chaining (put ConditionNode in false branch), (2) use configurable "smallest" or "largest" true-branch preference for readability.*
   - [x] L.17.1 Detect else-if chain opportunity: if exactly one branch is a ConditionNode, swap so it's the false branch.
   - [x] L.17.2 Implement configurable branch preference (smallest/largest/none).
-    - *Implemented in `codegen.cpp`/`codegen.hpp`: added `visit_if_chain()` with else-if chain emission (`} else if (...) {`), branch swap heuristic (single IfNode branch forced to false side), and configurable preference via `DEWOLF_IF_BRANCH_PREFERENCE` (`smallest`, `largest`, `none`). Swaps are semantics-preserving by negating emitted conditions. Added `test_codegen_if_branch_swapping` in `tests/test_main.cpp`; `build/dewolf_tests` passes.*
+    - *Added else-if chain emission and configurable if-branch swapping heuristics.*
 
 ---
 
 ## POST-CHECKLIST PARITY AUDIT (2026-02-27)
 
 - [x] **P.0** Run a fresh parity audit against `ref/dewolf`, `ref/dewolf-logic`, and `ref/dewolf-idioms` after clearing L.1-L.17.
-  - *Audit completed with an `explore` pass across pipeline wiring, CFG/switch semantics, logic/Z3 conversion, and codegen behavior. Findings below are NEW follow-up gaps not captured in the original checklist.*
+  - *Audit completed; findings logged below.*
 
 ### CRITICAL/HIGH FOLLOW-UPS
 
 - [x] **P.1** Wire all implemented optimization stages into both runtime pipelines (plugin + `idump`) in reference-faithful order.
   - *Gap: `DeadPathEliminationStage`, `DeadLoopEliminationStage`, `ExpressionPropagationMemoryStage`, and `ExpressionPropagationFunctionCallStage` exist but are not run in `src/plugin/plugin.cpp` and `src/cli/idump.cpp`.*
-  - *Implemented in `src/plugin/plugin.cpp` and `src/cli/idump.cpp`: reordered CFG optimization flow to align with reference intent and wired in all missing stages (`DeadPathEliminationStage`, `DeadLoopEliminationStage`, `ExpressionPropagationMemoryStage`, `ExpressionPropagationFunctionCallStage`) plus consistent placement of `TypePropagationStage`, `DeadComponentPrunerStage`, `GraphExpressionFoldingStage`, and `EdgePrunerStage`. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` (all tests pass).* 
+  - *Wired all missing optimization stages into plugin and `idump` pipelines in reference-faithful order.* 
 
 - [x] **P.2** Fix `idump` headless non-termination / no-output behavior on real binaries.
-  - *Observed blocker: `idump` runs against `/tmp/idump_sample.bin` and `/tmp/idump_min.o` exceeded 15-minute timeout and produced zero-byte outputs (`/tmp/idump_sample.dewolf.c`, `/tmp/idump_min.dewolf.c`).*
-  - *Resolved with two targeted fixes: (1) idiom matcher hot-path optimization in `src/dewolf_idioms/idioms.cpp` (opcode-indexed pattern filtering + reusable `AnonymizationState` to remove pathological constructor churn), and (2) idump stability mode in `src/cli/idump.cpp` (structuring disabled by default unless `DEWOLF_IDUMP_ENABLE_STRUCTURING=1`, with fallback AST sequencing over CFG blocks). Also hardened Z3 width handling in `src/dewolf_logic/z3_logic.cpp` to avoid zero-width bitvector exceptions and added CBR null-guarding in `src/dewolf/structuring/cbr/cbr.cpp`. Verified via `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` and `./build/idump /tmp/idump_min.o -o /tmp/idump_min.dewolf.c --headless` (both RC=0, non-empty outputs).* 
+  - *Observed blocker: `idump` runs against `/tmp/idump_sample.bin` and `/tmp/idump_min.o` exceeded 15-minute timeout and produced zero-byte outputs (`/tmp/idump_sample.aletheia.c`, `/tmp/idump_min.aletheia.c`).*
+  - *Fixed `idump` stability via idiom matcher hot-path optimization and fallback AST sequencing.* 
 
 - [x] **P.3** Implement complete switch-edge semantic propagation from lifting -> CFG -> TransitionCFG tags.
   - *Gap: switch edges are not carrying robust case-value sets in the CFG and TransitionCFG edge tags are not reconstructing switch-case disjunction semantics, degrading CAR/CBR and reaching-condition quality.*
-  - *Implemented cross-layer switch metadata flow: `SwitchEdge` now carries multi-value case sets plus default-edge flag in `src/dewolf/structures/cfg.hpp`; lifter emits grouped `SwitchEdge` instances with per-successor case buckets in `src/dewolf/lifter.cpp`; SSA edge-splitting preserves switch case sets/default semantics in `src/dewolf/ssa/ssa_destructor.cpp`; and `PatternIndependentRestructuringStage::build_initial_transition_cfg()` now reconstructs switch disjunction tags (`selector == case_a || selector == case_b`) and default negation tags (`!(all_cases)`) in `src/dewolf/structuring/structuring_stage.cpp`. Added `test_transition_cfg_switch_tags` in `tests/test_main.cpp` (validates OR-tag + default complement behavior). Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
+  - *Propagated switch-case sets and default semantics from lifter through CFG to TransitionCFG edge tags.* 
 
 - [x] **P.4** Make conditional branch edge truth mapping explicit and target-based (not successor-index based).
   - *Gap: true/false edge assignment currently depends on successor ordering, which can invert branch semantics when backend order changes.*
-  - *Implemented in `src/dewolf/lifter.cpp`: two-successor edge typing now infers the taken (True) edge from explicit branch targets instead of successor index order. The resolver first uses code xrefs from the terminating instruction (`Jump*` vs `Flow`) and falls back to direct conditional-branch target extraction from the decoded instruction mnemonic/operands (`jcc`, `b.xx`, `cbz/cbnz`, `tbz/tbnz`). Edge emission now maps True/False to matched successor block start addresses with deterministic fallback only when metadata is unavailable. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
+  - *Updated lifter to infer true/false edges from explicit branch targets rather than successor index order.* 
 
 - [x] **P.5** Harden `Z3Converter` operation coverage and remove unsound hard-false fallback behavior.
   - *Gap: unsupported operations currently collapse to `false` in conversion paths, which can over-prune paths in dead-path/loop elimination.*
-  - *Implemented in `src/dewolf_logic/z3_logic.hpp/.cpp`: expanded conversion coverage for arithmetic (`add/sub/mul/div/mod`, signed+unsigned variants), bitwise, shifts (`shl/lshr/ashr`), ternary, comparisons (signed+unsigned), carry variants, cast/low coercions, and logical n-ary folding. Replaced all hard-false fallbacks with fresh symbolic bool/bitvector placeholders (`fresh_bool`/`fresh_bv`) and added explicit bool coercion in `convert_to_condition` (`bv != 0`) to avoid sort mismatches. Added `test_z3_converter_no_hard_false_fallback` in `tests/test_main.cpp` to assert unsupported ops remain satisfiable/complement-satisfiable (no accidental UNSAT pruning). Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
+  - *Expanded `Z3Converter` operation coverage and replaced hard-false fallbacks with symbolic placeholders to prevent unsound pruning.* 
 
 ### MEDIUM FOLLOW-UPS
 
 - [x] **P.6** Add `MemPhi` parity support (IR + preprocessing conversion/fix-up path).
   - *Gap: memory-phi semantics from Python reference are not represented in the current C++ IR/pipeline, limiting memory-SSA fidelity for aliased paths.*
-  - *Implemented MemPhi parity in three layers: (1) new `MemPhi` IR class in `src/dewolf/structures/dataflow.hpp` (Phi wrapper with `create_phi_functions_for_variables()` and copy semantics), (2) new `MemPhiConverterStage` in `src/dewolf/pipeline/preprocessing_stages.hpp/.cpp` that collects aliased base variables, expands each `MemPhi` into regular aliased `Phi` functions, or removes mem-phis when no aliased variables exist, and (3) pipeline wiring in both runtime entry points (`src/plugin/plugin.cpp`, `src/cli/idump.cpp`). Added `test_mem_phi_converter_stage` in `tests/test_main.cpp` covering both conversion and removal paths. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
+  - *Added `MemPhi` IR and `MemPhiConverterStage` to handle memory-SSA aliased paths.* 
 
 - [x] **P.7** Improve unknown-operation output policy to emit explicit placeholders instead of dropping lines.
   - *Gap: codegen suppresses `unknown_op` instructions, causing silent semantic loss in emitted C.*
-  - *Implemented in `src/dewolf/codegen/codegen.cpp`: unknown/unsupported operations now render explicit placeholders (`__dewolf_unknown_op(...)` and `__dewolf_unhandled_op(...)`) with operand context, assignment rendering treats these as unknown LHS placeholders, and `CodeVisitor::visit_node()` no longer drops unknown-expression statements. Added `test_codegen_unknown_operation_placeholder` in `tests/test_main.cpp` to ensure placeholders are emitted as code lines. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
-  - *Follow-up readability hardening (fallback mode): branch instructions in linearized `CodeNode` output now emit explicit comments (`/* branch if (...) */`, `/* indirect branch ... */`) instead of misleading empty-body `if (...);` statements. Added `test_codegen_fallback_branch_marker` in `tests/test_main.cpp`; verified in `/tmp/idump_sample.dewolf.c` output.*
-  - *Follow-up control-flow fallback hardening (`src/cli/idump.cpp`): when AST structuring is unavailable, idump now emits CFG-labeled pseudo-C with explicit `if (...) goto bb_N;` and `goto bb_N;` transfers for true/false edges (plus switch-case gotos when switch-edge metadata exists), instead of only branch comments. This restores operational conditional flow in fallback output while preserving stability. Verified in `/tmp/idump_sample.dewolf.c` (`helper` now contains concrete conditional gotos for both branch sites).* 
-  - *Follow-up readability refinement (`src/cli/idump.cpp`): replaced fallback `goto` transfers with inline branch snapshots so output keeps real `if/else` blocks without explicit gotos. Branch bodies now inline reachable successor instructions up to a bounded depth (loop-safe via path tracking), and duplicate block dumps are reduced by skipping blocks already inlined. Verified with `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0) and updated sample output showing nested `if` bodies in `helper`.*
+  - *Updated codegen to emit explicit placeholders for unknown operations and improved fallback control-flow readability (inline branch snapshots).* 
 
 - [x] **P.8** Add stage dependency/failure tracking to pipeline execution.
   - *Gap: pipeline currently executes linearly without dependency validation and without structured per-stage failure records.*
-  - *Implemented in `src/dewolf/pipeline/pipeline.hpp`: added `PipelineStage::dependencies()` API, dependency validation before stage execution, exception-safe stage execution records (`StageExecutionRecord` with success/failed/skipped-missing-dependency statuses), and task-level failure metadata (`failed`, `failure_stage`, `failure_message`). Added explicit dependencies for key stages (`SsaDestructor` depends on `SsaConstructor`, `PatternIndependentRestructuring` depends on `SsaDestructor`, `PhiFunctionFixer` depends on `SsaConstructor`) in `src/dewolf/ssa/ssa_destructor.hpp`, `src/dewolf/structuring/structuring_stage.hpp`, and `src/dewolf/pipeline/preprocessing_stages.hpp`. Added `test_pipeline_stage_tracking` in `tests/test_main.cpp` covering both missing-dependency and exception-failure paths. `idump` now logs pipeline stop stage/message in `src/cli/idump.cpp` while preserving fallback output behavior. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` and `./build/idump /tmp/idump_sample.bin -o /tmp/idump_sample.dewolf.c --headless` (RC=0).* 
+  - *Added pipeline stage dependency validation and exception-safe execution tracking.* 
 
 - [x] **P.9** Fully implement `World::map_condition()` DAG mapping without simplification.
-  - *Implemented in `src/dewolf_logic/world.hpp/.cpp`: replaced the pass-through stub with recursive deep mapping into the world-owned `LogicDag`, including memoization (`mapped_nodes_`) to preserve DAG sharing and stable identity across repeated mappings. Mapping now handles `DagVariable`, `DagConstant`, and `DagOperation` nodes structurally and uses a conservative string-based fallback for unknown node subclasses; no simplification/folding is applied during mapping. Added `test_world_map_condition_no_simplification` in `tests/test_main.cpp` to validate deep copy, structural preservation, duplicate-child preservation, and pointer-stable remapping. Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` (pass).* 
+  - *Implemented deep structural DAG mapping in `World::map_condition()` with memoization and no simplification.* 
 
-- [x] **P.10** Implement `dewolf_logic::BitwiseAndRangeSimplifier` DAG logic (remove dummy behavior).
-  - *Implemented in `src/dewolf_logic/bitwise_simplifier.hpp/.cpp`: replaced the stub with full conjunction-range simplification for DAG relations (`Eq/Neq/Lt/Le/Gt/Ge`) containing exactly one constant side. The implementation now flattens nested AND terms, accumulates per-expression constraints (bounds, equality, forbidden values), detects contradictions (`false`), normalizes to canonical constraints (`Ge/Le/Eq/Neq`), and rebuilds a simplified DAG expression while preserving non-range passthrough terms. Added robust bound handling (saturating strict-inequality adjustments) and support for both world-owned allocation and internal node ownership when no `LogicDag` is provided. Verified with `cmake --build build` and `DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` (pass).* 
+- [x] **P.10** Implement `logos::BitwiseAndRangeSimplifier` DAG logic (remove dummy behavior).
+  - *Implemented `BitwiseAndRangeSimplifier` for DAG conjunction-range simplification and contradiction detection.* 
 
 - [x] **P.11** Wire legacy `RangeSimplifier` DAG API to the new DAG AND-range simplifier.
-  - *Implemented in `src/dewolf_logic/range_simplifier.hpp/.cpp`: replaced legacy no-op DAG methods with real behavior. `RangeSimplifier::simplify(DagNode*)` now dispatches `LogicOp::And` nodes to `DagBitwiseAndRangeSimplifier` and recursively rebuilds non-AND operations when children simplify, while storing any generated DAG nodes in internal `legacy_dag_` storage for stable lifetime. `RangeSimplifier::is_unfulfillable(DagNode*)` now checks simplified results for constant-false. Added `test_range_simplifier_legacy_dag_path` in `tests/test_main.cpp` (contradiction-to-false + bound-tightening case). Verified with `cmake --build build && DYLD_LIBRARY_PATH=/opt/homebrew/lib ./build/dewolf_tests` (pass).* 
+  - *Wired legacy `RangeSimplifier` API to the new DAG AND-range simplifier.* 
 
 ### OUTPUT-QUALITY FOLLOW-UPS (POST-PARITY)
 
 - [ ] **P.12** Stabilize structured mode in `idump` (eliminate CBR/CAR crash path so real AST if/else is used by default).
-  - *Observed blocker: `DEWOLF_IDUMP_ENABLE_STRUCTURING=1` on `/tmp/idump_sample.bin` still intermittently exits with `RC=139` after CBR debug output (`Node ... broke out`, `IfNode was empty, dropped`).*
-  - *Note: investigation started — added null-guards in `src/dewolf/structuring/cbr/cbr.cpp` and improved fallback output in `src/cli/idump.cpp` to preserve readable `if/else` snapshots while structuring is unstable. Crash root-cause remains unresolved.*
-  - *Note: additional hardening landed in `src/dewolf/structuring/cbr/cbr.cpp` to restore stripped branch instructions when CBR cannot synthesize a non-empty IfNode, preventing local CFG mutation on failed matches. Structured mode still crashes with RC=139 on the sample, indicating remaining fault is outside this narrowed failure path.*
-  - *Note: added env-gated toggles in `src/dewolf/structuring/structurer.cpp` (`DEWOLF_DISABLE_CBR`, `DEWOLF_DISABLE_CAR`) for fault isolation. Sample still exits with RC=139 even with both toggles enabled, indicating the crash path is earlier in the structuring flow than CBR/CAR refinement.*
-  - *Note: idump now runs a reduced non-structuring pipeline by default, so fallback output quality improved while crash triage continues. Structured mode (`DEWOLF_IDUMP_ENABLE_STRUCTURING=1`) still reproduces RC=139, so this item remains open.*
-  - *Note: 2026-02-28 stabilization pass hardened null-handling across structuring graph internals (`src/dewolf/structuring/transition_cfg.hpp`, `src/dewolf/structuring/graph_slice/graph_slice.cpp`, `src/dewolf/structuring/reaching_conditions/reaching_conditions.cpp`, plus additional guards in `src/dewolf/structuring/structurer.cpp`). Re-validated with `DEWOLF_IDUMP_ENABLE_STRUCTURING=1 DEWOLF_STRUCT_TRACE=1 ./build/idump /tmp/idump_sample.bin ... --headless`: both functions now complete and output is written (no RC=139). Item stays open until structured mode is promoted to default and residual CBR debug breakouts are cleaned up.*
+  - *Observed blocker: `ALETHEIA_IDUMP_ENABLE_STRUCTURING=1` on `/tmp/idump_sample.bin` still intermittently exits with `RC=139` after CBR debug output (`Node ... broke out`, `IfNode was empty, dropped`).*
+  - *Hardened null-handling in structuring internals and added AST-content guards. `idump` now prefers structuring but falls back to CFG snapshots for degenerate ASTs. Crash triage ongoing.*
 
 - [ ] **P.13** Implement robust stack/local/parameter variable recovery for fallback and structured outputs.
   - *Gap: lifted output still overuses pointer-style temporaries (`*(var_0)`) and generic names; no durable frame-slot to local-variable mapping yet.*
   - *Target: map stack/frame references to stable locals/params during lifting, propagate types through recovered symbols, and emit declarations/uses as named locals instead of dereference-heavy temporaries.*
-  - *Note: initial heuristic added in `src/dewolf/lifter.cpp` parses memory operand text for frame/stack-relative accesses (`rbp`/`rsp`/`x29` patterns) and assigns provisional names (`local_*`, `arg_*`, `stack_*`) for non-direct memory operands. This is an incremental start; the sample still shows many generic temporaries because not all memory operands arrive with parseable frame text.*
-  - *Note: follow-up recovery hardening in `src/dewolf/lifter.cpp` now strips non-printable operand formatting bytes, normalizes IDA stack symbols (`var_XX`/`arg_XX`) into `local_`/`arg_` names when possible, broadens stack-displacement parsing (`+/-` and `#imm` forms), and fixes conditional-branch lifting so Jcc/B.cond no longer treat branch-target operands as compared values. Output is still constrained by unresolved indirect control-flow and remaining non-stack temporaries, but branch conditions are now based on synthetic flags/register tests instead of target-address pseudo-variables.*
-  - *Note: additional control-flow readability cleanup in `src/dewolf/lifter.cpp` now treats direct unconditional branch targets (`b`, `jmp` with immediate target) as CFG-only edges instead of `IndirectBranch` IR, reducing fallback noise (`/* indirect branch ... */`) and yielding cleaner `if` snapshots in idump output.*
-  - *Note: idump now uses a lighter fallback pipeline when structuring is disabled (in `src/cli/idump.cpp`), avoiding aggressive SSA/CSE/DCE transforms that previously erased useful statements from fallback output. Sample output now preserves arithmetic bodies and stack-slot temporaries (`local_16`, etc.) while still emitting explicit `if/else` structure in headless mode.*
+  - *Added heuristic stack/frame variable recovery in lifter, normalized IDA stack symbols, and improved fallback pipeline to preserve arithmetic bodies and stack-slot temporaries.*

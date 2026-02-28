@@ -5,22 +5,22 @@
 #include <iostream>
 #include <vector>
 
-#include "../src/dewolf/dewolf.hpp"
-#include "../src/dewolf/pipeline/pipeline.hpp"
-#include "../src/dewolf/pipeline/optimization_stages.hpp"
-#include "../src/dewolf/pipeline/expressions/graph_expression_folding.hpp"
-#include "../src/dewolf/pipeline/dataflow_analysis/dead_code_elimination.hpp"
-#include "../src/dewolf/lifter.hpp"
-#include "../src/dewolf/ssa/ssa_constructor.hpp"
-#include "../src/dewolf/ssa/ssa_destructor.hpp"
-#include "../src/dewolf/structuring/structuring_stage.hpp"
-#include "../src/dewolf/codegen/codegen.hpp"
+#include "../src/aletheia/aletheia.hpp"
+#include "../src/aletheia/pipeline/pipeline.hpp"
+#include "../src/aletheia/pipeline/optimization_stages.hpp"
+#include "../src/aletheia/pipeline/expressions/graph_expression_folding.hpp"
+#include "../src/aletheia/pipeline/dataflow_analysis/dead_code_elimination.hpp"
+#include "../src/aletheia/lifter.hpp"
+#include "../src/aletheia/ssa/ssa_constructor.hpp"
+#include "../src/aletheia/ssa/ssa_destructor.hpp"
+#include "../src/aletheia/structuring/structuring_stage.hpp"
+#include "../src/aletheia/codegen/codegen.hpp"
 
-using namespace dewolf;
+using namespace aletheia;
 
 void test_function(const std::string& func_name) {
     std::cout << "\n=============================================\n";
-    std::cout << "Testing DeWolf Pipeline on: " << func_name << "\n";
+    std::cout << "Testing Aletheia Pipeline on: " << func_name << "\n";
     std::cout << "=============================================\n";
 
     auto ea_res = ida::name::resolve(func_name);
@@ -37,7 +37,7 @@ void test_function(const std::string& func_name) {
     std::cout << "[+] Found " << func_name << " at 0x" << std::hex << ea << std::dec << "\n";
 
     DecompilerTask task(ea);
-    dewolf_idioms::IdiomMatcher matcher;
+    idiomata::IdiomMatcher matcher;
     Lifter lifter(task.arena(), matcher);
 
     auto cfg_res = lifter.lift_function(ea);
