@@ -25,6 +25,10 @@ std::string hex_address_name(ida::Address ea) {
 }
 
 std::string sanitize_identifier(std::string text) {
+    text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) {
+        return c < 32 || c > 126;
+    }), text.end());
+
     if (auto ptr_pos = text.find("ptr "); ptr_pos != std::string::npos) {
         text = text.substr(ptr_pos + 4);
     }
@@ -64,11 +68,73 @@ std::string global_name_from_operand(const ida::instruction::Operand& op, ida::A
     return hex_address_name(op.value());
 }
 
+std::optional<std::string> normalize_ida_stack_symbol(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    auto parse_suffix_hex = [&](std::string_view prefix, std::string_view out_prefix) -> std::optional<std::string> {
+        if (!text.starts_with(prefix)) {
+            return std::nullopt;
+        }
+
+        const std::string_view suffix{text.c_str() + prefix.size(), text.size() - prefix.size()};
+        if (suffix.empty()) {
+            return std::nullopt;
+        }
+
+        std::uint64_t value = 0;
+        for (char c : suffix) {
+            int digit = 0;
+            if (c >= '0' && c <= '9') {
+                digit = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                digit = 10 + (c - 'a');
+            } else {
+                return std::nullopt;
+            }
+            value = (value << 4) + static_cast<std::uint64_t>(digit);
+        }
+
+        return std::string(out_prefix) + std::to_string(value);
+    };
+
+    if (auto local = parse_suffix_hex("var_", "local_")) {
+        return local;
+    }
+    if (auto arg = parse_suffix_hex("arg_", "arg_")) {
+        return arg;
+    }
+    return std::nullopt;
+}
+
 std::string to_lower_ascii(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
     return text;
+}
+
+bool is_identifier_char(char c) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    return std::isalnum(uc) || c == '_';
+}
+
+bool contains_register_token(std::string_view text, std::string_view token) {
+    if (token.empty()) {
+        return false;
+    }
+    std::size_t pos = text.find(token);
+    while (pos != std::string_view::npos) {
+        const bool left_ok = (pos == 0) || !is_identifier_char(text[pos - 1]);
+        const std::size_t end = pos + token.size();
+        const bool right_ok = (end >= text.size()) || !is_identifier_char(text[end]);
+        if (left_ok && right_ok) {
+            return true;
+        }
+        pos = text.find(token, pos + 1);
+    }
+    return false;
 }
 
 std::optional<std::int64_t> parse_signed_displacement(std::string_view text) {
@@ -126,26 +192,81 @@ std::optional<std::int64_t> parse_signed_displacement(std::string_view text) {
         return negative ? -value : value;
     }
 
+    // Fallback for forms like "[sp, #0x10]" where there is no explicit + sign.
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '#') {
+            continue;
+        }
+
+        std::size_t j = i + 1;
+        bool negative = false;
+        if (j < text.size() && (text[j] == '+' || text[j] == '-')) {
+            negative = text[j] == '-';
+            ++j;
+        }
+
+        int base = 10;
+        if (j + 1 < text.size() && text[j] == '0' && text[j + 1] == 'x') {
+            base = 16;
+            j += 2;
+        }
+
+        std::size_t start = j;
+        while (j < text.size()) {
+            const unsigned char ch = static_cast<unsigned char>(text[j]);
+            const bool ok = (base == 16)
+                ? std::isxdigit(ch)
+                : std::isdigit(ch);
+            if (!ok) {
+                break;
+            }
+            ++j;
+        }
+        if (j == start) {
+            continue;
+        }
+
+        std::int64_t value = 0;
+        for (std::size_t k = start; k < j; ++k) {
+            const char c = text[k];
+            int digit = 0;
+            if (c >= '0' && c <= '9') {
+                digit = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                digit = 10 + (c - 'a');
+            } else if (c >= 'A' && c <= 'F') {
+                digit = 10 + (c - 'A');
+            }
+            value = value * base + digit;
+        }
+
+        return negative ? -value : value;
+    }
+
     return std::nullopt;
 }
 
 std::optional<std::string> stack_slot_name_from_operand_text(std::string operand_text) {
+    operand_text.erase(std::remove_if(operand_text.begin(), operand_text.end(), [](unsigned char c) {
+        return c < 32 || c > 126;
+    }), operand_text.end());
+
     std::string t = to_lower_ascii(std::move(operand_text));
     if (t.find('[') == std::string::npos && t.find(']') == std::string::npos) {
-        return std::nullopt;
+        return normalize_ida_stack_symbol(t);
     }
 
     const bool frame_based =
-        t.find("rbp") != std::string::npos ||
-        t.find("ebp") != std::string::npos ||
-        t.find(" bp") != std::string::npos ||
-        t.find("x29") != std::string::npos ||
-        t.find("fp") != std::string::npos;
+        contains_register_token(t, "rbp") ||
+        contains_register_token(t, "ebp") ||
+        contains_register_token(t, "bp") ||
+        contains_register_token(t, "x29") ||
+        contains_register_token(t, "fp");
 
     const bool sp_based =
-        t.find("rsp") != std::string::npos ||
-        t.find("esp") != std::string::npos ||
-        t.find(" sp") != std::string::npos;
+        contains_register_token(t, "rsp") ||
+        contains_register_token(t, "esp") ||
+        contains_register_token(t, "sp");
 
     if (!frame_based && !sp_based) {
         return std::nullopt;
@@ -165,9 +286,9 @@ std::optional<std::string> stack_slot_name_from_operand_text(std::string operand
     }
 
     if (disp < 0) {
-        return "stack_m" + std::to_string(abs_disp);
+        return "local_m" + std::to_string(abs_disp);
     }
-    return "stack_" + std::to_string(abs_disp);
+    return "local_" + std::to_string(abs_disp);
 }
 
 bool is_conditional_branch_mnemonic(std::string_view mnemonic) {
@@ -480,6 +601,13 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
         expr = arena_.create<Variable>(op.register_name(), op.byte_width());
     } else if (op.is_immediate()) {
         expr = arena_.create<Constant>(op.value(), op.byte_width());
+    } else if (op.type() == ida::instruction::OperandType::NearAddress ||
+               op.type() == ida::instruction::OperandType::FarAddress) {
+        const std::uint64_t target = op.target_address() != ida::BadAddress
+            ? static_cast<std::uint64_t>(op.target_address())
+            : op.value();
+        const std::size_t width = op.byte_width() > 0 ? static_cast<std::size_t>(op.byte_width()) : 8U;
+        expr = arena_.create<Constant>(target, width);
     } else if (op.is_memory()) {
         const std::size_t width = op.byte_width() > 0 ? static_cast<std::size_t>(op.byte_width()) : 8U;
         if (op.type() == ida::instruction::OperandType::MemoryDirect) {
@@ -515,8 +643,19 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
     } else {
         auto txt_res = ida::instruction::operand_text(insn_addr, op.index());
         if (txt_res) {
-            std::string clean = *txt_res;
-            expr = arena_.create<Variable>(clean, op.byte_width());
+            if (auto stack_name = stack_slot_name_from_operand_text(*txt_res)) {
+                auto* slot = arena_.create<Variable>(*stack_name, op.byte_width());
+                slot->set_aliased(true);
+                expr = slot;
+            }
+
+            std::string clean = sanitize_identifier(*txt_res);
+            if (!expr) {
+                if (clean.empty()) {
+                    clean = "op_" + std::to_string(op.index());
+                }
+                expr = arena_.create<Variable>(clean, op.byte_width());
+            }
         } else {
             expr = arena_.create<Variable>("op_" + std::to_string(op.index()), op.byte_width());
         }
@@ -617,8 +756,10 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         else if (lmnem == "jnp" || lmnem == "jpo") cmp = OperationType::neq;  // PF=0 (approximate)
 
         if (cmp != OperationType::unknown) {
-            Expression* lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
-            Expression* rhs = operands.size() >= 2 ? operands[1] : arena_.create<Constant>(0, lhs->size_bytes);
+            // x86 Jcc operands are branch targets, not compared values.
+            // Model as condition over synthetic flags.
+            Expression* lhs = arena_.create<Variable>("flags", 1);
+            Expression* rhs = arena_.create<Constant>(0, 1);
             auto* cond = arena_.create<Condition>(cmp, lhs, rhs);
             auto* branch = arena_.create<Branch>(cond);
             branch->set_address(addr);
@@ -650,8 +791,21 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         else if (lmnem == "tbnz") cmp = OperationType::neq;
 
         if (cmp != OperationType::unknown) {
-            Expression* lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
-            Expression* rhs = operands.size() >= 2 ? operands[1] : arena_.create<Constant>(0, lhs->size_bytes);
+            Expression* lhs = nullptr;
+            Expression* rhs = nullptr;
+
+            if (lmnem == "cbz" || lmnem == "cbnz") {
+                lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
+                rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
+            } else if (lmnem == "tbz" || lmnem == "tbnz") {
+                lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
+                rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
+            } else {
+                // ARM B.cond takes target operand only; compare flags register.
+                lhs = arena_.create<Variable>("flags", 1);
+                rhs = arena_.create<Constant>(0, 1);
+            }
+
             auto* cond = arena_.create<Condition>(cmp, lhs, rhs);
             auto* branch = arena_.create<Branch>(cond);
             branch->set_address(addr);
@@ -662,15 +816,24 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     // Unconditional jump
     // =====================================================================
-    if (lmnem == "jmp" || lmnem == "b" || lmnem == "br") {
-        // Unconditional jumps are represented by CFG edges, not instructions.
-        // If there's a computed target (indirect jump), create an IndirectBranch.
-        if (!operands.empty()) {
-            auto* ib = arena_.create<IndirectBranch>(operands[0]);
-            ib->set_address(addr);
-            return ib;
+    if (lmnem == "b") {
+        // Direct ARM branch target is represented by CFG edges.
+        return nullptr;
+    }
+
+    if (lmnem == "jmp" || lmnem == "br") {
+        // Direct jumps are represented by CFG edges; keep only computed/indirect
+        // jumps as explicit IR.
+        if (operands.empty()) {
+            return nullptr;
         }
-        return nullptr;  // Direct jump: handled by CFG edges
+        if (dynamic_cast<Constant*>(operands[0]) != nullptr) {
+            return nullptr;
+        }
+
+        auto* ib = arena_.create<IndirectBranch>(operands[0]);
+        ib->set_address(addr);
+        return ib;
     }
 
     // =====================================================================

@@ -156,7 +156,7 @@ void emit_inline_branch_snapshot(
         lines.push_back(indent_of(indent_level) + "/* unknown target */");
         return;
     }
-    if (depth > 3) {
+    if (depth > 8) {
         lines.push_back(indent_of(indent_level) + "/* ... -> " + block_label(block) + " */");
         return;
     }
@@ -292,7 +292,47 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
             }
         }
         if (omitted > 0) {
-            lines.push_back("    /* omitted " + std::to_string(omitted) + " detached blocks */");
+            lines.push_back("    /* detached blocks: " + std::to_string(omitted) + " */");
+            lines.push_back("");
+
+            for (dewolf::BasicBlock* block : blocks) {
+                if (!block || inlined_blocks.contains(block)) {
+                    continue;
+                }
+
+                lines.push_back("    /* detached " + block_label(block) + " */");
+
+                const auto& insts = block->instructions();
+                dewolf::Instruction* tail = insts.empty() ? nullptr : insts.back();
+                const bool tail_is_branch = dynamic_cast<dewolf::Branch*>(tail) != nullptr;
+                const bool tail_is_indirect = dynamic_cast<dewolf::IndirectBranch*>(tail) != nullptr;
+
+                std::size_t limit = insts.size();
+                if ((tail_is_branch || tail_is_indirect) && limit > 0) {
+                    --limit;
+                }
+
+                for (std::size_t j = 0; j < limit; ++j) {
+                    std::string stmt = expr_gen.generate(insts[j]);
+                    if (!stmt.empty()) {
+                        lines.push_back("        " + stmt + ";");
+                    }
+                }
+
+                if (auto* branch = dynamic_cast<dewolf::Branch*>(tail)) {
+                    auto [true_edge, false_edge] = pick_true_false_edges(block);
+                    const std::string cond = expr_gen.generate(branch->condition());
+                    lines.push_back("        if (" + cond + ") {");
+                    lines.push_back("            /* then -> " + block_label(true_edge ? true_edge->target() : nullptr) + " */");
+                    lines.push_back("        } else {");
+                    lines.push_back("            /* else -> " + block_label(false_edge ? false_edge->target() : nullptr) + " */");
+                    lines.push_back("        }");
+                } else if (auto* indirect = dynamic_cast<dewolf::IndirectBranch*>(tail)) {
+                    lines.push_back("        /* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
+                }
+
+                lines.push_back("");
+            }
         }
     }
 
@@ -300,17 +340,22 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
     return lines;
 }
 
-dewolf::DecompilerPipeline build_pipeline() {
+dewolf::DecompilerPipeline build_pipeline(bool enable_structuring) {
     dewolf::DecompilerPipeline pipeline;
     pipeline.add_stage(std::make_unique<dewolf::CompilerIdiomHandlingStage>());
     pipeline.add_stage(std::make_unique<dewolf::RegisterPairHandlingStage>());
     pipeline.add_stage(std::make_unique<dewolf::RemoveGoPrologueStage>());
     pipeline.add_stage(std::make_unique<dewolf::RemoveStackCanaryStage>());
     pipeline.add_stage(std::make_unique<dewolf::RemoveNoreturnBoilerplateStage>());
-    pipeline.add_stage(std::make_unique<dewolf::InsertMissingDefinitionsStage>());
     pipeline.add_stage(std::make_unique<dewolf::SwitchVariableDetectionStage>());
-    pipeline.add_stage(std::make_unique<dewolf::MemPhiConverterStage>());
     pipeline.add_stage(std::make_unique<dewolf::CoherenceStage>());
+
+    if (!enable_structuring) {
+        return pipeline;
+    }
+
+    pipeline.add_stage(std::make_unique<dewolf::InsertMissingDefinitionsStage>());
+    pipeline.add_stage(std::make_unique<dewolf::MemPhiConverterStage>());
     pipeline.add_stage(std::make_unique<dewolf::SsaConstructor>());
     pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
     pipeline.add_stage(std::make_unique<dewolf::DeadComponentPrunerStage>());
@@ -332,9 +377,7 @@ dewolf::DecompilerPipeline build_pipeline() {
     pipeline.add_stage(std::make_unique<dewolf::EdgePrunerStage>());
     pipeline.add_stage(std::make_unique<dewolf::PhiFunctionFixerStage>());
     pipeline.add_stage(std::make_unique<dewolf::SsaDestructor>());
-    if (env_flag_enabled("DEWOLF_IDUMP_ENABLE_STRUCTURING")) {
-        pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
-    }
+    pipeline.add_stage(std::make_unique<dewolf::PatternIndependentRestructuringStage>());
     return pipeline;
 }
 
@@ -363,7 +406,8 @@ std::vector<std::string> decompile_function(
     task.set_cfg(std::move(*cfg_res));
     task.set_idiom_tags(std::move(idiom_tags));
 
-    auto pipeline = build_pipeline();
+    const bool enable_structuring = env_flag_enabled("DEWOLF_IDUMP_ENABLE_STRUCTURING");
+    auto pipeline = build_pipeline(enable_structuring);
     pipeline.run(task);
 
     if (task.failed()) {
@@ -388,13 +432,17 @@ std::vector<std::string> decompile_function(
         task.set_ast(std::move(fallback_ast));
     }
 
-    dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
-    apply_variable_naming(task);
-
     if (using_cfg_fallback) {
+        dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
+        if (env_flag_enabled("DEWOLF_IDUMP_RENAME_FALLBACK")) {
+            apply_variable_naming(task);
+        }
         ok = true;
         return generate_cfg_fallback_code(task);
     }
+
+    dewolf::InstructionLengthHandler::apply(task.ast(), task.arena());
+    apply_variable_naming(task);
 
     dewolf::CodeVisitor visitor;
     ok = true;

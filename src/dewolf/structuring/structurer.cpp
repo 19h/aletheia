@@ -7,12 +7,20 @@
 #include "reaching_conditions/reaching_conditions.hpp"
 #include "cbr/cbr.hpp"
 #include "car/car.hpp"
+#include <cstdlib>
 #include <unordered_set>
 #include <string>
 
 namespace dewolf {
 
 namespace {
+
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    std::string v(value);
+    return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES";
+}
 
 std::unordered_set<TransitionBlock*> compute_dominated_region(TransitionCFG& cfg, TransitionBlock* header) {
     std::unordered_set<TransitionBlock*> dominated;
@@ -513,10 +521,16 @@ void AcyclicRegionRestructurer::restructure_region(TransitionCFG* t_cfg, Transit
     }
 
     // 4. Condition-Based Refinement (CBR) - De Morgan's Law Application & Branch Synthesis
-    AstNode* cbr_root = ConditionBasedRefinement::refine(arena_, ctx, seq, reaching_conditions);
+    AstNode* cbr_root = seq;
+    if (!env_flag_enabled("DEWOLF_DISABLE_CBR")) {
+        cbr_root = ConditionBasedRefinement::refine(arena_, ctx, seq, reaching_conditions);
+    }
 
     // 5. Condition-Aware Refinement (CAR) - Switch Statement Extraction
-    AstNode* car_root = ConditionAwareRefinement::refine(arena_, ctx, cbr_root, reaching_conditions);
+    AstNode* car_root = cbr_root;
+    if (!env_flag_enabled("DEWOLF_DISABLE_CAR")) {
+        car_root = ConditionAwareRefinement::refine(arena_, ctx, cbr_root, reaching_conditions);
+    }
 
     header->set_ast_node(car_root);
 }
