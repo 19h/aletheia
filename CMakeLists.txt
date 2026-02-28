@@ -5,26 +5,20 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ── Aggressive Optimizations ────────────────────────────────────────────
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    add_compile_options(
-        $<$<CONFIG:Release>:-O3>
-        $<$<CONFIG:Release>:-march=native>
-        $<$<CONFIG:Release>:-funroll-loops>
-        $<$<CONFIG:Release>:-fomit-frame-pointer>
-        $<$<CONFIG:Release>:-ftree-vectorize>
-        $<$<CONFIG:Release>:-fvisibility=hidden>
-        $<$<CONFIG:Release>:-fvisibility-inlines-hidden>
-    )
+# ── Linker Optimization ────────────────────────────────────────────────
+if(APPLE)
+    # Apple's default linker is incredibly slow for massive static libraries like Z3.
+    # We attempt to use the new optimized linker in recent Xcode tools.
+    add_link_options(-Wl,-ld_new)
 endif()
 
-# Enable LTO/IPO for release builds globally
-cmake_policy(SET CMP0069 NEW)
-include(CheckIPOSupported)
-check_ipo_supported(RESULT lto_supported)
-if(lto_supported)
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+
+# ── Standard Optimizations ────────────────────────────────────────────
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options($<$<CONFIG:Release>:-O3>)
 endif()
+
+
 
 
 include(FetchContent)
@@ -42,7 +36,7 @@ FetchContent_MakeAvailable(idax)
 FetchContent_Declare(
     z3
     GIT_REPOSITORY https://github.com/Z3Prover/z3.git
-    GIT_TAG        z3-4.13.4
+    GIT_TAG        z3-4.16.0
 )
 
 set(Z3_BUILD_LIBZ3_SHARED OFF CACHE BOOL "Build static Z3" FORCE)
@@ -228,7 +222,7 @@ if(IDA_INSTALL_DIR)
             aletheia logos idiomata idax::idax
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDALIB_NAME}"
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDA_NAME}"
-            
+
     )
     target_compile_definitions(aletheia_idalib_test PRIVATE __EA64__ IDALIB_IMPL)
     target_include_directories(aletheia_idalib_test PRIVATE "${IDASDK}/include")
@@ -260,7 +254,7 @@ if(IDA_INSTALL_DIR)
             aletheia logos idiomata idax::idax
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDALIB_NAME}"
             "${IDA_INSTALL_DIR}/${ALETHEIA_IDA_NAME}"
-            
+
     )
     target_compile_definitions(idump PRIVATE __EA64__ IDALIB_IMPL)
     target_include_directories(idump PRIVATE "${IDASDK}/include")
@@ -269,3 +263,4 @@ if(IDA_INSTALL_DIR)
         INSTALL_RPATH "${IDA_INSTALL_DIR}"
     )
 endif()
+

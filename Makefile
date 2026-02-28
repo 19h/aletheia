@@ -23,6 +23,9 @@ debug: .configure-debug
 plugin: .configure-release
 	cmake --build --preset release-optimized --target aletheia_ida
 
+plugin-debug: .configure-debug
+	cmake --build --preset debug --target aletheia_ida
+
 idump: .configure-release
 	cmake --build --preset release-optimized --target idump
 
