@@ -112,6 +112,9 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
     while (!loop_heads.empty()) {
         TransitionBlock* head = loop_heads.back();
         loop_heads.pop_back();
+        if (!head) {
+            continue;
+        }
 
         size_t initial_nodes = cfg.blocks().size();
 
@@ -124,7 +127,11 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         }
         
         TransitionCFG* loop_region = GraphSlice::compute_graph_slice_for_sink_nodes(arena_, &cfg, head, latching_nodes, false);
+        if (!loop_region) {
+            continue;
+        }
         std::unordered_set<TransitionBlock*> region_set(loop_region->blocks().begin(), loop_region->blocks().end());
+        region_set.erase(nullptr);
 
         // 2. Restructure Abnormal Entry (TODO)
         // If there's a retreating edge into head
@@ -135,19 +142,45 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         if (has_retreating) {
             std::unordered_map<TransitionBlock*, std::vector<TransitionEdge*>> entry_edges;
             for (auto* node : region_set) {
+                if (!node) {
+                    continue;
+                }
                 for (auto* e : node->predecessors()) {
+                    if (!e || !e->source()) {
+                        continue;
+                    }
                     if (!region_set.contains(e->source())) {
                         entry_edges[node].push_back(e);
                     }
                 }
             }
 
-            size_t num_entries = entry_edges.size();
+            if (entry_edges.empty()) {
+                // Nothing enters the loop from outside this region; skip abnormal-entry rewriting.
+                goto skip_abnormal_entry;
+            }
+
+            std::vector<TransitionBlock*> ordered_entries;
+            ordered_entries.reserve(entry_edges.size());
+            if (entry_edges.contains(head)) {
+                ordered_entries.push_back(head);
+            }
+            for (auto& pair : entry_edges) {
+                if (pair.first != head) {
+                    ordered_entries.push_back(pair.first);
+                }
+            }
+
+            if (ordered_entries.empty()) {
+                goto skip_abnormal_entry;
+            }
+
+            const size_t num_entries = ordered_entries.size();
             std::string var_name = "entry_" + std::to_string(reinterpret_cast<uintptr_t>(head));
             auto* entry_var = arena_.create<Variable>(var_name, 4); entry_var->set_ir_type(Integer::int32_t());
 
             std::vector<std::pair<TransitionBlock*, dewolf_logic::LogicCondition>> condition_nodes;
-            for (size_t i = 0; i < num_entries - 1; ++i) {
+            for (size_t i = 0; i + 1 < num_entries; ++i) {
                 auto* cond_op = arena_.create<Condition>(OperationType::eq, entry_var, arena_.create<Constant>(i, 4));
                 auto* branch = arena_.create<Branch>(cond_op);
                 auto* bb = arena_.create<BasicBlock>(9000 + i);
@@ -183,6 +216,9 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             // Redirect loop edges (back/retreating) to new_head
             std::vector<TransitionEdge*> loop_edges;
             for (auto* e : head->predecessors()) {
+                if (!e) {
+                    continue;
+                }
                 if (e->property() == EdgeProperty::Back || e->property() == EdgeProperty::Retreating) {
                     loop_edges.push_back(e);
                 }
@@ -195,11 +231,6 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                 cfg.add_edge(src, new_head, tag, prop);
             }
 
-            std::vector<TransitionBlock*> sorted_entries = {head};
-            for (auto& pair : entry_edges) {
-                if (pair.first != head) sorted_entries.push_back(pair.first);
-            }
-
             std::vector<std::pair<TransitionBlock*, dewolf_logic::LogicCondition>> ext_conds = condition_nodes;
             if (!condition_nodes.empty()) {
                 ext_conds.push_back({condition_nodes.back().first, condition_nodes.back().second.negate()});
@@ -208,13 +239,19 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                 // Wait, if num_entries=1, new_head=head, no conditions. We still redirect the entry edges to code_nodes[0] -> head.
             }
 
-            for (size_t i = 0; i < sorted_entries.size(); ++i) {
-                auto* tb = sorted_entries[i];
+            for (size_t i = 0; i < ordered_entries.size(); ++i) {
+                auto* tb = ordered_entries[i];
                 auto* cn = code_nodes[i];
+                if (!tb || !cn) {
+                    continue;
+                }
                 if (i < ext_conds.size()) {
                     cfg.add_edge(ext_conds[i].first, tb, ext_conds[i].second, EdgeProperty::NonLoop);
                 }
                 for (auto* e : entry_edges[tb]) {
+                    if (!e || !e->source()) {
+                        continue;
+                    }
                     auto* src = e->source();
                     auto tag = e->tag();
                     auto prop = e->property();
@@ -223,8 +260,11 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                 }
             }
 
-            for (size_t i = 1; i < sorted_entries.size(); ++i) {
-                auto* tb = sorted_entries[i];
+            for (size_t i = 1; i < ordered_entries.size(); ++i) {
+                auto* tb = ordered_entries[i];
+                if (!tb) {
+                    continue;
+                }
                 auto* assign = arena_.create<Assignment>(entry_var, arena_.create<Constant>(0, 4));
                 
                 auto* ast = tb->ast_node();
@@ -251,12 +291,20 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             for(auto& p : condition_nodes) region_set.insert(p.first);
         }
 
+skip_abnormal_entry:
+
 
         // 3. Compute Loop Successors
         std::vector<TransitionBlock*> loop_successors;
         std::unordered_set<TransitionBlock*> succ_set;
         for (auto* node : loop_region->blocks()) {
+            if (!node) {
+                continue;
+            }
             for (auto* succ : node->successors_blocks()) {
+                if (!succ) {
+                    continue;
+                }
                 if (!region_set.contains(succ) && !succ_set.contains(succ)) {
                     loop_successors.push_back(succ);
                     succ_set.insert(succ);
@@ -324,6 +372,9 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                 
                 std::vector<TransitionEdge*> exit_edges;
                 for(auto* e : tb->predecessors()) {
+                    if (!e || !e->source()) {
+                        continue;
+                    }
                     if (region_set.contains(e->source())) exit_edges.push_back(e);
                 }
                 for (auto* e : exit_edges) {
@@ -342,15 +393,30 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         auto* loop_cfg = arena_.create<TransitionCFG>(arena_);
         std::unordered_map<TransitionBlock*, TransitionBlock*> block_map;
         for (auto* node : loop_region->blocks()) {
+            if (!node) {
+                continue;
+            }
             auto* clone = arena_.create<TransitionBlock>(node->ast_node());
             block_map[node] = clone;
             loop_cfg->add_block(clone);
         }
+        if (!block_map.contains(head) || block_map[head] == nullptr) {
+            continue;
+        }
         loop_cfg->set_entry(block_map[head]);
 
         for (auto* node : loop_region->blocks()) {
+            if (!node) {
+                continue;
+            }
             auto* clone_src = block_map[node];
+            if (!clone_src) {
+                continue;
+            }
             for (auto* e : node->successors()) {
+                if (!e) {
+                    continue;
+                }
                 auto* succ = e->sink();
                 if (succ == head && node != head && region_set.contains(node)) {
                     // Back edge -> Continue node
@@ -368,7 +434,9 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                     loop_cfg->add_edge(clone_src, brk_trans, dewolf_logic::LogicCondition(task_.z3_ctx().bool_val(true)), EdgeProperty::NonLoop);
                 } else if (block_map.contains(succ)) {
                     auto* clone_dst = block_map[succ];
-                    loop_cfg->add_edge(clone_src, clone_dst, e->tag(), e->property());
+                    if (clone_dst) {
+                        loop_cfg->add_edge(clone_src, clone_dst, e->tag(), e->property());
+                    }
                 }
             }
         }
@@ -376,14 +444,20 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         AcyclicRegionRestructurer acyclic(task_);
         acyclic.process(*loop_cfg);
 
+        if (!loop_cfg->entry()) {
+            continue;
+        }
         AstNode* loop_body_ast = loop_cfg->entry()->ast_node();
         auto* endless_loop = arena_.create<WhileLoopNode>(loop_body_ast);
         AstNode* refined = LoopStructurer::refine_loop(arena_, endless_loop);
         head->set_ast_node(refined);
 
         for (auto* succ : loop_successors) {
+            if (!succ) {
+                continue;
+            }
             for (auto* node : loop_region->blocks()) {
-                if (node != head) {
+                if (node && node != head) {
                     cfg.remove_edge_between(node, succ);
                 }
             }
@@ -393,7 +467,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         }
 
         for (auto* node : loop_region->blocks()) {
-            if (node == head) continue;
+            if (!node || node == head) continue;
             // Need to remove edges properly
             std::vector<TransitionEdge*> out_edges = node->successors();
             for (auto* e : out_edges) cfg.remove_edge(e);

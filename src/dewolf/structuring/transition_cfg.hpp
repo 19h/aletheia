@@ -57,13 +57,21 @@ public:
     // Compatibility methods
     std::vector<TransitionBlock*> predecessors_blocks() const {
         std::vector<TransitionBlock*> res;
-        for (auto* e : predecessors_) res.push_back(e->source());
+        for (auto* e : predecessors_) {
+            if (e && e->source()) {
+                res.push_back(e->source());
+            }
+        }
         return res;
     }
 
     std::vector<TransitionBlock*> successors_blocks() const {
         std::vector<TransitionBlock*> res;
-        for (auto* e : successors_) res.push_back(e->sink());
+        for (auto* e : successors_) {
+            if (e && e->sink()) {
+                res.push_back(e->sink());
+            }
+        }
         return res;
     }
 
@@ -87,7 +95,12 @@ public:
     void set_entry(TransitionBlock* entry) { entry_ = entry; }
     TransitionBlock* entry() const { return entry_; }
 
-    void add_block(TransitionBlock* block) { blocks_.push_back(block); }
+    void add_block(TransitionBlock* block) {
+        if (!block) {
+            return;
+        }
+        blocks_.push_back(block);
+    }
     
     void remove_block(TransitionBlock* block) {
         blocks_.erase(std::remove(blocks_.begin(), blocks_.end(), block), blocks_.end());
@@ -98,6 +111,9 @@ public:
 
     // Edge management
     TransitionEdge* add_edge(TransitionBlock* src, TransitionBlock* dst, dewolf_logic::LogicCondition tag, std::optional<EdgeProperty> prop = std::nullopt) {
+        if (!src || !dst) {
+            return nullptr;
+        }
         TransitionEdge* edge = arena_.create<TransitionEdge>(src, dst, tag, prop);
         src->add_successor_edge(edge);
         dst->add_predecessor_edge(edge);
@@ -106,6 +122,9 @@ public:
 
     
     void remove_edge_between(TransitionBlock* src, TransitionBlock* dst) {
+        if (!src || !dst) {
+            return;
+        }
         TransitionEdge* to_remove = nullptr;
         for (auto* e : src->successors()) {
             if (e->sink() == dst) {
@@ -117,16 +136,25 @@ public:
     }
 
     void remove_edge(TransitionEdge* edge) {
+        if (!edge || !edge->source() || !edge->sink()) {
+            return;
+        }
         edge->source()->remove_successor_edge(edge);
         edge->sink()->remove_predecessor_edge(edge);
     }
 
     // Utility methods
     std::vector<TransitionEdge*> get_in_edges(TransitionBlock* block) const {
+        if (!block) {
+            return {};
+        }
         return block->predecessors();
     }
-    
+
     std::vector<TransitionEdge*> get_out_edges(TransitionBlock* block) const {
+        if (!block) {
+            return {};
+        }
         return block->successors();
     }
 
@@ -147,11 +175,22 @@ public:
             auto& top = stack.back();
             TransitionBlock* parent = top.first;
             auto& child_idx = top.second;
-            
+            if (!parent) {
+                stack.pop_back();
+                continue;
+            }
+
             auto edges = parent->successors();
             if (child_idx < edges.size()) {
                 TransitionEdge* edge = edges[child_idx++];
+                if (!edge) {
+                    continue;
+                }
                 TransitionBlock* child = edge->sink();
+                if (!child) {
+                    edge->set_property(EdgeProperty::NonLoop);
+                    continue;
+                }
                 
                 if (visited_nodes.contains(child)) {
                     EdgeProperty prop = EdgeProperty::NonLoop;
@@ -194,7 +233,13 @@ public:
         
         std::vector<TransitionBlock*> loop_heads;
         for (auto* node : post_order) {
+            if (!node) {
+                continue;
+            }
             for (auto* e : node->predecessors()) {
+                if (!e) {
+                    continue;
+                }
                 if (e->property() == EdgeProperty::Back || e->property() == EdgeProperty::Retreating) {
                     loop_heads.push_back(node);
                     break;
@@ -213,6 +258,9 @@ public:
         std::vector<TransitionBlock*> stack = {entry_};
         while(!stack.empty()) {
             auto* curr = stack.back(); stack.pop_back();
+            if (!curr) {
+                continue;
+            }
             if (curr == b) return false;
             visited.insert(curr);
             for(auto* succ : curr->successors_blocks()) {

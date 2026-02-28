@@ -208,7 +208,11 @@ void emit_inline_branch_snapshot(
             inlined_blocks);
         lines.push_back(indent_of(indent_level) + "}");
     } else if (auto* indirect = dynamic_cast<dewolf::IndirectBranch*>(tail)) {
-        lines.push_back(indent_of(indent_level) + "/* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
+        const bool constant_target = dynamic_cast<dewolf::Constant*>(indirect->expression()) != nullptr;
+        const bool single_successor = block->successors().size() == 1;
+        if (!(constant_target && single_successor)) {
+            lines.push_back(indent_of(indent_level) + "/* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
+        }
         for (dewolf::Edge* edge : block->successors()) {
             emit_inline_branch_snapshot(
                 edge ? edge->target() : nullptr,
@@ -328,7 +332,11 @@ std::vector<std::string> generate_cfg_fallback_code(dewolf::DecompilerTask& task
                     lines.push_back("            /* else -> " + block_label(false_edge ? false_edge->target() : nullptr) + " */");
                     lines.push_back("        }");
                 } else if (auto* indirect = dynamic_cast<dewolf::IndirectBranch*>(tail)) {
-                    lines.push_back("        /* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
+                    const bool constant_target = dynamic_cast<dewolf::Constant*>(indirect->expression()) != nullptr;
+                    const bool single_successor = block->successors().size() == 1;
+                    if (!(constant_target && single_successor)) {
+                        lines.push_back("        /* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
+                    }
                 }
 
                 lines.push_back("");
@@ -351,6 +359,8 @@ dewolf::DecompilerPipeline build_pipeline(bool enable_structuring) {
     pipeline.add_stage(std::make_unique<dewolf::CoherenceStage>());
 
     if (!enable_structuring) {
+        pipeline.add_stage(std::make_unique<dewolf::GraphExpressionFoldingStage>());
+        pipeline.add_stage(std::make_unique<dewolf::ExpressionSimplificationStage>());
         return pipeline;
     }
 

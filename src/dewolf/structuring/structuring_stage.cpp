@@ -1,11 +1,20 @@
 #include "../../dewolf_logic/z3_logic.hpp"
 #include "structuring_stage.hpp"
 #include "condition_handler.hpp"
+#include <cstdlib>
+#include <iostream>
 #include <unordered_map>
 
 namespace dewolf {
 
 namespace {
+
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    std::string_view v{value};
+    return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES";
+}
 
 Expression* switch_selector_expression(BasicBlock* bb) {
     if (!bb || bb->instructions().empty()) {
@@ -90,14 +99,35 @@ std::unordered_map<Edge*, dewolf_logic::LogicCondition> build_switch_edge_tags_f
 } // namespace
 
 void PatternIndependentRestructuringStage::execute(DecompilerTask& task) {
+    const bool trace = env_flag_enabled("DEWOLF_STRUCT_TRACE");
+    const bool disable_cyclic = env_flag_enabled("DEWOLF_DISABLE_CYCLIC");
+    const bool disable_acyclic = env_flag_enabled("DEWOLF_DISABLE_ACYCLIC");
+
+    if (trace) {
+        std::cerr << "[Struct] begin execute\n";
+    }
+
     TransitionCFG tcfg(task.arena());
     build_initial_transition_cfg(task, tcfg);
+    if (trace) {
+        std::cerr << "[Struct] built initial transition cfg\n";
+    }
 
-    CyclicRegionFinder cyclic_finder(task);
-    cyclic_finder.process(tcfg);
+    if (!disable_cyclic) {
+        CyclicRegionFinder cyclic_finder(task);
+        cyclic_finder.process(tcfg);
+        if (trace) {
+            std::cerr << "[Struct] finished cyclic finder\n";
+        }
+    }
 
-    AcyclicRegionRestructurer acyclic_restructurer(task);
-    acyclic_restructurer.process(tcfg);
+    if (!disable_acyclic) {
+        AcyclicRegionRestructurer acyclic_restructurer(task);
+        acyclic_restructurer.process(tcfg);
+        if (trace) {
+            std::cerr << "[Struct] finished acyclic restructurer\n";
+        }
+    }
 
     auto forest = std::make_unique<AbstractSyntaxForest>();
     if (tcfg.entry()) {
@@ -109,6 +139,10 @@ void PatternIndependentRestructuringStage::execute(DecompilerTask& task) {
         forest->set_root(root);
     }
     task.set_ast(std::move(forest));
+
+    if (trace) {
+        std::cerr << "[Struct] end execute\n";
+    }
 }
 
 void PatternIndependentRestructuringStage::build_initial_transition_cfg(DecompilerTask& task, TransitionCFG& tcfg) {

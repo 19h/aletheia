@@ -11,6 +11,9 @@ std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> ReachingCondi
     TransitionCFG* original_cfg
 ) {
     std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> reaching_conditions;
+    if (!graph_slice || !src) {
+        return reaching_conditions;
+    }
 
     // Start with True for the source node
     reaching_conditions.insert({src, dewolf_logic::LogicCondition(ctx.bool_val(true))});
@@ -20,11 +23,20 @@ std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> ReachingCondi
     std::unordered_map<TransitionBlock*, int> in_degree;
 
     for (TransitionBlock* node : graph_slice->blocks()) {
+        if (!node) {
+            continue;
+        }
         in_degree[node] = 0;
     }
 
     for (TransitionBlock* node : graph_slice->blocks()) {
+        if (!node) {
+            continue;
+        }
         for (TransitionEdge* edge : node->successors()) {
+            if (!edge) {
+                continue;
+            }
             TransitionBlock* succ = edge->sink();
             if (in_degree.contains(succ)) {
                 in_degree[succ]++;
@@ -40,9 +52,15 @@ std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> ReachingCondi
     while (!q.empty()) {
         TransitionBlock* u = q.front();
         q.pop();
+        if (!u) {
+            continue;
+        }
         topo_order.push_back(u);
 
         for (TransitionEdge* edge : u->successors()) {
+            if (!edge) {
+                continue;
+            }
             TransitionBlock* v = edge->sink();
             if (in_degree.contains(v)) {
                 in_degree[v]--;
@@ -55,12 +73,15 @@ std::unordered_map<TransitionBlock*, dewolf_logic::LogicCondition> ReachingCondi
 
     // Propagate conditions
     for (TransitionBlock* node : topo_order) {
-        if (node == src) continue;
+        if (!node || node == src) continue;
 
         z3::expr node_cond = ctx.bool_val(false);
         bool has_preds = false;
 
         for (TransitionEdge* edge : node->predecessors()) {
+            if (!edge) {
+                continue;
+            }
             TransitionBlock* pred = edge->source();
             if (reaching_conditions.contains(pred)) {
                 // The edge tag holds the condition!
