@@ -548,6 +548,7 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
     pipeline.add_stage(std::make_unique<aletheia::EdgePrunerStage>());
     pipeline.add_stage(std::make_unique<aletheia::PhiFunctionFixerStage>());
     pipeline.add_stage(std::make_unique<aletheia::SsaDestructor>());
+    pipeline.add_stage(std::make_unique<aletheia::EmptyBasicBlockRemoverStage>());
     pipeline.add_stage(std::make_unique<aletheia::PatternIndependentRestructuringStage>());
     pipeline.add_stage(std::make_unique<aletheia::AstExpressionSimplificationStage>());
     return pipeline;

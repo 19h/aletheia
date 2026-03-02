@@ -1887,3 +1887,80 @@ void CoherenceStage::execute(DecompilerTask& task) {
 }
 
 } // namespace aletheia
+
+// =============================================================================
+// EmptyBasicBlockRemoverStage
+// =============================================================================
+// Removes empty basic blocks from the CFG, redirecting predecessors to successors.
+// An empty basic block has no instructions and exactly one unconditional successor.
+
+void aletheia::EmptyBasicBlockRemoverStage::execute(DecompilerTask& task) {
+    ControlFlowGraph* cfg = task.cfg();
+    if (!cfg) return;
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        
+        std::vector<BasicBlock*> to_remove;
+        
+        auto postorder = cfg->post_order();
+        for (BasicBlock* block : postorder) {
+            if (!block->instructions().empty()) continue;
+            
+            if (block->successors().size() > 1) continue;
+            
+            if (block->successors().empty()) {
+                bool all_unconditional = true;
+                for (Edge* pred_edge : block->predecessors()) {
+                    if (pred_edge->source()->successors().size() > 1) {
+                        all_unconditional = false;
+                        break;
+                    }
+                }
+                if (all_unconditional) {
+                    to_remove.push_back(block);
+                }
+                continue;
+            }
+            
+            BasicBlock* succ = block->successors().front()->target();
+            if (succ == block) continue; 
+            
+            to_remove.push_back(block);
+        }
+        
+        for (BasicBlock* block : to_remove) {
+            if (block->successors().empty()) {
+                std::unordered_set<BasicBlock*> dead = {block};
+                cfg->remove_nodes_from(dead);
+                if (cfg->entry_block() == block) cfg->set_entry_block(nullptr);
+                changed = true;
+                continue;
+            }
+            
+            BasicBlock* succ = block->successors().front()->target();
+            
+            std::vector<Edge*> preds = block->predecessors(); 
+            for (Edge* pred_edge : preds) {
+                BasicBlock* pred = pred_edge->source();
+                
+                bool has_edge = false;
+                for (Edge* e : pred->successors()) {
+                    if (e->target() == succ) { has_edge = true; break; }
+                }
+                
+                if (!has_edge) {
+                    auto* new_edge = task.arena().create<Edge>(pred, succ, pred_edge->type());
+                    pred->add_successor(new_edge);
+                    succ->add_predecessor(new_edge);
+                }
+            }
+            
+            if (cfg->entry_block() == block) cfg->set_entry_block(succ);
+            std::unordered_set<BasicBlock*> dead = {block};
+            cfg->remove_nodes_from(dead);
+            changed = true;
+        }
+    }
+}

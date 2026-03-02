@@ -58,6 +58,12 @@ public:
     std::vector<std::string> dependencies() const override { return {"SsaConstructor"}; }
 };
 
+class EmptyBasicBlockRemoverStage : public PipelineStage {
+public:
+    const char* name() const override { return "EmptyBasicBlockRemover"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class CoherenceStage : public PipelineStage {
 public:
     const char* name() const override { return "Coherence"; }

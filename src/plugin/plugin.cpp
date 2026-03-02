@@ -109,6 +109,7 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<aletheia::EdgePrunerStage>());
         pipeline.add_stage(std::make_unique<aletheia::PhiFunctionFixerStage>());
         pipeline.add_stage(std::make_unique<aletheia::SsaDestructor>());
+        pipeline.add_stage(std::make_unique<aletheia::EmptyBasicBlockRemoverStage>());
         pipeline.add_stage(std::make_unique<aletheia::PatternIndependentRestructuringStage>());
         pipeline.add_stage(std::make_unique<aletheia::AstExpressionSimplificationStage>());
         

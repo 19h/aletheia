@@ -1,4 +1,22 @@
 #include "optimization_stages.hpp"
+
+namespace {
+aletheia::OperationType flip_comparison(aletheia::OperationType op) {
+    using aletheia::OperationType;
+    switch (op) {
+        case OperationType::lt: return OperationType::gt;
+        case OperationType::le: return OperationType::ge;
+        case OperationType::gt: return OperationType::lt;
+        case OperationType::ge: return OperationType::le;
+        case OperationType::lt_us: return OperationType::gt_us;
+        case OperationType::le_us: return OperationType::ge_us;
+        case OperationType::gt_us: return OperationType::lt_us;
+        case OperationType::ge_us: return OperationType::le_us;
+        default: return op;
+    }
+}
+} // namespace
+
 #include "../../logos/z3_logic.hpp"
 #include "../ssa/dominators.hpp"
 #include <algorithm>
@@ -2427,10 +2445,61 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
         Expression* lhs_expr = op->operands()[0];
         Expression* rhs_expr = op->operands()[1];
 
+        // TermOrder: push constants to the right hand side for commutative operations
+        if (isa<Constant>(lhs_expr) && !isa<Constant>(rhs_expr)) {
+            switch (op->type()) {
+                case OperationType::add:
+                case OperationType::add_float:
+                case OperationType::mul:
+                case OperationType::mul_us:
+                case OperationType::mul_float:
+                case OperationType::bit_and:
+                case OperationType::bit_or:
+                case OperationType::bit_xor:
+                case OperationType::eq:
+                case OperationType::neq:
+                case OperationType::logical_and:
+                case OperationType::logical_or:
+                    std::swap(lhs_expr, rhs_expr);
+                    op->mutable_operands()[0] = lhs_expr;
+                    op->mutable_operands()[1] = rhs_expr;
+                    break;
+                case OperationType::lt:
+                case OperationType::le:
+                case OperationType::gt:
+                case OperationType::ge:
+                case OperationType::lt_us:
+                case OperationType::le_us:
+                case OperationType::gt_us:
+                case OperationType::ge_us: {
+                    std::swap(lhs_expr, rhs_expr);
+                    op->mutable_operands()[0] = lhs_expr;
+                    op->mutable_operands()[1] = rhs_expr;
+                    // For relations represented as Operations rather than Conditions
+                    op->set_type(::flip_comparison(op->type()));
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
         switch (op->type()) {
             case OperationType::add:
                 if (is_constant_value(rhs_expr, 0)) return lhs_expr;
                 if (is_constant_value(lhs_expr, 0)) return rhs_expr;
+                
+                // CollapseAddNeg: x + (-y) -> x - y
+                if (auto* rhs_op = dyn_cast<Operation>(rhs_expr)) {
+                    if (rhs_op->type() == OperationType::negate && rhs_op->operands().size() == 1) {
+                        SmallVector<Expression*, 4> new_ops;
+                        new_ops.push_back(lhs_expr);
+                        new_ops.push_back(rhs_op->operands()[0]);
+                        auto* as_sub = task.arena().create<Operation>(OperationType::sub, std::move(new_ops), op->size_bytes);
+                        as_sub->set_ir_type(op->ir_type());
+                        return simplify_expression_tree(task, as_sub);
+                    }
+                }
                 break;
             case OperationType::mul:
             case OperationType::mul_us:
