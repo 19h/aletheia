@@ -129,8 +129,13 @@ void PatternIndependentRestructuringStage::execute(DecompilerTask& task) {
         }
     }
 
+
     auto forest = std::make_unique<AbstractSyntaxForest>();
     if (tcfg.entry()) {
+        if (getenv("DEBUG_ENTRY")) {
+            std::cerr << "tcfg.entry() AST node present? " << (tcfg.entry()->ast_node() != nullptr) << std::endl;
+            std::cerr << "tcfg blocks size: " << tcfg.blocks().size() << std::endl;
+        }
         forest->set_root(tcfg.entry()->ast_node());
     } else if (task.cfg() && task.cfg()->entry_block()) {
         // Fallback for visualization if tcfg wasn't fully structured

@@ -674,6 +674,13 @@ std::vector<std::string> decompile_function(
 
     if (enable_structuring && !force_structured_output
         && generated_output_too_lossy(lifted_non_control_count, structured_lines)) {
+        if (ea == 0) {
+            std::cerr << "STRUCTURED LINES FOR FUNC 0:" << std::endl;
+            for (const auto& l : structured_lines) {
+                std::cerr << "  " << l << std::endl;
+            }
+        }
+        std::cerr << "FALLING BACK FOR FUNCTION " << std::hex << ea << std::dec << std::endl;
         if (auto rebuilt = regenerate_conservative_fallback(ea, matcher); rebuilt.has_value()) {
             ok = true;
             return *rebuilt;

@@ -255,7 +255,6 @@ add_library(aletheia_core STATIC
     src/aletheia/pipeline/preprocessing_stages.cpp
     src/aletheia/pipeline/optimization_stages.cpp
     src/aletheia/structuring/ast.cpp
-    src/aletheia/structuring/ast_processor.cpp
     src/aletheia/structuring/loop_structurer.cpp
     src/aletheia/structuring/structurer.cpp
     src/aletheia/structuring/structuring_stage.cpp

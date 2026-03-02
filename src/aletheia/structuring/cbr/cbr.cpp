@@ -320,6 +320,10 @@ AstNode* ConditionBasedRefinement::refine(
 
                         SeqNode* true_branch = arena.create<SeqNode>();
                         SeqNode* false_branch = arena.create<SeqNode>();
+                        static int if_count = 0;
+                        if (getenv("DEBUG_EXTRACT")) {
+                            std::cerr << "CBR created IfNode " << ++if_count << "\n";
+                        }
                         
                         while (i < nodes.size()) {
                             AstNode* next_node = nodes[i];

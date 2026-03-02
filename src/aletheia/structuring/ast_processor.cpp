@@ -1,3 +1,5 @@
+#include <iostream>
+#include <cstdlib>
 #include "ast_processor.hpp"
 
 namespace aletheia {
@@ -51,6 +53,16 @@ AstNode* extract_conditional_interruption(DecompilerArena& arena, AstNode* node,
     bool t_ends = ifn->true_branch() && is_interruption(ifn->true_branch());
     bool f_ends = ifn->false_branch() && is_interruption(ifn->false_branch());
 
+
+    if (getenv("DEBUG_EXTRACT")) {
+        std::cerr << "extract_conditional_interruption visited IfNode.\n";
+        std::cerr << "  t_ends=" << t_ends << " f_ends=" << f_ends << "\n";
+        if (ifn->true_branch()) {
+            std::cerr << "  true_branch ends_with_return? " << ifn->true_branch()->does_end_with_return() << "\n";
+            std::cerr << "  true_branch ends_with_break? " << ifn->true_branch()->does_end_with_break() << "\n";
+            std::cerr << "  is_interruption(true_branch)? " << is_interruption(ifn->true_branch()) << "\n";
+        }
+    }
     if (t_ends == f_ends) {
         return node;
     }
@@ -201,9 +213,20 @@ AstNode* AstProcessor::remove_redundant_continue_at_end_of_sequence(DecompilerAr
 AstNode* AstProcessor::combine_cascading_breaks(DecompilerArena& arena, AstNode* root) {
     return rewrite_ast(arena, root, [&](AstNode* node) -> AstNode* {
         if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
-            if (ifn->true_branch() && ifn->true_branch()->is_break_node() &&
-                ifn->false_branch() && ifn->false_branch()->is_break_node()) {
-                return arena.create<BreakNode>();
+            // Check if BOTH branches eventually end with a break.
+            // If they do, and neither does anything else, we can merge them.
+            // A more robust check: does_end_with_break() on both.
+            if (ifn->true_branch() && ifn->true_branch()->does_end_with_break() &&
+                ifn->false_branch() && ifn->false_branch()->does_end_with_break()) {
+                
+                // If they are pure breaks (or break conditions), we replace with a BreakNode.
+                // For simplicity, we just return the true_branch which is a break.
+                // But wait, if they contain logic, we can't just drop it.
+                // Let's just create a generic BreakNode and rely on CodeVisitor to ignore it if unhandled,
+                // BUT CodeVisitor doesn't handle BreakNode. So we should return the true branch if it's purely a break.
+                if (ifn->true_branch()->is_break_node() && ifn->false_branch()->is_break_node()) {
+                    return ifn->true_branch();
+                }
             }
         }
         return node;
@@ -211,7 +234,26 @@ AstNode* AstProcessor::combine_cascading_breaks(DecompilerArena& arena, AstNode*
 }
 
 AstNode* AstProcessor::sort_sequence_node_children_while_over_do_while(DecompilerArena& arena, AstNode* root) {
-    return root;
+    return rewrite_ast(arena, root, [&](AstNode* node) -> AstNode* {
+        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+            if (seq->empty()) return seq;
+            
+            auto& children = seq->mutable_nodes();
+            for (auto it = children.begin(); it != children.end(); ++it) {
+                if (auto* ifn = ast_dyn_cast<IfNode>(*it)) {
+                    // Check if it's a break condition: single branch, ending with break
+                    if (ifn->true_branch() && ifn->true_branch()->does_end_with_break() && !ifn->false_branch()) {
+                        // Float it to the front
+                        AstNode* break_cond = *it;
+                        children.erase(it);
+                        children.insert(children.begin(), break_cond);
+                        break;
+                    }
+                }
+            }
+        }
+        return node;
+    });
 }
 
 AstNode* AstProcessor::preprocess_loop(DecompilerArena& arena, AstNode* root) {
@@ -235,6 +277,9 @@ AstNode* AstProcessor::preprocess_acyclic(DecompilerArena& arena, AstNode* root)
 }
 
 AstNode* AstProcessor::postprocess_acyclic(DecompilerArena& arena, AstNode* root) {
+    if (getenv("DEBUG_EXTRACT")) {
+        std::cerr << "postprocess_acyclic called\n";
+    }
     root = clean_node(arena, root);
     root = combine_cascading_breaks(arena, root);
     root = extract_conditional_breaks(arena, root);
