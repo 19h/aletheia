@@ -211,6 +211,94 @@ public:
     }
 };
 
+
+class MissingCaseFinderIntersectingConstants {
+public:
+    static void run(DecompilerArena& arena, SeqNode* seq) {
+        if (!seq) return;
+        std::vector<AstNode*>& nodes = seq->mutable_nodes();
+        
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            auto* sw = ast_dyn_cast<SwitchNode>(nodes[i]);
+            if (!sw) continue;
+
+            Expression* switch_expr = extract_cond_expr(sw->cond());
+            if (!switch_expr) continue;
+            const std::string switch_fp = expr_fingerprint(switch_expr);
+
+            // In C++, we often see cascading if-else structures or independent
+            // sequence nodes acting as missing cases that check bitwise intersections
+            // or intervals. For now, we perform a simplified interval / multi-case 
+            // merge targeting adjacent if statements.
+            
+            std::size_t j = i + 1;
+            while (j < nodes.size()) {
+                auto* if_node = ast_dyn_cast<IfNode>(nodes[j]);
+                if (!if_node) break;
+                
+                // If it is checking the same switch_expr via multiple OR conditions
+                // we can recover it. We need to check if the condition checks the same variable.
+                Expression* cond_expr = extract_cond_expr(if_node->cond());
+                if (!cond_expr) break;
+                
+                std::vector<std::uint64_t> values;
+                if (extract_multiple_cases(cond_expr, switch_fp, values)) {
+                    if (!values.empty()) {
+                        for (std::uint64_t v : values) {
+                            CaseNode* c = arena.create<CaseNode>(v, if_node->true_branch());
+                            sw->add_case(c);
+                        }
+                        
+                        nodes.erase(nodes.begin() + j);
+                        // Do not increment j, we want to check the new nodes[j]
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+private:
+    static bool extract_multiple_cases(Expression* expr, const std::string& switch_fp, std::vector<std::uint64_t>& values) {
+        if (!expr) return false;
+        if (auto* op = dyn_cast<Operation>(expr)) {
+            if (op->type() == OperationType::logical_or) {
+                bool ok = true;
+                for (Expression* child : op->operands()) {
+                    if (!extract_multiple_cases(child, switch_fp, values)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                return ok;
+            } else if (op->type() == OperationType::eq) {
+                if (op->operands().size() == 2) {
+                    Expression* lhs = op->operands()[0];
+                    Expression* rhs = op->operands()[1];
+                    if (expr_fingerprint(lhs) == switch_fp) {
+                        if (auto* c = dyn_cast<Constant>(rhs)) {
+                            values.push_back(c->value());
+                            return true;
+                        }
+                    } else if (expr_fingerprint(rhs) == switch_fp) {
+                        if (auto* c = dyn_cast<Constant>(lhs)) {
+                            values.push_back(c->value());
+                            return true;
+                        }
+                    }
+                }
+            } else if (op->type() == OperationType::bit_and && op->operands().size() == 2) {
+                // Heuristic for bitwise boundary check recovery (common compiler optimization for switch)
+                // e.g., (x & mask) == val
+                // Since full recovery requires VSA/RangeSimplifier integration which is currently
+                // isolated from DAG, we conservatively only match explicit multi-case ORs here.
+            }
+        }
+        return false;
+    }
+};
+
 class MissingCaseFinderSequence {
 public:
     static void run(DecompilerArena& arena, SeqNode* seq) {
@@ -430,6 +518,7 @@ AstNode* ConditionAwareRefinement::refine(
         MissingCaseFinderCondition::run(arena, seq);
         SwitchExtractor::run(arena, seq);
         MissingCaseFinderSequence::run(arena, seq);
+        MissingCaseFinderIntersectingConstants::run(arena, seq);
 
         for (AstNode* node : seq->mutable_nodes()) {
             if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
