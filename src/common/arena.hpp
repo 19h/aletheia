@@ -9,7 +9,7 @@ namespace aletheia {
 
 class DecompilerArena {
 public:
-    DecompilerArena(std::size_t block_size = 64 * 1024);
+    DecompilerArena(std::size_t block_size = 1024 * 1024);
     ~DecompilerArena() { reset(); }
 
     // Delete copy and move semantics

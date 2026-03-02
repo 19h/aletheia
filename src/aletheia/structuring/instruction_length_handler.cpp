@@ -89,9 +89,10 @@ private:
         }
     }
 
+    template <typename OperandContainer>
     void simplify_operand_list(
         Instruction* owner,
-        std::vector<Expression*>& operands,
+        OperandContainer& operands,
         std::size_t target_bound,
         std::vector<Instruction*>& out) {
         if (!owner) return;

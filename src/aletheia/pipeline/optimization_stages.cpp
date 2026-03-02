@@ -65,11 +65,15 @@ static bool contains_variable_ptr(Expression* expr, Variable* target) {
     return false;
 }
 
-static Expression* replace_variable_ptr(
-    DecompilerArena& arena, Expression* expr,
-    Variable* target, Expression* replacement) {
+/// In-place variable replacement in an expression tree.
+/// Mutates operand pointers directly instead of creating new nodes.
+/// Returns the (possibly different) root: only different when the root
+/// itself is the target variable.
+static Expression* replace_variable_in_place(
+    Expression* expr, Variable* target, Expression* replacement) {
     if (!expr) return nullptr;
 
+    // Leaf: Variable — check if name+SSA match
     if (auto* v = dyn_cast<Variable>(expr)) {
         if (v->name() == target->name() &&
             v->ssa_version() == target->ssa_version()) {
@@ -78,48 +82,39 @@ static Expression* replace_variable_ptr(
         return v;
     }
 
-    if (auto* c = dyn_cast<Constant>(expr)) {
-        return c;
+    // Leaf: Constant — unchanged
+    if (isa<Constant>(expr)) {
+        return expr;
     }
 
-    if (auto* cond = dyn_cast<Condition>(expr)) {
-        Expression* new_lhs = replace_variable_ptr(arena, cond->lhs(), target, replacement);
-        Expression* new_rhs = replace_variable_ptr(arena, cond->rhs(), target, replacement);
-        if (new_lhs != cond->lhs() || new_rhs != cond->rhs()) {
-            return arena.create<Condition>(cond->type(), new_lhs, new_rhs, cond->size_bytes);
-        }
-        return cond;
-    }
-
+    // Operation (includes Condition and Call) — mutate operands in-place
     if (auto* op = dyn_cast<Operation>(expr)) {
-        std::vector<Expression*> new_operands;
-        bool changed = false;
-        for (auto* child : op->operands()) {
-            Expression* new_child = replace_variable_ptr(arena, child, target, replacement);
-            if (new_child != child) changed = true;
-            new_operands.push_back(new_child);
-        }
-        if (changed) {
-            return arena.create<Operation>(op->type(), std::move(new_operands), op->size_bytes);
+        auto& ops = op->mutable_operands();
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            ops[i] = replace_variable_in_place(ops[i], target, replacement);
         }
         return op;
     }
 
+    // ListOperation — mutate operands in-place
     if (auto* list = dyn_cast<ListOperation>(expr)) {
-        std::vector<Expression*> new_operands;
-        bool changed = false;
-        for (auto* child : list->operands()) {
-            Expression* new_child = replace_variable_ptr(arena, child, target, replacement);
-            if (new_child != child) changed = true;
-            new_operands.push_back(new_child);
-        }
-        if (changed) {
-            return arena.create<ListOperation>(std::move(new_operands), list->size_bytes);
+        auto& ops = list->mutable_operands();
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            ops[i] = replace_variable_in_place(ops[i], target, replacement);
         }
         return list;
     }
 
     return expr;
+}
+
+/// Backward-compatible wrapper that preserves the original API signature.
+/// The arena parameter is retained for call-site compatibility but is no
+/// longer used (in-place mutation eliminates all node allocation).
+static Expression* replace_variable_ptr(
+    DecompilerArena& /*arena*/, Expression* expr,
+    Variable* target, Expression* replacement) {
+    return replace_variable_in_place(expr, target, replacement);
 }
 
 // =============================================================================
@@ -507,53 +502,44 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                     Expression* replacement = def->value();
                     if (!replacement) continue;
 
-                    // Perform the substitution on the instruction
+                    // Perform in-place substitution on the instruction.
+                    // replace_variable_in_place mutates operand pointers
+                    // directly, so only the root return value differs when
+                    // the root itself is a matching variable.
                     bool changed = false;
 
                     if (auto* assign = dyn_cast<Assignment>(inst)) {
-                        Expression* new_val = replace_variable_ptr(
-                            task.arena(), assign->value(), req_var, replacement);
-                        if (new_val != assign->value()) {
+                        if (contains_variable_ptr(assign->value(), req_var)) {
+                            Expression* new_val = replace_variable_in_place(
+                                assign->value(), req_var, replacement);
                             assign->set_value(new_val);
                             changed = true;
                         }
                         // Also propagate into complex destinations (e.g., *(ptr+off) = val)
-                        if (!isa<Variable>(assign->destination())) {
-                            Expression* new_dest = replace_variable_ptr(
-                                task.arena(), assign->destination(), req_var, replacement);
-                            if (new_dest != assign->destination()) {
-                                assign->set_destination(new_dest);
-                                changed = true;
-                            }
+                        if (!isa<Variable>(assign->destination()) &&
+                            contains_variable_ptr(assign->destination(), req_var)) {
+                            Expression* new_dest = replace_variable_in_place(
+                                assign->destination(), req_var, replacement);
+                            assign->set_destination(new_dest);
+                            changed = true;
                         }
                     } else if (auto* branch = dyn_cast<Branch>(inst)) {
                         Condition* cond = branch->condition();
-                        Expression* new_lhs = replace_variable_ptr(
-                            task.arena(), cond->lhs(), req_var, replacement);
-                        Expression* new_rhs = replace_variable_ptr(
-                            task.arena(), cond->rhs(), req_var, replacement);
-                        if (new_lhs != cond->lhs() || new_rhs != cond->rhs()) {
-                            auto* new_cond = task.arena().create<Condition>(
-                                cond->type(), new_lhs, new_rhs, cond->size_bytes);
-                            branch->set_condition(new_cond);
+                        if (cond && contains_variable_ptr(cond, req_var)) {
+                            // Mutate condition operands in-place; only need
+                            // new Condition if the root variable is replaced
+                            // (which can't happen — Condition is not a Variable)
+                            replace_variable_in_place(cond, req_var, replacement);
                             changed = true;
                         }
                     } else if (auto* ret = dyn_cast<Return>(inst)) {
-                        // Return stores values directly; we need to rebuild
-                        std::vector<Expression*> new_vals;
-                        bool ret_changed = false;
-                        for (auto* val : ret->values()) {
-                            Expression* new_val = replace_variable_ptr(
-                                task.arena(), val, req_var, replacement);
-                            if (new_val != val) ret_changed = true;
-                            new_vals.push_back(new_val);
-                        }
-                        if (ret_changed) {
-                            auto* new_ret = task.arena().create<Return>(std::move(new_vals));
-                            new_ret->set_address(ret->address());
-                            instrs[idx] = new_ret;
-                            inst = new_ret;
-                            changed = true;
+                        auto& vals = ret->mutable_values();
+                        for (std::size_t vi = 0; vi < vals.size(); ++vi) {
+                            if (contains_variable_ptr(vals[vi], req_var)) {
+                                vals[vi] = replace_variable_in_place(
+                                    vals[vi], req_var, replacement);
+                                changed = true;
+                            }
                         }
                     }
 
@@ -951,44 +937,36 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
 
                     if (!safe) continue;
 
-                    // Perform substitution
+                    // Perform in-place substitution
                     Expression* replacement = def->value();
                     bool sub_changed = false;
 
                     if (auto* assign = dyn_cast<Assignment>(inst)) {
-                        Expression* new_val = replace_variable_ptr(task.arena(), assign->value(), req_var, replacement);
-                        if (new_val != assign->value()) {
-                            assign->set_value(new_val);
+                        if (contains_variable_ptr(assign->value(), req_var)) {
+                            assign->set_value(replace_variable_in_place(
+                                assign->value(), req_var, replacement));
                             sub_changed = true;
                         }
-                        if (!isa<Variable>(assign->destination())) {
-                            Expression* new_dest = replace_variable_ptr(task.arena(), assign->destination(), req_var, replacement);
-                            if (new_dest != assign->destination()) {
-                                assign->set_destination(new_dest);
-                                sub_changed = true;
-                            }
+                        if (!isa<Variable>(assign->destination()) &&
+                            contains_variable_ptr(assign->destination(), req_var)) {
+                            assign->set_destination(replace_variable_in_place(
+                                assign->destination(), req_var, replacement));
+                            sub_changed = true;
                         }
                     } else if (auto* branch = dyn_cast<Branch>(inst)) {
                         Condition* cond = branch->condition();
-                        Expression* new_lhs = replace_variable_ptr(task.arena(), cond->lhs(), req_var, replacement);
-                        Expression* new_rhs = replace_variable_ptr(task.arena(), cond->rhs(), req_var, replacement);
-                        if (new_lhs != cond->lhs() || new_rhs != cond->rhs()) {
-                            auto* new_cond = task.arena().create<Condition>(cond->type(), new_lhs, new_rhs, cond->size_bytes);
-                            branch->set_condition(new_cond);
+                        if (cond && contains_variable_ptr(cond, req_var)) {
+                            replace_variable_in_place(cond, req_var, replacement);
                             sub_changed = true;
                         }
                     } else if (auto* ret = dyn_cast<Return>(inst)) {
-                        std::vector<Expression*> new_vals;
-                        for (auto* val : ret->values()) {
-                            Expression* new_val = replace_variable_ptr(task.arena(), val, req_var, replacement);
-                            if (new_val != val) sub_changed = true;
-                            new_vals.push_back(new_val);
-                        }
-                        if (sub_changed) {
-                            auto* new_ret = task.arena().create<Return>(std::move(new_vals));
-                            new_ret->set_address(ret->address());
-                            instrs[i] = new_ret;
-                            inst = new_ret;
+                        auto& vals = ret->mutable_values();
+                        for (std::size_t vi = 0; vi < vals.size(); ++vi) {
+                            if (contains_variable_ptr(vals[vi], req_var)) {
+                                vals[vi] = replace_variable_in_place(
+                                    vals[vi], req_var, replacement);
+                                sub_changed = true;
+                            }
                         }
                     }
 

@@ -1,6 +1,7 @@
 #pragma once
 #include "../../common/arena_allocated.hpp"
 #include "../../common/arena.hpp"
+#include "../../common/small_vector.hpp"
 #include "../../common/types.hpp"
 #include "types.hpp"
 #include <cstdint>
@@ -532,7 +533,14 @@ struct ArrayAccessInfo {
 
 class Operation : public Expression {
 public:
-    Operation(OperationType type, std::vector<Expression*> operands, std::size_t size)
+    Operation(OperationType type, SmallVector<Expression*, 4> operands, std::size_t size)
+        : type_(type), operands_(std::move(operands)) {
+        this->node_kind_ = NodeKind::Operation;
+        this->size_bytes = size;
+    }
+
+    // Backward compat: accept std::vector rvalue (e.g. from lifter/copy code)
+    Operation(OperationType type, std::vector<Expression*>&& operands, std::size_t size)
         : type_(type), operands_(std::move(operands)) {
         this->node_kind_ = NodeKind::Operation;
         this->size_bytes = size;
@@ -549,7 +557,7 @@ public:
     }
 
     Expression* copy(DecompilerArena& arena) const override {
-        std::vector<Expression*> new_ops;
+        SmallVector<Expression*, 4> new_ops;
         new_ops.reserve(operands_.size());
         for (auto* op : operands_) {
             new_ops.push_back(op ? op->copy(arena) : nullptr);
@@ -585,15 +593,15 @@ public:
 
     OperationType type() const { return type_; }
     void set_type(OperationType t) { type_ = t; }
-    const std::vector<Expression*>& operands() const { return operands_; }
-    std::vector<Expression*>& mutable_operands() { return operands_; }
+    const SmallVector<Expression*, 4>& operands() const { return operands_; }
+    SmallVector<Expression*, 4>& mutable_operands() { return operands_; }
     const std::optional<ArrayAccessInfo>& array_access() const { return array_access_; }
     void set_array_access(ArrayAccessInfo info) { array_access_ = std::move(info); }
     void clear_array_access() { array_access_.reset(); }
 
 private:
     OperationType type_;
-    std::vector<Expression*> operands_;
+    SmallVector<Expression*, 4> operands_;
     std::optional<ArrayAccessInfo> array_access_;
 };
 
@@ -603,7 +611,14 @@ private:
 
 class ListOperation : public Expression {
 public:
-    explicit ListOperation(std::vector<Expression*> operands, std::size_t size = 0)
+    explicit ListOperation(SmallVector<Expression*, 4> operands, std::size_t size = 0)
+        : operands_(std::move(operands)) {
+        this->node_kind_ = NodeKind::ListOperation;
+        this->size_bytes = size;
+    }
+
+    // Backward compat: accept std::vector rvalue
+    explicit ListOperation(std::vector<Expression*>&& operands, std::size_t size = 0)
         : operands_(std::move(operands)) {
         this->node_kind_ = NodeKind::ListOperation;
         this->size_bytes = size;
@@ -620,7 +635,7 @@ public:
     }
 
     Expression* copy(DecompilerArena& arena) const override {
-        std::vector<Expression*> new_ops;
+        SmallVector<Expression*, 4> new_ops;
         new_ops.reserve(operands_.size());
         for (auto* op : operands_) {
             new_ops.push_back(op ? op->copy(arena) : nullptr);
@@ -639,14 +654,14 @@ public:
         }
     }
 
-    const std::vector<Expression*>& operands() const { return operands_; }
-    std::vector<Expression*>& mutable_operands() { return operands_; }
+    const SmallVector<Expression*, 4>& operands() const { return operands_; }
+    SmallVector<Expression*, 4>& mutable_operands() { return operands_; }
     bool empty() const { return operands_.empty(); }
     std::size_t size() const { return operands_.size(); }
     Expression* operator[](std::size_t i) const { return operands_[i]; }
 
 private:
-    std::vector<Expression*> operands_;
+    SmallVector<Expression*, 4> operands_;
 };
 
 // =============================================================================
@@ -659,7 +674,7 @@ private:
 class Condition : public Operation {
 public:
     Condition(OperationType cmp_type, Expression* lhs, Expression* rhs, std::size_t size = 1)
-        : Operation(cmp_type, {lhs, rhs}, size) {
+        : Operation(cmp_type, SmallVector<Expression*, 4>{lhs, rhs}, size) {
         this->node_kind_ = NodeKind::Condition;
     }
 
@@ -743,8 +758,8 @@ public:
     Expression* arg(std::size_t i) const { return operands()[i + 1]; }
 
 private:
-    static std::vector<Expression*> build_operands_(Expression* target, std::vector<Expression*> args) {
-        std::vector<Expression*> ops;
+    static SmallVector<Expression*, 4> build_operands_(Expression* target, std::vector<Expression*> args) {
+        SmallVector<Expression*, 4> ops;
         ops.reserve(1 + args.size());
         ops.push_back(target);
         for (auto* a : args) ops.push_back(a);
@@ -1016,7 +1031,13 @@ private:
 
 class Return : public Instruction {
 public:
-    explicit Return(std::vector<Expression*> values = {})
+    explicit Return(SmallVector<Expression*, 2> values = {})
+        : values_(std::move(values)) {
+        this->node_kind_ = NodeKind::Return;
+    }
+
+    // Backward compat: accept std::vector rvalue
+    explicit Return(std::vector<Expression*>&& values)
         : values_(std::move(values)) {
         this->node_kind_ = NodeKind::Return;
     }
@@ -1032,7 +1053,7 @@ public:
     }
 
     Instruction* copy(DecompilerArena& arena) const override {
-        std::vector<Expression*> new_vals;
+        SmallVector<Expression*, 2> new_vals;
         new_vals.reserve(values_.size());
         for (auto* v : values_) {
             new_vals.push_back(v ? v->copy(arena) : nullptr);
@@ -1052,12 +1073,12 @@ public:
         }
     }
 
-    const std::vector<Expression*>& values() const { return values_; }
-    std::vector<Expression*>& mutable_values() { return values_; }
+    const SmallVector<Expression*, 2>& values() const { return values_; }
+    SmallVector<Expression*, 2>& mutable_values() { return values_; }
     bool has_value() const { return !values_.empty(); }
 
 private:
-    std::vector<Expression*> values_;
+    SmallVector<Expression*, 2> values_;
 };
 
 // =============================================================================

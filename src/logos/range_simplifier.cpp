@@ -667,8 +667,16 @@ aletheia::Expression* SingleRangeSimplifier::simplify(
 // =============================================================================
 
 bool BitwiseAndRangeSimplifier::is_unfulfillable(
-    const std::vector<aletheia::Expression*>& and_operands)
+    aletheia::Expression* const* and_data, std::size_t and_count)
 {
+    // Wrap raw pointer+count for range-based iteration
+    struct OperandRange {
+        aletheia::Expression* const* d; std::size_t n;
+        aletheia::Expression* const* begin() const { return d; }
+        aletheia::Expression* const* end() const { return d + n; }
+        std::size_t size() const { return n; }
+    };
+    OperandRange and_operands{and_data, and_count};
     // Build ExpressionValues for each distinct variable expression
     // We use pointer identity for grouping (same Variable* = same variable)
     struct VarInfo {
@@ -735,7 +743,7 @@ aletheia::Expression* BitwiseAndRangeSimplifier::simplify(
 
     // 2. Remove operands that simplified to true (Constant 1)
     auto initial_size = and_operands.size();
-    std::erase_if(and_operands, [](aletheia::Expression* e) {
+    and_operands.erase_if([](aletheia::Expression* e) {
         auto* c = aletheia::dyn_cast<aletheia::Constant>(e);
         return c && c->value() == 1;
     });
@@ -750,7 +758,7 @@ aletheia::Expression* BitwiseAndRangeSimplifier::simplify(
     }
 
     // 4. Check for unfulfillability using the full constraints
-    if (is_unfulfillable(and_operands)) {
+    if (is_unfulfillable(and_operands.data(), and_operands.size())) {
         return arena.create<aletheia::Constant>(0, 1);
     }
 
@@ -895,7 +903,7 @@ aletheia::Expression* BitwiseAndRangeSimplifier::simplify(
         }
         
         if (structure_changed) {
-            return arena.create<aletheia::Operation>(op->type(), new_operands, 1);
+            return arena.create<aletheia::Operation>(op->type(), std::move(new_operands), 1);
         }
         return op;
     }
@@ -921,7 +929,7 @@ aletheia::Expression* BitwiseOrRangeSimplifier::simplify(
         negated_operands.push_back(negated_child);
     }
 
-    auto* new_and_op = arena.create<aletheia::Operation>(aletheia::OperationType::logical_and, negated_operands, 1);
+    auto* new_and_op = arena.create<aletheia::Operation>(aletheia::OperationType::logical_and, std::move(negated_operands), 1);
 
     auto* simplified_and = BitwiseAndRangeSimplifier::simplify(new_and_op, arena);
 
@@ -975,7 +983,7 @@ bool RangeSimplifier::is_unfulfillable(aletheia::Expression* condition) {
             }
         };
         collect(condition);
-        return BitwiseAndRangeSimplifier::is_unfulfillable(all_operands);
+        return BitwiseAndRangeSimplifier::is_unfulfillable(all_operands.data(), all_operands.size());
     }
 
     // If it's a bit_and (bitwise AND used for logic), same treatment
@@ -991,7 +999,7 @@ bool RangeSimplifier::is_unfulfillable(aletheia::Expression* condition) {
             }
         };
         collect(condition);
-        return BitwiseAndRangeSimplifier::is_unfulfillable(all_operands);
+        return BitwiseAndRangeSimplifier::is_unfulfillable(all_operands.data(), all_operands.size());
     }
 
     return false;
@@ -1024,7 +1032,7 @@ aletheia::Expression* RangeSimplifier::simplify(
         }
 
         // Remove operands that simplified to true (Constant 1)
-        std::erase_if(operands, [](aletheia::Expression* e) {
+        operands.erase_if([](aletheia::Expression* e) {
             auto* c = aletheia::dyn_cast<aletheia::Constant>(e);
             return c && c->value() == 1;
         });
@@ -1042,7 +1050,7 @@ aletheia::Expression* RangeSimplifier::simplify(
         if (operands.empty()) return arena.create<aletheia::Constant>(1, 1);
 
         // Check conjunction unfulfillability
-        if (BitwiseAndRangeSimplifier::is_unfulfillable(operands)) {
+        if (BitwiseAndRangeSimplifier::is_unfulfillable(operands.data(), operands.size())) {
             return arena.create<aletheia::Constant>(0, 1);
         }
 
@@ -1062,7 +1070,7 @@ aletheia::Expression* RangeSimplifier::simplify(
         }
 
         // Remove operands that simplified to false (Constant 0)
-        std::erase_if(operands, [](aletheia::Expression* e) {
+        operands.erase_if([](aletheia::Expression* e) {
             auto* c = aletheia::dyn_cast<aletheia::Constant>(e);
             return c && c->value() == 0;
         });

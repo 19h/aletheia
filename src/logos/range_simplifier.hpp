@@ -133,7 +133,7 @@ public:
     /// Attempt to simplify an AND of relations.
     /// Returns true if the conjunction is unfulfillable (the AND should become false).
     /// @param and_operands The operands of the AND operation.
-    static bool is_unfulfillable(const std::vector<aletheia::Expression*>& and_operands);
+    static bool is_unfulfillable(aletheia::Expression* const* data, std::size_t count);
 
     /// Attempt to simplify an AND operation.
     /// Returns a new Expression* (or Constant 0 if unfulfillable)
