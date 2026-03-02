@@ -42,96 +42,321 @@ static VarKey var_key(Variable* v) {
 // Expression tree operations: contains_variable, replace_variable
 // =============================================================================
 
-static bool contains_variable_ptr(Expression* expr, Variable* target) {
-    if (!expr) return false;
-
+/// Helper: check if a Variable matches the target by name + SSA version.
+/// Uses pointer-to-data comparison first (O(1) for SSO and same-pool strings),
+/// then falls back to length+content comparison only when pointers differ.
+static inline bool is_target_var(Expression* expr,
+                                  const std::string& target_name,
+                                  std::size_t target_ssa) {
     if (auto* v = dyn_cast<Variable>(expr)) {
-        return v->name() == target->name() &&
-               v->ssa_version() == target->ssa_version();
+        if (v->ssa_version() != target_ssa) return false;
+        // Fast path: compare string data pointers (works for SSO and interned)
+        const auto& vn = v->name();
+        if (vn.size() != target_name.size()) return false;
+        if (vn.data() == target_name.data()) return true;
+        return vn == target_name;
     }
-
-    if (auto* op = dyn_cast<Operation>(expr)) {
-        for (auto* child : op->operands()) {
-            if (contains_variable_ptr(child, target)) return true;
-        }
-    }
-
-    if (auto* list = dyn_cast<ListOperation>(expr)) {
-        for (auto* child : list->operands()) {
-            if (contains_variable_ptr(child, target)) return true;
-        }
-    }
-
     return false;
 }
 
-/// In-place variable replacement in an expression tree.
-/// Mutates operand pointers directly instead of creating new nodes.
-/// Returns the (possibly different) root: only different when the root
-/// itself is the target variable.
-static Expression* replace_variable_in_place(
-    Expression* expr, Variable* target, Expression* replacement) {
-    if (!expr) return nullptr;
+/// Compute the "weight" (number of unique nodes) in an expression DAG.
+/// Capped at `limit` to avoid traversing huge DAGs.
+/// Uses a visited set to handle shared subtrees correctly.
+static std::size_t expr_weight(Expression* expr, std::size_t limit) {
+    if (!expr || limit == 0) return 0;
 
-    // Leaf: Variable — check if name+SSA match
-    if (auto* v = dyn_cast<Variable>(expr)) {
-        if (v->name() == target->name() &&
-            v->ssa_version() == target->ssa_version()) {
-            return replacement;
+    SmallVector<Expression*, 32> stack;
+    std::unordered_set<Expression*> visited;
+    stack.push_back(expr);
+    visited.insert(expr);
+    std::size_t count = 0;
+
+    while (!stack.empty() && count < limit) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        ++count;
+
+        if (auto* op = dyn_cast<Operation>(node)) {
+            for (auto* child : op->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+        } else if (auto* list = dyn_cast<ListOperation>(node)) {
+            for (auto* child : list->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
         }
-        return v;
     }
-
-    // Leaf: Constant — unchanged
-    if (isa<Constant>(expr)) {
-        return expr;
-    }
-
-    // Operation (includes Condition and Call) — mutate operands in-place
-    if (auto* op = dyn_cast<Operation>(expr)) {
-        auto& ops = op->mutable_operands();
-        for (std::size_t i = 0; i < ops.size(); ++i) {
-            ops[i] = replace_variable_in_place(ops[i], target, replacement);
-        }
-        return op;
-    }
-
-    // ListOperation — mutate operands in-place
-    if (auto* list = dyn_cast<ListOperation>(expr)) {
-        auto& ops = list->mutable_operands();
-        for (std::size_t i = 0; i < ops.size(); ++i) {
-            ops[i] = replace_variable_in_place(ops[i], target, replacement);
-        }
-        return list;
-    }
-
-    return expr;
+    return count;
 }
 
-/// Backward-compatible wrapper that preserves the original API signature.
-/// The arena parameter is retained for call-site compatibility but is no
-/// longer used (in-place mutation eliminates all node allocation).
-static Expression* replace_variable_ptr(
-    DecompilerArena& /*arena*/, Expression* expr,
+/// Maximum expression tree weight after propagation.  If substituting
+/// `replacement` into the tree would push it past this, we skip it.
+static constexpr std::size_t MAX_EXPR_WEIGHT = 256;
+
+/// Replace all occurrences of `target` variable with `replacement` in `expr`.
+///
+/// Uses COPY-ON-WRITE with an ITERATIVE WORKLIST (no recursion, no DAG
+/// formation). Each variable match site gets a fresh deep-copy of
+/// `replacement` so expression trees remain true trees (no shared subtrees).
+/// Only nodes on the path from the root to a match are cloned; unchanged
+/// subtrees are shared with the original tree (structurally shared, not
+/// mutated).
+///
+/// Key correctness properties:
+/// - No DAG formation: every substitution copies the replacement, so no
+///   two instructions share the same Operation* node.
+/// - No recursion: uses an explicit parent-tracking worklist.
+/// - No exponential blowup: each node is visited at most once.
+///
+/// Returns: {new_root, did_mutate}. The root may be a new node if any
+/// child on the path from root changed.
+struct ReplaceResult {
+    Expression* root;
+    bool mutated;
+};
+
+static ReplaceResult replace_variable_cow(
+    DecompilerArena& arena, Expression* expr,
     Variable* target, Expression* replacement) {
-    return replace_variable_in_place(expr, target, replacement);
+    if (!expr) return {nullptr, false};
+
+    // Cache target identity for fast comparison
+    const std::string& target_name = target->name();
+    std::size_t target_ssa = target->ssa_version();
+
+    // Fast path: root is the target variable itself
+    if (is_target_var(expr, target_name, target_ssa)) {
+        return {replacement->copy(arena), true};
+    }
+
+    // Leaf: Constant or non-matching Variable — unchanged
+    if (isa<Constant>(expr) || isa<Variable>(expr)) {
+        return {expr, false};
+    }
+
+    // Iterative post-order traversal using an explicit stack.
+    // We process children first, then rebuild the parent only if any child
+    // changed. This is equivalent to recursive copy-on-write but without
+    // stack depth limits.
+    //
+    // Strategy: use a two-pass approach.
+    //  Pass 1: Flatten the tree into post-order (children before parents).
+    //  Pass 2: Process in post-order, building replacements bottom-up.
+
+    // Pass 1: collect unique nodes in pre-order, then reverse for post-order.
+    // Visited set prevents exponential blowup on pre-existing shared DAGs.
+    SmallVector<Expression*, 128> visit_order;
+    SmallVector<Expression*, 128> stack;
+    std::unordered_set<Expression*> visited;
+    stack.push_back(expr);
+    visited.insert(expr);
+    while (!stack.empty()) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        visit_order.push_back(node);
+        if (auto* op = dyn_cast<Operation>(node)) {
+            // Push in reverse so leftmost child is processed first
+            auto& ops = op->operands();
+            for (std::size_t i = ops.size(); i > 0; --i) {
+                if (ops[i-1] && visited.insert(ops[i-1]).second)
+                    stack.push_back(ops[i-1]);
+            }
+        } else if (auto* list = dyn_cast<ListOperation>(node)) {
+            auto& ops = list->operands();
+            for (std::size_t i = ops.size(); i > 0; --i) {
+                if (ops[i-1] && visited.insert(ops[i-1]).second)
+                    stack.push_back(ops[i-1]);
+            }
+        }
+    }
+
+    // Pass 2: process in reverse visit order (post-order: children before parents).
+    // Map each original node to its replacement (or itself if unchanged).
+    std::unordered_map<Expression*, Expression*> remap;
+    bool any_mutated = false;
+
+    for (std::size_t ri = visit_order.size(); ri > 0; --ri) {
+        Expression* node = visit_order[ri - 1];
+
+        // Leaf: Variable match → copy replacement
+        if (is_target_var(node, target_name, target_ssa)) {
+            remap[node] = replacement->copy(arena);
+            any_mutated = true;
+            continue;
+        }
+
+        // Leaf: unchanged
+        if (isa<Constant>(node) || isa<Variable>(node)) {
+            // remap[node] = node; // implicit — absence means unchanged
+            continue;
+        }
+
+        // Interior: Operation (includes Condition, Call)
+        if (auto* op = dyn_cast<Operation>(node)) {
+            bool child_changed = false;
+            SmallVector<Expression*, 4> new_ops;
+            new_ops.reserve(op->operands().size());
+            for (auto* child : op->operands()) {
+                auto rit = remap.find(child);
+                if (rit != remap.end()) {
+                    new_ops.push_back(rit->second);
+                    child_changed = true;
+                } else {
+                    new_ops.push_back(child);
+                }
+            }
+            if (child_changed) {
+                // Check if this is a Condition (needs special constructor)
+                if (auto* cond = dyn_cast<Condition>(node)) {
+                    auto* nc = arena.create<Condition>(
+                        cond->type(), new_ops[0], new_ops[1], cond->size_bytes);
+                    nc->set_ir_type(cond->ir_type());
+                    remap[node] = nc;
+                } else {
+                    auto* nop = arena.create<Operation>(
+                        op->type(), std::move(new_ops), op->size_bytes);
+                    nop->set_ir_type(op->ir_type());
+                    if (op->array_access().has_value())
+                        nop->set_array_access(*op->array_access());
+                    remap[node] = nop;
+                }
+            }
+            continue;
+        }
+
+        // Interior: ListOperation
+        if (auto* list = dyn_cast<ListOperation>(node)) {
+            bool child_changed = false;
+            SmallVector<Expression*, 4> new_ops;
+            new_ops.reserve(list->operands().size());
+            for (auto* child : list->operands()) {
+                auto rit = remap.find(child);
+                if (rit != remap.end()) {
+                    new_ops.push_back(rit->second);
+                    child_changed = true;
+                } else {
+                    new_ops.push_back(child);
+                }
+            }
+            if (child_changed) {
+                auto* nl = arena.create<ListOperation>(
+                    std::move(new_ops), list->size_bytes);
+                nl->set_ir_type(list->ir_type());
+                remap[node] = nl;
+            }
+            continue;
+        }
+    }
+
+    auto root_it = remap.find(expr);
+    if (root_it != remap.end()) {
+        return {root_it->second, true};
+    }
+    return {expr, any_mutated};
+}
+
+/// Backward-compatible wrapper.
+static Expression* replace_variable_ptr(
+    DecompilerArena& arena, Expression* expr,
+    Variable* target, Expression* replacement) {
+    return replace_variable_cow(arena, expr, target, replacement).root;
+}
+
+// =============================================================================
+// Iterative expression-tree walkers (stack-safe on arbitrarily deep DAGs)
+// =============================================================================
+
+/// Collect all Variable* leaves reachable from an expression DAG, iteratively.
+/// This replaces recursive Expression::collect_requirements() in hot paths.
+///
+/// Uses a visited set to prevent exponential blowup on shared DAGs: when
+/// in-place mutation causes the same Operation* to appear as a child of
+/// multiple parents, without deduplication the worklist would re-traverse
+/// shared subtrees O(2^depth) times.
+static void collect_variables_iterative(Expression* expr,
+                                        std::unordered_set<Variable*>& out) {
+    if (!expr) return;
+    SmallVector<Expression*, 64> stack;
+    std::unordered_set<Expression*> visited;
+    stack.push_back(expr);
+    visited.insert(expr);
+    while (!stack.empty()) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (auto* v = dyn_cast<Variable>(node)) {
+            out.insert(v);
+        } else if (auto* op = dyn_cast<Operation>(node)) {
+            for (auto* child : op->operands()) {
+                if (child && visited.insert(child).second) {
+                    stack.push_back(child);
+                }
+            }
+        } else if (auto* list = dyn_cast<ListOperation>(node)) {
+            for (auto* child : list->operands()) {
+                if (child && visited.insert(child).second) {
+                    stack.push_back(child);
+                }
+            }
+        }
+    }
+}
+
+/// Iterative collect_requirements for an Instruction.
+/// Mirrors the semantics of the virtual collect_requirements() but without
+/// recursion, so it's safe on arbitrarily deep expression trees.
+static void collect_requirements_iterative(Instruction* inst,
+                                           std::unordered_set<Variable*>& out) {
+    if (!inst) return;
+
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
+        // RHS is always a requirement
+        collect_variables_iterative(assign->value(), out);
+        // Complex destination (e.g., *(ptr+off) = val): sub-expressions are reqs
+        if (assign->destination() && !isa<Variable>(assign->destination())) {
+            collect_variables_iterative(assign->destination(), out);
+        }
+    } else if (auto* branch = dyn_cast<Branch>(inst)) {
+        collect_variables_iterative(branch->condition(), out);
+    } else if (auto* ret = dyn_cast<Return>(inst)) {
+        for (auto* val : ret->values()) {
+            collect_variables_iterative(val, out);
+        }
+    } else if (auto* rel = dyn_cast<Relation>(inst)) {
+        if (rel->value()) out.insert(rel->value());
+    } else if (auto* ibranch = dyn_cast<IndirectBranch>(inst)) {
+        collect_variables_iterative(ibranch->expression(), out);
+    }
+    // Break, Continue, Comment have no requirements
 }
 
 // =============================================================================
 // Rule checks for safe propagation
 // =============================================================================
 
-/// Check if an expression contains any aliased variable.
+/// Check if an expression DAG contains any aliased variable (iterative, DAG-safe).
 static bool contains_aliased_variable(Expression* expr) {
     if (!expr) return false;
-    if (auto* v = dyn_cast<Variable>(expr)) return v->is_aliased();
-    if (auto* op = dyn_cast<Operation>(expr)) {
-        for (auto* child : op->operands())
-            if (contains_aliased_variable(child)) return true;
-    }
-    if (auto* list = dyn_cast<ListOperation>(expr)) {
-        for (auto* child : list->operands())
-            if (contains_aliased_variable(child)) return true;
+    SmallVector<Expression*, 32> stack;
+    std::unordered_set<Expression*> visited;
+    stack.push_back(expr);
+    visited.insert(expr);
+    while (!stack.empty()) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (auto* v = dyn_cast<Variable>(node)) {
+            if (v->is_aliased()) return true;
+        } else if (auto* op = dyn_cast<Operation>(node)) {
+            for (auto* child : op->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+        } else if (auto* list = dyn_cast<ListOperation>(node)) {
+            for (auto* child : list->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+        }
     }
     return false;
 }
@@ -143,17 +368,27 @@ static bool is_address_of(Expression* expr) {
     return false;
 }
 
-/// Check if an expression contains a dereference operation.
+/// Check if an expression DAG contains a dereference operation (iterative, DAG-safe).
 static bool contains_dereference(Expression* expr) {
     if (!expr) return false;
-    if (auto* op = dyn_cast<Operation>(expr)) {
-        if (op->type() == OperationType::deref) return true;
-        for (auto* child : op->operands())
-            if (contains_dereference(child)) return true;
-    }
-    if (auto* list = dyn_cast<ListOperation>(expr)) {
-        for (auto* child : list->operands())
-            if (contains_dereference(child)) return true;
+    SmallVector<Expression*, 32> stack;
+    std::unordered_set<Expression*> visited;
+    stack.push_back(expr);
+    visited.insert(expr);
+    while (!stack.empty()) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+        if (auto* op = dyn_cast<Operation>(node)) {
+            if (op->type() == OperationType::deref) return true;
+            for (auto* child : op->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+        } else if (auto* list = dyn_cast<ListOperation>(node)) {
+            for (auto* child : list->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+        }
     }
     return false;
 }
@@ -456,9 +691,10 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
             for (std::size_t idx = 0; idx < instrs.size(); ++idx) {
                 Instruction* inst = instrs[idx];
 
-                // Collect the variables required by this instruction
+                // Collect the variables required by this instruction (iterative
+                // to avoid stack overflow on deeply nested expression trees).
                 std::unordered_set<Variable*> reqs;
-                inst->collect_requirements(reqs);
+                collect_requirements_iterative(inst, reqs);
 
                 for (Variable* req_var : reqs) {
                     VarKey key = var_key(req_var);
@@ -502,44 +738,49 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                     Expression* replacement = def->value();
                     if (!replacement) continue;
 
-                    // Perform in-place substitution on the instruction.
-                    // replace_variable_in_place mutates operand pointers
-                    // directly, so only the root return value differs when
-                    // the root itself is a matching variable.
+                    // Complexity guard: skip propagation if the replacement
+                    // is too large. This prevents exponential tree growth
+                    // from in-place aliasing across fixed-point iterations.
+                    if (!isa<Variable>(replacement) && !isa<Constant>(replacement)) {
+                        if (expr_weight(replacement, MAX_EXPR_WEIGHT + 1) > MAX_EXPR_WEIGHT)
+                            continue;
+                    }
+
+                    // Copy-on-write substitution: creates new nodes only on the
+                    // path from root to each match. Each match site gets a
+                    // fresh copy of `replacement` to prevent DAG formation.
                     bool changed = false;
 
                     if (auto* assign = dyn_cast<Assignment>(inst)) {
-                        if (contains_variable_ptr(assign->value(), req_var)) {
-                            Expression* new_val = replace_variable_in_place(
-                                assign->value(), req_var, replacement);
-                            assign->set_value(new_val);
-                            changed = true;
-                        }
+                        auto [new_val, m1] = replace_variable_cow(
+                            task.arena(), assign->value(), req_var, replacement);
+                        if (new_val != assign->value()) assign->set_value(new_val);
+                        changed |= m1;
                         // Also propagate into complex destinations (e.g., *(ptr+off) = val)
-                        if (!isa<Variable>(assign->destination()) &&
-                            contains_variable_ptr(assign->destination(), req_var)) {
-                            Expression* new_dest = replace_variable_in_place(
-                                assign->destination(), req_var, replacement);
-                            assign->set_destination(new_dest);
-                            changed = true;
+                        if (!isa<Variable>(assign->destination())) {
+                            auto [new_dest, m2] = replace_variable_cow(
+                                task.arena(), assign->destination(), req_var, replacement);
+                            if (new_dest != assign->destination()) assign->set_destination(new_dest);
+                            changed |= m2;
                         }
                     } else if (auto* branch = dyn_cast<Branch>(inst)) {
                         Condition* cond = branch->condition();
-                        if (cond && contains_variable_ptr(cond, req_var)) {
-                            // Mutate condition operands in-place; only need
-                            // new Condition if the root variable is replaced
-                            // (which can't happen — Condition is not a Variable)
-                            replace_variable_in_place(cond, req_var, replacement);
-                            changed = true;
+                        if (cond) {
+                            auto [new_cond, m] = replace_variable_cow(
+                                task.arena(), cond, req_var, replacement);
+                            if (new_cond != cond) {
+                                if (auto* nc = dyn_cast<Condition>(new_cond))
+                                    branch->set_condition(nc);
+                            }
+                            changed |= m;
                         }
                     } else if (auto* ret = dyn_cast<Return>(inst)) {
                         auto& vals = ret->mutable_values();
                         for (std::size_t vi = 0; vi < vals.size(); ++vi) {
-                            if (contains_variable_ptr(vals[vi], req_var)) {
-                                vals[vi] = replace_variable_in_place(
-                                    vals[vi], req_var, replacement);
-                                changed = true;
-                            }
+                            auto [new_v, m] = replace_variable_cow(
+                                task.arena(), vals[vi], req_var, replacement);
+                            if (new_v != vals[vi]) vals[vi] = new_v;
+                            changed |= m;
                         }
                     }
 
@@ -688,7 +929,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
                 // Dependency dict: variables required by branch -> Phi that defines them
                 std::unordered_map<Variable*, Phi*> phi_dependencies;
                 std::unordered_set<Variable*> reqs;
-                branch->collect_requirements(reqs);
+                collect_requirements_iterative(branch, reqs);
 
                 for (Variable* req : reqs) {
                     if (req->is_aliased()) continue;
@@ -859,7 +1100,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                     }
                 }
                 std::unordered_set<Variable*> reqs;
-                inst->collect_requirements(reqs);
+                collect_requirements_iterative(inst, reqs);
                 for (Variable* req : reqs) {
                     use_map[var_key(req)].insert(inst);
                 }
@@ -871,7 +1112,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
             for (std::size_t i = 0; i < instrs.size(); ++i) {
                 Instruction* inst = instrs[i];
                 std::unordered_set<Variable*> reqs;
-                inst->collect_requirements(reqs);
+                collect_requirements_iterative(inst, reqs);
 
                 for (Variable* req_var : reqs) {
                     VarKey key = var_key(req_var);
@@ -937,36 +1178,39 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
 
                     if (!safe) continue;
 
-                    // Perform in-place substitution
+                    // Copy-on-write substitution
                     Expression* replacement = def->value();
                     bool sub_changed = false;
 
                     if (auto* assign = dyn_cast<Assignment>(inst)) {
-                        if (contains_variable_ptr(assign->value(), req_var)) {
-                            assign->set_value(replace_variable_in_place(
-                                assign->value(), req_var, replacement));
-                            sub_changed = true;
-                        }
-                        if (!isa<Variable>(assign->destination()) &&
-                            contains_variable_ptr(assign->destination(), req_var)) {
-                            assign->set_destination(replace_variable_in_place(
-                                assign->destination(), req_var, replacement));
-                            sub_changed = true;
+                        auto [new_val, m1] = replace_variable_cow(
+                            task.arena(), assign->value(), req_var, replacement);
+                        if (new_val != assign->value()) assign->set_value(new_val);
+                        sub_changed |= m1;
+                        if (!isa<Variable>(assign->destination())) {
+                            auto [new_dest, m2] = replace_variable_cow(
+                                task.arena(), assign->destination(), req_var, replacement);
+                            if (new_dest != assign->destination()) assign->set_destination(new_dest);
+                            sub_changed |= m2;
                         }
                     } else if (auto* branch = dyn_cast<Branch>(inst)) {
                         Condition* cond = branch->condition();
-                        if (cond && contains_variable_ptr(cond, req_var)) {
-                            replace_variable_in_place(cond, req_var, replacement);
-                            sub_changed = true;
+                        if (cond) {
+                            auto [new_cond, m] = replace_variable_cow(
+                                task.arena(), cond, req_var, replacement);
+                            if (new_cond != cond) {
+                                if (auto* nc = dyn_cast<Condition>(new_cond))
+                                    branch->set_condition(nc);
+                            }
+                            sub_changed |= m;
                         }
                     } else if (auto* ret = dyn_cast<Return>(inst)) {
                         auto& vals = ret->mutable_values();
                         for (std::size_t vi = 0; vi < vals.size(); ++vi) {
-                            if (contains_variable_ptr(vals[vi], req_var)) {
-                                vals[vi] = replace_variable_in_place(
-                                    vals[vi], req_var, replacement);
-                                sub_changed = true;
-                            }
+                            auto [new_v, m] = replace_variable_cow(
+                                task.arena(), vals[vi], req_var, replacement);
+                            if (new_v != vals[vi]) vals[vi] = new_v;
+                            sub_changed |= m;
                         }
                     }
 
@@ -2487,7 +2731,7 @@ void collect_rhs_variables(Expression* expr, std::vector<Variable*>& out) {
         return;
     }
     std::unordered_set<Variable*> seen;
-    expr->collect_requirements(seen);
+    collect_variables_iterative(expr, seen);
     out.reserve(out.size() + seen.size());
     for (Variable* var : seen) {
         if (var != nullptr) {
