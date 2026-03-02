@@ -55,24 +55,24 @@ option(ALETHEIA_Z3_FROM_SOURCE "Force building Z3 from source instead of using s
 
 set(_z3_found_system FALSE)
 
-if(NOT ALETHEIA_Z3_FROM_SOURCE)
-    find_package(Z3 4.12 CONFIG QUIET
-        HINTS "/opt/homebrew" "/usr/local" "$ENV{HOMEBREW_PREFIX}"
-    )
-    if(Z3_FOUND AND TARGET z3::libz3)
-        set(_z3_found_system TRUE)
-        message(STATUS "Using system Z3 ${Z3_VERSION_STRING} (${Z3_C_INCLUDE_DIRS})")
-        # Create a compatibility alias so downstream targets can use the same
-        # name regardless of how Z3 was resolved.
-        if(NOT TARGET aletheia_z3)
-            add_library(aletheia_z3 ALIAS z3::libz3)
-        endif()
-        # Expose include dirs for targets that reference them explicitly.
-        set(ALETHEIA_Z3_INCLUDE_DIRS ${Z3_C_INCLUDE_DIRS})
-    else()
-        message(STATUS "System Z3 not found — falling back to building from source")
-    endif()
-endif()
+#if(NOT ALETHEIA_Z3_FROM_SOURCE)
+#    find_package(Z3 4.12 CONFIG QUIET
+#        HINTS "/opt/homebrew" "/usr/local" "$ENV{HOMEBREW_PREFIX}"
+#    )
+#    if(Z3_FOUND AND TARGET z3::libz3)
+#        set(_z3_found_system TRUE)
+#        message(STATUS "Using system Z3 ${Z3_VERSION_STRING} (${Z3_C_INCLUDE_DIRS})")
+#        # Create a compatibility alias so downstream targets can use the same
+#        # name regardless of how Z3 was resolved.
+#        if(NOT TARGET aletheia_z3)
+#            add_library(aletheia_z3 ALIAS z3::libz3)
+#        endif()
+#        # Expose include dirs for targets that reference them explicitly.
+#        set(ALETHEIA_Z3_INCLUDE_DIRS ${Z3_C_INCLUDE_DIRS})
+#    else()
+#        message(STATUS "System Z3 not found — falling back to building from source")
+#    endif()
+#endif()
 
 if(NOT _z3_found_system)
     message(STATUS "Building Z3 from source (this will take a while...)")
@@ -90,6 +90,11 @@ if(NOT _z3_found_system)
     set(WARNINGS_AS_ERRORS OFF CACHE BOOL "Disable warnings as errors" FORCE)
 
     FetchContent_MakeAvailable(z3)
+
+    # Force Z3 to use the same aggressive optimizations as the rest of the project
+    if(TARGET libz3)
+        target_compile_options(libz3 PRIVATE $<$<CONFIG:Release>:-O3>)
+    endif()
 
     # The FetchContent Z3 exposes a target called "libz3" (not z3::libz3).
     if(NOT TARGET aletheia_z3)
@@ -119,6 +124,21 @@ if(IDA_INSTALL_DIR)
     message(STATUS "IDA installation: ${IDA_INSTALL_DIR}")
 else()
     message(STATUS "IDA installation not found — plugin, idalib test, and idump targets will be skipped.")
+endif()
+
+# ── Interprocedural Optimization (LTO) ──────────────────────────────────
+# Enable LTO for Release builds to allow cross-translation-unit inlining.
+# We set this AFTER fetching Z3 so that Z3 itself isn't built with LTO,
+# which would massively and unnecessarily inflate link times.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+    if(ipo_supported)
+        message(STATUS "Enabling Interprocedural Optimization (LTO)")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    else()
+        message(STATUS "IPO / LTO not supported: ${ipo_error}")
+    endif()
 endif()
 
 # ── Platform-specific IDA library names ──────────────────────────────────

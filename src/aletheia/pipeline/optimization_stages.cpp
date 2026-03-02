@@ -92,21 +92,21 @@ static std::size_t expr_weight(Expression* expr, std::size_t limit) {
 /// Maximum expression tree weight after propagation.  If substituting
 /// `replacement` into the tree would push it past this, we skip it.
 static constexpr std::size_t MAX_EXPR_WEIGHT = 256;
+static constexpr int MAX_PROPAGATION_ITERATIONS = 24;
+static constexpr std::size_t MIN_PROPAGATION_SUBSTITUTIONS = 1024;
+static constexpr std::size_t PROPAGATION_SUBSTITUTIONS_PER_INSTRUCTION = 4;
 
 /// Replace all occurrences of `target` variable with `replacement` in `expr`.
 ///
-/// Uses COPY-ON-WRITE with an ITERATIVE WORKLIST (no recursion, no DAG
-/// formation). Each variable match site gets a fresh deep-copy of
-/// `replacement` so expression trees remain true trees (no shared subtrees).
-/// Only nodes on the path from the root to a match are cloned; unchanged
-/// subtrees are shared with the original tree (structurally shared, not
-/// mutated).
+/// Uses BOUNDED-DEPTH RECURSIVE COPY-ON-WRITE. Each variable match site
+/// gets a fresh deep-copy of `replacement` so expression trees remain true
+/// trees (no shared subtrees). Only nodes on the path from root to a match
+/// are cloned; unchanged subtrees are structurally shared (read-only).
 ///
-/// Key correctness properties:
-/// - No DAG formation: every substitution copies the replacement, so no
-///   two instructions share the same Operation* node.
-/// - No recursion: uses an explicit parent-tracking worklist.
-/// - No exponential blowup: each node is visited at most once.
+/// A depth limit prevents stack overflow. If the limit is exceeded, the
+/// function bails out without substitution (returns the original unchanged).
+/// The MAX_EXPR_WEIGHT complexity guard on the caller side ensures that
+/// trees don't grow beyond ~256 nodes, so the depth limit of 512 is generous.
 ///
 /// Returns: {new_root, did_mutate}. The root may be a new node if any
 /// child on the path from root changed.
@@ -115,16 +115,18 @@ struct ReplaceResult {
     bool mutated;
 };
 
-static ReplaceResult replace_variable_cow(
+/// Maximum recursion depth for replace_variable_cow.
+/// 512 frames × ~80 bytes/frame ≈ 40KB stack, well within limits.
+static constexpr int MAX_REPLACE_DEPTH = 512;
+
+static ReplaceResult replace_variable_cow_impl(
     DecompilerArena& arena, Expression* expr,
-    Variable* target, Expression* replacement) {
-    if (!expr) return {nullptr, false};
+    const std::string& target_name, std::size_t target_ssa,
+    Expression* replacement, int depth) {
 
-    // Cache target identity for fast comparison
-    const std::string& target_name = target->name();
-    std::size_t target_ssa = target->ssa_version();
+    if (!expr || depth <= 0) return {expr, false};
 
-    // Fast path: root is the target variable itself
+    // Leaf: Variable match → deep-copy replacement
     if (is_target_var(expr, target_name, target_ssa)) {
         return {replacement->copy(arena), true};
     }
@@ -134,126 +136,63 @@ static ReplaceResult replace_variable_cow(
         return {expr, false};
     }
 
-    // Iterative post-order traversal using an explicit stack.
-    // We process children first, then rebuild the parent only if any child
-    // changed. This is equivalent to recursive copy-on-write but without
-    // stack depth limits.
-    //
-    // Strategy: use a two-pass approach.
-    //  Pass 1: Flatten the tree into post-order (children before parents).
-    //  Pass 2: Process in post-order, building replacements bottom-up.
-
-    // Pass 1: collect unique nodes in pre-order, then reverse for post-order.
-    // Visited set prevents exponential blowup on pre-existing shared DAGs.
-    SmallVector<Expression*, 128> visit_order;
-    SmallVector<Expression*, 128> stack;
-    std::unordered_set<Expression*> visited;
-    stack.push_back(expr);
-    visited.insert(expr);
-    while (!stack.empty()) {
-        Expression* node = stack.back();
-        stack.pop_back();
-        if (!node) continue;
-        visit_order.push_back(node);
-        if (auto* op = dyn_cast<Operation>(node)) {
-            // Push in reverse so leftmost child is processed first
-            auto& ops = op->operands();
-            for (std::size_t i = ops.size(); i > 0; --i) {
-                if (ops[i-1] && visited.insert(ops[i-1]).second)
-                    stack.push_back(ops[i-1]);
-            }
-        } else if (auto* list = dyn_cast<ListOperation>(node)) {
-            auto& ops = list->operands();
-            for (std::size_t i = ops.size(); i > 0; --i) {
-                if (ops[i-1] && visited.insert(ops[i-1]).second)
-                    stack.push_back(ops[i-1]);
-            }
+    // Operation (includes Condition, Call) — recurse into children
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        SmallVector<Expression*, 4> new_ops;
+        bool changed = false;
+        new_ops.reserve(op->operands().size());
+        for (auto* child : op->operands()) {
+            auto [new_child, m] = replace_variable_cow_impl(
+                arena, child, target_name, target_ssa, replacement, depth - 1);
+            if (m) changed = true;
+            new_ops.push_back(new_child);
         }
+        if (changed) {
+            if (auto* cond = dyn_cast<Condition>(expr)) {
+                auto* nc = arena.create<Condition>(
+                    cond->type(), new_ops[0], new_ops[1], cond->size_bytes);
+                nc->set_ir_type(cond->ir_type());
+                return {nc, true};
+            }
+            auto* nop = arena.create<Operation>(
+                op->type(), std::move(new_ops), op->size_bytes);
+            nop->set_ir_type(op->ir_type());
+            if (op->array_access().has_value())
+                nop->set_array_access(*op->array_access());
+            return {nop, true};
+        }
+        return {op, false};
     }
 
-    // Pass 2: process in reverse visit order (post-order: children before parents).
-    // Map each original node to its replacement (or itself if unchanged).
-    std::unordered_map<Expression*, Expression*> remap;
-    bool any_mutated = false;
-
-    for (std::size_t ri = visit_order.size(); ri > 0; --ri) {
-        Expression* node = visit_order[ri - 1];
-
-        // Leaf: Variable match → copy replacement
-        if (is_target_var(node, target_name, target_ssa)) {
-            remap[node] = replacement->copy(arena);
-            any_mutated = true;
-            continue;
+    // ListOperation — recurse into children
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
+        SmallVector<Expression*, 4> new_ops;
+        bool changed = false;
+        new_ops.reserve(list->operands().size());
+        for (auto* child : list->operands()) {
+            auto [new_child, m] = replace_variable_cow_impl(
+                arena, child, target_name, target_ssa, replacement, depth - 1);
+            if (m) changed = true;
+            new_ops.push_back(new_child);
         }
-
-        // Leaf: unchanged
-        if (isa<Constant>(node) || isa<Variable>(node)) {
-            // remap[node] = node; // implicit — absence means unchanged
-            continue;
+        if (changed) {
+            auto* nl = arena.create<ListOperation>(
+                std::move(new_ops), list->size_bytes);
+            nl->set_ir_type(list->ir_type());
+            return {nl, true};
         }
-
-        // Interior: Operation (includes Condition, Call)
-        if (auto* op = dyn_cast<Operation>(node)) {
-            bool child_changed = false;
-            SmallVector<Expression*, 4> new_ops;
-            new_ops.reserve(op->operands().size());
-            for (auto* child : op->operands()) {
-                auto rit = remap.find(child);
-                if (rit != remap.end()) {
-                    new_ops.push_back(rit->second);
-                    child_changed = true;
-                } else {
-                    new_ops.push_back(child);
-                }
-            }
-            if (child_changed) {
-                // Check if this is a Condition (needs special constructor)
-                if (auto* cond = dyn_cast<Condition>(node)) {
-                    auto* nc = arena.create<Condition>(
-                        cond->type(), new_ops[0], new_ops[1], cond->size_bytes);
-                    nc->set_ir_type(cond->ir_type());
-                    remap[node] = nc;
-                } else {
-                    auto* nop = arena.create<Operation>(
-                        op->type(), std::move(new_ops), op->size_bytes);
-                    nop->set_ir_type(op->ir_type());
-                    if (op->array_access().has_value())
-                        nop->set_array_access(*op->array_access());
-                    remap[node] = nop;
-                }
-            }
-            continue;
-        }
-
-        // Interior: ListOperation
-        if (auto* list = dyn_cast<ListOperation>(node)) {
-            bool child_changed = false;
-            SmallVector<Expression*, 4> new_ops;
-            new_ops.reserve(list->operands().size());
-            for (auto* child : list->operands()) {
-                auto rit = remap.find(child);
-                if (rit != remap.end()) {
-                    new_ops.push_back(rit->second);
-                    child_changed = true;
-                } else {
-                    new_ops.push_back(child);
-                }
-            }
-            if (child_changed) {
-                auto* nl = arena.create<ListOperation>(
-                    std::move(new_ops), list->size_bytes);
-                nl->set_ir_type(list->ir_type());
-                remap[node] = nl;
-            }
-            continue;
-        }
+        return {list, false};
     }
 
-    auto root_it = remap.find(expr);
-    if (root_it != remap.end()) {
-        return {root_it->second, true};
-    }
-    return {expr, any_mutated};
+    return {expr, false};
+}
+
+static ReplaceResult replace_variable_cow(
+    DecompilerArena& arena, Expression* expr,
+    Variable* target, Expression* replacement) {
+    return replace_variable_cow_impl(
+        arena, expr, target->name(), target->ssa_version(),
+        replacement, MAX_REPLACE_DEPTH);
 }
 
 /// Backward-compatible wrapper.
@@ -604,6 +543,21 @@ struct InstLocation {
 static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
     if (!task.cfg()) return;
 
+    std::size_t instruction_count = 0;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        instruction_count += block->instructions().size();
+    }
+
+    const std::size_t substitution_budget = std::max<std::size_t>(
+        MIN_PROPAGATION_SUBSTITUTIONS,
+        instruction_count * (is_memory ? 2 : PROPAGATION_SUBSTITUTIONS_PER_INSTRUCTION));
+
+    auto within_weight_budget = [](Expression* expr) {
+        if (!expr) return true;
+        if (isa<Variable>(expr) || isa<Constant>(expr)) return true;
+        return expr_weight(expr, MAX_EXPR_WEIGHT + 1) <= MAX_EXPR_WEIGHT;
+    };
+
     // Cache reachability matrix if memory mode
     std::unordered_map<BasicBlock*, std::unordered_set<BasicBlock*>> reachability;
     if (is_memory) {
@@ -627,7 +581,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
     };
 
     // Fixed-point outer loop
-    for (int iteration = 0; iteration < 100; ++iteration) {
+    for (int iteration = 0; iteration < MAX_PROPAGATION_ITERATIONS; ++iteration) {
         // Step 1: Remove redundant phis before each iteration
         remove_redundant_phis(task.cfg(), task.arena());
 
@@ -684,6 +638,8 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
 
         // Step 3: Iterate blocks in RPO and propagate definitions
         bool any_change = false;
+        bool budget_exhausted = false;
+        std::size_t substitutions_this_iteration = 0;
 
         for (BasicBlock* block : task.cfg()->reverse_post_order()) {
             auto& instrs = block->mutable_instructions();
@@ -754,12 +710,20 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                     if (auto* assign = dyn_cast<Assignment>(inst)) {
                         auto [new_val, m1] = replace_variable_cow(
                             task.arena(), assign->value(), req_var, replacement);
+                        if (m1 && !within_weight_budget(new_val)) {
+                            new_val = assign->value();
+                            m1 = false;
+                        }
                         if (new_val != assign->value()) assign->set_value(new_val);
                         changed |= m1;
                         // Also propagate into complex destinations (e.g., *(ptr+off) = val)
                         if (!isa<Variable>(assign->destination())) {
                             auto [new_dest, m2] = replace_variable_cow(
                                 task.arena(), assign->destination(), req_var, replacement);
+                            if (m2 && !within_weight_budget(new_dest)) {
+                                new_dest = assign->destination();
+                                m2 = false;
+                            }
                             if (new_dest != assign->destination()) assign->set_destination(new_dest);
                             changed |= m2;
                         }
@@ -768,6 +732,10 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                         if (cond) {
                             auto [new_cond, m] = replace_variable_cow(
                                 task.arena(), cond, req_var, replacement);
+                            if (m && !within_weight_budget(new_cond)) {
+                                new_cond = cond;
+                                m = false;
+                            }
                             if (new_cond != cond) {
                                 if (auto* nc = dyn_cast<Condition>(new_cond))
                                     branch->set_condition(nc);
@@ -779,23 +747,38 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                         for (std::size_t vi = 0; vi < vals.size(); ++vi) {
                             auto [new_v, m] = replace_variable_cow(
                                 task.arena(), vals[vi], req_var, replacement);
+                            if (m && !within_weight_budget(new_v)) {
+                                new_v = vals[vi];
+                                m = false;
+                            }
                             if (new_v != vals[vi]) vals[vi] = new_v;
                             changed |= m;
                         }
                     }
 
-                    if (changed) any_change = true;
+                    if (changed) {
+                        any_change = true;
+                        ++substitutions_this_iteration;
+                        if (substitutions_this_iteration >= substitution_budget) {
+                            budget_exhausted = true;
+                            break;
+                        }
+                    }
                 }
+
+                if (budget_exhausted) break;
 
                 // CMP+branch folding after propagation
                 if (auto* branch = dyn_cast<Branch>(inst)) {
                     try_fold_cmp_branch(task.arena(), branch);
                 }
             }
+
+            if (budget_exhausted) break;
         }
 
         // Fixed-point: stop if no changes occurred in this iteration
-        if (!any_change) break;
+        if (!any_change || budget_exhausted) break;
     }
 }
 
