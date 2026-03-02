@@ -1028,11 +1028,11 @@ void CodeVisitor::visit_node(AstNode* node) {
                         } else {
                             current_line_ += "/* branch if (" + cond + ") */";
                         }
-                    } else {
-                        current_line_ += "/* branch if (" + expr_gen_.generate(branch->condition()) + ") */";
                     }
-                    lines_.push_back(current_line_);
-                    current_line_.clear();
+                    if (!current_line_.empty()) {
+                        lines_.push_back(current_line_);
+                        current_line_.clear();
+                    }
                     continue;
                 }
 

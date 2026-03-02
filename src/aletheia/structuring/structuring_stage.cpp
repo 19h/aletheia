@@ -183,7 +183,8 @@ void PatternIndependentRestructuringStage::build_initial_transition_cfg(Decompil
                     if (!bb->instructions().empty()) {
                         Instruction* last_inst = bb->instructions().back();
                         if (auto* branch = dyn_cast<Branch>(last_inst)) {
-                            logos::LogicCondition symbol_cond = condition_handler.add_condition(branch->condition());
+                            logos::Z3Converter z3conv(task.z3_ctx());
+                            logos::LogicCondition symbol_cond = z3conv.convert_to_condition(branch->condition());
                             tag = (e->type() == EdgeType::True) ? symbol_cond : symbol_cond.negate();
                         }
                     }

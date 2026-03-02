@@ -11,6 +11,24 @@ namespace {
 
 using namespace aletheia;
 
+bool ast_contains(AstNode* parent, AstNode* target) {
+    if (parent == target) return true;
+    if (!parent) return false;
+    if (auto* seq = ast_dyn_cast<SeqNode>(parent)) {
+        for (auto* c : seq->nodes()) if (ast_contains(c, target)) return true;
+    } else if (auto* ifn = ast_dyn_cast<IfNode>(parent)) {
+        if (ast_contains(ifn->true_branch(), target)) return true;
+        if (ast_contains(ifn->false_branch(), target)) return true;
+    } else if (auto* loop = ast_dyn_cast<LoopNode>(parent)) {
+        if (ast_contains(loop->body(), target)) return true;
+    } else if (auto* sw = ast_dyn_cast<SwitchNode>(parent)) {
+        for (auto* c : sw->cases()) if (ast_contains(c, target)) return true;
+    } else if (auto* c = ast_dyn_cast<CaseNode>(parent)) {
+        if (ast_contains(c->body(), target)) return true;
+    }
+    return false;
+}
+
 bool cbr_debug_enabled() {
     const char* value = std::getenv("ALETHEIA_CBR_DEBUG");
     if (!value) return false;
@@ -346,6 +364,10 @@ AstNode* ConditionBasedRefinement::refine(
                                 BasicBlock* tb_orig = tb_node->get_original_block();
                                 BasicBlock* next_orig = next_node->get_original_block();
                                 if (tb_orig != nullptr && next_orig != nullptr && tb_orig == next_orig) {
+                                    matching_tb = tb;
+                                    break;
+                                }
+                                if (ast_contains(tb_node, next_node)) {
                                     matching_tb = tb;
                                     break;
                                 }

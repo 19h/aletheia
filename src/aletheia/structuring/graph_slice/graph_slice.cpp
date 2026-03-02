@@ -68,8 +68,8 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
         bool reaches_sink = false;
         if (std::find(sink_nodes.begin(), sink_nodes.end(), node) != sink_nodes.end()) {
             reaches_sink = true;
-        } else {
-            for (TransitionBlock* succ : node->successors_blocks()) {
+        }
+        for (TransitionBlock* succ : node->successors_blocks()) {
                 if (!succ) {
                     continue;
                 }
@@ -88,7 +88,6 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
                     }
                 }
             }
-        }
 
         path.erase(node);
         

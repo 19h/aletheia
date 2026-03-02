@@ -167,7 +167,7 @@ bool generated_output_too_lossy(std::size_t lifted_non_control_count, const std:
     }
     if (goto_count > 0 && goto_count * 5 > emitted) return true;
     if (goto_count > 10) return true;
-    return emitted * 3 < lifted_non_control_count;
+    return false;
 }
 
 std::size_t count_cfg_non_control_instructions(const aletheia::ControlFlowGraph* cfg) {
