@@ -67,15 +67,37 @@ private:
 };
 
 enum class LogicOp {
+    // Logical
     And,
     Or,
     Not,
+    
+    // Relational
     Eq,
     Neq,
     Lt,
     Le,
     Gt,
-    Ge
+    Ge,
+
+    // Arithmetic
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Negate,
+    
+    // Bitwise
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
+    
+    // Shifts
+    Shl,
+    Shr,
+    ShrUs
 };
 
 class DagOperation : public DagNode {

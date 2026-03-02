@@ -14,6 +14,20 @@ std::string DagOperation::to_string() const {
         case LogicOp::Le: op_str = "<="; break;
         case LogicOp::Gt: op_str = ">"; break;
         case LogicOp::Ge: op_str = ">="; break;
+        case LogicOp::Add: op_str = "+"; break;
+        case LogicOp::Sub: op_str = "-"; break;
+        case LogicOp::Mul: op_str = "*"; break;
+        case LogicOp::Div: op_str = "/"; break;
+        case LogicOp::Mod: op_str = "%"; break;
+        case LogicOp::Negate: op_str = "-"; break;
+        case LogicOp::BitAnd: op_str = "&"; break;
+        case LogicOp::BitOr: op_str = "|"; break;
+        case LogicOp::BitXor: op_str = "^"; break;
+        case LogicOp::BitNot: op_str = "~"; break;
+        case LogicOp::Shl: op_str = "<<"; break;
+        case LogicOp::Shr: op_str = ">>"; break;
+        case LogicOp::ShrUs: op_str = ">>_us"; break;
+        default: op_str = "???"; break;
     }
 
     std::string result = "(" + op_str;

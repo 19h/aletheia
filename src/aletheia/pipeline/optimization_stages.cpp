@@ -31,6 +31,31 @@ aletheia::OperationType flip_comparison(aletheia::OperationType op) {
 
 namespace aletheia {
 
+namespace {
+std::string expr_fingerprint(Expression* expr) {
+    if (!expr) return "<null>";
+    if (auto* c = dyn_cast<Constant>(expr)) {
+        return "C:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
+    }
+    if (auto* v = dyn_cast<Variable>(expr)) {
+        return "V:" + v->name() + ":" + std::to_string(v->ssa_version());
+    }
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        std::string out = "O:" + std::to_string(static_cast<int>(op->type())) + "(";
+        bool first = true;
+        for (Expression* child : op->operands()) {
+            if (!first) out += ",";
+            first = false;
+            out += expr_fingerprint(child);
+        }
+        out += ")";
+        return out;
+    }
+    return "E:unknown";
+}
+} // namespace
+
+
 // =============================================================================
 // Variable identity key for SSA-form variables
 // =============================================================================
@@ -2485,6 +2510,63 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
         }
 
         switch (op->type()) {
+
+    if (op->type() == OperationType::add && op->operands().size() == 2) {
+        Expression* lhs_expr = op->operands()[0];
+        Expression* rhs_expr = op->operands()[1];
+        
+        // A.3 Arithmetic Factorization
+        // Factorize: c1*X + c2*X -> (c1+c2)*X
+        // Factorize: X + c*X -> (1+c)*X
+        // Factorize: c*X + X -> (c+1)*X
+        // Factorize: X + X -> 2*X
+        
+        auto match_term = [](Expression* e, Expression*& base, std::uint64_t& coeff) {
+            if (auto* term_op = dyn_cast<Operation>(e)) {
+                if ((term_op->type() == OperationType::mul || term_op->type() == OperationType::mul_us) && 
+                    term_op->operands().size() == 2) {
+                    if (auto* c = dyn_cast<Constant>(term_op->operands()[1])) { // TermOrder puts const on right
+                        base = term_op->operands()[0];
+                        coeff = c->value();
+                        return true;
+                    }
+                    if (auto* c = dyn_cast<Constant>(term_op->operands()[0])) {
+                        base = term_op->operands()[1];
+                        coeff = c->value();
+                        return true;
+                    }
+                }
+            }
+            base = e;
+            coeff = 1;
+            return true;
+        };
+
+        Expression* base1 = nullptr;
+        std::uint64_t coeff1 = 0;
+        Expression* base2 = nullptr;
+        std::uint64_t coeff2 = 0;
+
+        match_term(lhs_expr, base1, coeff1);
+        match_term(rhs_expr, base2, coeff2);
+
+        if (base1 && base2 && expr_fingerprint(base1) == expr_fingerprint(base2)) {
+            std::uint64_t new_coeff = coeff1 + coeff2;
+            if (new_coeff == 0) {
+                return make_simplified_constant(task, op, 0);
+            } else if (new_coeff == 1) {
+                return base1;
+            } else {
+                SmallVector<Expression*, 4> new_ops;
+                new_ops.push_back(base1);
+                new_ops.push_back(task.arena().create<Constant>(new_coeff, op->size_bytes));
+                auto* new_mul = task.arena().create<Operation>(OperationType::mul, std::move(new_ops), op->size_bytes);
+                new_mul->set_ir_type(op->ir_type());
+                return new_mul;
+            }
+        }
+    }
+
             case OperationType::add:
                 if (is_constant_value(rhs_expr, 0)) return lhs_expr;
                 if (is_constant_value(lhs_expr, 0)) return rhs_expr;
