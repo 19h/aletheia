@@ -60,11 +60,11 @@ bool ast_has_executable_content(aletheia::AstNode* node) {
         return false;
     }
 
-    if (dynamic_cast<aletheia::ExprAstNode*>(node) != nullptr) {
+    if (ast_dyn_cast<aletheia::ExprAstNode>(node) != nullptr) {
         return false;
     }
 
-    if (auto* code = dynamic_cast<aletheia::CodeNode*>(node)) {
+    if (auto* code = ast_dyn_cast<aletheia::CodeNode>(node)) {
         if (!code->block()) {
             return false;
         }
@@ -77,7 +77,7 @@ bool ast_has_executable_content(aletheia::AstNode* node) {
         return false;
     }
 
-    if (auto* seq = dynamic_cast<aletheia::SeqNode*>(node)) {
+    if (auto* seq = ast_dyn_cast<aletheia::SeqNode>(node)) {
         for (aletheia::AstNode* child : seq->nodes()) {
             if (ast_has_executable_content(child)) {
                 return true;
@@ -86,17 +86,17 @@ bool ast_has_executable_content(aletheia::AstNode* node) {
         return false;
     }
 
-    if (auto* if_node = dynamic_cast<aletheia::IfNode*>(node)) {
+    if (auto* if_node = ast_dyn_cast<aletheia::IfNode>(node)) {
         return if_node->condition_expr() != nullptr
             || ast_has_executable_content(if_node->true_branch())
             || ast_has_executable_content(if_node->false_branch());
     }
 
-    if (auto* loop = dynamic_cast<aletheia::LoopNode*>(node)) {
+    if (auto* loop = ast_dyn_cast<aletheia::LoopNode>(node)) {
         return loop->condition() != nullptr || ast_has_executable_content(loop->body());
     }
 
-    if (auto* sw = dynamic_cast<aletheia::SwitchNode*>(node)) {
+    if (auto* sw = ast_dyn_cast<aletheia::SwitchNode>(node)) {
         for (aletheia::CaseNode* case_node : sw->cases()) {
             if (ast_has_executable_content(case_node)) {
                 return true;
@@ -105,7 +105,7 @@ bool ast_has_executable_content(aletheia::AstNode* node) {
         return false;
     }
 
-    if (auto* case_node = dynamic_cast<aletheia::CaseNode*>(node)) {
+    if (auto* case_node = ast_dyn_cast<aletheia::CaseNode>(node)) {
         return ast_has_executable_content(case_node->body());
     }
 
@@ -351,7 +351,7 @@ void emit_inline_branch_snapshot(
             inlined_blocks);
         lines.push_back(indent_of(indent_level) + "}");
     } else if (auto* indirect = aletheia::dyn_cast<aletheia::IndirectBranch>(tail)) {
-        const bool constant_target = dynamic_cast<aletheia::Constant*>(indirect->expression()) != nullptr;
+        const bool constant_target = aletheia::dyn_cast<aletheia::Constant>(indirect->expression()) != nullptr;
         const bool single_successor = block->successors().size() == 1;
         if (!(constant_target && single_successor)) {
             lines.push_back(indent_of(indent_level) + "/* indirect branch " + expr_gen.generate(indirect->expression()) + " */");
@@ -399,7 +399,7 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
 
     std::string sig = "void ";
     if (task.function_type()) {
-        if (auto* func_type = dynamic_cast<const aletheia::FunctionTypeDef*>(task.function_type().get())) {
+        if (auto* func_type = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
             sig = func_type->return_type()->to_string() + " ";
         } else {
             sig = task.function_type()->to_string() + " ";
@@ -412,7 +412,7 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
     sig += name + "(";
 
     if (task.function_type()) {
-        if (auto* func_type = dynamic_cast<const aletheia::FunctionTypeDef*>(task.function_type().get())) {
+        if (auto* func_type = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
             const auto& params = func_type->parameters();
             // Build index -> name map from parameter_registers.
             std::unordered_map<int, std::string> index_to_name;
@@ -493,7 +493,7 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
                     lines.push_back("            /* else -> " + block_label(false_edge ? false_edge->target() : nullptr) + " */");
                     lines.push_back("        }");
                 } else if (auto* indirect = aletheia::dyn_cast<aletheia::IndirectBranch>(tail)) {
-                    const bool constant_target = dynamic_cast<aletheia::Constant*>(indirect->expression()) != nullptr;
+                    const bool constant_target = aletheia::dyn_cast<aletheia::Constant>(indirect->expression()) != nullptr;
                     const bool single_successor = block->successors().size() == 1;
                     if (!(constant_target && single_successor)) {
                         lines.push_back("        /* indirect branch " + expr_gen.generate(indirect->expression()) + " */");

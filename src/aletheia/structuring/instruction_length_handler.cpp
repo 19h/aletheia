@@ -209,39 +209,39 @@ private:
     void visit_node(AstNode* node) {
         if (!node) return;
 
-        if (auto* code = dynamic_cast<CodeNode*>(node)) {
+        if (auto* code = ast_dyn_cast<CodeNode>(node)) {
             process_block(code->block());
             return;
         }
-        if (auto* seq = dynamic_cast<SeqNode*>(node)) {
+        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
             for (AstNode* child : seq->nodes()) {
                 visit_node(child);
             }
             return;
         }
-        if (auto* if_node = dynamic_cast<IfNode*>(node)) {
+        if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
             visit_node(if_node->true_branch());
             visit_node(if_node->false_branch());
             return;
         }
-        if (auto* for_loop = dynamic_cast<ForLoopNode*>(node)) {
+        if (auto* for_loop = ast_dyn_cast<ForLoopNode>(node)) {
             std::vector<Instruction*> sink;
             simplify_instruction(for_loop->declaration(), sink);
             simplify_instruction(for_loop->modification(), sink);
             visit_node(for_loop->body());
             return;
         }
-        if (auto* loop = dynamic_cast<LoopNode*>(node)) {
+        if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
             visit_node(loop->body());
             return;
         }
-        if (auto* sw = dynamic_cast<SwitchNode*>(node)) {
+        if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
             for (CaseNode* case_node : sw->cases()) {
                 visit_node(case_node);
             }
             return;
         }
-        if (auto* case_node = dynamic_cast<CaseNode*>(node)) {
+        if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
             visit_node(case_node->body());
         }
     }

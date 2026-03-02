@@ -20,7 +20,7 @@ bool cbr_debug_enabled() {
 
 Expression* if_condition_expr(IfNode* node) {
     if (!node) return nullptr;
-    if (auto* expr_ast = dynamic_cast<ExprAstNode*>(node->cond())) {
+    if (auto* expr_ast = ast_dyn_cast<ExprAstNode>(node->cond())) {
         return expr_ast->expr();
     }
     return nullptr;
@@ -178,8 +178,8 @@ void apply_complementary_condition_pairing(
     while (changed) {
         changed = false;
         for (std::size_t i = 0; i + 1 < nodes.size(); ++i) {
-            auto* lhs_if = dynamic_cast<IfNode*>(nodes[i]);
-            auto* rhs_if = dynamic_cast<IfNode*>(nodes[i + 1]);
+            auto* lhs_if = ast_dyn_cast<IfNode>(nodes[i]);
+            auto* rhs_if = ast_dyn_cast<IfNode>(nodes[i + 1]);
             if (!lhs_if || !rhs_if) continue;
             if (lhs_if->false_branch() || rhs_if->false_branch()) continue;
 
@@ -208,7 +208,7 @@ void apply_cnf_subexpression_grouping(DecompilerArena& arena, std::vector<AstNod
         std::vector<std::size_t> candidate_indices;
         std::vector<IfNode*> candidates;
         for (std::size_t i = 0; i < nodes.size(); ++i) {
-            auto* if_node = dynamic_cast<IfNode*>(nodes[i]);
+            auto* if_node = ast_dyn_cast<IfNode>(nodes[i]);
             if (!if_node || if_node->false_branch() || !if_condition_expr(if_node)) continue;
             candidate_indices.push_back(i);
             candidates.push_back(if_node);
@@ -277,7 +277,7 @@ AstNode* ConditionBasedRefinement::refine(
     AstNode* root,
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
 ) {
-    if (auto* seq = dynamic_cast<SeqNode*>(root)) {
+    if (auto* seq = ast_dyn_cast<SeqNode>(root)) {
         std::vector<AstNode*> nodes = seq->nodes();
         if (nodes.empty()) return root;
 
@@ -287,7 +287,7 @@ AstNode* ConditionBasedRefinement::refine(
             AstNode* node = nodes[i];
             
             AstNode* branch_cond = nullptr;
-            if (CodeNode* cnode = dynamic_cast<CodeNode*>(node)) {
+            if (CodeNode* cnode = ast_dyn_cast<CodeNode>(node)) {
                 BasicBlock* block = cnode->block();
                 if (!block) {
                     new_seq->add_node(node);

@@ -29,6 +29,25 @@ enum class LoopType {
 };
 
 // =============================================================================
+// AstKind -- LLVM-style RTTI tag for AstNode hierarchy
+// =============================================================================
+// O(1) integer comparison replaces dynamic_cast's O(N) string matching.
+
+enum class AstKind : std::uint8_t {
+    CodeNode,
+    ExprAstNode,
+    SeqNode,
+    IfNode,
+    WhileLoopNode,
+    DoWhileLoopNode,
+    ForLoopNode,
+    CaseNode,
+    SwitchNode,
+    BreakNode,
+    ContinueNode,
+};
+
+// =============================================================================
 // AstNode -- Abstract base for all AST nodes
 // =============================================================================
 // Enhanced with property query methods matching the Python reference's
@@ -40,6 +59,13 @@ public:
     virtual ~AstNode() = default;
     virtual BasicBlock* get_original_block() const { return nullptr; }
 
+    /// LLVM-style RTTI tag.
+    AstKind ast_kind() const { return ast_kind_; }
+
+protected:
+    AstKind ast_kind_; // Set by each concrete constructor
+
+public:
     // ---- Property queries (match Python reference) ----
 
     /// Is this node a LoopNode with condition == true (i.e., while(true))?
@@ -95,7 +121,7 @@ public:
 
 class CodeNode : public AstNode {
 public:
-    explicit CodeNode(BasicBlock* block) : block_(block) {}
+    explicit CodeNode(BasicBlock* block) : block_(block) { ast_kind_ = AstKind::CodeNode; }
     BasicBlock* block() const { return block_; }
     BasicBlock* get_original_block() const override { return block_; }
 
@@ -126,7 +152,7 @@ private:
 
 class ExprAstNode : public AstNode {
 public:
-    explicit ExprAstNode(Expression* expr) : expr_(expr) {}
+    explicit ExprAstNode(Expression* expr) : expr_(expr) { ast_kind_ = AstKind::ExprAstNode; }
     Expression* expr() const { return expr_; }
 private:
     Expression* expr_;
@@ -138,6 +164,7 @@ private:
 
 class SeqNode : public AstNode {
 public:
+    SeqNode() { ast_kind_ = AstKind::SeqNode; }
     void add_node(AstNode* node) { nodes_.push_back(node); }
     const std::vector<AstNode*>& nodes() const { return nodes_; }
     std::vector<AstNode*>& mutable_nodes() { return nodes_; }
@@ -174,7 +201,7 @@ private:
 class IfNode : public AstNode {
 public:
     IfNode(AstNode* cond, AstNode* true_branch, AstNode* false_branch = nullptr)
-        : cond_(cond), true_branch_(true_branch), false_branch_(false_branch) {}
+        : cond_(cond), true_branch_(true_branch), false_branch_(false_branch) { ast_kind_ = AstKind::IfNode; }
 
     AstNode* cond() const { return cond_; }
     AstNode* true_branch() const { return true_branch_; }
@@ -189,8 +216,8 @@ public:
 
     /// Get the condition Expression (unwraps ExprAstNode if present).
     Expression* condition_expr() const {
-        if (auto* e = dynamic_cast<ExprAstNode*>(cond_))
-            return e->expr();
+        if (cond_ && cond_->ast_kind() == AstKind::ExprAstNode)
+            return static_cast<ExprAstNode*>(cond_)->expr();
         return nullptr;
     }
 
@@ -262,11 +289,11 @@ class WhileLoopNode : public LoopNode {
 public:
     /// Endless while(true) loop.
     explicit WhileLoopNode(AstNode* body)
-        : LoopNode(body, nullptr) {}
+        : LoopNode(body, nullptr) { ast_kind_ = AstKind::WhileLoopNode; }
 
     /// While loop with a condition.
     WhileLoopNode(AstNode* body, Expression* condition)
-        : LoopNode(body, condition) {}
+        : LoopNode(body, condition) { ast_kind_ = AstKind::WhileLoopNode; }
 
     LoopType loop_type() const override { return LoopType::While; }
 };
@@ -278,7 +305,7 @@ public:
 class DoWhileLoopNode : public LoopNode {
 public:
     DoWhileLoopNode(AstNode* body, Expression* condition)
-        : LoopNode(body, condition) {}
+        : LoopNode(body, condition) { ast_kind_ = AstKind::DoWhileLoopNode; }
 
     LoopType loop_type() const override { return LoopType::DoWhile; }
 };
@@ -292,7 +319,7 @@ public:
     ForLoopNode(AstNode* body, Expression* condition,
                 Instruction* declaration, Instruction* modification)
         : LoopNode(body, condition),
-          declaration_(declaration), modification_(modification) {}
+          declaration_(declaration), modification_(modification) { ast_kind_ = AstKind::ForLoopNode; }
 
     Instruction* declaration() const { return declaration_; }
     Instruction* modification() const { return modification_; }
@@ -311,7 +338,7 @@ private:
 class CaseNode : public AstNode {
 public:
     CaseNode(std::uint64_t val, AstNode* body, bool is_default = false, bool break_case = true)
-        : value_(val), body_(body), is_default_(is_default), break_case_(break_case) {}
+        : value_(val), body_(body), is_default_(is_default), break_case_(break_case) { ast_kind_ = AstKind::CaseNode; }
 
     std::uint64_t value() const { return value_; }
     AstNode* body() const { return body_; }
@@ -330,7 +357,7 @@ private:
 
 class SwitchNode : public AstNode {
 public:
-    explicit SwitchNode(AstNode* cond) : cond_(cond) {}
+    explicit SwitchNode(AstNode* cond) : cond_(cond) { ast_kind_ = AstKind::SwitchNode; }
     void add_case(CaseNode* c) { cases_.push_back(c); }
     AstNode* cond() const { return cond_; }
     const std::vector<CaseNode*>& cases() const { return cases_; }
@@ -353,8 +380,14 @@ private:
     std::vector<CaseNode*> cases_;
 };
 
-class BreakNode : public AstNode {};
-class ContinueNode : public AstNode {};
+class BreakNode : public AstNode {
+public:
+    BreakNode() { ast_kind_ = AstKind::BreakNode; }
+};
+class ContinueNode : public AstNode {
+public:
+    ContinueNode() { ast_kind_ = AstKind::ContinueNode; }
+};
 
 // =============================================================================
 // AbstractSyntaxForest
@@ -370,5 +403,53 @@ public:
 private:
     AstNode* root_ = nullptr;
 };
+
+// =============================================================================
+// LLVM-style RTTI helpers for AstNode hierarchy
+// =============================================================================
+// isa<T>(ptr) -- returns bool, O(1) integer comparison
+// cast<T>(ptr) -- asserts and returns T*, undefined behavior if wrong type
+// dyn_cast<T>(ptr) -- returns T* or nullptr (replaces dynamic_cast)
+
+template <typename T> bool ast_isa(const AstNode* n);
+
+template <> inline bool ast_isa<CodeNode>(const AstNode* n)         { return n && n->ast_kind() == AstKind::CodeNode; }
+template <> inline bool ast_isa<ExprAstNode>(const AstNode* n)      { return n && n->ast_kind() == AstKind::ExprAstNode; }
+template <> inline bool ast_isa<SeqNode>(const AstNode* n)          { return n && n->ast_kind() == AstKind::SeqNode; }
+template <> inline bool ast_isa<IfNode>(const AstNode* n)           { return n && n->ast_kind() == AstKind::IfNode; }
+template <> inline bool ast_isa<WhileLoopNode>(const AstNode* n)    { return n && n->ast_kind() == AstKind::WhileLoopNode; }
+template <> inline bool ast_isa<DoWhileLoopNode>(const AstNode* n)  { return n && n->ast_kind() == AstKind::DoWhileLoopNode; }
+template <> inline bool ast_isa<ForLoopNode>(const AstNode* n)      { return n && n->ast_kind() == AstKind::ForLoopNode; }
+template <> inline bool ast_isa<CaseNode>(const AstNode* n)         { return n && n->ast_kind() == AstKind::CaseNode; }
+template <> inline bool ast_isa<SwitchNode>(const AstNode* n)       { return n && n->ast_kind() == AstKind::SwitchNode; }
+template <> inline bool ast_isa<BreakNode>(const AstNode* n)        { return n && n->ast_kind() == AstKind::BreakNode; }
+template <> inline bool ast_isa<ContinueNode>(const AstNode* n)     { return n && n->ast_kind() == AstKind::ContinueNode; }
+
+// LoopNode matches any of the three loop subtypes
+template <> inline bool ast_isa<LoopNode>(const AstNode* n) {
+    return n && (n->ast_kind() == AstKind::WhileLoopNode ||
+                 n->ast_kind() == AstKind::DoWhileLoopNode ||
+                 n->ast_kind() == AstKind::ForLoopNode);
+}
+
+template <typename T>
+T* ast_cast(AstNode* n) {
+    return static_cast<T*>(n);
+}
+
+template <typename T>
+const T* ast_cast(const AstNode* n) {
+    return static_cast<const T*>(n);
+}
+
+template <typename T>
+T* ast_dyn_cast(AstNode* n) {
+    return ast_isa<T>(n) ? static_cast<T*>(n) : nullptr;
+}
+
+template <typename T>
+const T* ast_dyn_cast(const AstNode* n) {
+    return ast_isa<T>(n) ? static_cast<const T*>(n) : nullptr;
+}
 
 } // namespace aletheia

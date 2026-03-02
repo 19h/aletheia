@@ -26,7 +26,7 @@ static Expression* negate_condition_expr(DecompilerArena& arena, Expression* exp
 /// break-condition (single-branch if whose true arm is a break-only CodeNode).
 /// Returns nullptr if not a break-condition.
 static Expression* extract_break_condition_expr(AstNode* node) {
-    auto* ifn = dynamic_cast<IfNode*>(node);
+    auto* ifn = ast_dyn_cast<IfNode>(node);
     if (!ifn) return nullptr;
     if (ifn->false_branch() != nullptr) return nullptr;
     if (!ifn->true_branch() || !ifn->true_branch()->is_break_node()) return nullptr;
@@ -50,7 +50,7 @@ static void delete_break_statements(AstNode* node) {
     std::vector<AstNode*> ends;
     node->get_end_nodes(ends);
     for (auto* end : ends) {
-        if (auto* cn = dynamic_cast<CodeNode*>(end)) {
+        if (auto* cn = ast_dyn_cast<CodeNode>(end)) {
             cn->clean();
             if (cn->does_end_with_break()) {
                 cn->remove_last_instruction();
@@ -72,7 +72,7 @@ bool WhileLoopRule::can_be_applied(LoopNode* loop) const {
     if (body->is_break_condition()) return true;
 
     // Case 2: body is a SeqNode whose first child is a break-condition
-    if (auto* seq = dynamic_cast<SeqNode*>(body)) {
+    if (auto* seq = ast_dyn_cast<SeqNode>(body)) {
         if (!seq->nodes().empty() && seq->first()->is_break_condition()) return true;
     }
     return false;
@@ -93,7 +93,7 @@ AstNode* WhileLoopRule::restructure(DecompilerArena& arena, LoopNode* loop) {
     }
 
     // Case 2: body is SeqNode, first child is break-condition
-    auto* seq = dynamic_cast<SeqNode*>(body);
+    auto* seq = ast_dyn_cast<SeqNode>(body);
     AstNode* first = seq->first();
     Expression* break_cond = extract_break_condition_expr(first);
     Expression* negated = negate_condition_expr(arena, break_cond);
@@ -116,13 +116,13 @@ AstNode* WhileLoopRule::restructure(DecompilerArena& arena, LoopNode* loop) {
 
 bool DoWhileLoopRule::can_be_applied(LoopNode* loop) const {
     if (!loop->is_endless()) return false;
-    auto* seq = dynamic_cast<SeqNode*>(loop->body());
+    auto* seq = ast_dyn_cast<SeqNode>(loop->body());
     if (!seq || seq->empty()) return false;
     return seq->last()->is_break_condition();
 }
 
 AstNode* DoWhileLoopRule::restructure(DecompilerArena& arena, LoopNode* loop) {
-    auto* seq = dynamic_cast<SeqNode*>(loop->body());
+    auto* seq = ast_dyn_cast<SeqNode>(loop->body());
     AstNode* last = seq->last();
 
     Expression* break_cond = extract_break_condition_expr(last);
@@ -146,7 +146,7 @@ AstNode* DoWhileLoopRule::restructure(DecompilerArena& arena, LoopNode* loop) {
 
 bool NestedDoWhileLoopRule::can_be_applied(LoopNode* loop) const {
     if (!loop->is_endless()) return false;
-    auto* seq = dynamic_cast<SeqNode*>(loop->body());
+    auto* seq = ast_dyn_cast<SeqNode>(loop->body());
     if (!seq || seq->empty()) return false;
 
     // Last child must be a single-branch condition node
@@ -163,11 +163,11 @@ bool NestedDoWhileLoopRule::can_be_applied(LoopNode* loop) const {
 }
 
 AstNode* NestedDoWhileLoopRule::restructure(DecompilerArena& arena, LoopNode* loop) {
-    auto* seq = dynamic_cast<SeqNode*>(loop->body());
+    auto* seq = ast_dyn_cast<SeqNode>(loop->body());
     auto& nodes = seq->mutable_nodes();
 
     // Last node is a single-branch ConditionNode (IfNode)
-    auto* last_if = dynamic_cast<IfNode*>(nodes.back());
+    auto* last_if = ast_dyn_cast<IfNode>(nodes.back());
     Expression* cond_expr = last_if->condition_expr();
     Expression* negated = negate_condition_expr(arena, cond_expr);
 
@@ -197,7 +197,7 @@ AstNode* NestedDoWhileLoopRule::restructure(DecompilerArena& arena, LoopNode* lo
 
 bool SequenceRule::can_be_applied(LoopNode* loop) const {
     if (!loop->is_endless()) return false;
-    auto* seq = dynamic_cast<SeqNode*>(loop->body());
+    auto* seq = ast_dyn_cast<SeqNode>(loop->body());
     if (!seq) return false;
 
     // All end-nodes must be code-nodes ending with break
@@ -232,7 +232,7 @@ AstNode* SequenceRule::restructure(DecompilerArena& arena, LoopNode* loop) {
 
 bool ConditionToSequenceRule::can_be_applied(LoopNode* loop) const {
     if (!loop->is_endless()) return false;
-    auto* ifn = dynamic_cast<IfNode*>(loop->body());
+    auto* ifn = ast_dyn_cast<IfNode>(loop->body());
     if (!ifn) return false;
 
     bool break_in_true = ifn->true_branch() ? ifn->true_branch()->does_contain_break() : false;
@@ -243,7 +243,7 @@ bool ConditionToSequenceRule::can_be_applied(LoopNode* loop) const {
 }
 
 AstNode* ConditionToSequenceRule::restructure(DecompilerArena& arena, LoopNode* loop) {
-    auto* ifn = dynamic_cast<IfNode*>(loop->body());
+    auto* ifn = ast_dyn_cast<IfNode>(loop->body());
 
     bool break_in_true = ifn->true_branch() ? ifn->true_branch()->does_contain_break() : false;
 
@@ -310,7 +310,7 @@ AstNode* LoopStructurer::refine_loop(DecompilerArena& arena, LoopNode* loop) {
 
     // Iterate: apply a matching rule, then re-check. The rule may produce
     // a new root that is still a loop needing further refinement.
-    while (auto* loop_node = dynamic_cast<LoopNode*>(current)) {
+    while (auto* loop_node = ast_dyn_cast<LoopNode>(current)) {
         if (!loop_node->is_endless()) break; // Already has a condition, done
 
         auto* rule = match_rule(loop_node);

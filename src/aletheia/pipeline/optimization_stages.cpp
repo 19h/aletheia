@@ -2333,7 +2333,7 @@ bool extract_base_index(Expression* expr, Variable*& base, Expression*& index, s
 
 bool infer_array_confidence(const Variable* base, std::size_t element_size) {
     if (!base || !base->ir_type()) return false;
-    auto* ptr = dynamic_cast<const Pointer*>(base->ir_type().get());
+    auto* ptr = type_dyn_cast<Pointer>(base->ir_type().get());
     if (!ptr || !ptr->pointee()) return false;
     return ptr->pointee()->size_bytes() == element_size;
 }
@@ -2489,16 +2489,16 @@ bool is_non_primitive_type(const TypePtr& type) {
     if (!type) {
         return false;
     }
-    if (dynamic_cast<const UnknownType*>(type.get()) != nullptr) {
+    if (type_isa<UnknownType>(type.get())) {
         return false;
     }
-    if (dynamic_cast<const Integer*>(type.get()) != nullptr) {
+    if (type_isa<Integer>(type.get())) {
         return false;
     }
-    if (dynamic_cast<const Float*>(type.get()) != nullptr) {
+    if (type_isa<Float>(type.get())) {
         return false;
     }
-    if (dynamic_cast<const CustomType*>(type.get()) != nullptr) {
+    if (type_isa<CustomType>(type.get())) {
         return false;
     }
     return true;

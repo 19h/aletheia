@@ -1084,7 +1084,7 @@ aletheia::Expression* RangeSimplifier::simplify(
 
 bool RangeSimplifier::is_unfulfillable(DagNode* condition) {
     DagNode* simplified = simplify(condition);
-    auto* c = dynamic_cast<DagConstant*>(simplified);
+    auto* c = dag_dyn_cast<DagConstant>(simplified);
     return c != nullptr && c->value() == 0;
 }
 
@@ -1093,7 +1093,7 @@ DagNode* RangeSimplifier::simplify(DagNode* condition) {
         return nullptr;
     }
 
-    auto* op = dynamic_cast<DagOperation*>(condition);
+    auto* op = dag_dyn_cast<DagOperation>(condition);
     if (!op) {
         return condition;
     }

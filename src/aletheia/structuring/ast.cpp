@@ -7,20 +7,20 @@ namespace aletheia {
 // =============================================================================
 
 bool AstNode::is_endless_loop() const {
-    if (auto* loop = dynamic_cast<const LoopNode*>(this))
+    if (auto* loop = ast_dyn_cast<LoopNode>(this))
         return loop->is_endless();
     return false;
 }
 
 bool AstNode::is_break_node() const {
-    auto* code = dynamic_cast<const CodeNode*>(this);
+    auto* code = ast_dyn_cast<CodeNode>(this);
     if (!code || !code->block()) return false;
     auto& instrs = code->block()->instructions();
     return instrs.size() == 1 && isa<BreakInstr>(instrs[0]);
 }
 
 bool AstNode::is_break_condition() const {
-    auto* ifn = dynamic_cast<const IfNode*>(this);
+    auto* ifn = ast_dyn_cast<IfNode>(this);
     if (!ifn) return false;
     // Must be single-branch (no false/else arm)
     if (ifn->false_branch() != nullptr) return false;
@@ -30,7 +30,7 @@ bool AstNode::is_break_condition() const {
 }
 
 bool AstNode::is_single_branch() const {
-    auto* ifn = dynamic_cast<const IfNode*>(this);
+    auto* ifn = ast_dyn_cast<IfNode>(this);
     if (!ifn) return false;
     return ifn->false_branch() == nullptr;
 }
@@ -69,11 +69,11 @@ bool AstNode::does_end_with_return() const {
 }
 
 bool AstNode::is_code_node_ending_with_break() const {
-    return dynamic_cast<const CodeNode*>(this) && does_end_with_break();
+    return ast_dyn_cast<CodeNode>(this) && does_end_with_break();
 }
 
 bool AstNode::is_code_node_ending_with_continue() const {
-    return dynamic_cast<const CodeNode*>(this) && does_end_with_continue();
+    return ast_dyn_cast<CodeNode>(this) && does_end_with_continue();
 }
 
 void AstNode::get_end_nodes(std::vector<AstNode*>& out) {

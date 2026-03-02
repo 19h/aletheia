@@ -146,33 +146,33 @@ std::size_t ast_node_weight(AstNode* node) {
         return 0;
     }
 
-    if (auto* cnode = dynamic_cast<CodeNode*>(node)) {
+    if (auto* cnode = ast_dyn_cast<CodeNode>(node)) {
         if (!cnode->block()) {
             return 1;
         }
         return std::max<std::size_t>(1, cnode->block()->instructions().size());
     }
-    if (auto* seq = dynamic_cast<SeqNode*>(node)) {
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
         std::size_t sum = 0;
         for (AstNode* child : seq->nodes()) {
             sum += ast_node_weight(child);
         }
         return std::max<std::size_t>(1, sum);
     }
-    if (auto* inode = dynamic_cast<IfNode*>(node)) {
+    if (auto* inode = ast_dyn_cast<IfNode>(node)) {
         return 1 + ast_node_weight(inode->true_branch()) + ast_node_weight(inode->false_branch());
     }
-    if (auto* loop = dynamic_cast<LoopNode*>(node)) {
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
         return 1 + ast_node_weight(loop->body());
     }
-    if (auto* snode = dynamic_cast<SwitchNode*>(node)) {
+    if (auto* snode = ast_dyn_cast<SwitchNode>(node)) {
         std::size_t sum = 1;
         for (CaseNode* c : snode->cases()) {
             sum += ast_node_weight(c);
         }
         return sum;
     }
-    if (auto* cnode = dynamic_cast<CaseNode*>(node)) {
+    if (auto* cnode = ast_dyn_cast<CaseNode>(node)) {
         return 1 + ast_node_weight(cnode->body());
     }
 
@@ -184,8 +184,8 @@ bool should_swap_if_branches(IfNode* inode) {
         return false;
     }
 
-    const bool true_is_if = dynamic_cast<IfNode*>(inode->true_branch()) != nullptr;
-    const bool false_is_if = dynamic_cast<IfNode*>(inode->false_branch()) != nullptr;
+    const bool true_is_if = ast_dyn_cast<IfNode>(inode->true_branch()) != nullptr;
+    const bool false_is_if = ast_dyn_cast<IfNode>(inode->false_branch()) != nullptr;
     if (true_is_if != false_is_if) {
         return true_is_if;
     }
@@ -282,11 +282,11 @@ bool try_format_string_array(Constant* c, std::string& out) {
     if (!c || !c->ir_type()) {
         return false;
     }
-    auto* arr = dynamic_cast<const ArrayType*>(c->ir_type().get());
+    auto* arr = type_dyn_cast<ArrayType>(c->ir_type().get());
     if (!arr || arr->count() == 0 || arr->count() > 8) {
         return false;
     }
-    auto* elem = dynamic_cast<const Integer*>(arr->element().get());
+    auto* elem = type_dyn_cast<Integer>(arr->element().get());
     if (!elem || elem->size() != 8) {
         return false;
     }
@@ -314,7 +314,7 @@ std::string integer_suffix(Constant* c) {
     if (!c || !c->ir_type()) {
         return "";
     }
-    auto* integer = dynamic_cast<const Integer*>(c->ir_type().get());
+    auto* integer = type_dyn_cast<Integer>(c->ir_type().get());
     if (!integer) {
         return "";
     }
@@ -857,7 +857,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     // Generate function signature
     std::string sig = "void "; // default
     if (task.function_type()) {
-        if (auto* func_type = dynamic_cast<const FunctionTypeDef*>(task.function_type().get())) {
+        if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
             sig = func_type->return_type()->to_string() + " ";
         } else {
             sig = task.function_type()->to_string() + " ";
@@ -868,7 +868,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     sig += name + "(";
 
     if (task.function_type()) {
-        if (auto* func_type = dynamic_cast<const FunctionTypeDef*>(task.function_type().get())) {
+        if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
             const auto& params = func_type->parameters();
             // Build index -> name map from parameter_registers.
             std::unordered_map<int, std::string> index_to_name;
@@ -935,7 +935,7 @@ std::vector<std::string> CodeVisitor::generate_code(AbstractSyntaxForest* forest
 void CodeVisitor::visit_node(AstNode* node) {
     if (!node) return;
 
-    if (CodeNode* cnode = dynamic_cast<CodeNode*>(node)) {
+    if (CodeNode* cnode = ast_dyn_cast<CodeNode>(node)) {
         BasicBlock* block = cnode->block();
         if (block) {
             for (Instruction* inst : block->instructions()) {
@@ -966,17 +966,17 @@ void CodeVisitor::visit_node(AstNode* node) {
                 }
             }
         }
-    } else if (SeqNode* snode = dynamic_cast<SeqNode*>(node)) {
+    } else if (SeqNode* snode = ast_dyn_cast<SeqNode>(node)) {
         for (AstNode* child : snode->nodes()) {
             visit_node(child);
         }
-    } else if (IfNode* inode = dynamic_cast<IfNode*>(node)) {
+    } else if (IfNode* inode = ast_dyn_cast<IfNode>(node)) {
         visit_if_chain(inode, false);
-    } else if (auto* snode = dynamic_cast<SwitchNode*>(node)) {
+    } else if (auto* snode = ast_dyn_cast<SwitchNode>(node)) {
         indent();
         std::string cond_str = "/* switch_expr */";
         if (snode->cond()) {
-            if (auto* expr_ast = dynamic_cast<ExprAstNode*>(snode->cond())) {
+            if (auto* expr_ast = ast_dyn_cast<ExprAstNode>(snode->cond())) {
                 cond_str = expr_gen_.generate(expr_ast->expr());
             }
         }
@@ -995,7 +995,7 @@ void CodeVisitor::visit_node(AstNode* node) {
         current_line_ += "}";
         lines_.push_back(current_line_);
         current_line_.clear();
-    } else if (auto* cnode = dynamic_cast<CaseNode*>(node)) {
+    } else if (auto* cnode = ast_dyn_cast<CaseNode>(node)) {
         indent();
         if (cnode->is_default()) {
             current_line_ += "default:";
@@ -1014,7 +1014,7 @@ void CodeVisitor::visit_node(AstNode* node) {
             current_line_.clear();
         }
         indent_level_--;
-    } else if (auto* dowhile = dynamic_cast<DoWhileLoopNode*>(node)) {
+    } else if (auto* dowhile = ast_dyn_cast<DoWhileLoopNode>(node)) {
         indent();
         current_line_ += "do {";
         lines_.push_back(current_line_);
@@ -1032,7 +1032,7 @@ void CodeVisitor::visit_node(AstNode* node) {
         }
         lines_.push_back(current_line_);
         current_line_.clear();
-    } else if (auto* forloop = dynamic_cast<ForLoopNode*>(node)) {
+    } else if (auto* forloop = ast_dyn_cast<ForLoopNode>(node)) {
         indent();
         std::string decl_str = forloop->declaration() ? expr_gen_.generate(forloop->declaration()) : "";
         std::string cond_str = forloop->condition() ? expr_gen_.generate(forloop->condition()) : "";
@@ -1049,7 +1049,7 @@ void CodeVisitor::visit_node(AstNode* node) {
         current_line_ += "}";
         lines_.push_back(current_line_);
         current_line_.clear();
-    } else if (LoopNode* lnode = dynamic_cast<LoopNode*>(node)) {
+    } else if (LoopNode* lnode = ast_dyn_cast<LoopNode>(node)) {
         // WhileLoopNode or any other LoopNode subclass
         indent();
         if (lnode->condition()) {
@@ -1078,7 +1078,7 @@ void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
 
     std::string cond_str = "/* condition */";
     if (inode->cond()) {
-        if (auto* expr_ast = dynamic_cast<ExprAstNode*>(inode->cond())) {
+        if (auto* expr_ast = ast_dyn_cast<ExprAstNode>(inode->cond())) {
             cond_str = expr_gen_.generate(expr_ast->expr());
         }
     }
@@ -1100,7 +1100,7 @@ void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
     visit_node(true_branch);
     indent_level_--;
 
-    if (auto* nested_if = dynamic_cast<IfNode*>(false_branch)) {
+    if (auto* nested_if = ast_dyn_cast<IfNode>(false_branch)) {
         visit_if_chain(nested_if, true);
         return;
     }

@@ -268,9 +268,9 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                 auto* assign = arena_.create<Assignment>(entry_var, arena_.create<Constant>(0, 4));
                 
                 auto* ast = tb->ast_node();
-                if (auto* code_node = dynamic_cast<CodeNode*>(ast)) {
+                if (auto* code_node = ast_dyn_cast<CodeNode>(ast)) {
                     code_node->block()->add_instruction(assign);
-                } else if (auto* seq_node = dynamic_cast<SeqNode*>(ast)) {
+                } else if (auto* seq_node = ast_dyn_cast<SeqNode>(ast)) {
                     auto* new_bb = arena_.create<BasicBlock>(9200 + i);
                     new_bb->add_instruction(assign);
                     auto* new_cn = arena_.create<CodeNode>(new_bb);

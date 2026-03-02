@@ -34,12 +34,12 @@ DagNode* make_nary(LogicDag& dag, LogicOp op, const std::vector<DagNode*>& child
 }
 
 DagNode* to_nnf(LogicDag& dag, DagNode* node, bool negated) {
-    if (auto* c = dynamic_cast<DagConstant*>(node)) {
+    if (auto* c = dag_dyn_cast<DagConstant>(node)) {
         const bool value = c->value() != 0;
         return make_constant(dag, negated ? !value : value);
     }
 
-    auto* op = dynamic_cast<DagOperation*>(node);
+    auto* op = dag_dyn_cast<DagOperation>(node);
     if (!op) {
         return negated ? make_unary_not(dag, node) : node;
     }
@@ -67,7 +67,7 @@ DagNode* to_nnf(LogicDag& dag, DagNode* node, bool negated) {
 
 std::vector<DagNode*> flatten_same_op(LogicOp op, DagNode* node) {
     std::vector<DagNode*> out;
-    auto* n = dynamic_cast<DagOperation*>(node);
+    auto* n = dag_dyn_cast<DagOperation>(node);
     if (n && n->op() == op) {
         for (DagNode* child : n->children()) {
             out.push_back(child);
@@ -79,7 +79,7 @@ std::vector<DagNode*> flatten_same_op(LogicOp op, DagNode* node) {
 }
 
 DagNode* distribute_or_over_and_pair(LogicDag& dag, DagNode* lhs, DagNode* rhs) {
-    auto* lhs_op = dynamic_cast<DagOperation*>(lhs);
+    auto* lhs_op = dag_dyn_cast<DagOperation>(lhs);
     if (lhs_op && lhs_op->op() == LogicOp::And) {
         std::vector<DagNode*> expanded;
         expanded.reserve(lhs_op->children().size());
@@ -89,7 +89,7 @@ DagNode* distribute_or_over_and_pair(LogicDag& dag, DagNode* lhs, DagNode* rhs) 
         return make_nary(dag, LogicOp::And, expanded);
     }
 
-    auto* rhs_op = dynamic_cast<DagOperation*>(rhs);
+    auto* rhs_op = dag_dyn_cast<DagOperation>(rhs);
     if (rhs_op && rhs_op->op() == LogicOp::And) {
         std::vector<DagNode*> expanded;
         expanded.reserve(rhs_op->children().size());
@@ -109,7 +109,7 @@ DagNode* distribute_or_over_and_pair(LogicDag& dag, DagNode* lhs, DagNode* rhs) 
 }
 
 DagNode* distribute_and_over_or_pair(LogicDag& dag, DagNode* lhs, DagNode* rhs) {
-    auto* lhs_op = dynamic_cast<DagOperation*>(lhs);
+    auto* lhs_op = dag_dyn_cast<DagOperation>(lhs);
     if (lhs_op && lhs_op->op() == LogicOp::Or) {
         std::vector<DagNode*> expanded;
         expanded.reserve(lhs_op->children().size());
@@ -119,7 +119,7 @@ DagNode* distribute_and_over_or_pair(LogicDag& dag, DagNode* lhs, DagNode* rhs) 
         return make_nary(dag, LogicOp::Or, expanded);
     }
 
-    auto* rhs_op = dynamic_cast<DagOperation*>(rhs);
+    auto* rhs_op = dag_dyn_cast<DagOperation>(rhs);
     if (rhs_op && rhs_op->op() == LogicOp::Or) {
         std::vector<DagNode*> expanded;
         expanded.reserve(rhs_op->children().size());
@@ -139,7 +139,7 @@ DagNode* distribute_and_over_or_pair(LogicDag& dag, DagNode* lhs, DagNode* rhs) 
 }
 
 DagNode* to_cnf_impl(LogicDag& dag, DagNode* node) {
-    auto* op = dynamic_cast<DagOperation*>(node);
+    auto* op = dag_dyn_cast<DagOperation>(node);
     if (!op) {
         return node;
     }
@@ -169,7 +169,7 @@ DagNode* to_cnf_impl(LogicDag& dag, DagNode* node) {
 }
 
 DagNode* to_dnf_impl(LogicDag& dag, DagNode* node) {
-    auto* op = dynamic_cast<DagOperation*>(node);
+    auto* op = dag_dyn_cast<DagOperation>(node);
     if (!op) {
         return node;
     }

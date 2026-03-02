@@ -48,7 +48,7 @@ std::unordered_map<Edge*, logos::LogicCondition> build_switch_edge_tags_for_bloc
     z3::expr all_case_expr = task.z3_ctx().bool_val(false);
 
     for (Edge* edge : bb->successors()) {
-        auto* switch_edge = dynamic_cast<SwitchEdge*>(edge);
+        auto* switch_edge = (edge && edge->edge_kind() == EdgeKind::SwitchEdge ? static_cast<SwitchEdge*>(edge) : nullptr);
         if (!switch_edge) {
             continue;
         }

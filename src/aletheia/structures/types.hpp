@@ -10,6 +10,23 @@
 namespace aletheia {
 
 // =============================================================================
+// TypeKind -- LLVM-style RTTI tag for Type hierarchy
+// =============================================================================
+
+enum class TypeKind : std::uint8_t {
+    Unknown,
+    Integer,
+    Float,
+    Pointer,
+    Array,
+    Custom,
+    FunctionTypeDef,
+    Struct,
+    Union,
+    Enum,
+};
+
+// =============================================================================
 // Type -- Abstract base class for the Aletheia type system
 // =============================================================================
 // Types are immutable value objects. Unlike IR nodes (DataflowObject), types
@@ -40,9 +57,13 @@ public:
     virtual bool operator==(const Type& other) const = 0;
     bool operator!=(const Type& other) const { return !(*this == other); }
 
+    /// LLVM-style RTTI tag.
+    TypeKind type_kind() const { return type_kind_; }
+
 protected:
     explicit Type(std::size_t size_bits) : size_bits_(size_bits) {}
     std::size_t size_bits_;
+    TypeKind type_kind_;
 };
 
 // Convenience alias for shared ownership of immutable types
@@ -54,14 +75,14 @@ using TypePtr = std::shared_ptr<const Type>;
 
 class UnknownType final : public Type {
 public:
-    explicit UnknownType(std::size_t size_bits = 0) : Type(size_bits) {}
+    explicit UnknownType(std::size_t size_bits = 0) : Type(size_bits) { type_kind_ = TypeKind::Unknown; }
 
     std::string to_string() const override { return "unknown type"; }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const UnknownType*>(&other))
-            return size_bits_ == o->size_bits_;
-        return false;
+        if (other.type_kind() != TypeKind::Unknown) return false;
+        auto* o = static_cast<const UnknownType*>(&other);
+        return size_bits_ == o->size_bits_;
     }
 
     /// Singleton for zero-sized unknown type.
@@ -78,7 +99,7 @@ public:
 class Integer final : public Type {
 public:
     Integer(std::size_t size_bits, bool is_signed)
-        : Type(size_bits), signed_(is_signed) {}
+        : Type(size_bits), signed_(is_signed) { type_kind_ = TypeKind::Integer; }
 
     bool is_signed() const { return signed_; }
 
@@ -96,9 +117,9 @@ public:
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const Integer*>(&other))
-            return size_bits_ == o->size_bits_ && signed_ == o->signed_;
-        return false;
+        if (other.type_kind() != TypeKind::Integer) return false;
+        auto* o = static_cast<const Integer*>(&other);
+        return size_bits_ == o->size_bits_ && signed_ == o->signed_;
     }
 
     // ---- Factory methods matching the Python reference ----
@@ -124,7 +145,7 @@ private:
 
 class Float final : public Type {
 public:
-    explicit Float(std::size_t size_bits) : Type(size_bits) {}
+    explicit Float(std::size_t size_bits) : Type(size_bits) { type_kind_ = TypeKind::Float; }
 
     std::string to_string() const override {
         static const std::unordered_map<std::size_t, const char*> size_types = {
@@ -137,9 +158,8 @@ public:
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const Float*>(&other))
-            return size_bits_ == o->size_bits_;
-        return false;
+        if (other.type_kind() != TypeKind::Float) return false;
+        return size_bits_ == static_cast<const Float*>(&other)->size_bits_;
     }
 
     // ---- Factory methods ----
@@ -158,21 +178,21 @@ public:
     /// @param pointee The type being pointed to.
     /// @param ptr_size_bits Width of the pointer itself (32 or 64 typically).
     Pointer(TypePtr pointee, std::size_t ptr_size_bits = 64)
-        : Type(ptr_size_bits), pointee_(std::move(pointee)) {}
+        : Type(ptr_size_bits), pointee_(std::move(pointee)) { type_kind_ = TypeKind::Pointer; }
 
     const TypePtr& pointee() const { return pointee_; }
 
     std::string to_string() const override {
         // Nested pointers: "int **" vs "int *"
-        if (dynamic_cast<const Pointer*>(pointee_.get()))
+        if (pointee_ && pointee_->type_kind() == TypeKind::Pointer)
             return pointee_->to_string() + "*";
         return pointee_->to_string() + " *";
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const Pointer*>(&other))
-            return size_bits_ == o->size_bits_ && *pointee_ == *o->pointee_;
-        return false;
+        if (other.type_kind() != TypeKind::Pointer) return false;
+        auto* o = static_cast<const Pointer*>(&other);
+        return size_bits_ == o->size_bits_ && *pointee_ == *o->pointee_;
     }
 
 private:
@@ -188,7 +208,7 @@ public:
     /// @param element The type of each element.
     /// @param count Number of elements.
     ArrayType(TypePtr element, std::size_t count)
-        : Type(element->size() * count), element_(std::move(element)), count_(count) {}
+        : Type(element->size() * count), element_(std::move(element)), count_(count) { type_kind_ = TypeKind::Array; }
 
     const TypePtr& element() const { return element_; }
     std::size_t count() const { return count_; }
@@ -198,9 +218,9 @@ public:
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const ArrayType*>(&other))
-            return count_ == o->count_ && *element_ == *o->element_;
-        return false;
+        if (other.type_kind() != TypeKind::Array) return false;
+        auto* o = static_cast<const ArrayType*>(&other);
+        return count_ == o->count_ && *element_ == *o->element_;
     }
 
 private:
@@ -215,16 +235,16 @@ private:
 class CustomType final : public Type {
 public:
     CustomType(std::string text, std::size_t size_bits)
-        : Type(size_bits), text_(std::move(text)) {}
+        : Type(size_bits), text_(std::move(text)) { type_kind_ = TypeKind::Custom; }
 
     const std::string& text() const { return text_; }
 
     std::string to_string() const override { return text_; }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const CustomType*>(&other))
-            return text_ == o->text_ && size_bits_ == o->size_bits_;
-        return false;
+        if (other.type_kind() != TypeKind::Custom) return false;
+        auto* o = static_cast<const CustomType*>(&other);
+        return text_ == o->text_ && size_bits_ == o->size_bits_;
     }
 
     // ---- Factory methods ----
@@ -245,7 +265,7 @@ class FunctionTypeDef final : public Type {
 public:
     FunctionTypeDef(TypePtr return_type, std::vector<TypePtr> parameters)
         : Type(0), return_type_(std::move(return_type)),
-          parameters_(std::move(parameters)) {}
+          parameters_(std::move(parameters)) { type_kind_ = TypeKind::FunctionTypeDef; }
 
     const TypePtr& return_type() const { return return_type_; }
     const std::vector<TypePtr>& parameters() const { return parameters_; }
@@ -261,14 +281,13 @@ public:
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const FunctionTypeDef*>(&other)) {
-            if (*return_type_ != *o->return_type_) return false;
-            if (parameters_.size() != o->parameters_.size()) return false;
-            for (std::size_t i = 0; i < parameters_.size(); ++i)
-                if (*parameters_[i] != *o->parameters_[i]) return false;
-            return true;
-        }
-        return false;
+        if (other.type_kind() != TypeKind::FunctionTypeDef) return false;
+        auto* o = static_cast<const FunctionTypeDef*>(&other);
+        if (*return_type_ != *o->return_type_) return false;
+        if (parameters_.size() != o->parameters_.size()) return false;
+        for (std::size_t i = 0; i < parameters_.size(); ++i)
+            if (*parameters_[i] != *o->parameters_[i]) return false;
+        return true;
     }
 
 private:
@@ -317,7 +336,7 @@ public:
            std::unordered_map<std::size_t, ComplexTypeMember> members,
            bool is_class = false)
         : ComplexType(std::move(name), size_bits),
-          members_(std::move(members)), is_class_(is_class) {}
+          members_(std::move(members)), is_class_(is_class) { type_kind_ = TypeKind::Struct; }
 
     bool is_class() const { return is_class_; }
     const std::unordered_map<std::size_t, ComplexTypeMember>& members() const {
@@ -352,9 +371,9 @@ public:
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const Struct*>(&other))
-            return name_ == o->name_ && size_bits_ == o->size_bits_;
-        return false;
+        if (other.type_kind() != TypeKind::Struct) return false;
+        auto* o = static_cast<const Struct*>(&other);
+        return name_ == o->name_ && size_bits_ == o->size_bits_;
     }
 
 private:
@@ -368,7 +387,7 @@ public:
     Union(std::string name, std::size_t size_bits,
           std::vector<ComplexTypeMember> members)
         : ComplexType(std::move(name), size_bits),
-          members_(std::move(members)) {}
+          members_(std::move(members)) { type_kind_ = TypeKind::Union; }
 
     const std::vector<ComplexTypeMember>& members() const { return members_; }
 
@@ -388,9 +407,9 @@ public:
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const Union*>(&other))
-            return name_ == o->name_ && size_bits_ == o->size_bits_;
-        return false;
+        if (other.type_kind() != TypeKind::Union) return false;
+        auto* o = static_cast<const Union*>(&other);
+        return name_ == o->name_ && size_bits_ == o->size_bits_;
     }
 
 private:
@@ -403,7 +422,7 @@ public:
     Enum(std::string name, std::size_t size_bits,
          std::unordered_map<int64_t, ComplexTypeMember> members)
         : ComplexType(std::move(name), size_bits),
-          members_(std::move(members)) {}
+          members_(std::move(members)) { type_kind_ = TypeKind::Enum; }
 
     const std::unordered_map<int64_t, ComplexTypeMember>& members() const {
         return members_;
@@ -428,9 +447,9 @@ public:
     }
 
     bool operator==(const Type& other) const override {
-        if (auto* o = dynamic_cast<const Enum*>(&other))
-            return name_ == o->name_ && size_bits_ == o->size_bits_;
-        return false;
+        if (other.type_kind() != TypeKind::Enum) return false;
+        auto* o = static_cast<const Enum*>(&other);
+        return name_ == o->name_ && size_bits_ == o->size_bits_;
     }
 
 private:
@@ -510,5 +529,52 @@ private:
         return r;
     }
 };
+
+// =============================================================================
+// LLVM-style RTTI helpers for Type hierarchy
+// =============================================================================
+
+// Forward declarations needed for specializations
+class ComplexType;
+
+template <typename T> bool type_isa(const Type* t);
+
+template <> inline bool type_isa<UnknownType>(const Type* t)      { return t && t->type_kind() == TypeKind::Unknown; }
+template <> inline bool type_isa<Integer>(const Type* t)           { return t && t->type_kind() == TypeKind::Integer; }
+template <> inline bool type_isa<Float>(const Type* t)             { return t && t->type_kind() == TypeKind::Float; }
+template <> inline bool type_isa<Pointer>(const Type* t)           { return t && t->type_kind() == TypeKind::Pointer; }
+template <> inline bool type_isa<ArrayType>(const Type* t)         { return t && t->type_kind() == TypeKind::Array; }
+template <> inline bool type_isa<CustomType>(const Type* t)        { return t && t->type_kind() == TypeKind::Custom; }
+template <> inline bool type_isa<FunctionTypeDef>(const Type* t)   { return t && t->type_kind() == TypeKind::FunctionTypeDef; }
+template <> inline bool type_isa<Struct>(const Type* t)            { return t && t->type_kind() == TypeKind::Struct; }
+template <> inline bool type_isa<Union>(const Type* t)             { return t && t->type_kind() == TypeKind::Union; }
+template <> inline bool type_isa<Enum>(const Type* t)              { return t && t->type_kind() == TypeKind::Enum; }
+
+// ComplexType matches Struct, Union, or Enum
+template <> inline bool type_isa<ComplexType>(const Type* t) {
+    return t && (t->type_kind() == TypeKind::Struct ||
+                 t->type_kind() == TypeKind::Union ||
+                 t->type_kind() == TypeKind::Enum);
+}
+
+template <typename T>
+T* type_dyn_cast(Type* t) {
+    return type_isa<T>(t) ? static_cast<T*>(t) : nullptr;
+}
+
+template <typename T>
+const T* type_dyn_cast(const Type* t) {
+    return type_isa<T>(t) ? static_cast<const T*>(t) : nullptr;
+}
+
+template <typename T>
+T* type_cast(Type* t) {
+    return static_cast<T*>(t);
+}
+
+template <typename T>
+const T* type_cast(const Type* t) {
+    return static_cast<const T*>(t);
+}
 
 } // namespace aletheia

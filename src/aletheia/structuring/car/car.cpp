@@ -8,7 +8,7 @@ namespace aletheia {
 namespace {
 
 Expression* extract_cond_expr(AstNode* cond_node) {
-    if (auto* expr_ast = dynamic_cast<ExprAstNode*>(cond_node)) {
+    if (auto* expr_ast = ast_dyn_cast<ExprAstNode>(cond_node)) {
         return expr_ast->expr();
     }
     return nullptr;
@@ -78,7 +78,7 @@ public:
         std::vector<AstNode*>& nodes = seq->mutable_nodes();
 
         for (AstNode*& node : nodes) {
-            auto* if_node = dynamic_cast<IfNode*>(node);
+            auto* if_node = ast_dyn_cast<IfNode>(node);
             if (!if_node) continue;
 
             Expression* selector = nullptr;
@@ -111,7 +111,7 @@ public:
                 cases.push_back({case_value, cursor->true_branch()});
 
                 AstNode* false_branch = cursor->false_branch();
-                if (auto* nested = dynamic_cast<IfNode*>(false_branch)) {
+                if (auto* nested = ast_dyn_cast<IfNode>(false_branch)) {
                     cursor = nested;
                 } else {
                     default_branch = false_branch;
@@ -138,7 +138,7 @@ public:
     static void run(DecompilerArena& arena, SeqNode* seq) {
         if (!seq) return;
         for (AstNode* node : seq->mutable_nodes()) {
-            auto* sw = dynamic_cast<SwitchNode*>(node);
+            auto* sw = ast_dyn_cast<SwitchNode>(node);
             if (!sw) continue;
 
             Expression* switch_expr = extract_cond_expr(sw->cond());
@@ -147,7 +147,7 @@ public:
 
             std::vector<CaseNode*> new_cases;
             for (CaseNode* c : sw->cases()) {
-                auto* nested_if = dynamic_cast<IfNode*>(c->body());
+                auto* nested_if = ast_dyn_cast<IfNode>(c->body());
                 if (!nested_if) continue;
 
                 Expression* nested_selector = nullptr;
@@ -181,7 +181,7 @@ public:
     static void run(DecompilerArena& arena, SeqNode* seq) {
         if (!seq) return;
         for (AstNode*& node : seq->mutable_nodes()) {
-            auto* wrapper_if = dynamic_cast<IfNode*>(node);
+            auto* wrapper_if = ast_dyn_cast<IfNode>(node);
             if (!wrapper_if) continue;
 
             Expression* selector = nullptr;
@@ -191,7 +191,7 @@ public:
                 continue;
             }
 
-            auto* inner_switch = dynamic_cast<SwitchNode*>(wrapper_if->false_branch());
+            auto* inner_switch = ast_dyn_cast<SwitchNode>(wrapper_if->false_branch());
             if (!inner_switch) continue;
 
             Expression* inner_selector = extract_cond_expr(inner_switch->cond());
@@ -218,7 +218,7 @@ public:
         std::vector<AstNode*>& nodes = seq->mutable_nodes();
 
         for (std::size_t i = 0; i < nodes.size(); ++i) {
-            auto* sw = dynamic_cast<SwitchNode*>(nodes[i]);
+            auto* sw = ast_dyn_cast<SwitchNode>(nodes[i]);
             if (!sw) continue;
 
             Expression* switch_expr = extract_cond_expr(sw->cond());
@@ -227,7 +227,7 @@ public:
 
             std::size_t j = i + 1;
             while (j < nodes.size()) {
-                auto* if_node = dynamic_cast<IfNode*>(nodes[j]);
+                auto* if_node = ast_dyn_cast<IfNode>(nodes[j]);
                 if (!if_node) break;
 
                 Expression* selector = nullptr;
@@ -280,7 +280,7 @@ Assignment* extract_single_assignment(CodeNode* node) {
 Assignment* extract_trailing_assignment(AstNode* body, CodeNode** owner_code) {
     if (!body) return nullptr;
 
-    if (auto* code = dynamic_cast<CodeNode*>(body)) {
+    if (auto* code = ast_dyn_cast<CodeNode>(body)) {
         if (!code->block() || code->block()->instructions().empty()) return nullptr;
         Instruction* tail = code->block()->instructions().back();
         auto* assign = dyn_cast<Assignment>(tail);
@@ -288,9 +288,9 @@ Assignment* extract_trailing_assignment(AstNode* body, CodeNode** owner_code) {
         return assign;
     }
 
-    auto* seq = dynamic_cast<SeqNode*>(body);
+    auto* seq = ast_dyn_cast<SeqNode>(body);
     if (!seq || seq->nodes().empty()) return nullptr;
-    auto* tail_code = dynamic_cast<CodeNode*>(seq->last());
+    auto* tail_code = ast_dyn_cast<CodeNode>(seq->last());
     if (!tail_code || !tail_code->block() || tail_code->block()->instructions().empty()) return nullptr;
     Instruction* tail = tail_code->block()->instructions().back();
     auto* assign = dyn_cast<Assignment>(tail);
@@ -318,12 +318,12 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
     if (nodes.size() < 2) return;
 
     for (std::size_t i = 1; i < nodes.size(); ++i) {
-        auto* while_node = dynamic_cast<WhileLoopNode*>(nodes[i]);
+        auto* while_node = ast_dyn_cast<WhileLoopNode>(nodes[i]);
         if (!while_node || while_node->condition() == nullptr || while_node->body() == nullptr) {
             continue;
         }
 
-        auto* init_code = dynamic_cast<CodeNode*>(nodes[i - 1]);
+        auto* init_code = ast_dyn_cast<CodeNode>(nodes[i - 1]);
         auto* init_assign = extract_single_assignment(init_code);
         if (!init_assign) continue;
 
@@ -361,7 +361,7 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
 AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
     if (!node) return nullptr;
 
-    if (auto* seq = dynamic_cast<SeqNode*>(node)) {
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
         for (AstNode*& child : seq->mutable_nodes()) {
             child = rewrite_guarded_do_while(arena, child);
         }
@@ -369,7 +369,7 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
         return seq;
     }
 
-    if (auto* if_node = dynamic_cast<IfNode*>(node)) {
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
         if (if_node->true_branch()) {
             if_node->set_true_branch(rewrite_guarded_do_while(arena, if_node->true_branch()));
         }
@@ -380,7 +380,7 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
         // Guarded do-while pattern:
         // if (cond) { do { body } while (cond); }  -->  while (cond) { body }
         if (if_node->false_branch() == nullptr) {
-            auto* dowhile = dynamic_cast<DoWhileLoopNode*>(if_node->true_branch());
+            auto* dowhile = ast_dyn_cast<DoWhileLoopNode>(if_node->true_branch());
             Expression* guard_cond = if_node->condition_expr();
             if (dowhile != nullptr && guard_cond != nullptr && dowhile->condition() != nullptr) {
                 if (expr_fingerprint(guard_cond) == expr_fingerprint(dowhile->condition())) {
@@ -392,21 +392,21 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
         return if_node;
     }
 
-    if (auto* loop = dynamic_cast<LoopNode*>(node)) {
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
         if (loop->body()) {
             loop->set_body(rewrite_guarded_do_while(arena, loop->body()));
         }
         return loop;
     }
 
-    if (auto* sw = dynamic_cast<SwitchNode*>(node)) {
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
         for (CaseNode* c : sw->mutable_cases()) {
             c->set_body(rewrite_guarded_do_while(arena, c->body()));
         }
         return sw;
     }
 
-    if (auto* c = dynamic_cast<CaseNode*>(node)) {
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
         c->set_body(rewrite_guarded_do_while(arena, c->body()));
         return c;
     }
@@ -422,7 +422,7 @@ AstNode* ConditionAwareRefinement::refine(
     AstNode* root,
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
 ) {
-    if (auto* seq = dynamic_cast<SeqNode*>(root)) {
+    if (auto* seq = ast_dyn_cast<SeqNode>(root)) {
         (void)ctx;
         (void)reaching_conditions;
 
@@ -432,7 +432,7 @@ AstNode* ConditionAwareRefinement::refine(
         MissingCaseFinderSequence::run(arena, seq);
 
         for (AstNode* node : seq->mutable_nodes()) {
-            if (auto* sw = dynamic_cast<SwitchNode*>(node)) {
+            if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
                 sw->mutable_cases() = CaseDependencyGraph::order_cases(sw->cases());
             }
         }

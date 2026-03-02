@@ -10,13 +10,13 @@ namespace logos {
 namespace {
 
 bool is_const_bool(DagNode* node, bool value) {
-    auto* c = dynamic_cast<DagConstant*>(node);
+    auto* c = dag_dyn_cast<DagConstant>(node);
     if (!c) return false;
     return (c->value() != 0) == value;
 }
 
 bool is_not_of(DagNode* lhs, DagNode* rhs) {
-    auto* op = dynamic_cast<DagOperation*>(lhs);
+    auto* op = dag_dyn_cast<DagOperation>(lhs);
     if (!op || op->op() != LogicOp::Not || op->children().size() != 1) return false;
     return op->children()[0]->to_string() == rhs->to_string();
 }
@@ -51,7 +51,7 @@ std::vector<DagNode*> simplify_children(LogicDag& dag, DagOperation* op) {
 std::vector<DagNode*> flatten_associative(LogicOp op, const std::vector<DagNode*>& children) {
     std::vector<DagNode*> out;
     for (DagNode* child : children) {
-        auto* child_op = dynamic_cast<DagOperation*>(child);
+        auto* child_op = dag_dyn_cast<DagOperation>(child);
         if (child_op && child_op->op() == op) {
             for (DagNode* grand : child_op->children()) {
                 out.push_back(grand);
@@ -67,7 +67,7 @@ DagNode* fold_all_constant_operation(LogicDag& dag, LogicOp op, const std::vecto
     std::vector<uint64_t> values;
     values.reserve(children.size());
     for (DagNode* child : children) {
-        auto* c = dynamic_cast<DagConstant*>(child);
+        auto* c = dag_dyn_cast<DagConstant>(child);
         if (!c) return nullptr;
         values.push_back(c->value());
     }
@@ -121,12 +121,12 @@ DagNode* simplify_not(LogicDag& dag, const std::vector<DagNode*>& children) {
     }
 
     DagNode* child = children[0];
-    if (auto* c = dynamic_cast<DagConstant*>(child)) {
+    if (auto* c = dag_dyn_cast<DagConstant>(child)) {
         return make_bool_constant(dag, c->value() == 0);
     }
 
     // De Morgan: !(a && b) -> !a || !b ; !(a || b) -> !a && !b
-    if (auto* op = dynamic_cast<DagOperation*>(child)) {
+    if (auto* op = dag_dyn_cast<DagOperation>(child)) {
         if (op->op() == LogicOp::And || op->op() == LogicOp::Or) {
             const LogicOp flipped = op->op() == LogicOp::And ? LogicOp::Or : LogicOp::And;
             std::vector<DagNode*> negated;
@@ -203,7 +203,7 @@ DagNode* simplify_commutative(LogicDag& dag, LogicOp op, const std::vector<DagNo
 } // namespace
 
 DagNode* simplify_node(LogicDag& dag, DagNode* node) {
-    auto* op = dynamic_cast<DagOperation*>(node);
+    auto* op = dag_dyn_cast<DagOperation>(node);
     if (!op) {
         return node;
     }

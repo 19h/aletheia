@@ -237,7 +237,7 @@ void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph
             cfg.remove_edge(pred_to_bb);
 
             Edge* pred_to_split = nullptr;
-            if (auto* switch_edge = dynamic_cast<SwitchEdge*>(pred_to_bb)) {
+            if (auto* switch_edge = (pred_to_bb && pred_to_bb->edge_kind() == EdgeKind::SwitchEdge ? static_cast<SwitchEdge*>(pred_to_bb) : nullptr)) {
                 pred_to_split = arena.create<SwitchEdge>(
                     pred_block,
                     split_block,

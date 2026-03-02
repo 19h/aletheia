@@ -40,13 +40,13 @@ std::string type_prefix_for(const TypePtr& type) {
         return "v";
     }
 
-    if (dynamic_cast<const Pointer*>(type.get()) != nullptr) {
+    if (type_isa<Pointer>(type.get())) {
         return "p";
     }
-    if (dynamic_cast<const Float*>(type.get()) != nullptr) {
+    if (type_isa<Float>(type.get())) {
         return "f";
     }
-    if (dynamic_cast<const Integer*>(type.get()) != nullptr) {
+    if (type_isa<Integer>(type.get())) {
         return "i";
     }
     if (type->is_boolean()) {
@@ -144,7 +144,7 @@ void rename_expression(Expression* expr, RenameState& state) {
 void rename_ast_node(AstNode* node, RenameState& state) {
     if (!node) return;
 
-    if (auto* code = dynamic_cast<CodeNode*>(node)) {
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
         if (!code->block()) return;
         for (Instruction* inst : code->block()->instructions()) {
             rename_instruction(inst, state);
@@ -152,37 +152,37 @@ void rename_ast_node(AstNode* node, RenameState& state) {
         return;
     }
 
-    if (auto* expr_node = dynamic_cast<ExprAstNode*>(node)) {
+    if (auto* expr_node = ast_dyn_cast<ExprAstNode>(node)) {
         rename_expression(expr_node->expr(), state);
         return;
     }
 
-    if (auto* seq = dynamic_cast<SeqNode*>(node)) {
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
         for (AstNode* child : seq->nodes()) {
             rename_ast_node(child, state);
         }
         return;
     }
 
-    if (auto* if_node = dynamic_cast<IfNode*>(node)) {
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
         rename_ast_node(if_node->cond(), state);
         rename_ast_node(if_node->true_branch(), state);
         rename_ast_node(if_node->false_branch(), state);
         return;
     }
 
-    if (auto* loop = dynamic_cast<LoopNode*>(node)) {
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
         rename_expression(loop->condition(), state);
         rename_ast_node(loop->body(), state);
 
-        if (auto* for_loop = dynamic_cast<ForLoopNode*>(loop)) {
+        if (auto* for_loop = ast_dyn_cast<ForLoopNode>(loop)) {
             rename_instruction(for_loop->declaration(), state);
             rename_instruction(for_loop->modification(), state);
         }
         return;
     }
 
-    if (auto* sw = dynamic_cast<SwitchNode*>(node)) {
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
         rename_ast_node(sw->cond(), state);
         for (CaseNode* c : sw->cases()) {
             rename_ast_node(c, state);
@@ -190,7 +190,7 @@ void rename_ast_node(AstNode* node, RenameState& state) {
         return;
     }
 
-    if (auto* c = dynamic_cast<CaseNode*>(node)) {
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
         rename_ast_node(c->body(), state);
     }
 }

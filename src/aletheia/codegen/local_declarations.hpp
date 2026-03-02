@@ -59,34 +59,34 @@ public:
 
     void traverse(AstNode* node) {
         if (!node) return;
-        if (auto* expr_node = dynamic_cast<ExprAstNode*>(node)) {
+        if (auto* expr_node = ast_dyn_cast<ExprAstNode>(node)) {
             if (expr_node->expr()) expr_node->expr()->accept(*this);
-        } else if (auto* cnode = dynamic_cast<CodeNode*>(node)) {
+        } else if (auto* cnode = ast_dyn_cast<CodeNode>(node)) {
             if (cnode->block()) {
                 for (auto* inst : cnode->block()->instructions()) {
                     if (inst) inst->accept(*this);
                 }
             }
-        } else if (auto* snode = dynamic_cast<SeqNode*>(node)) {
+        } else if (auto* snode = ast_dyn_cast<SeqNode>(node)) {
             for (auto* child : snode->nodes()) traverse(child);
-        } else if (auto* inode = dynamic_cast<IfNode*>(node)) {
+        } else if (auto* inode = ast_dyn_cast<IfNode>(node)) {
             traverse(inode->cond());
             traverse(inode->true_branch());
             traverse(inode->false_branch());
-        } else if (auto* lnode = dynamic_cast<LoopNode*>(node)) {
+        } else if (auto* lnode = ast_dyn_cast<LoopNode>(node)) {
             if (lnode->condition()) lnode->condition()->accept(*this);
             
             // ForLoopNode might have declaration and modification instructions
-            if (auto* fnode = dynamic_cast<ForLoopNode*>(node)) {
+            if (auto* fnode = ast_dyn_cast<ForLoopNode>(node)) {
                 if (fnode->declaration()) fnode->declaration()->accept(*this);
                 if (fnode->modification()) fnode->modification()->accept(*this);
             }
             
             traverse(lnode->body());
-        } else if (auto* swnode = dynamic_cast<SwitchNode*>(node)) {
+        } else if (auto* swnode = ast_dyn_cast<SwitchNode>(node)) {
             traverse(swnode->cond());
             for (auto* c : swnode->cases()) traverse(c);
-        } else if (auto* casenode = dynamic_cast<CaseNode*>(node)) {
+        } else if (auto* casenode = ast_dyn_cast<CaseNode>(node)) {
             traverse(casenode->body());
         }
     }

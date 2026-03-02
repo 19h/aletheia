@@ -49,7 +49,7 @@ bool is_relation_op(LogicOp op) {
 }
 
 bool try_parse_relation(DagNode* node, ParsedRelation& out) {
-    auto* rel = dynamic_cast<DagOperation*>(node);
+    auto* rel = dag_dyn_cast<DagOperation>(node);
     if (!rel || !is_relation_op(rel->op())) {
         return false;
     }
@@ -59,8 +59,8 @@ bool try_parse_relation(DagNode* node, ParsedRelation& out) {
 
     DagNode* lhs = rel->children()[0];
     DagNode* rhs = rel->children()[1];
-    auto* lhs_const = dynamic_cast<DagConstant*>(lhs);
-    auto* rhs_const = dynamic_cast<DagConstant*>(rhs);
+    auto* lhs_const = dag_dyn_cast<DagConstant>(lhs);
+    auto* rhs_const = dag_dyn_cast<DagConstant>(rhs);
 
     if ((lhs_const == nullptr) == (rhs_const == nullptr)) {
         // Either both constant or none constant: not a range relation we handle.
@@ -83,7 +83,7 @@ bool try_parse_relation(DagNode* node, ParsedRelation& out) {
 }
 
 void collect_and_terms(DagNode* node, std::vector<DagNode*>& out) {
-    auto* op = dynamic_cast<DagOperation*>(node);
+    auto* op = dag_dyn_cast<DagOperation>(node);
     if (op && op->op() == LogicOp::And) {
         for (DagNode* child : op->children()) {
             collect_and_terms(child, out);
@@ -179,7 +179,7 @@ DagNode* DagBitwiseAndRangeSimplifier::simplify(DagNode* condition) {
         return nullptr;
     }
 
-    auto* root = dynamic_cast<DagOperation*>(condition);
+    auto* root = dag_dyn_cast<DagOperation>(condition);
     if (!root || root->op() != LogicOp::And) {
         return condition;
     }
@@ -192,7 +192,7 @@ DagNode* DagBitwiseAndRangeSimplifier::simplify(DagNode* condition) {
     bool changed = false;
 
     for (DagNode* term : terms) {
-        if (auto* c = dynamic_cast<DagConstant*>(term)) {
+        if (auto* c = dag_dyn_cast<DagConstant>(term)) {
             changed = true;
             if (c->value() == 0) {
                 return make_node<DagConstant>(0);

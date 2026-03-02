@@ -28,16 +28,25 @@ enum class EdgeProperty {
     NonLoop
 };
 
+enum class EdgeKind : std::uint8_t {
+    Edge,
+    SwitchEdge,
+};
+
 class Edge : public ArenaAllocated {
 public:
     Edge(BasicBlock* source, BasicBlock* target, EdgeType type)
-        : source_(source), target_(target), type_(type) {}
+        : source_(source), target_(target), type_(type), edge_kind_(EdgeKind::Edge) {}
 
     virtual ~Edge() = default;
 
     BasicBlock* source() const { return source_; }
     BasicBlock* target() const { return target_; }
     EdgeType type() const { return type_; }
+    EdgeKind edge_kind() const { return edge_kind_; }
+
+protected:
+    EdgeKind edge_kind_;
 
 private:
     BasicBlock* source_;
@@ -48,7 +57,7 @@ private:
 class SwitchEdge : public Edge {
 public:
     SwitchEdge(BasicBlock* source, BasicBlock* target, std::uint64_t case_value)
-        : Edge(source, target, EdgeType::Switch), case_values_{static_cast<std::int64_t>(case_value)} {}
+        : Edge(source, target, EdgeType::Switch), case_values_{static_cast<std::int64_t>(case_value)} { edge_kind_ = EdgeKind::SwitchEdge; }
 
     SwitchEdge(BasicBlock* source,
                BasicBlock* target,
@@ -56,7 +65,7 @@ public:
                bool is_default = false)
         : Edge(source, target, EdgeType::Switch),
           case_values_(std::move(case_values)),
-          is_default_(is_default) {}
+          is_default_(is_default) { edge_kind_ = EdgeKind::SwitchEdge; }
 
     std::int64_t case_value() const {
         if (case_values_.empty()) {
