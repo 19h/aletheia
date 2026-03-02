@@ -161,7 +161,13 @@ bool generated_output_too_lossy(std::size_t lifted_non_control_count, const std:
     if (emitted == 0) {
         return true;
     }
-    return emitted * 2 < lifted_non_control_count;
+    int goto_count = 0;
+    for (const auto& line : lines) {
+        if (line.find("goto bb_") != std::string::npos || line.find("/* branch if") != std::string::npos) goto_count++;
+    }
+    if (goto_count > 0 && goto_count * 5 > emitted) return true;
+    if (goto_count > 10) return true;
+    return emitted * 3 < lifted_non_control_count;
 }
 
 std::size_t count_cfg_non_control_instructions(const aletheia::ControlFlowGraph* cfg) {

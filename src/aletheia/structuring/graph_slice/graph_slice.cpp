@@ -100,64 +100,7 @@ TransitionCFG* GraphSlice::compute_graph_slice_for_sink_nodes(
 
     dfs(source, dfs);
 
-    // Now reconstruct edges within the slice
-    // We must return the blocks in topological order so that CBR processes them correctly sequentially.
-    std::vector<TransitionBlock*> topo_order;
-    std::unordered_map<TransitionBlock*, int> in_degree;
-
     for (TransitionBlock* node : slice_nodes) {
-        if (!node) {
-            continue;
-        }
-        in_degree[node] = 0;
-    }
-
-    for (TransitionBlock* node : slice_nodes) {
-        if (!node) {
-            continue;
-        }
-        for (TransitionBlock* succ : node->successors_blocks()) {
-            if (!succ) {
-                continue;
-            }
-            if (slice_nodes.contains(succ)) {
-                in_degree[succ]++;
-            }
-        }
-    }
-
-    std::vector<TransitionBlock*> q;
-    for (TransitionBlock* node : slice_nodes) {
-        if (!node) {
-            continue;
-        }
-        if (in_degree[node] == 0) {
-            q.push_back(node);
-        }
-    }
-
-    size_t head = 0;
-    while (head < q.size()) {
-        TransitionBlock* u = q[head++];
-        if (!u) {
-            continue;
-        }
-        topo_order.push_back(u);
-
-        for (TransitionBlock* v : u->successors_blocks()) {
-            if (!v) {
-                continue;
-            }
-            if (slice_nodes.contains(v)) {
-                in_degree[v]--;
-                if (in_degree[v] == 0) {
-                    q.push_back(v);
-                }
-            }
-        }
-    }
-
-    for (TransitionBlock* node : topo_order) {
         if (node) {
             slice->add_block(node);
         }

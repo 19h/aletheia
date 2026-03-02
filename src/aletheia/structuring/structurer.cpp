@@ -289,7 +289,11 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             loop_region->set_entry(new_head);
             head = new_head;
             region_set.insert(new_head);
-            for(auto& p : condition_nodes) region_set.insert(p.first);
+            loop_region->add_block(new_head);
+            for(auto& p : condition_nodes) {
+                region_set.insert(p.first);
+                loop_region->add_block(p.first);
+            }
         }
 
 skip_abnormal_entry:
@@ -558,12 +562,12 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
                 }
             }
             
+            bool was_entry = (cfg.entry() == best_header);
             for (auto* node : best_region) {
                 cfg.remove_block(node);
             }
             cfg.add_block(collapsed_block);
-            
-            if (cfg.entry() == best_header) {
+            if (was_entry) {
                 cfg.set_entry(collapsed_block);
             }
 
@@ -600,7 +604,11 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
             if (!cfg.entry() || all_blocks.empty()) break;
             restructure_region(&cfg, cfg.entry(), all_blocks);
             
-            // At this point, the root of cfg.entry() has the fully nested AST!
+            TransitionBlock* collapsed_block = arena_.create<TransitionBlock>(cfg.entry()->ast_node());
+            for (auto* node : all_blocks) cfg.remove_block(node);
+            cfg.add_block(collapsed_block);
+            cfg.set_entry(collapsed_block);
+            
             break;
         }
     }
