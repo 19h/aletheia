@@ -113,7 +113,7 @@ public:
         
         for (auto* var : collector.variables()) {
             // Skip global variables.
-            if (dynamic_cast<GlobalVariable*>(var) != nullptr) {
+            if (isa<GlobalVariable>(var)) {
                 continue;
             }
             
@@ -164,7 +164,7 @@ public:
 
         std::map<std::string, GlobalVariable*> globals_by_name;
         for (auto* var : collector.variables()) {
-            auto* gv = dynamic_cast<GlobalVariable*>(var);
+            auto* gv = dyn_cast<GlobalVariable>(var);
             if (!gv) continue;
             globals_by_name.try_emplace(gv->name(), gv);
         }

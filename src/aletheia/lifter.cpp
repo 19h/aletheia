@@ -675,7 +675,7 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
         const bool likely_switch_dispatch =
             ida_block.successors.size() > 2 &&
             !block->instructions().empty() &&
-            dynamic_cast<IndirectBranch*>(block->instructions().back()) != nullptr;
+            isa<IndirectBranch>(block->instructions().back());
 
         if (likely_switch_dispatch) {
             std::vector<int> ordered_targets;
@@ -942,7 +942,7 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
     }
 
     // Tag any remaining untagged variables.
-    if (auto* var = dynamic_cast<Variable*>(expr)) {
+    if (auto* var = dyn_cast<Variable>(expr)) {
         if (var->kind() == VariableKind::Register) {
             tag_variable(var, insn_addr);
         }
@@ -1110,7 +1110,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         if (operands.empty()) {
             return nullptr;
         }
-        if (dynamic_cast<Constant*>(operands[0]) != nullptr) {
+        if (isa<Constant>(operands[0])) {
             return nullptr;
         }
 
@@ -1270,7 +1270,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         // LEA dest, [address_expression]
         // The memory operand was lifted as deref(addr), strip the deref
         Expression* effective_addr = operands[1];
-        if (auto* deref_op = dynamic_cast<Operation*>(effective_addr)) {
+        if (auto* deref_op = dyn_cast<Operation>(effective_addr)) {
             if (deref_op->type() == OperationType::deref && !deref_op->operands().empty()) {
                 effective_addr = deref_op->operands()[0];
             }

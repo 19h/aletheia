@@ -25,13 +25,13 @@ const std::unordered_set<std::string>& LivenessAnalysis::defs_phi(BasicBlock* bl
 
 void LivenessAnalysis::extract_vars(Expression* expr, std::unordered_set<std::string>& out) {
     if (!expr) return;
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
+    if (auto* v = dyn_cast<Variable>(expr)) {
         out.insert(v->name());
-    } else if (auto* op = dynamic_cast<Operation*>(expr)) {
+    } else if (auto* op = dyn_cast<Operation>(expr)) {
         for (auto* child : op->operands()) {
             extract_vars(child, out);
         }
-    } else if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (auto* child : list->operands()) {
             extract_vars(child, out);
         }
@@ -41,7 +41,7 @@ void LivenessAnalysis::extract_vars(Expression* expr, std::unordered_set<std::st
 void LivenessAnalysis::init_usages_definitions_of_blocks() {
     for (BasicBlock* block : cfg_.blocks()) {
         for (Instruction* inst : block->instructions()) {
-            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+            if (auto* phi = dyn_cast<Phi>(inst)) {
                 // Phi: destination is a definition, operands are uses
                 if (Variable* def_var = phi->dest_var()) {
                     defs_phi_block_[block].insert(def_var->name());
@@ -55,7 +55,7 @@ void LivenessAnalysis::init_usages_definitions_of_blocks() {
                         }
                     }
                 }
-            } else if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+            } else if (auto* assign = dyn_cast<Assignment>(inst)) {
                 // Assignment: destination is a definition, value is a use
                 std::unordered_set<std::string> defs;
                 extract_vars(assign->destination(), defs);
@@ -64,12 +64,12 @@ void LivenessAnalysis::init_usages_definitions_of_blocks() {
                 std::unordered_set<std::string> uses;
                 extract_vars(assign->value(), uses);
                 for (const auto& u : uses) uses_block_[block].insert(u);
-            } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+            } else if (auto* branch = dyn_cast<Branch>(inst)) {
                 // Branch: condition variables are uses
                 std::unordered_set<std::string> uses;
                 extract_vars(branch->condition(), uses);
                 for (const auto& u : uses) uses_block_[block].insert(u);
-            } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+            } else if (auto* ret = dyn_cast<Return>(inst)) {
                 // Return: return values are uses
                 for (auto* val : ret->values()) {
                     std::unordered_set<std::string> uses;

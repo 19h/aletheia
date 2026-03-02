@@ -16,13 +16,13 @@ Expression* extract_cond_expr(AstNode* cond_node) {
 
 std::string expr_fingerprint(Expression* expr) {
     if (!expr) return "<null>";
-    if (auto* c = dynamic_cast<Constant*>(expr)) {
+    if (auto* c = dyn_cast<Constant>(expr)) {
         return "C:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
     }
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
+    if (auto* v = dyn_cast<Variable>(expr)) {
         return "V:" + v->name() + ":" + std::to_string(v->ssa_version());
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         std::string out = "O:" + std::to_string(static_cast<int>(op->type())) + "(";
         bool first = true;
         for (auto* child : op->operands()) {
@@ -37,11 +37,11 @@ std::string expr_fingerprint(Expression* expr) {
 }
 
 bool decode_switch_case_condition(Expression* expr, Expression*& selector, std::string& selector_fp, std::uint64_t& value) {
-    auto* cond = dynamic_cast<Condition*>(expr);
+    auto* cond = dyn_cast<Condition>(expr);
     if (!cond || cond->type() != OperationType::eq) return false;
 
-    auto* lhs_const = dynamic_cast<Constant*>(cond->lhs());
-    auto* rhs_const = dynamic_cast<Constant*>(cond->rhs());
+    auto* lhs_const = dyn_cast<Constant>(cond->lhs());
+    auto* rhs_const = dyn_cast<Constant>(cond->rhs());
     if (lhs_const && !rhs_const) {
         selector = cond->rhs();
         selector_fp = expr_fingerprint(selector);
@@ -258,13 +258,13 @@ bool same_variable(const Variable* lhs, const Variable* rhs) {
 }
 
 Variable* extract_condition_variable(Expression* expr) {
-    auto* cond = dynamic_cast<Condition*>(expr);
+    auto* cond = dyn_cast<Condition>(expr);
     if (!cond) return nullptr;
 
-    if (auto* lhs_var = dynamic_cast<Variable*>(cond->lhs())) {
+    if (auto* lhs_var = dyn_cast<Variable>(cond->lhs())) {
         return lhs_var;
     }
-    if (auto* rhs_var = dynamic_cast<Variable*>(cond->rhs())) {
+    if (auto* rhs_var = dyn_cast<Variable>(cond->rhs())) {
         return rhs_var;
     }
     return nullptr;
@@ -274,7 +274,7 @@ Assignment* extract_single_assignment(CodeNode* node) {
     if (!node || !node->block()) return nullptr;
     const auto& insts = node->block()->instructions();
     if (insts.size() != 1) return nullptr;
-    return dynamic_cast<Assignment*>(insts[0]);
+    return dyn_cast<Assignment>(insts[0]);
 }
 
 Assignment* extract_trailing_assignment(AstNode* body, CodeNode** owner_code) {
@@ -283,7 +283,7 @@ Assignment* extract_trailing_assignment(AstNode* body, CodeNode** owner_code) {
     if (auto* code = dynamic_cast<CodeNode*>(body)) {
         if (!code->block() || code->block()->instructions().empty()) return nullptr;
         Instruction* tail = code->block()->instructions().back();
-        auto* assign = dynamic_cast<Assignment*>(tail);
+        auto* assign = dyn_cast<Assignment>(tail);
         if (assign && owner_code) *owner_code = code;
         return assign;
     }
@@ -293,22 +293,22 @@ Assignment* extract_trailing_assignment(AstNode* body, CodeNode** owner_code) {
     auto* tail_code = dynamic_cast<CodeNode*>(seq->last());
     if (!tail_code || !tail_code->block() || tail_code->block()->instructions().empty()) return nullptr;
     Instruction* tail = tail_code->block()->instructions().back();
-    auto* assign = dynamic_cast<Assignment*>(tail);
+    auto* assign = dyn_cast<Assignment>(tail);
     if (assign && owner_code) *owner_code = tail_code;
     return assign;
 }
 
 bool is_induction_update(Assignment* assign, Variable* variable) {
     if (!assign || !variable) return false;
-    auto* dst = dynamic_cast<Variable*>(assign->destination());
+    auto* dst = dyn_cast<Variable>(assign->destination());
     if (!same_variable(dst, variable)) return false;
 
-    auto* op = dynamic_cast<Operation*>(assign->value());
+    auto* op = dyn_cast<Operation>(assign->value());
     if (!op || op->operands().size() != 2) return false;
     if (op->type() != OperationType::add && op->type() != OperationType::sub) return false;
 
-    auto* lhs_var = dynamic_cast<Variable*>(op->operands()[0]);
-    auto* rhs_var = dynamic_cast<Variable*>(op->operands()[1]);
+    auto* lhs_var = dyn_cast<Variable>(op->operands()[0]);
+    auto* rhs_var = dyn_cast<Variable>(op->operands()[1]);
     return same_variable(lhs_var, variable) || same_variable(rhs_var, variable);
 }
 
@@ -327,7 +327,7 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
         auto* init_assign = extract_single_assignment(init_code);
         if (!init_assign) continue;
 
-        auto* init_var = dynamic_cast<Variable*>(init_assign->destination());
+        auto* init_var = dyn_cast<Variable>(init_assign->destination());
         auto* cond_var = extract_condition_variable(while_node->condition());
         if (!same_variable(init_var, cond_var)) continue;
 
@@ -335,7 +335,7 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
         auto* mod_assign = extract_trailing_assignment(while_node->body(), &mod_owner);
         if (!mod_assign) continue;
 
-        auto* mod_var = dynamic_cast<Variable*>(mod_assign->destination());
+        auto* mod_var = dyn_cast<Variable>(mod_assign->destination());
         if (!same_variable(mod_var, init_var) || !is_induction_update(mod_assign, init_var)) {
             continue;
         }

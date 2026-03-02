@@ -153,10 +153,10 @@ void remove_identity_assignments(ControlFlowGraph& cfg) {
         std::vector<Instruction*> rewritten;
         rewritten.reserve(block->instructions().size());
         for (Instruction* inst : block->instructions()) {
-            auto* assign = dynamic_cast<Assignment*>(inst);
+            auto* assign = dyn_cast<Assignment>(inst);
             if (assign != nullptr) {
-                auto* dst = dynamic_cast<Variable*>(assign->destination());
-                auto* src = dynamic_cast<Variable*>(assign->value());
+                auto* dst = dyn_cast<Variable>(assign->destination());
+                auto* src = dyn_cast<Variable>(assign->value());
                 if (dst != nullptr && src != nullptr && dst == src) {
                     continue;
                 }

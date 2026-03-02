@@ -13,8 +13,8 @@ bool expressions_equivalent(Expression* lhs, Expression* rhs) {
     if (lhs == rhs) {
         return true;
     }
-    auto* lvar = dynamic_cast<Variable*>(lhs);
-    auto* rvar = dynamic_cast<Variable*>(rhs);
+    auto* lvar = dyn_cast<Variable>(lhs);
+    auto* rvar = dyn_cast<Variable>(rhs);
     if (lvar && rvar) {
         return lvar->name() == rvar->name() && lvar->ssa_version() == rvar->ssa_version();
     }
@@ -89,7 +89,7 @@ std::int64_t sign_extend_to_i64(std::uint64_t value, std::size_t bytes) {
 }
 
 bool constant_is_plus_minus_one(Expression* expr, int& sign) {
-    auto* c = dynamic_cast<Constant*>(expr);
+    auto* c = dyn_cast<Constant>(expr);
     if (!c) {
         return false;
     }
@@ -408,10 +408,10 @@ int precedence_for_operation(OperationType type) {
 }
 
 int precedence_for_expression(Expression* expr) {
-    if (auto* cond = dynamic_cast<Condition*>(expr)) {
+    if (auto* cond = dyn_cast<Condition>(expr)) {
         return precedence_for_operation(cond->type());
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         return precedence_for_operation(op->type());
     }
     return 1000; // constants/variables bind strongest for printing
@@ -630,7 +630,7 @@ void CExpressionGenerator::visit(Operation* o) {
                 result_ = "!(" + generate(ops[0]) + ")";
                 return;
             case OperationType::deref:
-                if (auto* g = dynamic_cast<GlobalVariable*>(ops[0])) {
+                if (auto* g = dyn_cast<GlobalVariable>(ops[0])) {
                     result_ = generate(g);
                 } else if (o->array_access().has_value() && o->array_access()->base && o->array_access()->index) {
                     result_ = generate(o->array_access()->base) + "[" + generate(o->array_access()->index) + "]";
@@ -754,7 +754,7 @@ void CExpressionGenerator::visit(Condition* c) {
 }
 
 void CExpressionGenerator::visit_assignment(Assignment* i) {
-    if (auto* rhs_op = dynamic_cast<Operation*>(i->value());
+    if (auto* rhs_op = dyn_cast<Operation>(i->value());
         rhs_op != nullptr && rhs_op->operands().size() == 2) {
         const OperationType op_type = rhs_op->type();
         const char* op_symbol = compound_operator_symbol(op_type);
@@ -941,14 +941,14 @@ void CodeVisitor::visit_node(AstNode* node) {
             for (Instruction* inst : block->instructions()) {
                 indent();
 
-                if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                if (auto* branch = dyn_cast<Branch>(inst)) {
                     current_line_ += "/* branch if (" + expr_gen_.generate(branch->condition()) + ") */";
                     lines_.push_back(current_line_);
                     current_line_.clear();
                     continue;
                 }
 
-                if (auto* indirect = dynamic_cast<IndirectBranch*>(inst)) {
+                if (auto* indirect = dyn_cast<IndirectBranch>(inst)) {
                     current_line_ += "/* indirect branch " + expr_gen_.generate(indirect->expression()) + " */";
                     lines_.push_back(current_line_);
                     current_line_.clear();

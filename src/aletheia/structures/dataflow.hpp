@@ -38,6 +38,76 @@ class Relation;
 class BasicBlock; // Forward from cfg.hpp for Phi::origin_block
 
 // =============================================================================
+// NodeKind -- LLVM-style RTTI tag for O(1) type checks
+// =============================================================================
+// Every concrete DataflowObject subclass carries a NodeKind tag set at
+// construction time. Use isa<T>(ptr), cast<T>(ptr), dyn_cast<T>(ptr) instead
+// of dynamic_cast<T*>(ptr) in hot paths -- the tag check is a single integer
+// comparison vs. dynamic_cast's O(N) string comparisons on macOS.
+
+enum class NodeKind : std::uint8_t {
+    // Expressions
+    Constant,
+    Variable,
+    GlobalVariable,
+    Operation,
+    Call,
+    ListOperation,
+    Condition,
+
+    // Instructions
+    Assignment,
+    Branch,
+    IndirectBranch,
+    Return,
+    Phi,
+    MemPhi,
+    BreakInstr,
+    ContinueInstr,
+    Comment,
+    Relation,
+};
+
+// =============================================================================
+// LLVM-style RTTI helpers: isa<T>, cast<T>, dyn_cast<T>
+// =============================================================================
+// These are O(1) integer comparisons. Use them instead of dynamic_cast in hot
+// paths. They handle inheritance: isa<Variable> matches GlobalVariable,
+// isa<Operation> matches Call/Condition, isa<Assignment> matches Phi/MemPhi.
+
+class DataflowObject; // forward
+
+/// Check if a DataflowObject pointer is of a specific concrete type (or a
+/// subclass mapped to that kind). Returns false for nullptr.
+template <typename T>
+inline bool isa(const DataflowObject* obj);
+
+/// Unconditional downcast -- UB if the type doesn't match. Use after isa<T>.
+template <typename T>
+inline T* cast(DataflowObject* obj) {
+    return static_cast<T*>(obj);
+}
+
+template <typename T>
+inline const T* cast(const DataflowObject* obj) {
+    return static_cast<const T*>(obj);
+}
+
+/// Safe downcast -- returns nullptr if the type doesn't match.
+template <typename T>
+inline T* dyn_cast(DataflowObject* obj) {
+    return (obj && isa<T>(obj)) ? static_cast<T*>(obj) : nullptr;
+}
+
+template <typename T>
+inline const T* dyn_cast(const DataflowObject* obj) {
+    return (obj && isa<T>(obj)) ? static_cast<const T*>(obj) : nullptr;
+}
+
+// Expression* and Instruction* overloads are defined after class definitions
+// (see bottom of file) to avoid incomplete-type static_cast errors.
+
+// =============================================================================
 // Visitor Interface
 // =============================================================================
 // The full visitor with methods for every concrete Expression and Instruction
@@ -83,6 +153,9 @@ public:
     virtual ~DataflowObject() = default;
     virtual void accept(DataflowObjectVisitorInterface& visitor) = 0;
 
+    /// LLVM-style RTTI tag -- O(1) type identification without dynamic_cast.
+    NodeKind node_kind() const { return node_kind_; }
+
     /// Collect all Variable* that this object reads from (its requirements).
     /// Subclasses override to add their specific variable references.
     virtual void collect_requirements(std::unordered_set<Variable*>& out) const {
@@ -104,9 +177,75 @@ public:
     TypePtr ir_type() const { return type_; }
     void set_ir_type(TypePtr t) { type_ = std::move(t); }
 
+protected:
+    /// Subclasses set this in their constructor.
+    NodeKind node_kind_;
+
 private:
     TypePtr type_;
 };
+
+// =============================================================================
+// isa<T> specializations -- define right after DataflowObject so that inline
+// class method bodies can use isa<T>/dyn_cast<T> freely.
+// =============================================================================
+// Each specialization handles the inheritance hierarchy correctly:
+//   isa<Variable> matches Variable OR GlobalVariable
+//   isa<Operation> matches Operation OR Call OR Condition
+//   isa<Assignment> matches Assignment OR Phi OR MemPhi
+//   isa<Phi> matches Phi OR MemPhi
+
+template <> inline bool isa<Constant>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::Constant;
+}
+template <> inline bool isa<Variable>(const DataflowObject* obj) {
+    return obj && (obj->node_kind() == NodeKind::Variable || obj->node_kind() == NodeKind::GlobalVariable);
+}
+template <> inline bool isa<GlobalVariable>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::GlobalVariable;
+}
+template <> inline bool isa<Operation>(const DataflowObject* obj) {
+    return obj && (obj->node_kind() == NodeKind::Operation || obj->node_kind() == NodeKind::Call || obj->node_kind() == NodeKind::Condition);
+}
+template <> inline bool isa<Call>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::Call;
+}
+template <> inline bool isa<ListOperation>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::ListOperation;
+}
+template <> inline bool isa<Condition>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::Condition;
+}
+template <> inline bool isa<Assignment>(const DataflowObject* obj) {
+    return obj && (obj->node_kind() == NodeKind::Assignment || obj->node_kind() == NodeKind::Phi || obj->node_kind() == NodeKind::MemPhi);
+}
+template <> inline bool isa<Relation>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::Relation;
+}
+template <> inline bool isa<Branch>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::Branch;
+}
+template <> inline bool isa<IndirectBranch>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::IndirectBranch;
+}
+template <> inline bool isa<Return>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::Return;
+}
+template <> inline bool isa<Phi>(const DataflowObject* obj) {
+    return obj && (obj->node_kind() == NodeKind::Phi || obj->node_kind() == NodeKind::MemPhi);
+}
+template <> inline bool isa<MemPhi>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::MemPhi;
+}
+template <> inline bool isa<BreakInstr>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::BreakInstr;
+}
+template <> inline bool isa<ContinueInstr>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::ContinueInstr;
+}
+template <> inline bool isa<Comment>(const DataflowObject* obj) {
+    return obj && obj->node_kind() == NodeKind::Comment;
+}
 
 // =============================================================================
 // Expression -- Base class for all value-producing IR nodes
@@ -130,6 +269,7 @@ public:
 class Constant : public Expression {
 public:
     Constant(std::uint64_t value, std::size_t size) : value_(value) {
+        this->node_kind_ = NodeKind::Constant;
         this->size_bytes = size;
     }
 
@@ -167,6 +307,7 @@ enum class VariableKind : std::uint8_t {
 class Variable : public Expression {
 public:
     Variable(std::string name, std::size_t size) : name_(std::move(name)) {
+        this->node_kind_ = NodeKind::Variable;
         this->size_bytes = size;
     }
 
@@ -246,7 +387,9 @@ public:
                    bool is_constant = false)
         : Variable(std::move(name), size),
           initial_value_(initial_value),
-          is_constant_(is_constant) {}
+          is_constant_(is_constant) {
+        this->node_kind_ = NodeKind::GlobalVariable;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit(this);
@@ -391,6 +534,7 @@ class Operation : public Expression {
 public:
     Operation(OperationType type, std::vector<Expression*> operands, std::size_t size)
         : type_(type), operands_(std::move(operands)) {
+        this->node_kind_ = NodeKind::Operation;
         this->size_bytes = size;
     }
 
@@ -429,7 +573,7 @@ public:
         }
         if (array_access_.has_value()) {
             if (array_access_->base == replacee) {
-                if (auto* replacement_var = dynamic_cast<Variable*>(replacement)) {
+                if (auto* replacement_var = dyn_cast<Variable>(replacement)) {
                     array_access_->base = replacement_var;
                 }
             }
@@ -461,6 +605,7 @@ class ListOperation : public Expression {
 public:
     explicit ListOperation(std::vector<Expression*> operands, std::size_t size = 0)
         : operands_(std::move(operands)) {
+        this->node_kind_ = NodeKind::ListOperation;
         this->size_bytes = size;
     }
 
@@ -514,7 +659,9 @@ private:
 class Condition : public Operation {
 public:
     Condition(OperationType cmp_type, Expression* lhs, Expression* rhs, std::size_t size = 1)
-        : Operation(cmp_type, {lhs, rhs}, size) {}
+        : Operation(cmp_type, {lhs, rhs}, size) {
+        this->node_kind_ = NodeKind::Condition;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit(this);
@@ -552,8 +699,8 @@ public:
     /// Is this an equality check with a constant on one side?
     bool is_equality_with_constant() const {
         return type() == OperationType::eq &&
-               (dynamic_cast<Constant*>(operands()[0]) ||
-                dynamic_cast<Constant*>(operands()[1]));
+               (isa<Constant>(operands()[0]) ||
+                isa<Constant>(operands()[1]));
     }
 };
 
@@ -566,7 +713,9 @@ public:
 class Call : public Operation {
 public:
     Call(Expression* target, std::vector<Expression*> args, std::size_t size)
-        : Operation(OperationType::call, build_operands_(target, std::move(args)), size) {}
+        : Operation(OperationType::call, build_operands_(target, std::move(args)), size) {
+        this->node_kind_ = NodeKind::Call;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit(this);
@@ -667,7 +816,9 @@ protected:
 class Assignment : public Instruction {
 public:
     Assignment(Expression* destination, Expression* value)
-        : destination_(destination), value_(value) {}
+        : destination_(destination), value_(value) {
+        this->node_kind_ = NodeKind::Assignment;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_assignment(this);
@@ -679,17 +830,17 @@ public:
         // If the destination is NOT a plain Variable (e.g., *(ptr+off) = val),
         // the destination's sub-expressions are also requirements (the pointer
         // address must be computed).
-        if (destination_ && !dynamic_cast<Variable*>(destination_)) {
+        if (destination_ && !isa<Variable>(destination_)) {
             destination_->collect_requirements(out);
         }
     }
 
     void collect_definitions(std::unordered_set<Variable*>& out) const override {
-        if (auto* var = dynamic_cast<Variable*>(destination_)) {
+        if (auto* var = dyn_cast<Variable>(destination_)) {
             out.insert(var);
         }
         // ListOperation destination (e.g., [a,b] = f()) -- each element is a def
-        if (auto* list = dynamic_cast<ListOperation*>(destination_)) {
+        if (auto* list = dyn_cast<ListOperation>(destination_)) {
             list->collect_requirements(out); // variables in the list are defs
         }
     }
@@ -721,7 +872,7 @@ public:
     /// Rename the destination variable (for SSA renaming).
     /// Only works when destination is a Variable.
     void rename_destination(Variable* old_var, Variable* new_var) {
-        if (auto* var = dynamic_cast<Variable*>(destination_)) {
+        if (auto* var = dyn_cast<Variable>(destination_)) {
             if (var == old_var) {
                 destination_ = new_var;
             }
@@ -740,7 +891,9 @@ protected:
 class Relation : public Instruction {
 public:
     Relation(Variable* destination, Variable* value)
-        : destination_(destination), value_(value) {}
+        : destination_(destination), value_(value) {
+        this->node_kind_ = NodeKind::Relation;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_relation(this);
@@ -765,10 +918,10 @@ public:
 
     void substitute(Expression* replacee, Expression* replacement) override {
         if (value_ == replacee) {
-            if (auto* v = dynamic_cast<Variable*>(replacement)) value_ = v;
+            if (auto* v = dyn_cast<Variable>(replacement)) value_ = v;
         }
         if (destination_ == replacee) {
-            if (auto* v = dynamic_cast<Variable*>(replacement)) destination_ = v;
+            if (auto* v = dyn_cast<Variable>(replacement)) destination_ = v;
         }
     }
 
@@ -786,7 +939,9 @@ private:
 
 class Branch : public Instruction {
 public:
-    explicit Branch(Condition* condition) : condition_(condition) {}
+    explicit Branch(Condition* condition) : condition_(condition) {
+        this->node_kind_ = NodeKind::Branch;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_branch(this);
@@ -807,7 +962,7 @@ public:
     void substitute(Expression* replacee, Expression* replacement) override {
         if (condition_) condition_->substitute(replacee, replacement);
         if (condition_ == replacee) {
-            if (auto* c = dynamic_cast<Condition*>(replacement)) condition_ = c;
+            if (auto* c = dyn_cast<Condition>(replacement)) condition_ = c;
         }
     }
 
@@ -824,7 +979,9 @@ private:
 
 class IndirectBranch : public Instruction {
 public:
-    explicit IndirectBranch(Expression* expression) : expression_(expression) {}
+    explicit IndirectBranch(Expression* expression) : expression_(expression) {
+        this->node_kind_ = NodeKind::IndirectBranch;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_indirect_branch(this);
@@ -860,7 +1017,9 @@ private:
 class Return : public Instruction {
 public:
     explicit Return(std::vector<Expression*> values = {})
-        : values_(std::move(values)) {}
+        : values_(std::move(values)) {
+        this->node_kind_ = NodeKind::Return;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_return(this);
@@ -914,7 +1073,9 @@ public:
     /// Construct a Phi with destination variable and a pre-built ListOperation.
     /// The ListOperation must be arena-allocated by the caller.
     Phi(Variable* destination, ListOperation* operands)
-        : Assignment(destination, operands) {}
+        : Assignment(destination, operands) {
+        this->node_kind_ = NodeKind::Phi;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_phi(this);
@@ -981,7 +1142,9 @@ private:
 class MemPhi : public Phi {
 public:
     MemPhi(Variable* destination, ListOperation* operands)
-        : Phi(destination, operands) {}
+        : Phi(destination, operands) {
+        this->node_kind_ = NodeKind::MemPhi;
+    }
 
     Instruction* copy(DecompilerArena& arena) const override {
         auto* new_dest = dest_var() ? static_cast<Variable*>(dest_var()->copy(arena)) : nullptr;
@@ -1023,7 +1186,7 @@ public:
             std::vector<Expression*> phi_args;
             phi_args.reserve(mem_sources->size());
             for (Expression* src_expr : mem_sources->operands()) {
-                if (auto* src_var = dynamic_cast<Variable*>(src_expr)) {
+                if (auto* src_var = dyn_cast<Variable>(src_expr)) {
                     auto* arg = static_cast<Variable*>(base->copy(arena));
                     arg->set_ssa_version(src_var->ssa_version());
                     arg->set_aliased(true);
@@ -1038,7 +1201,7 @@ public:
 
             std::unordered_map<BasicBlock*, Expression*> origins;
             for (const auto& [pred, mem_expr] : origin_block()) {
-                auto* mem_var = dynamic_cast<Variable*>(mem_expr);
+                auto* mem_var = dyn_cast<Variable>(mem_expr);
                 if (!pred || !mem_var) {
                     continue;
                 }
@@ -1066,7 +1229,7 @@ public:
 
 class BreakInstr : public Instruction {
 public:
-    BreakInstr() = default;
+    BreakInstr() { this->node_kind_ = NodeKind::BreakInstr; }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_break(this);
@@ -1085,7 +1248,7 @@ public:
 
 class ContinueInstr : public Instruction {
 public:
-    ContinueInstr() = default;
+    ContinueInstr() { this->node_kind_ = NodeKind::ContinueInstr; }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_continue(this);
@@ -1104,7 +1267,9 @@ public:
 
 class Comment : public Instruction {
 public:
-    explicit Comment(std::string message) : message_(std::move(message)) {}
+    explicit Comment(std::string message) : message_(std::move(message)) {
+        this->node_kind_ = NodeKind::Comment;
+    }
 
     void accept(DataflowObjectVisitorInterface& visitor) override {
         visitor.visit_comment(this);
@@ -1162,5 +1327,84 @@ inline void DataflowObjectVisitorInterface::visit_break(BreakInstr* i) { (void)i
 inline void DataflowObjectVisitorInterface::visit_continue(ContinueInstr* i) { (void)i; }
 inline void DataflowObjectVisitorInterface::visit_comment(Comment* i) { (void)i; }
 inline void DataflowObjectVisitorInterface::visit_relation(Relation* i) { (void)i; }
+
+// =============================================================================
+// Expression* / Instruction* overloads for isa/cast/dyn_cast
+// =============================================================================
+// Placed here (after all class definitions) so static_cast knows the
+// inheritance relationship between Expression/Instruction and DataflowObject.
+
+template <typename T>
+inline bool isa(const Expression* obj) { return isa<T>(static_cast<const DataflowObject*>(obj)); }
+template <typename T>
+inline T* dyn_cast(Expression* obj) { return dyn_cast<T>(static_cast<DataflowObject*>(obj)); }
+template <typename T>
+inline const T* dyn_cast(const Expression* obj) { return dyn_cast<T>(static_cast<const DataflowObject*>(obj)); }
+template <typename T>
+inline T* cast(Expression* obj) { return cast<T>(static_cast<DataflowObject*>(obj)); }
+
+template <typename T>
+inline bool isa(const Instruction* obj) { return isa<T>(static_cast<const DataflowObject*>(obj)); }
+template <typename T>
+inline T* dyn_cast(Instruction* obj) { return dyn_cast<T>(static_cast<DataflowObject*>(obj)); }
+template <typename T>
+inline const T* dyn_cast(const Instruction* obj) { return dyn_cast<T>(static_cast<const DataflowObject*>(obj)); }
+template <typename T>
+inline T* cast(Instruction* obj) { return cast<T>(static_cast<DataflowObject*>(obj)); }
+
+// =============================================================================
+// Hash-based expression fingerprint -- O(1) per node, no string allocation
+// =============================================================================
+// Use this instead of string-based expression_fingerprint() in hot paths.
+// Returns a uint64_t hash suitable for use in unordered_map keys.
+
+inline std::uint64_t hash_combine(std::uint64_t seed, std::uint64_t value) {
+    // boost::hash_combine equivalent
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 12) + (seed >> 4);
+    return seed;
+}
+
+inline std::uint64_t expression_fingerprint_hash(const Expression* expr) {
+    if (!expr) return 0;
+
+    switch (expr->node_kind()) {
+    case NodeKind::Constant: {
+        auto* c = static_cast<const Constant*>(expr);
+        std::uint64_t h = hash_combine(0x100, c->value());
+        return hash_combine(h, c->size_bytes);
+    }
+    case NodeKind::Variable: {
+        auto* v = static_cast<const Variable*>(expr);
+        // Hash the name using std::hash (typically FNV or similar) + ssa version
+        std::uint64_t h = hash_combine(0x200, std::hash<std::string>{}(v->name()));
+        return hash_combine(h, v->ssa_version());
+    }
+    case NodeKind::GlobalVariable: {
+        auto* v = static_cast<const GlobalVariable*>(expr);
+        std::uint64_t h = hash_combine(0x300, std::hash<std::string>{}(v->name()));
+        return hash_combine(h, v->ssa_version());
+    }
+    case NodeKind::ListOperation: {
+        auto* list = static_cast<const ListOperation*>(expr);
+        std::uint64_t h = 0x400;
+        for (const Expression* child : list->operands()) {
+            h = hash_combine(h, expression_fingerprint_hash(child));
+        }
+        return h;
+    }
+    case NodeKind::Operation:
+    case NodeKind::Call:
+    case NodeKind::Condition: {
+        auto* op = static_cast<const Operation*>(expr);
+        std::uint64_t h = hash_combine(0x500, static_cast<std::uint64_t>(op->type()));
+        for (const Expression* child : op->operands()) {
+            h = hash_combine(h, expression_fingerprint_hash(child));
+        }
+        return h;
+    }
+    default:
+        return 0x999;
+    }
+}
 
 } // namespace aletheia

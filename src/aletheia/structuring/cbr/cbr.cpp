@@ -28,13 +28,13 @@ Expression* if_condition_expr(IfNode* node) {
 
 std::string expr_fingerprint(Expression* expr) {
     if (!expr) return "<null>";
-    if (auto* c = dynamic_cast<Constant*>(expr)) {
+    if (auto* c = dyn_cast<Constant>(expr)) {
         return "C:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
     }
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
+    if (auto* v = dyn_cast<Variable>(expr)) {
         return "V:" + v->name() + ":" + std::to_string(v->ssa_version());
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         std::string out = "O:" + std::to_string(static_cast<int>(op->type())) + "(";
         bool first = true;
         for (auto* child : op->operands()) {
@@ -50,7 +50,7 @@ std::string expr_fingerprint(Expression* expr) {
 
 void flatten_conjunction(Expression* expr, std::vector<Expression*>& out) {
     if (!expr) return;
-    auto* op = dynamic_cast<Operation*>(expr);
+    auto* op = dyn_cast<Operation>(expr);
     if (op && op->type() == OperationType::logical_and && op->operands().size() == 2) {
         flatten_conjunction(op->operands()[0], out);
         flatten_conjunction(op->operands()[1], out);
@@ -61,7 +61,7 @@ void flatten_conjunction(Expression* expr, std::vector<Expression*>& out) {
 
 void flatten_disjunction(Expression* expr, std::vector<Expression*>& out) {
     if (!expr) return;
-    auto* op = dynamic_cast<Operation*>(expr);
+    auto* op = dyn_cast<Operation>(expr);
     if (op && op->type() == OperationType::logical_or && op->operands().size() == 2) {
         flatten_disjunction(op->operands()[0], out);
         flatten_disjunction(op->operands()[1], out);
@@ -299,7 +299,7 @@ AstNode* ConditionBasedRefinement::refine(
                     Instruction* last_inst = block->instructions().back();
                     
                     // Check if the last instruction is a Branch (conditional)
-                    if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+                    if (auto* branch = dyn_cast<Branch>(last_inst)) {
                         branch_cond = arena.create<ExprAstNode>(branch->condition());
                         Instruction* removed_branch = last_inst;
                         

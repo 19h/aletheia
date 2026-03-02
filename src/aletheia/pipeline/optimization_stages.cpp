@@ -45,18 +45,18 @@ static VarKey var_key(Variable* v) {
 static bool contains_variable_ptr(Expression* expr, Variable* target) {
     if (!expr) return false;
 
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
+    if (auto* v = dyn_cast<Variable>(expr)) {
         return v->name() == target->name() &&
                v->ssa_version() == target->ssa_version();
     }
 
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (auto* child : op->operands()) {
             if (contains_variable_ptr(child, target)) return true;
         }
     }
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (auto* child : list->operands()) {
             if (contains_variable_ptr(child, target)) return true;
         }
@@ -70,7 +70,7 @@ static Expression* replace_variable_ptr(
     Variable* target, Expression* replacement) {
     if (!expr) return nullptr;
 
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
+    if (auto* v = dyn_cast<Variable>(expr)) {
         if (v->name() == target->name() &&
             v->ssa_version() == target->ssa_version()) {
             return replacement;
@@ -78,11 +78,11 @@ static Expression* replace_variable_ptr(
         return v;
     }
 
-    if (auto* c = dynamic_cast<Constant*>(expr)) {
+    if (auto* c = dyn_cast<Constant>(expr)) {
         return c;
     }
 
-    if (auto* cond = dynamic_cast<Condition*>(expr)) {
+    if (auto* cond = dyn_cast<Condition>(expr)) {
         Expression* new_lhs = replace_variable_ptr(arena, cond->lhs(), target, replacement);
         Expression* new_rhs = replace_variable_ptr(arena, cond->rhs(), target, replacement);
         if (new_lhs != cond->lhs() || new_rhs != cond->rhs()) {
@@ -91,7 +91,7 @@ static Expression* replace_variable_ptr(
         return cond;
     }
 
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         std::vector<Expression*> new_operands;
         bool changed = false;
         for (auto* child : op->operands()) {
@@ -105,7 +105,7 @@ static Expression* replace_variable_ptr(
         return op;
     }
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         std::vector<Expression*> new_operands;
         bool changed = false;
         for (auto* child : list->operands()) {
@@ -129,12 +129,12 @@ static Expression* replace_variable_ptr(
 /// Check if an expression contains any aliased variable.
 static bool contains_aliased_variable(Expression* expr) {
     if (!expr) return false;
-    if (auto* v = dynamic_cast<Variable*>(expr)) return v->is_aliased();
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* v = dyn_cast<Variable>(expr)) return v->is_aliased();
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (auto* child : op->operands())
             if (contains_aliased_variable(child)) return true;
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (auto* child : list->operands())
             if (contains_aliased_variable(child)) return true;
     }
@@ -143,7 +143,7 @@ static bool contains_aliased_variable(Expression* expr) {
 
 /// Check if an expression is an address_of operation.
 static bool is_address_of(Expression* expr) {
-    if (auto* op = dynamic_cast<Operation*>(expr))
+    if (auto* op = dyn_cast<Operation>(expr))
         return op->type() == OperationType::address_of;
     return false;
 }
@@ -151,12 +151,12 @@ static bool is_address_of(Expression* expr) {
 /// Check if an expression contains a dereference operation.
 static bool contains_dereference(Expression* expr) {
     if (!expr) return false;
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         if (op->type() == OperationType::deref) return true;
         for (auto* child : op->operands())
             if (contains_dereference(child)) return true;
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (auto* child : list->operands())
             if (contains_dereference(child)) return true;
     }
@@ -167,10 +167,10 @@ static bool contains_dereference(Expression* expr) {
 /// instruction. Returns true if the propagation is allowed.
 static bool definition_can_be_propagated(Assignment* def, Instruction* target) {
     // Rule: Don't propagate phi definitions
-    if (dynamic_cast<Phi*>(def)) return false;
+    if (isa<Phi>(def)) return false;
 
     // Rule: Don't propagate call assignments (handled by EPFC)
-    if (auto* val = dynamic_cast<Operation*>(def->value())) {
+    if (auto* val = dyn_cast<Operation>(def->value())) {
         if (val->type() == OperationType::call) return false;
     }
 
@@ -185,8 +185,8 @@ static bool definition_can_be_propagated(Assignment* def, Instruction* target) {
     if (contains_dereference(def->value())) return false;
 
     // Rule: Don't propagate operations into phi arguments
-    if (dynamic_cast<Phi*>(target)) {
-        if (dynamic_cast<Operation*>(def->value())) return false;
+    if (isa<Phi>(target)) {
+        if (isa<Operation>(def->value())) return false;
     }
 
     return true;
@@ -202,9 +202,9 @@ static void try_fold_cmp_branch(DecompilerArena& arena, Branch* branch) {
     Expression* lhs = cond->lhs();
     Expression* rhs = cond->rhs();
 
-    if (auto* sub_op = dynamic_cast<Operation*>(lhs)) {
+    if (auto* sub_op = dyn_cast<Operation>(lhs)) {
         if (sub_op->type() == OperationType::sub && sub_op->operands().size() == 2) {
-            if (auto* zero = dynamic_cast<Constant*>(rhs)) {
+            if (auto* zero = dyn_cast<Constant>(rhs)) {
                 if (zero->value() == 0) {
                     auto* new_cond = arena.create<Condition>(
                         cond->type(), sub_op->operands()[0], sub_op->operands()[1], cond->size_bytes);
@@ -229,7 +229,7 @@ static void remove_redundant_phis(ControlFlowGraph* cfg, DecompilerArena& arena)
         for (BasicBlock* block : cfg->blocks()) {
             auto& instrs = block->mutable_instructions();
             for (std::size_t i = 0; i < instrs.size(); ) {
-                auto* phi = dynamic_cast<Phi*>(instrs[i]);
+                auto* phi = dyn_cast<Phi>(instrs[i]);
                 if (!phi) { ++i; continue; }
 
                 Variable* dest = phi->dest_var();
@@ -238,7 +238,7 @@ static void remove_redundant_phis(ControlFlowGraph* cfg, DecompilerArena& arena)
 
                 for (auto* operand : phi->operand_list()->operands()) {
                     // Skip self-references (phi dest used in its own operand list)
-                    if (auto* v = dynamic_cast<Variable*>(operand)) {
+                    if (auto* v = dyn_cast<Variable>(operand)) {
                         if (v->name() == dest->name() &&
                             v->ssa_version() == dest->ssa_version()) continue;
                     }
@@ -246,8 +246,8 @@ static void remove_redundant_phis(ControlFlowGraph* cfg, DecompilerArena& arena)
                         single_value = operand;
                     } else {
                         // Check if this operand is the same as single_value
-                        auto* sv = dynamic_cast<Variable*>(single_value);
-                        auto* ov = dynamic_cast<Variable*>(operand);
+                        auto* sv = dyn_cast<Variable>(single_value);
+                        auto* ov = dyn_cast<Variable>(operand);
                         if (sv && ov && sv->name() == ov->name() &&
                             sv->ssa_version() == ov->ssa_version()) {
                             // Same variable, continue
@@ -351,13 +351,13 @@ static Variable* representative_for_identity_component(
 // =============================================================================
 
 static bool is_dangerous_memory_instruction(Instruction* inst) {
-    if (dynamic_cast<Relation*>(inst)) return true;
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (isa<Relation>(inst)) return true;
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         if (contains_dereference(assign->destination())) return true;
-        if (auto* op = dynamic_cast<Operation*>(assign->value())) {
+        if (auto* op = dyn_cast<Operation>(assign->value())) {
             if (op->type() == OperationType::call) return true;
         }
-        if (dynamic_cast<Call*>(assign->value())) return true;
+        if (isa<Call>(assign->value())) return true;
     }
     return false;
 }
@@ -416,9 +416,9 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                     dangerous_uses.push_back(inst);
                 }
 
-                auto* assign = dynamic_cast<Assignment*>(inst);
+                auto* assign = dyn_cast<Assignment>(inst);
                 if (!assign) continue;
-                if (auto* dest = dynamic_cast<Variable*>(assign->destination())) {
+                if (auto* dest = dyn_cast<Variable>(assign->destination())) {
                     VarKey key = var_key(dest);
                     if (!def_map.contains(key)) {
                         def_map[key] = assign;
@@ -477,14 +477,14 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
 
                     // Apply rule checks
                     bool allowed = true;
-                    if (dynamic_cast<Phi*>(def)) allowed = false;
-                    else if (auto* val = dynamic_cast<Operation*>(def->value())) {
+                    if (isa<Phi>(def)) allowed = false;
+                    else if (auto* val = dyn_cast<Operation>(def->value())) {
                         if (val->type() == OperationType::call) allowed = false;
-                    } else if (dynamic_cast<Call*>(def->value())) {
+                    } else if (isa<Call>(def->value())) {
                         allowed = false;
                     }
                     if (allowed && is_address_of(def->value())) allowed = false;
-                    if (allowed && dynamic_cast<Phi*>(inst) && dynamic_cast<Operation*>(def->value())) allowed = false;
+                    if (allowed && isa<Phi>(inst) && isa<Operation>(def->value())) allowed = false;
 
                     if (!allowed) continue;
 
@@ -510,7 +510,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                     // Perform the substitution on the instruction
                     bool changed = false;
 
-                    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                    if (auto* assign = dyn_cast<Assignment>(inst)) {
                         Expression* new_val = replace_variable_ptr(
                             task.arena(), assign->value(), req_var, replacement);
                         if (new_val != assign->value()) {
@@ -518,7 +518,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                             changed = true;
                         }
                         // Also propagate into complex destinations (e.g., *(ptr+off) = val)
-                        if (!dynamic_cast<Variable*>(assign->destination())) {
+                        if (!isa<Variable>(assign->destination())) {
                             Expression* new_dest = replace_variable_ptr(
                                 task.arena(), assign->destination(), req_var, replacement);
                             if (new_dest != assign->destination()) {
@@ -526,7 +526,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                                 changed = true;
                             }
                         }
-                    } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                    } else if (auto* branch = dyn_cast<Branch>(inst)) {
                         Condition* cond = branch->condition();
                         Expression* new_lhs = replace_variable_ptr(
                             task.arena(), cond->lhs(), req_var, replacement);
@@ -538,7 +538,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                             branch->set_condition(new_cond);
                             changed = true;
                         }
-                    } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+                    } else if (auto* ret = dyn_cast<Return>(inst)) {
                         // Return stores values directly; we need to rebuild
                         std::vector<Expression*> new_vals;
                         bool ret_changed = false;
@@ -561,7 +561,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                 }
 
                 // CMP+branch folding after propagation
-                if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                if (auto* branch = dyn_cast<Branch>(inst)) {
                     try_fold_cmp_branch(task.arena(), branch);
                 }
             }
@@ -596,7 +596,7 @@ void DeadPathEliminationStage::execute(DecompilerTask& task) {
         if (block->successors().size() > 1) {
             if (block->instructions().empty()) continue;
             Instruction* last_inst = block->instructions().back();
-            if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+            if (auto* branch = dyn_cast<Branch>(last_inst)) {
                 // If the branch is a generic Branch (not indirect), check its condition
                 logos::LogicCondition cond = converter.convert_to_condition(branch->condition());
 
@@ -622,7 +622,7 @@ void DeadPathEliminationStage::execute(DecompilerTask& task) {
 
         // Remove the branch instruction if it's there
         if (!source->instructions().empty()) {
-            if (dynamic_cast<Branch*>(source->instructions().back())) {
+            if (isa<Branch>(source->instructions().back())) {
                 source->mutable_instructions().pop_back();
             }
         }
@@ -652,7 +652,7 @@ void DeadPathEliminationStage::execute(DecompilerTask& task) {
     // Fix phi origin blocks
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+            if (auto* phi = dyn_cast<Phi>(inst)) {
                 std::vector<BasicBlock*> to_remove;
                 for (auto& pair : phi->origin_block()) {
                     if (dead_blocks.contains(pair.first)) {
@@ -681,8 +681,8 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
     DefMap def_map;
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
-                if (auto* dest = dynamic_cast<Variable*>(assign->destination())) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                if (auto* dest = dyn_cast<Variable>(assign->destination())) {
                     VarKey key = var_key(dest);
                     if (!def_map.contains(key)) {
                         def_map[key] = assign;
@@ -698,7 +698,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
         if (block->successors().size() > 1) {
             if (block->instructions().empty()) continue;
             Instruction* last_inst = block->instructions().back();
-            if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+            if (auto* branch = dyn_cast<Branch>(last_inst)) {
                 // Dependency dict: variables required by branch -> Phi that defines them
                 std::unordered_map<Variable*, Phi*> phi_dependencies;
                 std::unordered_set<Variable*> reqs;
@@ -708,7 +708,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
                     if (req->is_aliased()) continue;
                     auto it = def_map.find(var_key(req));
                     if (it != def_map.end()) {
-                        if (auto* phi = dynamic_cast<Phi*>(it->second)) {
+                        if (auto* phi = dyn_cast<Phi>(it->second)) {
                             phi_dependencies[req] = phi;
                         }
                     }
@@ -722,7 +722,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
                     Constant* unique_upstream_value = nullptr;
                     bool multiple_values = false;
                     for (auto& [var_block, expr] : phi->origin_block()) {
-                        if (auto* c = dynamic_cast<Constant*>(expr)) {
+                        if (auto* c = dyn_cast<Constant>(expr)) {
                             // If var_block == block, or no path exists from block to var_block
                             // (we skip precise dominator checks here for simplicity and assume it's valid if it reaches)
                             if (!unique_upstream_value) {
@@ -750,7 +750,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
                     patched_condition_expr = replace_variable_ptr(task.arena(), patched_condition_expr, var, constant);
                 }
 
-                if (auto* patched_cond = dynamic_cast<Condition*>(patched_condition_expr)) {
+                if (auto* patched_cond = dyn_cast<Condition>(patched_condition_expr)) {
                     logos::LogicCondition cond = converter.convert_to_condition(patched_cond);
 
                     Edge* sat_edge = nullptr;
@@ -806,7 +806,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
     for (Edge* dead_edge : prunable_edges) {
         BasicBlock* source = dead_edge->source();
         if (!source->instructions().empty()) {
-            if (dynamic_cast<Branch*>(source->instructions().back())) {
+            if (isa<Branch>(source->instructions().back())) {
                 source->mutable_instructions().pop_back();
             }
         }
@@ -832,7 +832,7 @@ void DeadLoopEliminationStage::execute(DecompilerTask& task) {
 
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+            if (auto* phi = dyn_cast<Phi>(inst)) {
                 std::vector<BasicBlock*> to_remove;
                 for (auto& pair : phi->origin_block()) {
                     if (dead_blocks.contains(pair.first)) {
@@ -866,8 +866,8 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
 
         for (BasicBlock* block : task.cfg()->blocks()) {
             for (Instruction* inst : block->instructions()) {
-                if (auto* assign = dynamic_cast<Assignment*>(inst)) {
-                    if (auto* dest = dynamic_cast<Variable*>(assign->destination())) {
+                if (auto* assign = dyn_cast<Assignment>(inst)) {
+                    if (auto* dest = dyn_cast<Variable>(assign->destination())) {
                         VarKey key = var_key(dest);
                         if (!def_map.contains(key)) def_map[key] = assign;
                     }
@@ -895,9 +895,9 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
 
                     // We only propagate call assignments
                     bool is_call = false;
-                    if (auto* op = dynamic_cast<Operation*>(def->value())) {
+                    if (auto* op = dyn_cast<Operation>(def->value())) {
                         if (op->type() == OperationType::call) is_call = true;
-                    } else if (dynamic_cast<Call*>(def->value())) {
+                    } else if (isa<Call>(def->value())) {
                         is_call = true;
                     }
 
@@ -955,20 +955,20 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                     Expression* replacement = def->value();
                     bool sub_changed = false;
 
-                    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+                    if (auto* assign = dyn_cast<Assignment>(inst)) {
                         Expression* new_val = replace_variable_ptr(task.arena(), assign->value(), req_var, replacement);
                         if (new_val != assign->value()) {
                             assign->set_value(new_val);
                             sub_changed = true;
                         }
-                        if (!dynamic_cast<Variable*>(assign->destination())) {
+                        if (!isa<Variable>(assign->destination())) {
                             Expression* new_dest = replace_variable_ptr(task.arena(), assign->destination(), req_var, replacement);
                             if (new_dest != assign->destination()) {
                                 assign->set_destination(new_dest);
                                 sub_changed = true;
                             }
                         }
-                    } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+                    } else if (auto* branch = dyn_cast<Branch>(inst)) {
                         Condition* cond = branch->condition();
                         Expression* new_lhs = replace_variable_ptr(task.arena(), cond->lhs(), req_var, replacement);
                         Expression* new_rhs = replace_variable_ptr(task.arena(), cond->rhs(), req_var, replacement);
@@ -977,7 +977,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                             branch->set_condition(new_cond);
                             sub_changed = true;
                         }
-                    } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+                    } else if (auto* ret = dyn_cast<Return>(inst)) {
                         std::vector<Expression*> new_vals;
                         for (auto* val : ret->values()) {
                             Expression* new_val = replace_variable_ptr(task.arena(), val, req_var, replacement);
@@ -1034,25 +1034,25 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
             for (Variable* req : inst->requirements()) intern(req);
             for (Variable* def : inst->definitions()) intern(def);
 
-            auto* assign = dynamic_cast<Assignment*>(inst);
+            auto* assign = dyn_cast<Assignment>(inst);
             if (!assign) continue;
 
-            auto* dest = dynamic_cast<Variable*>(assign->destination());
+            auto* dest = dyn_cast<Variable>(assign->destination());
             if (!dest) continue;
 
-            if (auto* src = dynamic_cast<Variable*>(assign->value())) {
+            if (auto* src = dyn_cast<Variable>(assign->value())) {
                 if (type_compatible_for_identity(dest, src)) {
                     direct_identity_edges.push_back({var_key(dest), var_key(src)});
                 }
                 continue;
             }
 
-            auto* phi = dynamic_cast<Phi*>(inst);
+            auto* phi = dyn_cast<Phi>(inst);
             if (!phi || !phi->operand_list()) continue;
 
             PhiIdentityInfo info{var_key(dest), {}};
             for (Expression* op : phi->operand_list()->operands()) {
-                auto* ov = dynamic_cast<Variable*>(op);
+                auto* ov = dyn_cast<Variable>(op);
                 if (!ov) {
                     info.operands.clear();
                     break;
@@ -1158,7 +1158,7 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
         rewritten.reserve(block->instructions().size());
 
         for (Instruction* inst : block->instructions()) {
-            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+            if (auto* phi = dyn_cast<Phi>(inst)) {
                 Variable* dest = phi->dest_var();
                 if (!dest || !phi->operand_list()) {
                     continue;
@@ -1167,7 +1167,7 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
                 Variable* single = nullptr;
                 bool all_same = true;
                 for (Expression* op : phi->operand_list()->operands()) {
-                    auto* ov = dynamic_cast<Variable*>(op);
+                    auto* ov = dyn_cast<Variable>(op);
                     if (!ov) {
                         all_same = false;
                         break;
@@ -1191,9 +1191,9 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
                 }
             }
 
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
-                auto* dst = dynamic_cast<Variable*>(assign->destination());
-                auto* src = dynamic_cast<Variable*>(assign->value());
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                auto* dst = dyn_cast<Variable>(assign->destination());
+                auto* src = dyn_cast<Variable>(assign->value());
                 if (dst && src && var_key(dst) == var_key(src)) {
                     continue;
                 }
@@ -1216,7 +1216,7 @@ struct ExistingSubexpressionDef {
 
 static std::size_t expression_complexity(Expression* expr) {
     if (!expr) return 0;
-    if (dynamic_cast<Constant*>(expr) || dynamic_cast<Variable*>(expr)) return 1;
+    if (isa<Constant>(expr) || isa<Variable>(expr)) return 1;
 
     std::vector<Expression*> stack;
     stack.push_back(expr);
@@ -1227,11 +1227,11 @@ static std::size_t expression_complexity(Expression* expr) {
         stack.pop_back();
         ++score;
 
-        if (auto* op = dynamic_cast<Operation*>(current)) {
+        if (auto* op = dyn_cast<Operation>(current)) {
             for (Expression* child : op->operands()) {
                 stack.push_back(child);
             }
-        } else if (auto* list = dynamic_cast<ListOperation*>(current)) {
+        } else if (auto* list = dyn_cast<ListOperation>(current)) {
             for (Expression* child : list->operands()) {
                 stack.push_back(child);
             }
@@ -1241,59 +1241,32 @@ static std::size_t expression_complexity(Expression* expr) {
     return score;
 }
 
-static std::string expression_fingerprint(Expression* expr) {
-    if (!expr) return "null";
-    if (auto* c = dynamic_cast<Constant*>(expr)) {
-        return "C:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
-    }
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
-        return "V:" + v->name() + "#" + std::to_string(v->ssa_version());
-    }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
-        std::string out = "L[";
-        bool first = true;
-        for (Expression* child : list->operands()) {
-            if (!first) out += ",";
-            first = false;
-            out += expression_fingerprint(child);
-        }
-        out += "]";
-        return out;
-    }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
-        std::string out = "O:" + std::to_string(static_cast<int>(op->type())) + "(";
-        bool first = true;
-        for (Expression* child : op->operands()) {
-            if (!first) out += ",";
-            first = false;
-            out += expression_fingerprint(child);
-        }
-    }
-    return "X";
+static std::uint64_t expression_fp(Expression* expr) {
+    return expression_fingerprint_hash(expr);
 }
 
 static void collect_subexpressions(Expression* root, std::vector<Expression*>& out) {
     if (!root) return;
     out.push_back(root);
-    if (auto* op = dynamic_cast<Operation*>(root)) {
+    if (auto* op = dyn_cast<Operation>(root)) {
         for (Expression* child : op->operands()) collect_subexpressions(child, out);
         return;
     }
-    if (auto* list = dynamic_cast<ListOperation*>(root)) {
+    if (auto* list = dyn_cast<ListOperation>(root)) {
         for (Expression* child : list->operands()) collect_subexpressions(child, out);
     }
 }
 
 static bool contains_call_expression(Expression* expr) {
     if (!expr) return false;
-    if (dynamic_cast<Call*>(expr)) return true;
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (isa<Call>(expr)) return true;
+    if (auto* op = dyn_cast<Operation>(expr)) {
         if (op->type() == OperationType::call) return true;
         for (Expression* child : op->operands()) {
             if (contains_call_expression(child)) return true;
         }
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* child : list->operands()) {
             if (contains_call_expression(child)) return true;
         }
@@ -1304,31 +1277,31 @@ static bool contains_call_expression(Expression* expr) {
 static std::vector<Expression*> instruction_subexpressions(Instruction* inst) {
     std::vector<Expression*> out;
 
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         collect_subexpressions(assign->value(), out);
-        if (assign->destination() && !dynamic_cast<Variable*>(assign->destination())) {
-            if (auto* op = dynamic_cast<Operation*>(assign->destination())) {
+        if (assign->destination() && !isa<Variable>(assign->destination())) {
+            if (auto* op = dyn_cast<Operation>(assign->destination())) {
                 for (Expression* child : op->operands()) collect_subexpressions(child, out);
-            } else if (auto* list = dynamic_cast<ListOperation*>(assign->destination())) {
+            } else if (auto* list = dyn_cast<ListOperation>(assign->destination())) {
                 for (Expression* child : list->operands()) collect_subexpressions(child, out);
             }
         }
         return out;
     }
 
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         if (branch->condition()) {
             for (Expression* child : branch->condition()->operands()) collect_subexpressions(child, out);
         }
         return out;
     }
 
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         collect_subexpressions(ib->expression(), out);
         return out;
     }
 
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) collect_subexpressions(value, out);
     }
 
@@ -1347,7 +1320,7 @@ static bool can_replace_subexpression(
 
     const auto& insts = use_block->instructions();
     for (std::size_t i = def.index + 1; i < use_index && i < insts.size(); ++i) {
-        if (auto* rel = dynamic_cast<Relation*>(insts[i])) {
+        if (auto* rel = dyn_cast<Relation>(insts[i])) {
             auto* dst = rel->destination();
             if (dst && dst->name() == def.variable->name()) return false;
         }
@@ -1369,7 +1342,7 @@ private:
     void process_block(BasicBlock* block) {
         if (!block) return;
 
-        std::vector<std::string> inserted_keys;
+        std::vector<std::uint64_t> inserted_keys;
 
         auto& insts = block->mutable_instructions();
         for (std::size_t idx = 0; idx < insts.size(); ++idx) {
@@ -1389,7 +1362,7 @@ private:
                 });
 
                 for (Expression* subexpr : subexprs) {
-                    std::string fp = expression_fingerprint(subexpr);
+                    std::uint64_t fp = expression_fp(subexpr);
                     auto it = defining_variable_of_.find(fp);
                     if (it == defining_variable_of_.end() || it->second.empty()) continue;
 
@@ -1402,16 +1375,16 @@ private:
                 }
             }
 
-            auto* assign = dynamic_cast<Assignment*>(inst);
-            if (!assign || dynamic_cast<Phi*>(inst)) continue;
+            auto* assign = dyn_cast<Assignment>(inst);
+            if (!assign || isa<Phi>(inst)) continue;
 
-            auto* dest = dynamic_cast<Variable*>(assign->destination());
+            auto* dest = dyn_cast<Variable>(assign->destination());
             Expression* value = assign->value();
             if (!dest || !value) continue;
             if (expression_complexity(value) <= 1) continue;
             if (contains_dereference(value) || contains_call_expression(value)) continue;
 
-            std::string fp = expression_fingerprint(value);
+            std::uint64_t fp = expression_fp(value);
             if (defining_variable_of_.contains(fp) && !defining_variable_of_[fp].empty()) continue;
 
             defining_variable_of_[fp].push_back({dest, block, idx});
@@ -1435,7 +1408,7 @@ private:
 private:
     ControlFlowGraph& cfg_;
     DominatorTree& dom_;
-    std::unordered_map<std::string, std::vector<ExistingSubexpressionDef>> defining_variable_of_;
+    std::unordered_map<std::uint64_t, std::vector<ExistingSubexpressionDef>> defining_variable_of_;
 };
 
 struct SubexpressionUsage {
@@ -1464,7 +1437,7 @@ public:
             auto usage_map = collect_usage_map();
             auto candidates = sorted_candidates(usage_map);
 
-            for (const std::string& fp : candidates) {
+            for (const std::uint64_t fp : candidates) {
                 auto it = usage_map.find(fp);
                 if (it == usage_map.end()) continue;
 
@@ -1477,8 +1450,8 @@ public:
     }
 
 private:
-    std::unordered_map<std::string, SubexpressionStats> collect_usage_map() {
-        std::unordered_map<std::string, SubexpressionStats> usage_map;
+    std::unordered_map<std::uint64_t, SubexpressionStats> collect_usage_map() {
+        std::unordered_map<std::uint64_t, SubexpressionStats> usage_map;
 
         for (BasicBlock* block : cfg_.blocks()) {
             const auto& insts = block->instructions();
@@ -1489,7 +1462,7 @@ private:
                 std::vector<Expression*> subexprs = instruction_subexpressions(inst);
                 for (Expression* expr : subexprs) {
                     if (!expr) continue;
-                    std::string fp = expression_fingerprint(expr);
+                    std::uint64_t fp = expression_fp(expr);
                     auto& stats = usage_map[fp];
                     if (!stats.exemplar) {
                         stats.exemplar = expr;
@@ -1503,8 +1476,8 @@ private:
         return usage_map;
     }
 
-    std::vector<std::string> sorted_candidates(const std::unordered_map<std::string, SubexpressionStats>& usage_map) {
-        std::vector<std::pair<std::string, const SubexpressionStats*>> rows;
+    std::vector<std::uint64_t> sorted_candidates(const std::unordered_map<std::uint64_t, SubexpressionStats>& usage_map) {
+        std::vector<std::pair<std::uint64_t, const SubexpressionStats*>> rows;
         rows.reserve(usage_map.size());
 
         for (const auto& [fp, stats] : usage_map) {
@@ -1522,7 +1495,7 @@ private:
             return lhs.first < rhs.first;
         });
 
-        std::vector<std::string> out;
+        std::vector<std::uint64_t> out;
         out.reserve(rows.size());
         for (auto& [fp, _] : rows) {
             (void)_;
@@ -1535,28 +1508,28 @@ private:
         if (!stats.exemplar) return false;
         if (stats.complexity < 2) return false;
         if (stats.usages.size() < 2) return false;
-        if (dynamic_cast<ListOperation*>(stats.exemplar)) return false;
+        if (isa<ListOperation>(stats.exemplar)) return false;
         if (contains_dereference(stats.exemplar)) return false;
         if (contains_call_expression(stats.exemplar)) return false;
         return true;
     }
 
     static bool replace_in_expression(Expression*& expr,
-                                      const std::string& target_fp,
+                                      std::uint64_t target_fp,
                                       Variable* replacement) {
         if (!expr) return false;
 
-        if (expression_fingerprint(expr) == target_fp) {
+        if (expression_fp(expr) == target_fp) {
             expr = replacement;
             return true;
         }
 
         bool changed = false;
-        if (auto* op = dynamic_cast<Operation*>(expr)) {
+        if (auto* op = dyn_cast<Operation>(expr)) {
             for (Expression*& child : op->mutable_operands()) {
                 changed = replace_in_expression(child, target_fp, replacement) || changed;
             }
-        } else if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        } else if (auto* list = dyn_cast<ListOperation>(expr)) {
             for (Expression*& child : list->mutable_operands()) {
                 changed = replace_in_expression(child, target_fp, replacement) || changed;
             }
@@ -1566,18 +1539,18 @@ private:
     }
 
     static bool rewrite_instruction(Instruction* inst,
-                                    const std::string& target_fp,
+                                    std::uint64_t target_fp,
                                     Variable* replacement) {
         bool changed = false;
 
-        if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        if (auto* assign = dyn_cast<Assignment>(inst)) {
             Expression* value = assign->value();
             if (replace_in_expression(value, target_fp, replacement)) {
                 assign->set_value(value);
                 changed = true;
             }
 
-            if (assign->destination() && !dynamic_cast<Variable*>(assign->destination())) {
+            if (assign->destination() && !isa<Variable>(assign->destination())) {
                 Expression* dest = assign->destination();
                 if (replace_in_expression(dest, target_fp, replacement)) {
                     assign->set_destination(dest);
@@ -1587,7 +1560,7 @@ private:
             return changed;
         }
 
-        if (auto* branch = dynamic_cast<Branch*>(inst)) {
+        if (auto* branch = dyn_cast<Branch>(inst)) {
             if (auto* cond = branch->condition()) {
                 for (Expression*& child : cond->mutable_operands()) {
                     changed = replace_in_expression(child, target_fp, replacement) || changed;
@@ -1596,7 +1569,7 @@ private:
             return changed;
         }
 
-        if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+        if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
             Expression* before = ib->expression();
             Expression* after = before;
             if (replace_in_expression(after, target_fp, replacement)) {
@@ -1608,7 +1581,7 @@ private:
             return changed;
         }
 
-        if (auto* ret = dynamic_cast<Return*>(inst)) {
+        if (auto* ret = dyn_cast<Return>(inst)) {
             for (Expression* value : ret->values()) {
                 Expression* rewritten = value;
                 if (replace_in_expression(rewritten, target_fp, replacement)) {
@@ -1666,14 +1639,14 @@ private:
         return insts.size();
     }
 
-    bool apply_candidate(const std::string& fp, const SubexpressionStats& stats) {
+    bool apply_candidate(std::uint64_t fp, const SubexpressionStats& stats) {
         if (!stats.exemplar) return false;
 
         std::unordered_set<BasicBlock*> uniq;
         std::vector<BasicBlock*> usage_blocks;
         for (const auto& usage : stats.usages) {
             if (!usage.instruction || !usage.block) continue;
-            if (dynamic_cast<Phi*>(usage.instruction)) {
+            if (isa<Phi>(usage.instruction)) {
                 return false;
             }
             if (uniq.insert(usage.block).second) {
@@ -1778,12 +1751,12 @@ bool is_boolean_result_op(OperationType type) {
 }
 
 bool is_constant_value(const Expression* expr, uint64_t value) {
-    const auto* c = dynamic_cast<const Constant*>(expr);
+    const auto* c = dyn_cast<Constant>(expr);
     return c && c->value() == value;
 }
 
 bool is_all_ones_constant(const Expression* expr, std::size_t size_bytes) {
-    const auto* c = dynamic_cast<const Constant*>(expr);
+    const auto* c = dyn_cast<Constant>(expr);
     if (!c) return false;
     const std::size_t width = size_bytes == 0 ? c->size_bytes : size_bytes;
     return c->value() == mask_for_size(width);
@@ -1812,18 +1785,18 @@ Expression* try_collapse_nested_constants(DecompilerTask& task, Operation* op) {
     }
 
     auto try_orientation = [&](Expression* inner_candidate, Expression* outer_constant_candidate) -> Expression* {
-        auto* outer_const = dynamic_cast<Constant*>(outer_constant_candidate);
+        auto* outer_const = dyn_cast<Constant>(outer_constant_candidate);
         if (!outer_const) return nullptr;
 
-        auto* inner = dynamic_cast<Operation*>(inner_candidate);
+        auto* inner = dyn_cast<Operation>(inner_candidate);
         if (!inner || inner->type() != op->type() || inner->operands().size() != 2) {
             return nullptr;
         }
 
-        Constant* inner_const = dynamic_cast<Constant*>(inner->operands()[0]);
+        auto* inner_const = dyn_cast<Constant>(inner->operands()[0]);
         Expression* inner_other = inner->operands()[1];
         if (!inner_const) {
-            inner_const = dynamic_cast<Constant*>(inner->operands()[1]);
+            inner_const = dyn_cast<Constant>(inner->operands()[1]);
             inner_other = inner->operands()[0];
         }
         if (!inner_const) return nullptr;
@@ -1956,16 +1929,16 @@ std::optional<FoldedConstant> collapse_binary_constants(
 
 Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
     if (!expr) return nullptr;
-    if (dynamic_cast<Constant*>(expr) || dynamic_cast<Variable*>(expr)) return expr;
+    if (isa<Constant>(expr) || isa<Variable>(expr)) return expr;
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression*& child : list->mutable_operands()) {
             child = simplify_expression_tree(task, child);
         }
         return expr;
     }
 
-    auto* op = dynamic_cast<Operation*>(expr);
+    auto* op = dyn_cast<Operation>(expr);
     if (!op) return expr;
 
     for (Expression*& child : op->mutable_operands()) {
@@ -1990,9 +1963,9 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                 if (is_constant_value(lhs_expr, 1)) return rhs_expr;
                 break;
             case OperationType::sub:
-                if (auto* rhs_op = dynamic_cast<Operation*>(rhs_expr);
+                if (auto* rhs_op = dyn_cast<Operation>(rhs_expr);
                     rhs_op && rhs_op->type() == OperationType::negate && rhs_op->operands().size() == 1) {
-                    if (auto* negated_const = dynamic_cast<Constant*>(rhs_op->operands()[0])) {
+                    if (auto* negated_const = dyn_cast<Constant>(rhs_op->operands()[0])) {
                         auto* as_add = task.arena().create<Operation>(
                             OperationType::add,
                             std::vector<Expression*>{lhs_expr, negated_const},
@@ -2030,8 +2003,8 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             return nested;
         }
 
-        auto* lhs = dynamic_cast<Constant*>(op->operands()[0]);
-        auto* rhs = dynamic_cast<Constant*>(op->operands()[1]);
+        auto* lhs = dyn_cast<Constant>(op->operands()[0]);
+        auto* rhs = dyn_cast<Constant>(op->operands()[1]);
         if (lhs && rhs) {
             if (auto folded = collapse_binary_constants(op->type(), lhs, rhs, op->size_bytes)) {
                 auto* c = task.arena().create<Constant>(folded->value, folded->size_bytes);
@@ -2047,13 +2020,13 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
 void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
     if (!inst) return;
 
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         Expression* new_value = simplify_expression_tree(task, assign->value());
         if (new_value != assign->value()) {
             assign->set_value(new_value);
         }
 
-        if (!dynamic_cast<Variable*>(assign->destination())) {
+        if (!isa<Variable>(assign->destination())) {
             Expression* new_dest = simplify_expression_tree(task, assign->destination());
             if (new_dest != assign->destination()) {
                 assign->set_destination(new_dest);
@@ -2062,7 +2035,7 @@ void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
         return;
     }
 
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         Condition* cond = branch->condition();
         if (!cond) return;
 
@@ -2070,8 +2043,8 @@ void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
         Expression* rhs = simplify_expression_tree(task, cond->rhs());
         auto* rebuilt = task.arena().create<Condition>(cond->type(), lhs, rhs, cond->size_bytes);
 
-        auto* cl = dynamic_cast<Constant*>(lhs);
-        auto* cr = dynamic_cast<Constant*>(rhs);
+        auto* cl = dyn_cast<Constant>(lhs);
+        auto* cr = dyn_cast<Constant>(rhs);
         if (cl && cr) {
             if (auto folded = collapse_binary_constants(cond->type(), cl, cr, 1)) {
                 auto* folded_const = task.arena().create<Constant>(folded->value, 1);
@@ -2084,7 +2057,7 @@ void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
         return;
     }
 
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         Expression* expr = ib->expression();
         Expression* simplified = simplify_expression_tree(task, expr);
         if (simplified != expr) {
@@ -2093,7 +2066,7 @@ void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
         return;
     }
 
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             Expression* simplified = simplify_expression_tree(task, value);
             if (simplified != value) {
@@ -2105,16 +2078,16 @@ void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
 
 Expression* simplify_cast_expression_tree(DecompilerTask& task, Expression* expr) {
     if (!expr) return nullptr;
-    if (dynamic_cast<Constant*>(expr) || dynamic_cast<Variable*>(expr)) return expr;
+    if (isa<Constant>(expr) || isa<Variable>(expr)) return expr;
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression*& child : list->mutable_operands()) {
             child = simplify_cast_expression_tree(task, child);
         }
         return expr;
     }
 
-    auto* op = dynamic_cast<Operation*>(expr);
+    auto* op = dyn_cast<Operation>(expr);
     if (!op) return expr;
 
     for (Expression*& child : op->mutable_operands()) {
@@ -2135,7 +2108,7 @@ Expression* simplify_cast_expression_tree(DecompilerTask& task, Expression* expr
     }
 
     // Rule 2: Fold constant-to-constant casts.
-    if (auto* c = dynamic_cast<Constant*>(src)) {
+    if (auto* c = dyn_cast<Constant>(src)) {
         uint64_t value = c->value();
         std::size_t out_size = op->size_bytes != 0 ? op->size_bytes : c->size_bytes;
 
@@ -2166,13 +2139,13 @@ Expression* simplify_cast_expression_tree(DecompilerTask& task, Expression* expr
 void simplify_instruction_casts(DecompilerTask& task, Instruction* inst) {
     if (!inst) return;
 
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         Expression* new_value = simplify_cast_expression_tree(task, assign->value());
         if (new_value != assign->value()) {
             assign->set_value(new_value);
         }
 
-        if (!dynamic_cast<Variable*>(assign->destination())) {
+        if (!isa<Variable>(assign->destination())) {
             Expression* new_dest = simplify_cast_expression_tree(task, assign->destination());
             if (new_dest != assign->destination()) {
                 assign->set_destination(new_dest);
@@ -2181,7 +2154,7 @@ void simplify_instruction_casts(DecompilerTask& task, Instruction* inst) {
         return;
     }
 
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         Condition* cond = branch->condition();
         if (!cond) return;
         Expression* lhs = simplify_cast_expression_tree(task, cond->lhs());
@@ -2190,7 +2163,7 @@ void simplify_instruction_casts(DecompilerTask& task, Instruction* inst) {
         return;
     }
 
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         Expression* expr = ib->expression();
         Expression* simplified = simplify_cast_expression_tree(task, expr);
         if (simplified != expr) {
@@ -2199,7 +2172,7 @@ void simplify_instruction_casts(DecompilerTask& task, Instruction* inst) {
         return;
     }
 
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             Expression* simplified = simplify_cast_expression_tree(task, value);
             if (simplified != value) {
@@ -2220,8 +2193,8 @@ struct ExpressionGraph {
 
 bool assignment_has_call_value(const Assignment* assign) {
     if (!assign) return false;
-    if (dynamic_cast<const Call*>(assign->value())) return true;
-    const auto* op = dynamic_cast<const Operation*>(assign->value());
+    if (isa<Call>(assign->value())) return true;
+    const auto* op = dyn_cast<Operation>(assign->value());
     return op && op->type() == OperationType::call;
 }
 
@@ -2229,7 +2202,7 @@ bool assignment_has_side_effect_destination(const Assignment* assign) {
     if (!assign) return false;
     // Any non-variable destination is treated as a side-effecting write
     // (e.g., dereference/member store). Keep it conservatively.
-    return dynamic_cast<const Variable*>(assign->destination()) == nullptr;
+    return !isa<Variable>(assign->destination());
 }
 
 ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
@@ -2251,7 +2224,7 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
     // Pass 2: connect use -> def dependencies and identify sink instructions.
     for (BasicBlock* block : cfg->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
                 if (assignment_has_call_value(assign) || assignment_has_side_effect_destination(assign)) {
                     graph.sinks.insert(inst);
                 }
@@ -2302,14 +2275,14 @@ std::unordered_set<Instruction*> compute_live_component(const ExpressionGraph& g
 bool extract_scaled_index(Expression* expr, Expression*& index, std::size_t& element_size) {
     if (!expr) return false;
 
-    if (auto* mul = dynamic_cast<Operation*>(expr);
+    if (auto* mul = dyn_cast<Operation>(expr);
         mul && (mul->type() == OperationType::mul || mul->type() == OperationType::mul_us) &&
         mul->operands().size() == 2) {
         Expression* lhs = mul->operands()[0];
         Expression* rhs = mul->operands()[1];
 
-        auto* lhs_const = dynamic_cast<Constant*>(lhs);
-        auto* rhs_const = dynamic_cast<Constant*>(rhs);
+        auto* lhs_const = dyn_cast<Constant>(lhs);
+        auto* rhs_const = dyn_cast<Constant>(rhs);
 
         if (lhs_const && !rhs_const) {
             const std::uint64_t scale = lhs_const->value();
@@ -2335,13 +2308,13 @@ bool extract_scaled_index(Expression* expr, Expression*& index, std::size_t& ele
 }
 
 bool extract_base_index(Expression* expr, Variable*& base, Expression*& index, std::size_t& element_size) {
-    auto* add = dynamic_cast<Operation*>(expr);
+    auto* add = dyn_cast<Operation>(expr);
     if (!add || add->type() != OperationType::add || add->operands().size() != 2) {
         return false;
     }
 
     auto try_form = [&](Expression* base_expr, Expression* index_expr) -> bool {
-        auto* base_var = dynamic_cast<Variable*>(base_expr);
+        auto* base_var = dyn_cast<Variable>(base_expr);
         if (!base_var) return false;
 
         Expression* idx = nullptr;
@@ -2368,14 +2341,14 @@ bool infer_array_confidence(const Variable* base, std::size_t element_size) {
 void annotate_array_access_expr(Expression* expr) {
     if (!expr) return;
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* child : list->operands()) {
             annotate_array_access_expr(child);
         }
         return;
     }
 
-    auto* op = dynamic_cast<Operation*>(expr);
+    auto* op = dyn_cast<Operation>(expr);
     if (!op) return;
 
     for (Expression* child : op->operands()) {
@@ -2402,20 +2375,20 @@ void annotate_array_access_expr(Expression* expr) {
 }
 
 void annotate_array_access_inst(Instruction* inst) {
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         annotate_array_access_expr(assign->destination());
         annotate_array_access_expr(assign->value());
         return;
     }
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         annotate_array_access_expr(branch->condition());
         return;
     }
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         annotate_array_access_expr(ib->expression());
         return;
     }
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             annotate_array_access_expr(value);
         }
@@ -2424,7 +2397,7 @@ void annotate_array_access_inst(Instruction* inst) {
 
 Expression* strip_cast_expr(Expression* expr) {
     Expression* current = expr;
-    while (auto* op = dynamic_cast<Operation*>(current)) {
+    while (auto* op = dyn_cast<Operation>(current)) {
         if (op->type() != OperationType::cast || op->operands().size() != 1 || op->operands()[0] == nullptr) {
             break;
         }
@@ -2434,12 +2407,12 @@ Expression* strip_cast_expr(Expression* expr) {
 }
 
 bool match_shift_one(Expression* expr, Expression*& amount_expr) {
-    auto* op = dynamic_cast<Operation*>(strip_cast_expr(expr));
+    auto* op = dyn_cast<Operation>(strip_cast_expr(expr));
     if (!op || op->type() != OperationType::shl || op->operands().size() != 2) {
         return false;
     }
 
-    auto* one = dynamic_cast<Constant*>(strip_cast_expr(op->operands()[0]));
+    auto* one = dyn_cast<Constant>(strip_cast_expr(op->operands()[0]));
     if (!one || one->value() != 1) {
         return false;
     }
@@ -2449,7 +2422,7 @@ bool match_shift_one(Expression* expr, Expression*& amount_expr) {
 }
 
 bool match_bitfield_mask(Expression* expr, Expression*& amount_expr, std::uint64_t& mask, std::size_t& mask_bytes) {
-    auto* op = dynamic_cast<Operation*>(strip_cast_expr(expr));
+    auto* op = dyn_cast<Operation>(strip_cast_expr(expr));
     if (!op || op->type() != OperationType::bit_and || op->operands().size() != 2) {
         return false;
     }
@@ -2460,7 +2433,7 @@ bool match_bitfield_mask(Expression* expr, Expression*& amount_expr, std::uint64
             return false;
         }
 
-        auto* mask_const = dynamic_cast<Constant*>(strip_cast_expr(mask_side));
+        auto* mask_const = dyn_cast<Constant>(strip_cast_expr(mask_side));
         if (!mask_const) {
             return false;
         }
@@ -2613,7 +2586,7 @@ bool try_unroll_bitfield_branch_condition(DecompilerTask& task, Branch* branch) 
     }
 
     auto is_zero_const = [](Expression* expr) -> bool {
-        auto* c = dynamic_cast<Constant*>(strip_cast_expr(expr));
+        auto* c = dyn_cast<Constant>(strip_cast_expr(expr));
         return c != nullptr && c->value() == 0;
     };
 
@@ -2674,8 +2647,8 @@ void TypePropagationStage::execute(DecompilerTask& task) {
                 note_variable(def);
             }
 
-            auto* assign = dynamic_cast<Assignment*>(inst);
-            auto* dst = assign ? dynamic_cast<Variable*>(assign->destination()) : nullptr;
+            auto* assign = dyn_cast<Assignment>(inst);
+            auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
             if (!dst) {
                 continue;
             }
@@ -2746,7 +2719,7 @@ void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            if (auto* branch = dynamic_cast<Branch*>(inst)) {
+            if (auto* branch = dyn_cast<Branch>(inst)) {
                 (void)try_unroll_bitfield_branch_condition(task, branch);
             }
         }
@@ -2813,26 +2786,26 @@ void CommonSubexpressionEliminationStage::execute(DecompilerTask& task) {
 namespace {
 
 struct EdgePrunerCandidate {
-    std::string fingerprint;
+    std::uint64_t fingerprint = 0;
     Expression* exemplar = nullptr;
     std::size_t complexity = 0;
     std::vector<std::size_t> instruction_indices;
 };
 
-bool edge_replace_in_expression(Expression*& expr, const std::string& fingerprint, Variable* replacement) {
+bool edge_replace_in_expression(Expression*& expr, std::uint64_t fingerprint, Variable* replacement) {
     if (!expr) return false;
 
-    if (expression_fingerprint(expr) == fingerprint) {
+    if (expression_fp(expr) == fingerprint) {
         expr = replacement;
         return true;
     }
 
     bool changed = false;
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression*& child : op->mutable_operands()) {
             changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
         }
-    } else if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression*& child : list->mutable_operands()) {
             changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
         }
@@ -2840,18 +2813,18 @@ bool edge_replace_in_expression(Expression*& expr, const std::string& fingerprin
     return changed;
 }
 
-bool edge_rewrite_instruction(Instruction* inst, const std::string& fingerprint, Variable* replacement) {
+bool edge_rewrite_instruction(Instruction* inst, std::uint64_t fingerprint, Variable* replacement) {
     if (!inst) return false;
 
     bool changed = false;
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         Expression* value = assign->value();
         if (edge_replace_in_expression(value, fingerprint, replacement)) {
             assign->set_value(value);
             changed = true;
         }
 
-        if (assign->destination() && !dynamic_cast<Variable*>(assign->destination())) {
+        if (assign->destination() && !isa<Variable>(assign->destination())) {
             Expression* dest = assign->destination();
             if (edge_replace_in_expression(dest, fingerprint, replacement)) {
                 assign->set_destination(dest);
@@ -2861,7 +2834,7 @@ bool edge_rewrite_instruction(Instruction* inst, const std::string& fingerprint,
         return changed;
     }
 
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         if (auto* cond = branch->condition()) {
             for (Expression*& child : cond->mutable_operands()) {
                 changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
@@ -2870,7 +2843,7 @@ bool edge_rewrite_instruction(Instruction* inst, const std::string& fingerprint,
         return changed;
     }
 
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         Expression* before = ib->expression();
         Expression* after = before;
         if (edge_replace_in_expression(after, fingerprint, replacement)) {
@@ -2882,7 +2855,7 @@ bool edge_rewrite_instruction(Instruction* inst, const std::string& fingerprint,
         return changed;
     }
 
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             Expression* rewritten = value;
             if (edge_replace_in_expression(rewritten, fingerprint, replacement)) {
@@ -2901,17 +2874,17 @@ bool edge_rewrite_instruction(Instruction* inst, const std::string& fingerprint,
 std::optional<EdgePrunerCandidate> select_edge_pruner_candidate(BasicBlock* block) {
     if (!block) return std::nullopt;
 
-    std::unordered_map<std::string, EdgePrunerCandidate> candidates;
+    std::unordered_map<std::uint64_t, EdgePrunerCandidate> candidates;
 
     const auto& insts = block->instructions();
     for (std::size_t idx = 0; idx < insts.size(); ++idx) {
         Instruction* inst = insts[idx];
-        if (!inst || dynamic_cast<Phi*>(inst)) continue;
+        if (!inst || isa<Phi>(inst)) continue;
 
         std::vector<Expression*> subexprs = instruction_subexpressions(inst);
         for (Expression* expr : subexprs) {
             if (!expr) continue;
-            if (dynamic_cast<Variable*>(expr) || dynamic_cast<Constant*>(expr) || dynamic_cast<ListOperation*>(expr)) {
+            if (isa<Variable>(expr) || isa<Constant>(expr) || isa<ListOperation>(expr)) {
                 continue;
             }
             if (contains_dereference(expr) || contains_call_expression(expr)) {
@@ -2921,7 +2894,7 @@ std::optional<EdgePrunerCandidate> select_edge_pruner_candidate(BasicBlock* bloc
             const std::size_t complexity = expression_complexity(expr);
             if (complexity < 2) continue;
 
-            const std::string fp = expression_fingerprint(expr);
+            const std::uint64_t fp = expression_fp(expr);
             auto& candidate = candidates[fp];
             candidate.fingerprint = fp;
             candidate.exemplar = expr;

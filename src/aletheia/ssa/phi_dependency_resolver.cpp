@@ -35,7 +35,7 @@ void PhiDependencyResolver::resolve(DecompilerArena& arena, ControlFlowGraph& cf
         std::vector<Instruction*> non_phis;
 
         for (Instruction* inst : bb->instructions()) {
-            if (auto* phi = dynamic_cast<Phi*>(inst)) {
+            if (auto* phi = dyn_cast<Phi>(inst)) {
                 phis.push_back(phi);
             } else {
                 non_phis.push_back(inst);

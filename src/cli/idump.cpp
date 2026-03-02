@@ -69,8 +69,8 @@ bool ast_has_executable_content(aletheia::AstNode* node) {
             return false;
         }
         for (aletheia::Instruction* inst : code->block()->instructions()) {
-            if (dynamic_cast<aletheia::Branch*>(inst) == nullptr
-                && dynamic_cast<aletheia::IndirectBranch*>(inst) == nullptr) {
+             if (!aletheia::isa<aletheia::Branch>(inst)
+                && !aletheia::isa<aletheia::IndirectBranch>(inst)) {
                 return true;
             }
         }
@@ -174,8 +174,8 @@ std::size_t count_cfg_non_control_instructions(const aletheia::ControlFlowGraph*
             continue;
         }
         for (aletheia::Instruction* inst : block->instructions()) {
-            if (dynamic_cast<aletheia::Branch*>(inst) == nullptr
-                && dynamic_cast<aletheia::IndirectBranch*>(inst) == nullptr) {
+             if (!aletheia::isa<aletheia::Branch>(inst)
+                && !aletheia::isa<aletheia::IndirectBranch>(inst)) {
                 ++count;
             }
         }
@@ -313,8 +313,8 @@ void emit_inline_branch_snapshot(
 
     const auto& insts = block->instructions();
     aletheia::Instruction* tail = insts.empty() ? nullptr : insts.back();
-    const bool tail_is_branch = dynamic_cast<aletheia::Branch*>(tail) != nullptr;
-    const bool tail_is_indirect = dynamic_cast<aletheia::IndirectBranch*>(tail) != nullptr;
+    const bool tail_is_branch = aletheia::isa<aletheia::Branch>(tail);
+    const bool tail_is_indirect = aletheia::isa<aletheia::IndirectBranch>(tail);
 
     std::size_t limit = insts.size();
     if ((tail_is_branch || tail_is_indirect) && limit > 0) {
@@ -328,7 +328,7 @@ void emit_inline_branch_snapshot(
         }
     }
 
-    if (auto* branch = dynamic_cast<aletheia::Branch*>(tail)) {
+    if (auto* branch = aletheia::dyn_cast<aletheia::Branch>(tail)) {
         auto [true_edge, false_edge] = pick_true_false_edges(block);
         const std::string cond = expr_gen.generate(branch->condition());
         lines.push_back(indent_of(indent_level) + "if (" + cond + ") {");
@@ -350,7 +350,7 @@ void emit_inline_branch_snapshot(
             path,
             inlined_blocks);
         lines.push_back(indent_of(indent_level) + "}");
-    } else if (auto* indirect = dynamic_cast<aletheia::IndirectBranch*>(tail)) {
+    } else if (auto* indirect = aletheia::dyn_cast<aletheia::IndirectBranch>(tail)) {
         const bool constant_target = dynamic_cast<aletheia::Constant*>(indirect->expression()) != nullptr;
         const bool single_successor = block->successors().size() == 1;
         if (!(constant_target && single_successor)) {
@@ -469,8 +469,8 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
 
                 const auto& insts = block->instructions();
                 aletheia::Instruction* tail = insts.empty() ? nullptr : insts.back();
-                const bool tail_is_branch = dynamic_cast<aletheia::Branch*>(tail) != nullptr;
-                const bool tail_is_indirect = dynamic_cast<aletheia::IndirectBranch*>(tail) != nullptr;
+                const bool tail_is_branch = aletheia::isa<aletheia::Branch>(tail);
+                const bool tail_is_indirect = aletheia::isa<aletheia::IndirectBranch>(tail);
 
                 std::size_t limit = insts.size();
                 if ((tail_is_branch || tail_is_indirect) && limit > 0) {
@@ -484,7 +484,7 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
                     }
                 }
 
-                if (auto* branch = dynamic_cast<aletheia::Branch*>(tail)) {
+                if (auto* branch = aletheia::dyn_cast<aletheia::Branch>(tail)) {
                     auto [true_edge, false_edge] = pick_true_false_edges(block);
                     const std::string cond = expr_gen.generate(branch->condition());
                     lines.push_back("        if (" + cond + ") {");
@@ -492,7 +492,7 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
                     lines.push_back("        } else {");
                     lines.push_back("            /* else -> " + block_label(false_edge ? false_edge->target() : nullptr) + " */");
                     lines.push_back("        }");
-                } else if (auto* indirect = dynamic_cast<aletheia::IndirectBranch*>(tail)) {
+                } else if (auto* indirect = aletheia::dyn_cast<aletheia::IndirectBranch>(tail)) {
                     const bool constant_target = dynamic_cast<aletheia::Constant*>(indirect->expression()) != nullptr;
                     const bool single_successor = block->successors().size() == 1;
                     if (!(constant_target && single_successor)) {

@@ -67,7 +67,7 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
 
 void rename_variable(Variable* var, RenameState& state) {
     if (!var) return;
-    if (dynamic_cast<GlobalVariable*>(var) != nullptr) return;
+    if (isa<GlobalVariable>(var)) return;
 
     if (auto it = state.pointer_name.find(var); it != state.pointer_name.end()) {
         var->set_name(it->second);
@@ -90,30 +90,30 @@ void rename_variable(Variable* var, RenameState& state) {
 void rename_instruction(Instruction* inst, RenameState& state) {
     if (!inst) return;
 
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         rename_expression(assign->destination(), state);
         rename_expression(assign->value(), state);
         return;
     }
 
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         rename_expression(branch->condition(), state);
         return;
     }
 
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         rename_expression(ib->expression(), state);
         return;
     }
 
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             rename_expression(value, state);
         }
         return;
     }
 
-    if (auto* relation = dynamic_cast<Relation*>(inst)) {
+    if (auto* relation = dyn_cast<Relation>(inst)) {
         rename_variable(relation->destination(), state);
         rename_variable(relation->value(), state);
     }
@@ -122,19 +122,19 @@ void rename_instruction(Instruction* inst, RenameState& state) {
 void rename_expression(Expression* expr, RenameState& state) {
     if (!expr) return;
 
-    if (auto* var = dynamic_cast<Variable*>(expr)) {
+    if (auto* var = dyn_cast<Variable>(expr)) {
         rename_variable(var, state);
         return;
     }
 
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression* child : op->operands()) {
             rename_expression(child, state);
         }
         return;
     }
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* child : list->operands()) {
             rename_expression(child, state);
         }

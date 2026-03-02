@@ -16,8 +16,8 @@ void SsaConstructor::gather_definitions(ControlFlowGraph& cfg) {
     for (BasicBlock* block : cfg.blocks()) {
         for (Instruction* inst : block->instructions()) {
             // Use the new Assignment type to identify definitions
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
-                if (auto* var = dynamic_cast<Variable*>(assign->destination())) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                if (auto* var = dyn_cast<Variable>(assign->destination())) {
                     var_defs_[var->name()].push_back(block);
                 }
             }
@@ -74,15 +74,15 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
     // Recursively update SSA versions on Variable uses within an Expression tree.
     auto update_uses = [&](Expression* expr, auto& update_uses_ref) -> void {
         if (!expr) return;
-        if (Variable* v = dynamic_cast<Variable*>(expr)) {
+        if (auto* v = dyn_cast<Variable>(expr)) {
             if (counters.contains(v->name())) {
                 v->set_ssa_version(counters[v->name()].top());
             }
-        } else if (Operation* op = dynamic_cast<Operation*>(expr)) {
+        } else if (auto* op = dyn_cast<Operation>(expr)) {
             for (Expression* child : op->operands()) {
                 update_uses_ref(child, update_uses_ref);
             }
-        } else if (ListOperation* list = dynamic_cast<ListOperation*>(expr)) {
+        } else if (auto* list = dyn_cast<ListOperation>(expr)) {
             for (Expression* child : list->operands()) {
                 update_uses_ref(child, update_uses_ref);
             }
@@ -107,27 +107,27 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
 
         // Process regular instructions
         for (Instruction* inst : block->instructions()) {
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
                 // For assignments: first rename uses (RHS), then define (LHS)
                 update_uses(assign->value(), update_uses);
                 
                 // If destination is a complex expression (e.g., deref), update
                 // uses in the destination too
-                if (!dynamic_cast<Variable*>(assign->destination())) {
+                if (!isa<Variable>(assign->destination())) {
                     update_uses(assign->destination(), update_uses);
                 }
                 
                 // Rename the definition
-                if (auto* def_var = dynamic_cast<Variable*>(assign->destination())) {
+                if (auto* def_var = dyn_cast<Variable>(assign->destination())) {
                     std::size_t count = counts[def_var->name()]++;
                     counters[def_var->name()].push(count);
                     def_var->set_ssa_version(count);
                     pushed_in_this_block[def_var->name()]++;
                 }
-            } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+            } else if (auto* branch = dyn_cast<Branch>(inst)) {
                 // Branches only have uses (in the condition)
                 update_uses(branch->condition(), update_uses);
-            } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+            } else if (auto* ret = dyn_cast<Return>(inst)) {
                 // Return values are uses
                 for (auto* val : ret->values()) {
                     update_uses(val, update_uses);

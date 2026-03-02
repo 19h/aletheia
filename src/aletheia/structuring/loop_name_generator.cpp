@@ -31,7 +31,7 @@ void rename_expression(Expression* expr, const std::unordered_map<VarKey, std::s
 
 void rename_variable(Variable* var, const std::unordered_map<VarKey, std::string, VarKeyHash>& names) {
     if (!var) return;
-    if (dynamic_cast<GlobalVariable*>(var) != nullptr) return;
+    if (isa<GlobalVariable>(var)) return;
     VarKey key{var->name(), var->ssa_version()};
     auto it = names.find(key);
     if (it == names.end()) return;
@@ -42,26 +42,26 @@ void rename_variable(Variable* var, const std::unordered_map<VarKey, std::string
 void rename_instruction(Instruction* inst, const std::unordered_map<VarKey, std::string, VarKeyHash>& names) {
     if (!inst) return;
 
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         rename_expression(assign->destination(), names);
         rename_expression(assign->value(), names);
         return;
     }
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         rename_expression(branch->condition(), names);
         return;
     }
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         rename_expression(ib->expression(), names);
         return;
     }
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             rename_expression(value, names);
         }
         return;
     }
-    if (auto* rel = dynamic_cast<Relation*>(inst)) {
+    if (auto* rel = dyn_cast<Relation>(inst)) {
         rename_variable(rel->destination(), names);
         rename_variable(rel->value(), names);
     }
@@ -69,17 +69,17 @@ void rename_instruction(Instruction* inst, const std::unordered_map<VarKey, std:
 
 void rename_expression(Expression* expr, const std::unordered_map<VarKey, std::string, VarKeyHash>& names) {
     if (!expr) return;
-    if (auto* var = dynamic_cast<Variable*>(expr)) {
+    if (auto* var = dyn_cast<Variable>(expr)) {
         rename_variable(var, names);
         return;
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression* child : op->operands()) {
             rename_expression(child, names);
         }
         return;
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* child : list->operands()) {
             rename_expression(child, names);
         }
@@ -108,8 +108,8 @@ void collect_for_loop_names(
 
     if (auto* loop = dynamic_cast<LoopNode*>(node)) {
         if (auto* for_loop = dynamic_cast<ForLoopNode*>(loop)) {
-            if (auto* decl = dynamic_cast<Assignment*>(for_loop->declaration())) {
-                if (auto* dst = dynamic_cast<Variable*>(decl->destination())) {
+            if (auto* decl = dyn_cast<Assignment>(for_loop->declaration())) {
+                if (auto* dst = dyn_cast<Variable>(decl->destination())) {
                     VarKey key{dst->name(), dst->ssa_version()};
                     if (!names.contains(key)) {
                         if (next_id < kForNames.size()) {
@@ -141,12 +141,12 @@ void collect_for_loop_names(
 }
 
 Variable* extract_condition_variable(Expression* expr) {
-    auto* cond = dynamic_cast<Condition*>(expr);
+    auto* cond = dyn_cast<Condition>(expr);
     if (!cond) return nullptr;
-    if (auto* lhs = dynamic_cast<Variable*>(cond->lhs())) {
+    if (auto* lhs = dyn_cast<Variable>(cond->lhs())) {
         return lhs;
     }
-    if (auto* rhs = dynamic_cast<Variable*>(cond->rhs())) {
+    if (auto* rhs = dyn_cast<Variable>(cond->rhs())) {
         return rhs;
     }
     return nullptr;

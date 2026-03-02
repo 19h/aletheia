@@ -16,7 +16,7 @@ bool AstNode::is_break_node() const {
     auto* code = dynamic_cast<const CodeNode*>(this);
     if (!code || !code->block()) return false;
     auto& instrs = code->block()->instructions();
-    return instrs.size() == 1 && dynamic_cast<BreakInstr*>(instrs[0]) != nullptr;
+    return instrs.size() == 1 && isa<BreakInstr>(instrs[0]);
 }
 
 bool AstNode::is_break_condition() const {
@@ -101,7 +101,7 @@ bool AstNode::has_descendant_code_node_breaking_ancestor_loop() {
 bool CodeNode::does_end_with_break() const {
     if (!block_) return false;
     auto& instrs = block_->instructions();
-    return !instrs.empty() && dynamic_cast<BreakInstr*>(instrs.back()) != nullptr;
+    return !instrs.empty() && isa<BreakInstr>(instrs.back());
 }
 
 bool CodeNode::does_contain_break() const {
@@ -111,13 +111,13 @@ bool CodeNode::does_contain_break() const {
 bool CodeNode::does_end_with_continue() const {
     if (!block_) return false;
     auto& instrs = block_->instructions();
-    return !instrs.empty() && dynamic_cast<ContinueInstr*>(instrs.back()) != nullptr;
+    return !instrs.empty() && isa<ContinueInstr>(instrs.back());
 }
 
 bool CodeNode::does_end_with_return() const {
     if (!block_) return false;
     auto& instrs = block_->instructions();
-    return !instrs.empty() && dynamic_cast<Return*>(instrs.back()) != nullptr;
+    return !instrs.empty() && isa<Return>(instrs.back());
 }
 
 void CodeNode::get_descendant_code_nodes_interrupting_ancestor_loop(
@@ -131,9 +131,9 @@ void CodeNode::clean() {
     if (!block_) return;
     auto& instrs = block_->mutable_instructions();
     for (std::size_t i = 0; i < instrs.size(); ++i) {
-        if (dynamic_cast<BreakInstr*>(instrs[i]) ||
-            dynamic_cast<Return*>(instrs[i]) ||
-            dynamic_cast<ContinueInstr*>(instrs[i])) {
+        if (isa<BreakInstr>(instrs[i]) ||
+            isa<Return>(instrs[i]) ||
+            isa<ContinueInstr>(instrs[i])) {
             instrs.resize(i + 1);
             break;
         }

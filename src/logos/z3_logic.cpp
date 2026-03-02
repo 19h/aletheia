@@ -94,11 +94,11 @@ z3::expr Z3Converter::convert(aletheia::DataflowObject* obj) {
         return fresh_bool("null_obj");
     }
     
-    if (auto* c = dynamic_cast<aletheia::Constant*>(obj)) {
+    if (auto* c = aletheia::dyn_cast<aletheia::Constant>(obj)) {
         return convert_constant(c);
-    } else if (auto* v = dynamic_cast<aletheia::Variable*>(obj)) {
+    } else if (auto* v = aletheia::dyn_cast<aletheia::Variable>(obj)) {
         return convert_variable(v);
-    } else if (auto* o = dynamic_cast<aletheia::Operation*>(obj)) {
+    } else if (auto* o = aletheia::dyn_cast<aletheia::Operation>(obj)) {
         return convert_operation(o);
     }
     

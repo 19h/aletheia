@@ -258,11 +258,11 @@ ExprDepMap expression_dependencies(Expression* expr) {
         return {};
     }
 
-    if (auto* var = dynamic_cast<Variable*>(expr)) {
+    if (auto* var = dyn_cast<Variable>(expr)) {
         return {{key_of(var), 1.0}};
     }
 
-    auto* op = dynamic_cast<Operation*>(expr);
+    auto* op = dyn_cast<Operation>(expr);
     if (op == nullptr) {
         return {};
     }
@@ -301,7 +301,7 @@ ExprDepMap expression_dependencies(Expression* expr) {
 void build_dependency_weights(ControlFlowGraph& cfg, DependencyWeightMap& weights) {
     for (BasicBlock* block : cfg.blocks()) {
         for (Instruction* inst : block->instructions()) {
-            auto* assign = dynamic_cast<Assignment*>(inst);
+            auto* assign = dyn_cast<Assignment>(inst);
             if (assign == nullptr || assign->value() == nullptr) {
                 continue;
             }
@@ -341,10 +341,10 @@ void remove_identity_assignments(ControlFlowGraph& cfg) {
         std::vector<Instruction*> rewritten;
         rewritten.reserve(block->instructions().size());
         for (Instruction* inst : block->instructions()) {
-            auto* assign = dynamic_cast<Assignment*>(inst);
+            auto* assign = dyn_cast<Assignment>(inst);
             if (assign != nullptr) {
-                auto* dst = dynamic_cast<Variable*>(assign->destination());
-                auto* src = dynamic_cast<Variable*>(assign->value());
+                auto* dst = dyn_cast<Variable>(assign->destination());
+                auto* src = dyn_cast<Variable>(assign->value());
                 if (dst != nullptr && src != nullptr && dst == src) {
                     continue;
                 }

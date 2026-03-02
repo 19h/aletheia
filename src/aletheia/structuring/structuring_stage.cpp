@@ -21,7 +21,7 @@ Expression* switch_selector_expression(BasicBlock* bb) {
         return nullptr;
     }
     Instruction* tail = bb->instructions().back();
-    auto* indirect = dynamic_cast<IndirectBranch*>(tail);
+    auto* indirect = dyn_cast<IndirectBranch>(tail);
     if (!indirect) {
         return nullptr;
     }
@@ -177,7 +177,7 @@ void PatternIndependentRestructuringStage::build_initial_transition_cfg(Decompil
                 } else if (e->type() == EdgeType::True || e->type() == EdgeType::False) {
                     if (!bb->instructions().empty()) {
                         Instruction* last_inst = bb->instructions().back();
-                        if (auto* branch = dynamic_cast<Branch*>(last_inst)) {
+                        if (auto* branch = dyn_cast<Branch>(last_inst)) {
                             logos::LogicCondition symbol_cond = condition_handler.add_condition(branch->condition());
                             tag = (e->type() == EdgeType::True) ? symbol_cond : symbol_cond.negate();
                         }

@@ -70,7 +70,7 @@ bool window_has_unhandled_instructions(const std::vector<Instruction*>& insts, s
         if (is_branch(inst) || is_return(inst) || is_phi(inst)) {
             return true;
         }
-        if (dynamic_cast<BreakInstr*>(inst) != nullptr || dynamic_cast<ContinueInstr*>(inst) != nullptr) {
+        if (isa<BreakInstr>(inst) || isa<ContinueInstr>(inst)) {
             return true;
         }
     }
@@ -139,7 +139,7 @@ constexpr std::array<RegisterPairSpec, 3> kRegisterPairs = {
 };
 
 Expression* strip_cast(Expression* expr) {
-    while (auto* op = dynamic_cast<Operation*>(expr)) {
+    while (auto* op = dyn_cast<Operation>(expr)) {
         if (op->type() != OperationType::cast || op->operands().size() != 1 || op->operands()[0] == nullptr) {
             break;
         }
@@ -149,7 +149,7 @@ Expression* strip_cast(Expression* expr) {
 }
 
 Variable* match_low_register(Expression* expr, const RegisterPairSpec& spec) {
-    auto* v = dynamic_cast<Variable*>(strip_cast(expr));
+    auto* v = dyn_cast<Variable>(strip_cast(expr));
     if (v != nullptr && v->name() == spec.low) {
         return v;
     }
@@ -157,13 +157,13 @@ Variable* match_low_register(Expression* expr, const RegisterPairSpec& spec) {
 }
 
 Variable* match_shifted_high_register(Expression* expr, const RegisterPairSpec& spec) {
-    auto* op = dynamic_cast<Operation*>(strip_cast(expr));
+    auto* op = dyn_cast<Operation>(strip_cast(expr));
     if (op == nullptr || op->type() != OperationType::shl || op->operands().size() != 2) {
         return nullptr;
     }
 
-    auto* high = dynamic_cast<Variable*>(strip_cast(op->operands()[0]));
-    auto* shift = dynamic_cast<Constant*>(strip_cast(op->operands()[1]));
+    auto* high = dyn_cast<Variable>(strip_cast(op->operands()[0]));
+    auto* shift = dyn_cast<Constant>(strip_cast(op->operands()[1]));
     if (high == nullptr || shift == nullptr) {
         return nullptr;
     }
@@ -211,7 +211,7 @@ Expression* rewrite_register_pair_expression(DecompilerTask& task, Expression* e
         return nullptr;
     }
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression*& item : list->mutable_operands()) {
             Expression* rewritten = rewrite_register_pair_expression(task, item, changed);
             if (rewritten != item && rewritten != nullptr) {
@@ -222,7 +222,7 @@ Expression* rewrite_register_pair_expression(DecompilerTask& task, Expression* e
         return expr;
     }
 
-    auto* op = dynamic_cast<Operation*>(expr);
+    auto* op = dyn_cast<Operation>(expr);
     if (op == nullptr) {
         return expr;
     }
@@ -248,7 +248,7 @@ void rewrite_register_pairs_in_instruction(DecompilerTask& task, Instruction* in
         return;
     }
 
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
         Expression* new_dest = rewrite_register_pair_expression(task, assign->destination(), changed);
         Expression* new_val = rewrite_register_pair_expression(task, assign->value(), changed);
         if (new_dest != assign->destination()) {
@@ -262,10 +262,10 @@ void rewrite_register_pairs_in_instruction(DecompilerTask& task, Instruction* in
         return;
     }
 
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         Expression* rewritten = rewrite_register_pair_expression(task, branch->condition(), changed);
         if (rewritten != branch->condition()) {
-            if (auto* cond = dynamic_cast<Condition*>(rewritten)) {
+            if (auto* cond = dyn_cast<Condition>(rewritten)) {
                 branch->set_condition(cond);
                 changed = true;
             }
@@ -273,7 +273,7 @@ void rewrite_register_pairs_in_instruction(DecompilerTask& task, Instruction* in
         return;
     }
 
-    if (auto* ib = dynamic_cast<IndirectBranch*>(inst)) {
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         Expression* before = ib->expression();
         Expression* after = rewrite_register_pair_expression(task, before, changed);
         if (after != before && after != nullptr) {
@@ -283,7 +283,7 @@ void rewrite_register_pairs_in_instruction(DecompilerTask& task, Instruction* in
         return;
     }
 
-    if (auto* ret = dynamic_cast<Return*>(inst)) {
+    if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             Expression* rewritten = rewrite_register_pair_expression(task, value, changed);
             if (rewritten != value && rewritten != nullptr) {
@@ -392,62 +392,27 @@ using UseMap = std::unordered_map<VarKey, std::vector<Instruction*>, VarKeyHash>
 
 Variable* as_variable_ignoring_cast(Expression* expr) {
     Expression* current = strip_cast(expr);
-    return dynamic_cast<Variable*>(current);
+    return dyn_cast<Variable>(current);
 }
 
-std::string expression_fingerprint(Expression* expr) {
-    if (expr == nullptr) {
-        return "null";
-    }
-    if (auto* c = dynamic_cast<Constant*>(expr)) {
-        return "c:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
-    }
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
-        return "v:" + v->name() + "#" + std::to_string(v->ssa_version());
-    }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
-        std::string out = "l(";
-        bool first = true;
-        for (Expression* item : list->operands()) {
-            if (!first) {
-                out += ",";
-            }
-            first = false;
-            out += expression_fingerprint(item);
-        }
-        out += ")";
-        return out;
-    }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
-        std::string out = "o:" + std::to_string(static_cast<int>(op->type())) + "(";
-        bool first = true;
-        for (Expression* item : op->operands()) {
-            if (!first) {
-                out += ",";
-            }
-            first = false;
-            out += expression_fingerprint(item);
-        }
-        out += ")";
-        return out;
-    }
-    return "expr";
+std::uint64_t expression_fp(Expression* expr) {
+    return expression_fingerprint_hash(expr);
 }
 
-void collect_deref_fingerprints(Expression* expr, std::unordered_set<std::string>& out) {
+void collect_deref_fingerprints(Expression* expr, std::unordered_set<std::uint64_t>& out) {
     if (expr == nullptr) {
         return;
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         if (op->type() == OperationType::deref) {
-            out.insert(expression_fingerprint(expr));
+            out.insert(expression_fp(expr));
         }
         for (Expression* item : op->operands()) {
             collect_deref_fingerprints(item, out);
         }
         return;
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* item : list->operands()) {
             collect_deref_fingerprints(item, out);
         }
@@ -460,20 +425,20 @@ void collect_variables(Expression* expr,
     if (expr == nullptr) {
         return;
     }
-    if (auto* var = dynamic_cast<Variable*>(expr)) {
+    if (auto* var = dyn_cast<Variable>(expr)) {
         VarKey key = var_key(var);
         if (seen.insert(key).second) {
             out.push_back(var);
         }
         return;
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression* item : op->operands()) {
             collect_variables(item, out, seen);
         }
         return;
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* item : list->operands()) {
             collect_variables(item, out, seen);
         }
@@ -493,11 +458,11 @@ Variable* first_variable(Expression* expr) {
 void build_def_use_maps(ControlFlowGraph* cfg,
                         DefMap& def_map,
                         UseMap& use_map,
-                        std::unordered_set<std::string>& branch_dereferences) {
+                        std::unordered_set<std::uint64_t>& branch_dereferences) {
     for (BasicBlock* block : cfg->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
-                if (auto* dst = dynamic_cast<Variable*>(assign->destination())) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                if (auto* dst = dyn_cast<Variable>(assign->destination())) {
                     def_map[var_key(dst)] = assign;
                 }
             }
@@ -506,7 +471,7 @@ void build_def_use_maps(ControlFlowGraph* cfg,
                 use_map[var_key(req)].push_back(inst);
             }
 
-            if (auto* branch = dynamic_cast<Branch*>(inst)) {
+            if (auto* branch = dyn_cast<Branch>(inst)) {
                 collect_deref_fingerprints(branch->condition(), branch_dereferences);
             }
         }
@@ -535,11 +500,11 @@ bool is_used_in_condition_assignment(const Variable* value, const UseMap& use_ma
         return false;
     }
     for (Instruction* use : it->second) {
-        auto* assign = dynamic_cast<Assignment*>(use);
+        auto* assign = dyn_cast<Assignment>(use);
         if (assign == nullptr) {
             continue;
         }
-        if (dynamic_cast<Condition*>(assign->value()) == nullptr) {
+        if (!isa<Condition>(assign->value())) {
             continue;
         }
         if (instruction_requires_single_var(assign, var_key(value))) {
@@ -555,7 +520,7 @@ bool is_used_in_branch(const Variable* value, const UseMap& use_map) {
         return false;
     }
     for (Instruction* use : it->second) {
-        auto* branch = dynamic_cast<Branch*>(use);
+        auto* branch = dyn_cast<Branch>(use);
         if (branch == nullptr) {
             continue;
         }
@@ -568,7 +533,7 @@ bool is_used_in_branch(const Variable* value, const UseMap& use_map) {
 
 bool is_predecessor_dereferenced_in_branch(const Variable* value,
                                            const DefMap& def_map,
-                                           const std::unordered_set<std::string>& branch_dereferences) {
+                                           const std::unordered_set<std::uint64_t>& branch_dereferences) {
     auto it = def_map.find(var_key(value));
     if (it == def_map.end() || it->second == nullptr) {
         return false;
@@ -579,13 +544,13 @@ bool is_predecessor_dereferenced_in_branch(const Variable* value,
         return false;
     }
 
-    if (branch_dereferences.contains(expression_fingerprint(rhs))) {
+    if (branch_dereferences.contains(expression_fp(rhs))) {
         return true;
     }
 
-    std::unordered_set<std::string> def_dereferences;
+    std::unordered_set<std::uint64_t> def_dereferences;
     collect_deref_fingerprints(rhs, def_dereferences);
-    for (const std::string& fp : def_dereferences) {
+    for (const std::uint64_t fp : def_dereferences) {
         if (branch_dereferences.contains(fp)) {
             return true;
         }
@@ -596,7 +561,7 @@ bool is_predecessor_dereferenced_in_branch(const Variable* value,
 bool is_bounds_checked(const Variable* value,
                        const DefMap& def_map,
                        const UseMap& use_map,
-                       const std::unordered_set<std::string>& branch_dereferences) {
+                       const std::unordered_set<std::uint64_t>& branch_dereferences) {
     return is_copy_assigned(value, def_map)
         || is_used_in_condition_assignment(value, use_map)
         || is_used_in_branch(value, use_map)
@@ -606,7 +571,7 @@ bool is_bounds_checked(const Variable* value,
 Variable* find_switch_candidate(Variable* start,
                                 const DefMap& def_map,
                                 const UseMap& use_map,
-                                const std::unordered_set<std::string>& branch_dereferences) {
+                                const std::unordered_set<std::uint64_t>& branch_dereferences) {
     if (start == nullptr) {
         return nullptr;
     }
@@ -651,7 +616,7 @@ Variable* find_switch_candidate(Variable* start,
 
 bool is_switch_block(BasicBlock* block) {
     bool has_indirect = !block->instructions().empty()
-        && dynamic_cast<IndirectBranch*>(block->instructions().back()) != nullptr;
+        && isa<IndirectBranch>(block->instructions().back());
     bool has_switch_edge = std::any_of(
         block->successors().begin(),
         block->successors().end(),
@@ -678,17 +643,17 @@ bool expression_has_constant(Expression* expr, int64_t target) {
     if (expr == nullptr) {
         return false;
     }
-    if (auto* c = dynamic_cast<Constant*>(expr)) {
+    if (auto* c = dyn_cast<Constant>(expr)) {
         return constant_matches_signed(c, target);
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression* child : op->operands()) {
             if (expression_has_constant(child, target)) {
                 return true;
             }
         }
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* child : list->operands()) {
             if (expression_has_constant(child, target)) {
                 return true;
@@ -702,17 +667,17 @@ bool expression_has_variable_prefix(Expression* expr, const std::string& prefix)
     if (expr == nullptr) {
         return false;
     }
-    if (auto* v = dynamic_cast<Variable*>(expr)) {
+    if (auto* v = dyn_cast<Variable>(expr)) {
         return to_lower_ascii(v->name()).starts_with(prefix);
     }
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression* child : op->operands()) {
             if (expression_has_variable_prefix(child, prefix)) {
                 return true;
             }
         }
     }
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* child : list->operands()) {
             if (expression_has_variable_prefix(child, prefix)) {
                 return true;
@@ -727,12 +692,12 @@ bool expression_is_addressish(Expression* expr) {
         return false;
     }
     Expression* base = strip_cast(expr);
-    if (auto* op = dynamic_cast<Operation*>(base)) {
+    if (auto* op = dyn_cast<Operation>(base)) {
         if (op->type() == OperationType::address_of) {
             return true;
         }
     }
-    if (auto* v = dynamic_cast<Variable*>(base)) {
+    if (auto* v = dyn_cast<Variable>(base)) {
         const std::string name = to_lower_ascii(v->name());
         return name.find("return") != std::string::npos;
     }
@@ -792,16 +757,16 @@ bool expression_contains_morestack_call(Expression* expr) {
         return false;
     }
 
-    if (auto* call = dynamic_cast<Call*>(expr)) {
-        if (auto* target_var = dynamic_cast<Variable*>(call->target())) {
+    if (auto* call = dyn_cast<Call>(expr)) {
+        if (auto* target_var = dyn_cast<Variable>(call->target())) {
             return to_lower_ascii(target_var->name()).find("morestack") != std::string::npos;
         }
         return false;
     }
 
-    if (auto* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         if (op->type() == OperationType::call && !op->operands().empty()) {
-            if (auto* target_var = dynamic_cast<Variable*>(op->operands()[0])) {
+            if (auto* target_var = dyn_cast<Variable>(op->operands()[0])) {
                 if (to_lower_ascii(target_var->name()).find("morestack") != std::string::npos) {
                     return true;
                 }
@@ -814,7 +779,7 @@ bool expression_contains_morestack_call(Expression* expr) {
         }
     }
 
-    if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* child : list->operands()) {
             if (expression_contains_morestack_call(child)) {
                 return true;
@@ -830,7 +795,7 @@ bool block_contains_morestack_call(BasicBlock* block) {
         return false;
     }
     for (Instruction* inst : block->instructions()) {
-        if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        if (auto* assign = dyn_cast<Assignment>(inst)) {
             if (expression_contains_morestack_call(assign->value())) {
                 return true;
             }
@@ -939,7 +904,7 @@ bool is_failed_stack_canary_in_edge(Edge* in_edge) {
         return false;
     }
 
-    auto* branch = dynamic_cast<Branch*>(pred->instructions().back());
+    auto* branch = dyn_cast<Branch>(pred->instructions().back());
     if (branch == nullptr || branch->condition() == nullptr) {
         return false;
     }
@@ -972,15 +937,15 @@ bool block_contains_stack_chk_fail(BasicBlock* node) {
         return false;
     }
     for (Instruction* inst : node->instructions()) {
-        auto* assign = dynamic_cast<Assignment*>(inst);
+        auto* assign = dyn_cast<Assignment>(inst);
         if (assign == nullptr) {
             continue;
         }
 
         Expression* rhs = assign->value();
-        auto* call = dynamic_cast<Call*>(rhs);
+        auto* call = dyn_cast<Call>(rhs);
         if (call != nullptr) {
-            if (auto* target_var = dynamic_cast<Variable*>(call->target())) {
+            if (auto* target_var = dyn_cast<Variable>(call->target())) {
                 if (to_lower_ascii(target_var->name()).find("stack_chk_fail") != std::string::npos) {
                     return true;
                 }
@@ -988,9 +953,9 @@ bool block_contains_stack_chk_fail(BasicBlock* node) {
             continue;
         }
 
-        auto* op = dynamic_cast<Operation*>(rhs);
+        auto* op = dyn_cast<Operation>(rhs);
         if (op != nullptr && op->type() == OperationType::call && !op->operands().empty()) {
-            if (auto* target_var = dynamic_cast<Variable*>(op->operands()[0])) {
+            if (auto* target_var = dyn_cast<Variable>(op->operands()[0])) {
                 if (to_lower_ascii(target_var->name()).find("stack_chk_fail") != std::string::npos) {
                     return true;
                 }
@@ -1012,7 +977,7 @@ void patch_branch_condition_if_needed(BasicBlock* node) {
         return;
     }
     auto& insts = node->mutable_instructions();
-    if (!insts.empty() && dynamic_cast<Branch*>(insts.back()) != nullptr) {
+    if (!insts.empty() && isa<Branch>(insts.back())) {
         insts.pop_back();
     }
 }
@@ -1176,7 +1141,7 @@ void SwitchVariableDetectionStage::execute(DecompilerTask& task) {
 
     DefMap def_map;
     UseMap use_map;
-    std::unordered_set<std::string> branch_dereferences;
+    std::unordered_set<std::uint64_t> branch_dereferences;
     build_def_use_maps(task.cfg(), def_map, use_map, branch_dereferences);
 
     for (BasicBlock* block : task.cfg()->blocks()) {
@@ -1184,7 +1149,7 @@ void SwitchVariableDetectionStage::execute(DecompilerTask& task) {
             continue;
         }
 
-        auto* switch_inst = dynamic_cast<IndirectBranch*>(block->instructions().back());
+        auto* switch_inst = dyn_cast<IndirectBranch>(block->instructions().back());
         if (switch_inst == nullptr) {
             continue;
         }
@@ -1226,7 +1191,7 @@ void MemPhiConverterStage::execute(DecompilerTask& task) {
         bool changed = false;
 
         for (Instruction* inst : block->instructions()) {
-            auto* mem_phi = dynamic_cast<MemPhi*>(inst);
+            auto* mem_phi = dyn_cast<MemPhi>(inst);
             if (!mem_phi) {
                 rewritten.push_back(inst);
                 continue;
@@ -1261,7 +1226,7 @@ void RemoveGoPrologueStage::execute(DecompilerTask& task) {
         return;
     }
 
-    auto* root_branch = dynamic_cast<Branch*>(root->instructions().back());
+    auto* root_branch = dyn_cast<Branch>(root->instructions().back());
     if (root_branch == nullptr || !branch_condition_matches_go_root_guard(root_branch)) {
         return;
     }
@@ -1284,7 +1249,7 @@ void RemoveGoPrologueStage::execute(DecompilerTask& task) {
     auto& root_insts = root->mutable_instructions();
     if (root->successors().size() == 1
         && !root_insts.empty()
-        && dynamic_cast<Branch*>(root_insts.back()) != nullptr) {
+        && isa<Branch>(root_insts.back())) {
         root_insts.pop_back();
     }
 
@@ -1351,10 +1316,10 @@ Expression* extract_call_target_expression(Assignment* assign) {
     if (!assign || !assign->value()) {
         return nullptr;
     }
-    if (auto* call = dynamic_cast<Call*>(assign->value())) {
+    if (auto* call = dyn_cast<Call>(assign->value())) {
         return call->target();
     }
-    auto* op = dynamic_cast<Operation*>(assign->value());
+    auto* op = dyn_cast<Operation>(assign->value());
     if (!op || op->type() != OperationType::call || op->operands().empty()) {
         return nullptr;
     }
@@ -1362,10 +1327,10 @@ Expression* extract_call_target_expression(Assignment* assign) {
 }
 
 std::string call_target_name(Expression* target) {
-    if (auto* v = dynamic_cast<Variable*>(target)) {
+    if (auto* v = dyn_cast<Variable>(target)) {
         return v->name();
     }
-    if (auto* g = dynamic_cast<GlobalVariable*>(target)) {
+    if (auto* g = dyn_cast<GlobalVariable>(target)) {
         return g->name();
     }
     return {};
@@ -1378,7 +1343,7 @@ bool find_noreturn_call_index(BasicBlock* block, std::size_t& index_out) {
 
     const auto& insts = block->instructions();
     for (std::size_t i = 0; i < insts.size(); ++i) {
-        auto* assign = dynamic_cast<Assignment*>(insts[i]);
+        auto* assign = dyn_cast<Assignment>(insts[i]);
         if (!assign) {
             continue;
         }
@@ -1406,7 +1371,7 @@ std::vector<BasicBlock*> collect_exit_blocks(ControlFlowGraph* cfg) {
             exits.push_back(block);
             continue;
         }
-        if (!block->instructions().empty() && dynamic_cast<Return*>(block->instructions().back()) != nullptr) {
+        if (!block->instructions().empty() && isa<Return>(block->instructions().back())) {
             exits.push_back(block);
         }
     }
@@ -1610,7 +1575,7 @@ std::size_t insertion_index_for_missing_definition(BasicBlock* block, const VarK
 
     const auto& insts = block->instructions();
     std::size_t phi_prefix = 0;
-    while (phi_prefix < insts.size() && dynamic_cast<Phi*>(insts[phi_prefix]) != nullptr) {
+    while (phi_prefix < insts.size() && isa<Phi>(insts[phi_prefix])) {
         ++phi_prefix;
     }
 
@@ -1831,7 +1796,7 @@ void PhiFunctionFixerStage::execute(DecompilerTask& task) {
 
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
-            auto* phi = dynamic_cast<Phi*>(inst);
+            auto* phi = dyn_cast<Phi>(inst);
             if (!phi) {
                 continue;
             }

@@ -7,9 +7,9 @@ namespace aletheia {
 
 static void substitute_uses(Expression* expr, const std::unordered_map<Variable*, Expression*>& subs) {
     if (!expr) return;
-    if (Operation* op = dynamic_cast<Operation*>(expr)) {
+    if (auto* op = dyn_cast<Operation>(expr)) {
         for (size_t i = 0; i < op->operands().size(); ++i) {
-            if (Variable* v = dynamic_cast<Variable*>(op->operands()[i])) {
+            if (auto* v = dyn_cast<Variable>(op->operands()[i])) {
                 auto it = subs.find(v);
                 if (it != subs.end()) {
                     op->mutable_operands()[i] = it->second;
@@ -18,9 +18,9 @@ static void substitute_uses(Expression* expr, const std::unordered_map<Variable*
                 substitute_uses(op->operands()[i], subs);
             }
         }
-    } else if (ListOperation* list = dynamic_cast<ListOperation*>(expr)) {
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (size_t i = 0; i < list->operands().size(); ++i) {
-            if (Variable* v = dynamic_cast<Variable*>(list->operands()[i])) {
+            if (auto* v = dyn_cast<Variable>(list->operands()[i])) {
                 auto it = subs.find(v);
                 if (it != subs.end()) {
                     list->mutable_operands()[i] = it->second;
@@ -44,14 +44,14 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
             // Skip phi nodes
-            if (dynamic_cast<Phi*>(inst)) continue;
+            if (isa<Phi>(inst)) continue;
 
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
-                if (Variable* target = dynamic_cast<Variable*>(assign->destination())) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                if (auto* target = dyn_cast<Variable>(assign->destination())) {
                     Expression* value = assign->value();
                     
                     // If assigning to a Constant or another Variable without side effects
-                    if (dynamic_cast<Constant*>(value) || dynamic_cast<Variable*>(value)) {
+                    if (isa<Constant>(value) || isa<Variable>(value)) {
                         substitutions[target] = value;
                         dead_instructions.insert(inst);
                     }
@@ -65,7 +65,7 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
     while (changed) {
         changed = false;
         for (auto& [target, value] : substitutions) {
-            if (Variable* v_val = dynamic_cast<Variable*>(value)) {
+            if (auto* v_val = dyn_cast<Variable>(value)) {
                 if (substitutions.contains(v_val)) {
                     substitutions[target] = substitutions[v_val];
                     changed = true;
@@ -83,15 +83,15 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
             }
 
             // Skip phi nodes (don't substitute naively into phis)
-            if (dynamic_cast<Phi*>(inst)) {
+            if (isa<Phi>(inst)) {
                 new_insts.push_back(inst);
                 continue;
             }
 
-            if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
                 // Substitute in the value (RHS) only
                 Expression* value = assign->value();
-                if (Variable* v = dynamic_cast<Variable*>(value)) {
+                if (auto* v = dyn_cast<Variable>(value)) {
                     auto it = substitutions.find(v);
                     if (it != substitutions.end()) {
                         assign->set_value(it->second);
@@ -99,10 +99,10 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
                 } else {
                     substitute_uses(value, substitutions);
                 }
-            } else if (auto* branch = dynamic_cast<Branch*>(inst)) {
+            } else if (auto* branch = dyn_cast<Branch>(inst)) {
                 // Substitute in branch condition
                 substitute_uses(branch->condition(), substitutions);
-            } else if (auto* ret = dynamic_cast<Return*>(inst)) {
+            } else if (auto* ret = dyn_cast<Return>(inst)) {
                 // Return values: substitute handled via expression walk
                 for (auto* val : ret->values()) {
                     substitute_uses(val, substitutions);

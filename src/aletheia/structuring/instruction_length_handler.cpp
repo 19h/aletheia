@@ -22,17 +22,17 @@ public:
 private:
     static std::size_t expression_complexity(Expression* expr) {
         if (!expr) return 0;
-        if (dynamic_cast<Constant*>(expr) != nullptr || dynamic_cast<Variable*>(expr) != nullptr) {
+        if (isa<Constant>(expr) || isa<Variable>(expr)) {
             return 1;
         }
-        if (auto* op = dynamic_cast<Operation*>(expr)) {
+        if (auto* op = dyn_cast<Operation>(expr)) {
             std::size_t total = 0;
             for (Expression* child : op->operands()) {
                 total += expression_complexity(child);
             }
             return total;
         }
-        if (auto* list = dynamic_cast<ListOperation*>(expr)) {
+        if (auto* list = dyn_cast<ListOperation>(expr)) {
             std::size_t total = 0;
             for (Expression* child : list->operands()) {
                 total += expression_complexity(child);
@@ -43,7 +43,7 @@ private:
     }
 
     static bool is_simple(Expression* expr) {
-        return dynamic_cast<Constant*>(expr) != nullptr || dynamic_cast<Variable*>(expr) != nullptr;
+        return isa<Constant>(expr) || isa<Variable>(expr);
     }
 
     Variable* make_tmp(Expression* source) {
@@ -129,19 +129,19 @@ private:
         if (!owner || !target) return;
         if (expression_complexity(target) <= target_bound) return;
 
-        if (auto* call = dynamic_cast<Call*>(target)) {
+        if (auto* call = dyn_cast<Call>(target)) {
             auto& mutable_ops = call->mutable_operands();
             simplify_operand_list(owner, mutable_ops, target_bound, out);
             return;
         }
 
-        if (auto* list = dynamic_cast<ListOperation*>(target)) {
+        if (auto* list = dyn_cast<ListOperation>(target)) {
             auto& mutable_ops = list->mutable_operands();
             simplify_operand_list(owner, mutable_ops, target_bound, out);
             return;
         }
 
-        if (auto* op = dynamic_cast<Operation*>(target)) {
+        if (auto* op = dyn_cast<Operation>(target)) {
             if (op->operands().size() == 2) {
                 simplify_binary_target(owner, op, target_bound, out);
                 return;
@@ -154,7 +154,7 @@ private:
 
     void simplify_assignment(Assignment* assign, std::vector<Instruction*>& out) {
         if (!assign || !assign->value()) return;
-        const std::size_t bound = dynamic_cast<Call*>(assign->value()) != nullptr
+        const std::size_t bound = isa<Call>(assign->value())
             ? bounds_.call_operation
             : bounds_.assignment_instr;
         simplify_target(assign, assign->value(), bound, out);
@@ -176,11 +176,11 @@ private:
     }
 
     void simplify_instruction(Instruction* inst, std::vector<Instruction*>& out) {
-        if (auto* assign = dynamic_cast<Assignment*>(inst)) {
+        if (auto* assign = dyn_cast<Assignment>(inst)) {
             simplify_assignment(assign, out);
             return;
         }
-        if (auto* ret = dynamic_cast<Return*>(inst)) {
+        if (auto* ret = dyn_cast<Return>(inst)) {
             simplify_return(ret, out);
         }
     }

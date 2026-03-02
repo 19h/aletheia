@@ -461,17 +461,17 @@ std::optional<BoundRelation> BoundRelation::from(aletheia::Expression* expr) {
     using OT = aletheia::OperationType;
 
     // Must be a Condition (binary comparison)
-    auto* cond = dynamic_cast<aletheia::Condition*>(expr);
+    auto* cond = aletheia::dyn_cast<aletheia::Condition>(expr);
     if (!cond) {
         // Also accept a generic Operation with a comparison type and 2 operands
-        auto* op = dynamic_cast<aletheia::Operation*>(expr);
+        auto* op = aletheia::dyn_cast<aletheia::Operation>(expr);
         if (!op || op->operands().size() != 2 || !is_comparison(op->type()))
             return std::nullopt;
         // Use the Operation directly
         auto* lhs = op->operands()[0];
         auto* rhs = op->operands()[1];
-        auto* lhs_const = dynamic_cast<aletheia::Constant*>(lhs);
-        auto* rhs_const = dynamic_cast<aletheia::Constant*>(rhs);
+        auto* lhs_const = aletheia::dyn_cast<aletheia::Constant>(lhs);
+        auto* rhs_const = aletheia::dyn_cast<aletheia::Constant>(rhs);
 
         // Exactly one operand must be a constant
         if ((!lhs_const && !rhs_const) || (lhs_const && rhs_const))
@@ -493,8 +493,8 @@ std::optional<BoundRelation> BoundRelation::from(aletheia::Expression* expr) {
 
     auto* lhs = cond->lhs();
     auto* rhs = cond->rhs();
-    auto* lhs_const = dynamic_cast<aletheia::Constant*>(lhs);
-    auto* rhs_const = dynamic_cast<aletheia::Constant*>(rhs);
+    auto* lhs_const = aletheia::dyn_cast<aletheia::Constant>(lhs);
+    auto* rhs_const = aletheia::dyn_cast<aletheia::Constant>(rhs);
 
     // Exactly one operand must be a constant
     if ((!lhs_const && !rhs_const) || (lhs_const && rhs_const))
@@ -531,14 +531,14 @@ aletheia::Expression* SingleRangeSimplifier::simplify(
     using OT = aletheia::OperationType;
 
     // Must be a comparison operation with 2 operands
-    auto* op = dynamic_cast<aletheia::Operation*>(expr);
+    auto* op = aletheia::dyn_cast<aletheia::Operation>(expr);
     if (!op || op->operands().size() != 2 || !is_comparison(op->type()))
         return nullptr;
 
     auto* lhs = op->operands()[0];
     auto* rhs = op->operands()[1];
-    auto* lhs_const = dynamic_cast<aletheia::Constant*>(lhs);
-    auto* rhs_const = dynamic_cast<aletheia::Constant*>(rhs);
+    auto* lhs_const = aletheia::dyn_cast<aletheia::Constant>(lhs);
+    auto* rhs_const = aletheia::dyn_cast<aletheia::Constant>(rhs);
 
     // Need at least one constant
     if (!lhs_const && !rhs_const) return nullptr;
@@ -560,8 +560,8 @@ aletheia::Expression* SingleRangeSimplifier::simplify(
         aletheia::Expression* smaller_operand = info.smaller_is_lhs ? lhs : rhs;
         aletheia::Expression* greater_operand = info.smaller_is_lhs ? rhs : lhs;
 
-        auto* smaller_const = dynamic_cast<aletheia::Constant*>(smaller_operand);
-        auto* greater_const = dynamic_cast<aletheia::Constant*>(greater_operand);
+        auto* smaller_const = aletheia::dyn_cast<aletheia::Constant>(smaller_operand);
+        auto* greater_const = aletheia::dyn_cast<aletheia::Constant>(greater_operand);
 
         std::int64_t smaller_bound = smaller_const
             ? static_cast<std::int64_t>(smaller_const->value()) : min_val;
@@ -629,8 +629,8 @@ aletheia::Expression* SingleRangeSimplifier::simplify(
         aletheia::Expression* smaller_operand = info.smaller_is_lhs ? lhs : rhs;
         aletheia::Expression* greater_operand = info.smaller_is_lhs ? rhs : lhs;
 
-        auto* smaller_const = dynamic_cast<aletheia::Constant*>(smaller_operand);
-        auto* greater_const = dynamic_cast<aletheia::Constant*>(greater_operand);
+        auto* smaller_const = aletheia::dyn_cast<aletheia::Constant>(smaller_operand);
+        auto* greater_const = aletheia::dyn_cast<aletheia::Constant>(greater_operand);
 
         std::int64_t smaller_bound = smaller_const
             ? static_cast<std::int64_t>(smaller_const->value()) : min_val;
@@ -683,8 +683,8 @@ bool BitwiseAndRangeSimplifier::is_unfulfillable(
         for (auto& vi : var_infos) {
             // Match by pointer identity or by Variable name+ssa_version
             if (vi.var_expr == var_expr) return vi.values;
-            auto* v1 = dynamic_cast<aletheia::Variable*>(vi.var_expr);
-            auto* v2 = dynamic_cast<aletheia::Variable*>(var_expr);
+            auto* v1 = aletheia::dyn_cast<aletheia::Variable>(vi.var_expr);
+            auto* v2 = aletheia::dyn_cast<aletheia::Variable>(var_expr);
             if (v1 && v2 && v1->name() == v2->name() &&
                 v1->ssa_version() == v2->ssa_version())
                 return vi.values;
@@ -736,14 +736,14 @@ aletheia::Expression* BitwiseAndRangeSimplifier::simplify(
     // 2. Remove operands that simplified to true (Constant 1)
     auto initial_size = and_operands.size();
     std::erase_if(and_operands, [](aletheia::Expression* e) {
-        auto* c = dynamic_cast<aletheia::Constant*>(e);
+        auto* c = aletheia::dyn_cast<aletheia::Constant>(e);
         return c && c->value() == 1;
     });
     if (and_operands.size() != initial_size) any_changed = true;
 
     // 3. If any operand is false, the whole AND is false
     for (auto* child : and_operands) {
-        auto* c = dynamic_cast<aletheia::Constant*>(child);
+        auto* c = aletheia::dyn_cast<aletheia::Constant>(child);
         if (c && c->value() == 0) {
             return arena.create<aletheia::Constant>(0, 1);
         }
@@ -765,8 +765,8 @@ aletheia::Expression* BitwiseAndRangeSimplifier::simplify(
     auto find_or_create = [&](aletheia::Expression* var_expr, std::size_t bit_size) -> ExpressionValues& {
         for (auto& vi : var_infos) {
             if (vi.var_expr == var_expr) return vi.values;
-            auto* v1 = dynamic_cast<aletheia::Variable*>(vi.var_expr);
-            auto* v2 = dynamic_cast<aletheia::Variable*>(var_expr);
+            auto* v1 = aletheia::dyn_cast<aletheia::Variable>(vi.var_expr);
+            auto* v2 = aletheia::dyn_cast<aletheia::Variable>(var_expr);
             if (v1 && v2 && v1->name() == v2->name() &&
                 v1->ssa_version() == v2->ssa_version())
                 return vi.values;
@@ -925,7 +925,7 @@ aletheia::Expression* BitwiseOrRangeSimplifier::simplify(
 
     auto* simplified_and = BitwiseAndRangeSimplifier::simplify(new_and_op, arena);
 
-    if (auto* c = dynamic_cast<aletheia::Constant*>(simplified_and)) {
+    if (auto* c = aletheia::dyn_cast<aletheia::Constant>(simplified_and)) {
         if (c->value() == 0) {
             // Not(False) == True
             return arena.create<aletheia::Constant>(1, 1);
@@ -961,12 +961,12 @@ bool RangeSimplifier::is_unfulfillable(aletheia::Expression* condition) {
     }
 
     // If it's a logical AND, check all operands together
-    auto* op = dynamic_cast<aletheia::Operation*>(condition);
+    auto* op = aletheia::dyn_cast<aletheia::Operation>(condition);
     if (op && op->type() == OT::logical_and) {
         // Collect all AND operands (potentially nested)
         std::vector<aletheia::Expression*> all_operands;
         std::function<void(aletheia::Expression*)> collect = [&](aletheia::Expression* e) {
-            auto* inner = dynamic_cast<aletheia::Operation*>(e);
+            auto* inner = aletheia::dyn_cast<aletheia::Operation>(e);
             if (inner && inner->type() == OT::logical_and) {
                 for (auto* child : inner->operands())
                     collect(child);
@@ -982,7 +982,7 @@ bool RangeSimplifier::is_unfulfillable(aletheia::Expression* condition) {
     if (op && op->type() == OT::bit_and) {
         std::vector<aletheia::Expression*> all_operands;
         std::function<void(aletheia::Expression*)> collect = [&](aletheia::Expression* e) {
-            auto* inner = dynamic_cast<aletheia::Operation*>(e);
+            auto* inner = aletheia::dyn_cast<aletheia::Operation>(e);
             if (inner && inner->type() == OT::bit_and) {
                 for (auto* child : inner->operands())
                     collect(child);
@@ -1010,7 +1010,7 @@ aletheia::Expression* RangeSimplifier::simplify(
 
     // Step 2: If it's a logical/bitwise AND, simplify each operand first,
     // then check the conjunction.
-    auto* op = dynamic_cast<aletheia::Operation*>(condition);
+    auto* op = aletheia::dyn_cast<aletheia::Operation>(condition);
     if (op && (op->type() == OT::logical_and || op->type() == OT::bit_and)) {
         // Simplify each operand individually
         bool any_changed = false;
@@ -1025,13 +1025,13 @@ aletheia::Expression* RangeSimplifier::simplify(
 
         // Remove operands that simplified to true (Constant 1)
         std::erase_if(operands, [](aletheia::Expression* e) {
-            auto* c = dynamic_cast<aletheia::Constant*>(e);
+            auto* c = aletheia::dyn_cast<aletheia::Constant>(e);
             return c && c->value() == 1;
         });
 
         // If any operand is false, the whole AND is false
         for (auto* child : operands) {
-            auto* c = dynamic_cast<aletheia::Constant*>(child);
+            auto* c = aletheia::dyn_cast<aletheia::Constant>(child);
             if (c && c->value() == 0) {
                 return arena.create<aletheia::Constant>(0, 1);
             }
@@ -1063,13 +1063,13 @@ aletheia::Expression* RangeSimplifier::simplify(
 
         // Remove operands that simplified to false (Constant 0)
         std::erase_if(operands, [](aletheia::Expression* e) {
-            auto* c = dynamic_cast<aletheia::Constant*>(e);
+            auto* c = aletheia::dyn_cast<aletheia::Constant>(e);
             return c && c->value() == 0;
         });
 
         // If any operand is true, the whole OR is true
         for (auto* child : operands) {
-            auto* c = dynamic_cast<aletheia::Constant*>(child);
+            auto* c = aletheia::dyn_cast<aletheia::Constant>(child);
             if (c && c->value() == 1) {
                 return arena.create<aletheia::Constant>(1, 1);
             }

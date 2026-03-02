@@ -168,10 +168,10 @@ private:
 /// value is an Operation, or if the instruction wraps a known expression type.
 /// Returns nullptr if the instruction does not contain an Operation.
 inline Operation* get_operation(Instruction* inst) {
-    if (auto* assign = dynamic_cast<Assignment*>(inst)) {
-        return dynamic_cast<Operation*>(assign->value());
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
+        return dyn_cast<Operation>(assign->value());
     }
-    if (auto* branch = dynamic_cast<Branch*>(inst)) {
+    if (auto* branch = dyn_cast<Branch>(inst)) {
         return branch->condition();  // Condition IS-A Operation
     }
     return nullptr;
@@ -179,23 +179,23 @@ inline Operation* get_operation(Instruction* inst) {
 
 /// Check if an Instruction is an assignment (including Phi).
 inline bool is_assignment(Instruction* inst) {
-    return dynamic_cast<Assignment*>(inst) != nullptr;
+    return dyn_cast<Assignment>(inst) != nullptr;
 }
 
 /// Check if an Instruction is a phi function.
 inline bool is_phi(Instruction* inst) {
-    return dynamic_cast<Phi*>(inst) != nullptr;
+    return dyn_cast<Phi>(inst) != nullptr;
 }
 
 /// Check if an Instruction is a branch (conditional or indirect).
 inline bool is_branch(Instruction* inst) {
-    return dynamic_cast<Branch*>(inst) != nullptr ||
-           dynamic_cast<IndirectBranch*>(inst) != nullptr;
+    return dyn_cast<Branch>(inst) != nullptr ||
+           isa<IndirectBranch>(inst);
 }
 
 /// Check if an Instruction is a return.
 inline bool is_return(Instruction* inst) {
-    return dynamic_cast<Return*>(inst) != nullptr;
+    return dyn_cast<Return>(inst) != nullptr;
 }
 
 } // namespace aletheia

@@ -71,8 +71,8 @@ private:
         Expression* lhs = condition->lhs();
         Expression* rhs = condition->rhs();
 
-        auto* lhs_const = dynamic_cast<Constant*>(lhs);
-        auto* rhs_const = dynamic_cast<Constant*>(rhs);
+        auto* lhs_const = dyn_cast<Constant>(lhs);
+        auto* rhs_const = dyn_cast<Constant>(rhs);
 
         if (lhs_const && !rhs_const) {
             case_properties_[symbol] = {rhs, lhs_const, condition->type() == OperationType::neq};
