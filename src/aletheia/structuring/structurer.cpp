@@ -596,6 +596,7 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
             std::unordered_set<TransitionBlock*> all_blocks;
             for (auto* b : cfg.blocks()) all_blocks.insert(b);
             
+            if (!cfg.entry() || all_blocks.empty()) break;
             restructure_region(&cfg, cfg.entry(), all_blocks);
             
             // At this point, the root of cfg.entry() has the fully nested AST!
@@ -631,7 +632,9 @@ void AcyclicRegionRestructurer::restructure_region(TransitionCFG* t_cfg, Transit
         car_root = ConditionAwareRefinement::refine(arena_, ctx, cbr_root, reaching_conditions);
     }
 
-    header->set_ast_node(car_root);
+    if (header) {
+        header->set_ast_node(car_root);
+    }
 }
 
 } // namespace aletheia
