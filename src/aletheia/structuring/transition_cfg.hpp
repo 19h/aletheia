@@ -100,11 +100,13 @@ public:
             return;
         }
         blocks_.push_back(block);
+        domtree_valid_ = false;
     }
     
     void remove_block(TransitionBlock* block) {
         blocks_.erase(std::remove(blocks_.begin(), blocks_.end(), block), blocks_.end());
         if (entry_ == block) entry_ = nullptr;
+        domtree_valid_ = false;
     }
 
     const std::vector<TransitionBlock*>& blocks() const { return blocks_; }
@@ -117,6 +119,7 @@ public:
         TransitionEdge* edge = arena_.create<TransitionEdge>(src, dst, tag, prop);
         src->add_successor_edge(edge);
         dst->add_predecessor_edge(edge);
+        domtree_valid_ = false;
         return edge;
     }
 
@@ -141,6 +144,7 @@ public:
         }
         edge->source()->remove_successor_edge(edge);
         edge->sink()->remove_predecessor_edge(edge);
+        domtree_valid_ = false;
     }
 
     // Utility methods
@@ -249,34 +253,117 @@ public:
         return loop_heads;
     }
 
+    /// Compute or refresh the cached dominator tree (Cooper et al. algorithm).
+    /// Called automatically on first `dominates()` query. Call `invalidate_domtree()`
+    /// after modifying the CFG structure (adding/removing blocks or edges).
+    void compute_domtree() const {
+        idom_.clear();
+        rpo_.clear();
+        rpo_index_.clear();
+        if (!entry_) return;
+
+        // 1. Compute reverse post-order (RPO) via iterative DFS.
+        std::unordered_set<TransitionBlock*> visited;
+        std::vector<TransitionBlock*> post_order;
+        std::vector<std::pair<TransitionBlock*, std::size_t>> stk;
+        stk.push_back({entry_, 0});
+        visited.insert(entry_);
+        while (!stk.empty()) {
+            auto& [node, idx] = stk.back();
+            auto succs = node->successors_blocks();
+            if (idx < succs.size()) {
+                auto* child = succs[idx++];
+                if (child && !visited.contains(child)) {
+                    visited.insert(child);
+                    stk.push_back({child, 0});
+                }
+            } else {
+                post_order.push_back(node);
+                stk.pop_back();
+            }
+        }
+
+        rpo_.assign(post_order.rbegin(), post_order.rend());
+        for (std::size_t i = 0; i < rpo_.size(); ++i) {
+            rpo_index_[rpo_[i]] = i;
+        }
+
+        // 2. Initialize idom: entry dominates itself.
+        idom_[entry_] = entry_;
+
+        auto intersect = [&](TransitionBlock* b1, TransitionBlock* b2) -> TransitionBlock* {
+            while (b1 != b2) {
+                while (rpo_index_.at(b1) > rpo_index_.at(b2)) b1 = idom_.at(b1);
+                while (rpo_index_.at(b2) > rpo_index_.at(b1)) b2 = idom_.at(b2);
+            }
+            return b1;
+        };
+
+        // 3. Iterate until fixed point.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (TransitionBlock* b : rpo_) {
+                if (b == entry_) continue;
+
+                TransitionBlock* new_idom = nullptr;
+                for (TransitionBlock* pred : b->predecessors_blocks()) {
+                    if (!pred || !idom_.contains(pred)) continue;
+                    if (!new_idom) {
+                        new_idom = pred;
+                    } else {
+                        new_idom = intersect(new_idom, pred);
+                    }
+                }
+
+                if (new_idom && idom_[b] != new_idom) {
+                    idom_[b] = new_idom;
+                    changed = true;
+                }
+            }
+        }
+
+        domtree_valid_ = true;
+    }
+
+    /// Query dominance: does `a` dominate `b`?
+    /// Uses the cached dominator tree for O(depth) per query instead of O(V+E).
     bool dominates(TransitionBlock* a, TransitionBlock* b) const {
         if (a == b) return true;
         if (a == entry_) return true;
         if (b == entry_) return false;
+        if (!a || !b) return false;
         
-        std::unordered_set<TransitionBlock*> visited;
-        std::vector<TransitionBlock*> stack = {entry_};
-        while(!stack.empty()) {
-            auto* curr = stack.back(); stack.pop_back();
-            if (!curr) {
-                continue;
-            }
-            if (curr == b) return false;
-            visited.insert(curr);
-            for(auto* succ : curr->successors_blocks()) {
-                if (succ != a && !visited.contains(succ)) {
-                    stack.push_back(succ);
-                }
-            }
+        if (!domtree_valid_) {
+            compute_domtree();
         }
-        return true;
+
+        // Walk the idom chain from b up to entry; if we encounter a, it dominates.
+        TransitionBlock* cur = b;
+        while (cur != entry_ && cur != nullptr) {
+            auto it = idom_.find(cur);
+            if (it == idom_.end()) return false; // b is unreachable from entry
+            if (it->second == a) return true;
+            if (it->second == cur) return false; // self-loop in idom = entry
+            cur = it->second;
+        }
+        return cur == a;
     }
 
+    /// Invalidate the cached dominator tree. Must be called after structural
+    /// modifications (add/remove block or edge).
+    void invalidate_domtree() const { domtree_valid_ = false; }
 
 private:
     DecompilerArena& arena_;
     TransitionBlock* entry_ = nullptr;
     std::vector<TransitionBlock*> blocks_;
+
+    // Cached dominator tree (computed lazily on first dominates() query).
+    mutable std::unordered_map<TransitionBlock*, TransitionBlock*> idom_;
+    mutable std::vector<TransitionBlock*> rpo_;
+    mutable std::unordered_map<TransitionBlock*, std::size_t> rpo_index_;
+    mutable bool domtree_valid_ = false;
 };
 
 } // namespace aletheia

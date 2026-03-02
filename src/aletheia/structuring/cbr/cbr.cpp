@@ -314,6 +314,10 @@ AstNode* ConditionBasedRefinement::refine(
                         new_seq->add_node(node);
                         i++;
 
+                        // Remember where the inner loop starts consuming
+                        // nodes so we can rewind if the IfNode synthesis fails.
+                        size_t inner_start = i;
+
                         SeqNode* true_branch = arena.create<SeqNode>();
                         SeqNode* false_branch = arena.create<SeqNode>();
                         
@@ -369,12 +373,16 @@ AstNode* ConditionBasedRefinement::refine(
                             IfNode* if_node = arena.create<IfNode>(branch_cond, true_branch, false_branch->nodes().empty() ? nullptr : false_branch);
                             new_seq->add_node(if_node);
                         } else {
-                            // Keep CFG semantics intact when we fail to synthesize an IfNode.
+                            // IfNode synthesis failed: no nodes were classified
+                            // into true/false branches. Restore the branch
+                            // instruction and rewind the index so the consumed
+                            // nodes are re-emitted as sequential statements.
                             auto restored = block->instructions();
                             restored.push_back(removed_branch);
                             block->set_instructions(std::move(restored));
+                            i = inner_start;
                             if (cbr_debug_enabled()) {
-                                std::cerr << "[CBR Debug] IfNode was empty, dropped!" << std::endl;
+                                std::cerr << "[CBR Debug] IfNode was empty, dropped! Rewinding " << (i - inner_start) << " consumed nodes." << std::endl;
                             }
                         }
                         

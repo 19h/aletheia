@@ -41,6 +41,16 @@ void* DecompilerArena::allocate(std::size_t size, std::size_t alignment) {
 }
 
 void DecompilerArena::reset() {
+    // Call registered destructors in reverse order (LIFO) to ensure proper
+    // teardown of objects that reference other arena-allocated objects.
+    // This is critical: arena-allocated types with non-trivial members
+    // (std::vector, std::string, std::unordered_map, z3::expr, etc.) will
+    // leak their heap-allocated internal buffers if destructors are not called.
+    for (auto it = destructors_.rbegin(); it != destructors_.rend(); ++it) {
+        it->dtor(it->obj);
+    }
+    destructors_.clear();
+
     for (auto& block : blocks_) {
         block->used = 0;
     }

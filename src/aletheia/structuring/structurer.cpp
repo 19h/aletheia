@@ -488,8 +488,11 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
     if (!cfg.entry()) return;
 
     bool reduced = true;
-    while (reduced && cfg.blocks().size() > 1) {
+    constexpr std::size_t max_iterations = 500;
+    std::size_t iteration = 0;
+    while (reduced && cfg.blocks().size() > 1 && iteration < max_iterations) {
         reduced = false;
+        ++iteration;
 
         std::unordered_set<TransitionBlock*> best_region;
         TransitionBlock* best_header = nullptr;
@@ -565,9 +568,31 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
 
             reduced = true;
         } else {
-            // Force collapse everything remaining into a single sequential block to avoid truncation when there are unstructured jumps
-            // But we must call restructure_region on this final set to process Conditions correctly!
-            
+            // Force collapse everything remaining into a single sequential
+            // block. Before calling restructure_region (which requires a DAG
+            // for topological sort), strip any remaining back/retreating
+            // edges to break cycles. Without this, Kahn's algorithm in
+            // ReachingConditions::compute() silently drops cyclic nodes,
+            // causing CBR to fail to classify them and produce empty ASTs.
+
+            cfg.refresh_edge_properties();
+            {
+                std::vector<TransitionEdge*> back_edges;
+                for (auto* b : cfg.blocks()) {
+                    if (!b) continue;
+                    for (auto* e : b->successors()) {
+                        if (!e) continue;
+                        if (e->property() == EdgeProperty::Back ||
+                            e->property() == EdgeProperty::Retreating) {
+                            back_edges.push_back(e);
+                        }
+                    }
+                }
+                for (auto* e : back_edges) {
+                    cfg.remove_edge(e);
+                }
+            }
+
             std::unordered_set<TransitionBlock*> all_blocks;
             for (auto* b : cfg.blocks()) all_blocks.insert(b);
             

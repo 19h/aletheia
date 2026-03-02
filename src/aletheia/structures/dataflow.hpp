@@ -155,6 +155,15 @@ private:
 // Variable -- Named storage location (register, stack slot, temp, etc.)
 // =============================================================================
 
+/// Storage classification for variables.
+enum class VariableKind : std::uint8_t {
+    Register,       ///< Stored in a CPU register (default).
+    StackLocal,     ///< Local variable on the stack frame (negative FP offset).
+    StackArgument,  ///< Incoming stack argument (positive FP offset / arg area).
+    Parameter,      ///< Function parameter (register-passed or identified by prototype).
+    Temporary,      ///< Compiler/decompiler-generated temporary.
+};
+
 class Variable : public Expression {
 public:
     Variable(std::string name, std::size_t size) : name_(std::move(name)) {
@@ -176,6 +185,9 @@ public:
         v->set_ssa_version(ssa_version_);
         v->set_aliased(is_aliased_);
         v->set_ir_type(ir_type());
+        v->set_kind(kind_);
+        v->set_stack_offset(stack_offset_);
+        v->set_parameter_index(parameter_index_);
         return v;
     }
 
@@ -192,10 +204,34 @@ public:
     bool is_aliased() const { return is_aliased_; }
     void set_aliased(bool aliased) { is_aliased_ = aliased; }
 
+    /// Storage classification.
+    VariableKind kind() const { return kind_; }
+    void set_kind(VariableKind kind) { kind_ = kind; }
+
+    /// Stack frame offset (meaningful for StackLocal / StackArgument kinds).
+    /// For frame-pointer-based: negative = local, positive = argument.
+    /// For SP-based: normalized to frame-base-relative via SP delta.
+    std::int64_t stack_offset() const { return stack_offset_; }
+    void set_stack_offset(std::int64_t offset) { stack_offset_ = offset; }
+
+    /// Parameter index (0-based, meaningful for Parameter kind).
+    /// -1 means not a parameter.
+    int parameter_index() const { return parameter_index_; }
+    void set_parameter_index(int index) { parameter_index_ = index; }
+
+    /// Convenience predicates.
+    bool is_parameter() const { return kind_ == VariableKind::Parameter; }
+    bool is_stack_variable() const {
+        return kind_ == VariableKind::StackLocal || kind_ == VariableKind::StackArgument;
+    }
+
 private:
     std::string name_;
     std::size_t ssa_version_ = 0;
     bool is_aliased_ = false;
+    VariableKind kind_ = VariableKind::Register;
+    std::int64_t stack_offset_ = 0;
+    int parameter_index_ = -1;
 };
 
 // =============================================================================

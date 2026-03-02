@@ -6,6 +6,7 @@
 #include "../../idiomata/idioms.hpp"
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <ida/idax.hpp>
@@ -86,6 +87,30 @@ public:
         failure_message_ = std::move(message);
     }
 
+    /// Maps register names (e.g., "rdi", "rsi", "x0") to parameter info.
+    /// Populated during lifting based on function prototype and calling convention.
+    struct ParameterInfo {
+        std::string name;     ///< Display name (e.g., "a1", or user-defined from IDA).
+        int index = -1;       ///< 0-based parameter index.
+        TypePtr type;         ///< Parameter type from the prototype.
+    };
+
+    const std::unordered_map<std::string, ParameterInfo>& parameter_registers() const {
+        return parameter_registers_;
+    }
+    void set_parameter_register(const std::string& reg_name, ParameterInfo info) {
+        parameter_registers_[reg_name] = std::move(info);
+    }
+
+    /// Set of parameter display names (for filtering from local declarations).
+    std::unordered_set<std::string> parameter_names() const {
+        std::unordered_set<std::string> result;
+        for (const auto& [reg, info] : parameter_registers_) {
+            result.insert(info.name);
+        }
+        return result;
+    }
+
 private:
     ida::Address function_address_;
     DecompilerArena arena_;
@@ -96,6 +121,7 @@ private:
     TypePtr function_type_;
     std::vector<idiomata::IdiomTag> idiom_tags_;
     OutOfSsaMode out_of_ssa_mode_ = OutOfSsaMode::LiftMinimal;
+    std::unordered_map<std::string, ParameterInfo> parameter_registers_;
     std::vector<StageExecutionRecord> stage_records_;
     bool failed_ = false;
     std::string failure_stage_;

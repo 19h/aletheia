@@ -10,7 +10,9 @@ namespace aletheia {
 
 /// Negate a Condition expression: if it's a Condition (comparison), flip the
 /// comparison operator. Otherwise, wrap in logical_not.
+/// Returns nullptr if expr is nullptr (caller must handle).
 static Expression* negate_condition_expr(DecompilerArena& arena, Expression* expr) {
+    if (!expr) return nullptr;
     if (auto* cond = dynamic_cast<Condition*>(expr)) {
         auto negated_op = Condition::negate_comparison(cond->type());
         return arena.create<Condition>(negated_op, cond->lhs(), cond->rhs(), cond->size_bytes);

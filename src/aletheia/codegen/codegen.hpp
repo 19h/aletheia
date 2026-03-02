@@ -3,6 +3,7 @@
 #include "../structures/dataflow.hpp"
 #include "../pipeline/pipeline.hpp"
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace aletheia {
@@ -10,6 +11,12 @@ namespace aletheia {
 class CExpressionGenerator : public DataflowObjectVisitorInterface {
 public:
     std::string generate(DataflowObject* obj);
+
+    /// Set the parameter register -> display name mapping for parameter rendering.
+    /// Key: lowercase register name (e.g., "rdi"), Value: display name (e.g., "a1").
+    void set_parameter_names(const std::unordered_map<std::string, std::string>& map) {
+        param_display_names_ = map;
+    }
 
     // Expression visitors
     void visit(Constant* c) override;
@@ -30,6 +37,8 @@ public:
 
 private:
     std::string result_;
+    /// Maps lowercase register name -> display name for parameter rendering.
+    std::unordered_map<std::string, std::string> param_display_names_;
 };
 
 class CodeVisitor {

@@ -515,6 +515,26 @@ void CExpressionGenerator::visit(Constant* c) {
 
 void CExpressionGenerator::visit(Variable* v) {
     std::string base_name = v->name();
+
+    // Check if this variable is a parameter register with a display name.
+    if (v->is_parameter() || !param_display_names_.empty()) {
+        // Normalize to lowercase for lookup.
+        std::string lower_name = base_name;
+        for (char& c : lower_name) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        auto it = param_display_names_.find(lower_name);
+        if (it != param_display_names_.end()) {
+            // Use the display name, but still append SSA suffix if present.
+            if (v->ssa_version() > 0) {
+                result_ = it->second + "_" + std::to_string(v->ssa_version());
+            } else {
+                result_ = it->second;
+            }
+            return;
+        }
+    }
+
     if (v->ssa_version() > 0) {
         result_ = base_name + "_" + std::to_string(v->ssa_version());
     } else {
@@ -817,6 +837,15 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     current_line_.clear();
     indent_level_ = 0;
 
+    // Set up parameter display name mapping for the expression generator.
+    {
+        std::unordered_map<std::string, std::string> param_names;
+        for (const auto& [reg, info] : task.parameter_registers()) {
+            param_names[reg] = info.name;
+        }
+        expr_gen_.set_parameter_names(param_names);
+    }
+
     auto global_decls = GlobalDeclarationGenerator::generate(task);
     for (const auto& decl : global_decls) {
         lines_.push_back(decl);
@@ -841,9 +870,18 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     if (task.function_type()) {
         if (auto* func_type = dynamic_cast<const FunctionTypeDef*>(task.function_type().get())) {
             const auto& params = func_type->parameters();
+            // Build index -> name map from parameter_registers.
+            std::unordered_map<int, std::string> index_to_name;
+            for (const auto& [reg, info] : task.parameter_registers()) {
+                index_to_name[info.index] = info.name;
+            }
             for (size_t i = 0; i < params.size(); ++i) {
                 if (i > 0) sig += ", ";
-                sig += params[i]->to_string() + " a" + std::to_string(i + 1); // a1, a2, ...
+                auto it = index_to_name.find(static_cast<int>(i));
+                std::string pname = (it != index_to_name.end() && !it->second.empty())
+                    ? it->second
+                    : "a" + std::to_string(i + 1);
+                sig += params[i]->to_string() + " " + pname;
             }
         }
     }

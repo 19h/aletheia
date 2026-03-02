@@ -1268,8 +1268,6 @@ static std::string expression_fingerprint(Expression* expr) {
             first = false;
             out += expression_fingerprint(child);
         }
-        out += ")";
-        return out;
     }
     return "X";
 }

@@ -1,6 +1,7 @@
 #include "lifter.hpp"
 #include <ida/lines.hpp>
 #include <ida/function.hpp>
+#include <ida/database.hpp>
 #include <ida/type.hpp>
 #include <ida/segment.hpp>
 #include <ida/xref.hpp>
@@ -384,6 +385,51 @@ std::optional<ida::Address> infer_taken_target_from_xrefs(
 
 } // namespace
 
+namespace {
+
+/// Calling convention parameter register tables.
+/// x86-64 System V ABI: rdi, rsi, rdx, rcx, r8, r9
+constexpr std::string_view kX86_64_SysV_IntRegs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+/// x86-64 Windows (fastcall): rcx, rdx, r8, r9
+constexpr std::string_view kX86_64_Win_IntRegs[] = {"rcx", "rdx", "r8", "r9"};
+/// ARM64 (AAPCS): x0-x7
+constexpr std::string_view kARM64_IntRegs[] = {"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"};
+
+/// Detect the architecture from the processor name. Returns "x86_64", "arm64", or "".
+std::string detect_arch() {
+    auto proc = ida::database::processor_name();
+    if (!proc) return "";
+    std::string p = to_lower_ascii(*proc);
+    if (p.find("arm") != std::string::npos || p.find("aarch64") != std::string::npos) {
+        return "arm64";
+    }
+    if (p.find("metapc") != std::string::npos || p.find("x86") != std::string::npos ||
+        p.find("pc") != std::string::npos) {
+        return "x86_64";
+    }
+    return "";
+}
+
+/// Get parameter registers for the detected architecture.
+/// Returns a span-like pair of (pointer, count).
+std::pair<const std::string_view*, std::size_t> param_register_table() {
+    static std::string cached_arch;
+    if (cached_arch.empty()) {
+        cached_arch = detect_arch();
+    }
+    if (cached_arch == "arm64") {
+        return {kARM64_IntRegs, std::size(kARM64_IntRegs)};
+    }
+    if (cached_arch == "x86_64") {
+        // Default to System V ABI (Linux/macOS). Windows detection could be
+        // added by checking the input file's format, but System V is more common.
+        return {kX86_64_SysV_IntRegs, std::size(kX86_64_SysV_IntRegs)};
+    }
+    return {nullptr, 0};
+}
+
+} // namespace (parameter tables)
+
 void Lifter::populate_task_signature(DecompilerTask& task) {
     auto ea = task.function_address();
     
@@ -397,6 +443,8 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
     task.set_function_name(name);
 
     auto type_res = ida::type::retrieve(ea);
+    std::size_t param_count = 0;
+
     if (type_res) {
         auto& type_info = *type_res;
         TypeParser parser;
@@ -420,6 +468,23 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
             }
             
             task.set_function_type(std::make_shared<const FunctionTypeDef>(ret_type, params));
+            param_count = params.size();
+
+            // Build parameter register -> parameter info mapping.
+            auto [reg_table, reg_count] = param_register_table();
+            param_register_map_.clear();
+            if (reg_table) {
+                for (std::size_t i = 0; i < param_count && i < reg_count; ++i) {
+                    std::string reg_name(reg_table[i]);
+                    param_register_map_[reg_name] = static_cast<int>(i);
+                    
+                    DecompilerTask::ParameterInfo info;
+                    info.name = "a" + std::to_string(i + 1);
+                    info.index = static_cast<int>(i);
+                    info.type = (i < params.size()) ? params[i] : nullptr;
+                    task.set_parameter_register(reg_name, std::move(info));
+                }
+            }
         } else {
             auto type_str = type_info.to_string();
             if (type_str) {
@@ -427,11 +492,133 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
             }
         }
     }
+
+    // Also check for register variables defined by the user in IDA.
+    auto regvars = ida::function::register_variables(ea);
+    if (regvars) {
+        for (const auto& rv : *regvars) {
+            if (!rv.user_name.empty()) {
+                std::string canonical = to_lower_ascii(rv.canonical_name);
+                // If this register is a parameter, update the display name.
+                auto it = param_register_map_.find(canonical);
+                if (it != param_register_map_.end()) {
+                    DecompilerTask::ParameterInfo info;
+                    info.name = rv.user_name;
+                    info.index = it->second;
+                    info.type = nullptr; // Already set from function type.
+                    task.set_parameter_register(canonical, std::move(info));
+                }
+            }
+        }
+    }
+}
+
+void Lifter::populate_frame_layout(ida::Address function_address) {
+    frame_layout_ = FrameLayout{}; // Reset.
+    
+    auto frame_res = ida::function::frame(function_address);
+    if (!frame_res) {
+        return; // No frame info available; fall back to text heuristics.
+    }
+
+    const auto& sf = *frame_res;
+    frame_layout_.local_size = sf.local_variables_size();
+    frame_layout_.regs_size = sf.saved_registers_size();
+    frame_layout_.args_size = sf.arguments_size();
+    frame_layout_.total_size = sf.total_size();
+    frame_layout_.valid = true;
+
+    // Build offset-to-variable map.
+    // IDA frame offsets are relative to the frame structure base.
+    // The frame structure is laid out as:
+    //   [0 .. local_size)         -> local variables
+    //   [local_size .. local_size + regs_size) -> saved registers
+    //   [local_size + regs_size .. total_size) -> arguments
+    // To convert to frame-pointer-relative (FP = base + local_size + regs_size):
+    //   fp_relative = byte_offset - (local_size + regs_size)
+    // So locals have negative FP offsets, arguments have non-negative FP offsets.
+    const auto fp_base = static_cast<std::int64_t>(frame_layout_.local_size + frame_layout_.regs_size);
+
+    for (const auto& fv : sf.variables()) {
+        if (fv.is_special) continue; // Skip __return_address, __saved_registers.
+        
+        const auto fp_offset = static_cast<std::int64_t>(fv.byte_offset) - fp_base;
+        frame_layout_.offset_to_var[fp_offset] = fv;
+    }
+}
+
+std::optional<std::string> Lifter::resolve_frame_variable(std::int64_t frame_offset,
+                                                           std::size_t access_size) const {
+    if (!frame_layout_.valid) {
+        return std::nullopt;
+    }
+
+    // Exact match first.
+    auto it = frame_layout_.offset_to_var.find(frame_offset);
+    if (it != frame_layout_.offset_to_var.end() && !it->second.name.empty()) {
+        return it->second.name;
+    }
+
+    // Try to find a variable that contains this offset (subfield access).
+    for (const auto& [off, fv] : frame_layout_.offset_to_var) {
+        if (fv.name.empty()) continue;
+        if (frame_offset >= off &&
+            static_cast<std::size_t>(frame_offset - off) < fv.byte_size) {
+            // Inside this variable's range.
+            if (frame_offset == off) {
+                return fv.name; // Exact start.
+            }
+            // Subfield: append offset suffix.
+            return fv.name + "_" + std::to_string(frame_offset - off);
+        }
+    }
+
+    return std::nullopt;
+}
+
+void Lifter::tag_variable(Variable* var, ida::Address insn_addr) const {
+    if (!var) return;
+
+    const std::string& vname = var->name();
+
+    // Check if this is a parameter register.
+    std::string lower_name = to_lower_ascii(vname);
+    auto pit = param_register_map_.find(lower_name);
+    if (pit != param_register_map_.end()) {
+        var->set_kind(VariableKind::Parameter);
+        var->set_parameter_index(pit->second);
+        return;
+    }
+
+    // Check if this is a recognized stack variable name.
+    if (vname.starts_with("local_")) {
+        var->set_kind(VariableKind::StackLocal);
+        // Try to extract offset from name (e.g., "local_16" -> -16).
+        auto suffix = vname.substr(6);
+        if (!suffix.empty() && suffix[0] != 'm') {
+            try {
+                auto offset = std::stoll(suffix);
+                var->set_stack_offset(-offset); // Locals are at negative FP offsets.
+            } catch (...) {}
+        }
+    } else if (vname.starts_with("arg_")) {
+        var->set_kind(VariableKind::StackArgument);
+        auto suffix = vname.substr(4);
+        try {
+            auto offset = std::stoll(suffix);
+            var->set_stack_offset(offset);
+        } catch (...) {}
+    }
 }
 
 ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
     ida::Address function_address,
     std::vector<idiomata::IdiomTag>* idiom_tags_out) {
+
+    // Cache function address and populate frame layout for stack recovery.
+    current_function_ea_ = function_address;
+    populate_frame_layout(function_address);
+
     auto flowchart_res = ida::graph::flowchart(function_address);
     if (!flowchart_res) {
         return std::unexpected(flowchart_res.error());
@@ -598,7 +785,19 @@ std::vector<Expression*> Lifter::lift_operands(const ida::instruction::Instructi
 Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Address insn_addr) {
     Expression* expr = nullptr;
     if (op.is_register()) {
-        expr = arena_.create<Variable>(op.register_name(), op.byte_width());
+        std::string reg_name = op.register_name();
+        std::string lower_reg = to_lower_ascii(reg_name);
+        
+        // Check if this register is a parameter register.
+        auto pit = param_register_map_.find(lower_reg);
+        if (pit != param_register_map_.end()) {
+            auto* var = arena_.create<Variable>(reg_name, op.byte_width());
+            var->set_kind(VariableKind::Parameter);
+            var->set_parameter_index(pit->second);
+            expr = var;
+        } else {
+            expr = arena_.create<Variable>(reg_name, op.byte_width());
+        }
     } else if (op.is_immediate()) {
         expr = arena_.create<Constant>(op.value(), op.byte_width());
     } else if (op.type() == ida::instruction::OperandType::NearAddress ||
@@ -626,12 +825,84 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
                 std::vector<Expression*>{global},
                 width);
         } else {
+            // Memory phrase/displacement: try IDA frame resolution first,
+            // then fall back to text heuristic.
             auto op_text = ida::instruction::operand_text(insn_addr, op.index());
             if (op_text) {
-                if (auto stack_name = stack_slot_name_from_operand_text(*op_text)) {
-                    auto* slot = arena_.create<Variable>(*stack_name, width);
-                    slot->set_aliased(true);
-                    expr = slot;
+                std::string text = *op_text;
+                std::string lower_text = to_lower_ascii(text);
+
+                // Strategy 1: Use IDA frame API if available.
+                // Detect frame-pointer or stack-pointer reference and resolve
+                // the offset through the frame variable map.
+                bool resolved = false;
+                if (frame_layout_.valid) {
+                    const bool is_fp_based =
+                        contains_register_token(lower_text, "rbp") ||
+                        contains_register_token(lower_text, "ebp") ||
+                        contains_register_token(lower_text, "bp") ||
+                        contains_register_token(lower_text, "x29") ||
+                        contains_register_token(lower_text, "fp");
+                    const bool is_sp_based =
+                        contains_register_token(lower_text, "rsp") ||
+                        contains_register_token(lower_text, "esp") ||
+                        contains_register_token(lower_text, "sp");
+
+                    if (is_fp_based || is_sp_based) {
+                        auto disp = parse_signed_displacement(lower_text);
+                        std::int64_t fp_offset = disp.value_or(0);
+
+                        // For SP-based references, adjust using SP delta to get
+                        // frame-pointer-relative offset.
+                        if (is_sp_based && !is_fp_based) {
+                            auto sp_delta = ida::function::sp_delta_at(insn_addr);
+                            if (sp_delta) {
+                                // sp_delta_at returns the SP change from function entry.
+                                // FP = initial_SP - (local_size + regs_size)
+                                // SP at insn = initial_SP + sp_delta (sp_delta is negative)
+                                // actual_addr = SP_at_insn + disp = initial_SP + sp_delta + disp
+                                // FP_relative = actual_addr - FP
+                                //             = (initial_SP + sp_delta + disp) - (initial_SP - fp_base)
+                                //             = sp_delta + disp + fp_base
+                                const auto fp_base = static_cast<std::int64_t>(
+                                    frame_layout_.local_size + frame_layout_.regs_size);
+                                fp_offset = *sp_delta + fp_offset + fp_base;
+                            }
+                        }
+
+                        // Try to resolve via IDA frame variable map.
+                        auto frame_name = resolve_frame_variable(fp_offset, width);
+                        if (frame_name) {
+                            auto* slot = arena_.create<Variable>(*frame_name, width);
+                            slot->set_aliased(true);
+                            slot->set_stack_offset(fp_offset);
+                            if (fp_offset >= 0) {
+                                slot->set_kind(VariableKind::StackArgument);
+                            } else {
+                                slot->set_kind(VariableKind::StackLocal);
+                            }
+                            
+                            // Try to get type from frame variable.
+                            auto it = frame_layout_.offset_to_var.find(fp_offset);
+                            if (it != frame_layout_.offset_to_var.end() && it->second.byte_size > 0) {
+                                slot->set_ir_type(std::make_shared<Integer>(
+                                    it->second.byte_size * 8, false));
+                            }
+                            
+                            expr = slot;
+                            resolved = true;
+                        }
+                    }
+                }
+
+                // Strategy 2: Fall back to text-heuristic stack name parsing.
+                if (!resolved) {
+                    if (auto stack_name = stack_slot_name_from_operand_text(text)) {
+                        auto* slot = arena_.create<Variable>(*stack_name, width);
+                        slot->set_aliased(true);
+                        tag_variable(slot, insn_addr);
+                        expr = slot;
+                    }
                 }
             }
 
@@ -646,6 +917,7 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
             if (auto stack_name = stack_slot_name_from_operand_text(*txt_res)) {
                 auto* slot = arena_.create<Variable>(*stack_name, op.byte_width());
                 slot->set_aliased(true);
+                tag_variable(slot, insn_addr);
                 expr = slot;
             }
 
@@ -661,10 +933,21 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
         }
     }
     
-    // Attach types to Variable and Constant nodes during lifting
+    // Attach types to Variable and Constant nodes during lifting.
     if (expr && op.byte_width() > 0) {
-        expr->set_ir_type(std::make_shared<Integer>(op.byte_width() * 8, false));
+        // Don't overwrite type if already set (e.g., from frame variable resolution).
+        if (!expr->ir_type()) {
+            expr->set_ir_type(std::make_shared<Integer>(op.byte_width() * 8, false));
+        }
     }
+
+    // Tag any remaining untagged variables.
+    if (auto* var = dynamic_cast<Variable*>(expr)) {
+        if (var->kind() == VariableKind::Register) {
+            tag_variable(var, insn_addr);
+        }
+    }
+
     return expr;
 }
 

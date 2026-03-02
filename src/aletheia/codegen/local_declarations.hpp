@@ -105,23 +105,32 @@ public:
             collector.traverse(task.ast()->root());
         }
 
-        // Group by type string
-        // Use a map to type_string -> set of variable names (to sort them)
-        std::map<std::string, std::set<std::string>> type_to_vars;
+        // Build the set of parameter names to exclude from local declarations.
+        auto param_names = task.parameter_names();
 
-        // Collect parameters (not supported properly yet, but we will skip a1, a2)
-        // Wait, Aletheia lifter doesn't rename registers to a1, a2. It just uses register names (e.g. x0, rdi).
-        // Since we don't have argument tracking yet, we will just declare everything we find.
+        // Group by type string -> sorted set of variable names.
+        std::map<std::string, std::set<std::string>> type_to_vars;
         
         for (auto* var : collector.variables()) {
+            // Skip global variables.
             if (dynamic_cast<GlobalVariable*>(var) != nullptr) {
                 continue;
             }
+            
+            // Skip parameter variables (they appear in the function signature).
+            if (var->is_parameter()) {
+                continue;
+            }
+
             std::string var_name = expr_gen.generate(var);
+
+            // Also skip by name match against parameter names (catches cases
+            // where the Variable node wasn't tagged but shares a parameter name).
+            if (param_names.contains(var_name)) {
+                continue;
+            }
             
-            // Global variables should be filtered, but we don't have them yet.
-            
-            std::string type_str = "int"; // Default fallback
+            std::string type_str = "int"; // Default fallback.
             if (var->ir_type()) {
                 type_str = var->ir_type()->to_string();
             }

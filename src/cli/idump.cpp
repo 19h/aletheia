@@ -380,6 +380,15 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
     std::vector<std::string> lines;
     aletheia::CExpressionGenerator expr_gen;
 
+    // Set up parameter display name mapping.
+    {
+        std::unordered_map<std::string, std::string> param_names;
+        for (const auto& [reg, info] : task.parameter_registers()) {
+            param_names[reg] = info.name;
+        }
+        expr_gen.set_parameter_names(param_names);
+    }
+
     auto global_decls = aletheia::GlobalDeclarationGenerator::generate(task);
     for (const auto& decl : global_decls) {
         lines.push_back(decl);
@@ -405,9 +414,18 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
     if (task.function_type()) {
         if (auto* func_type = dynamic_cast<const aletheia::FunctionTypeDef*>(task.function_type().get())) {
             const auto& params = func_type->parameters();
+            // Build index -> name map from parameter_registers.
+            std::unordered_map<int, std::string> index_to_name;
+            for (const auto& [reg, info] : task.parameter_registers()) {
+                index_to_name[info.index] = info.name;
+            }
             for (std::size_t i = 0; i < params.size(); ++i) {
                 if (i > 0) sig += ", ";
-                sig += params[i]->to_string() + " a" + std::to_string(i + 1);
+                auto it = index_to_name.find(static_cast<int>(i));
+                std::string pname = (it != index_to_name.end() && !it->second.empty())
+                    ? it->second
+                    : "a" + std::to_string(i + 1);
+                sig += params[i]->to_string() + " " + pname;
             }
         }
     }

@@ -162,8 +162,10 @@ void ControlFlowGraph::classify_edges(DominatorTree& dom_tree) {
         
         if (child_idx < parent->successors().size()) {
             Edge* edge = parent->successors()[child_idx];
-            BasicBlock* child = edge->target();
             child_idx++;
+            if (!edge) continue;
+            BasicBlock* child = edge->target();
+            if (!child) continue;
             
             if (visited_nodes.count(child)) {
                 EdgeProperty prop;
