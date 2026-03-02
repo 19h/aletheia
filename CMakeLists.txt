@@ -6,22 +6,35 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Linker Optimization ────────────────────────────────────────────────
-if(APPLE)
-    # Apple's default linker is incredibly slow for massive static libraries like Z3.
-    # We attempt to use the new optimized linker in recent Xcode tools.
-    add_link_options(-Wl,-ld_new)
+# mold (https://github.com/rui314/mold) is an extremely fast ELF linker
+# but does NOT support macOS (Mach-O). Only use it on Linux/FreeBSD.
+# On macOS, the system linker (ld) is the only real option; ld_new is
+# available on newer Xcode toolchains and is faster for large archives.
+if(NOT APPLE AND NOT WIN32)
+    find_program(MOLD_LINKER mold
+        HINTS "/usr/local/bin" "/usr/bin"
+        DOC "Path to the mold linker"
+    )
+    if(MOLD_LINKER)
+        message(STATUS "Using mold linker: ${MOLD_LINKER}")
+        add_link_options("-fuse-ld=${MOLD_LINKER}")
+    else()
+        message(STATUS "mold linker not found — falling back to system default")
+    endif()
+elseif(APPLE)
+    message(STATUS "Using system linker (macOS)")
 endif()
-
-
-# ── Standard Optimizations ────────────────────────────────────────────
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    add_compile_options($<$<CONFIG:Release>:-O3>)
-endif()
-
 
 
 
 include(FetchContent)
+
+# Prevent FetchContent from re-checking remote repositories on every build.
+# Without this, ninja triggers cmake reconfiguration on each invocation to
+# check if upstream repos have changed, which stalls the build for seconds
+# (or minutes if the network is slow). Run `cmake --fresh` to force updates.
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
+    "Do not re-check FetchContent remotes on every build" FORCE)
 
 # ── idax dependency ─────────────────────────────────────────────────────
 FetchContent_Declare(
@@ -32,21 +45,58 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(idax)
 
-# ── Z3 dependency (Built from source) ───────────────────────────────────
-FetchContent_Declare(
-    z3
-    GIT_REPOSITORY https://github.com/Z3Prover/z3.git
-    GIT_TAG        z3-4.16.0
-)
+# ── Z3 dependency ───────────────────────────────────────────────────────
+# Prefer a system-installed Z3 (e.g. Homebrew, apt, vcpkg) for vastly faster
+# builds. Building Z3 from source compiles ~860 files into a 50+ MB archive
+# and can take 10-15 minutes even on fast hardware.
+#
+# Pass -DALETHEIA_Z3_FROM_SOURCE=ON to force building from source.
+option(ALETHEIA_Z3_FROM_SOURCE "Force building Z3 from source instead of using system Z3" OFF)
 
-set(Z3_BUILD_LIBZ3_SHARED OFF CACHE BOOL "Build static Z3" FORCE)
-set(Z3_BUILD_EXECUTABLE OFF CACHE BOOL "Skip Z3 executable" FORCE)
-set(Z3_BUILD_TEST_EXECUTABLES OFF CACHE BOOL "Skip Z3 tests" FORCE)
-set(Z3_ENABLE_EXAMPLE_TARGETS OFF CACHE BOOL "Skip Z3 examples" FORCE)
-set(Z3_BUILD_DOCUMENTATION OFF CACHE BOOL "Skip Z3 docs" FORCE)
-set(WARNINGS_AS_ERRORS OFF CACHE BOOL "Disable warnings as errors" FORCE)
+set(_z3_found_system FALSE)
 
-FetchContent_MakeAvailable(z3)
+if(NOT ALETHEIA_Z3_FROM_SOURCE)
+    find_package(Z3 4.12 CONFIG QUIET
+        HINTS "/opt/homebrew" "/usr/local" "$ENV{HOMEBREW_PREFIX}"
+    )
+    if(Z3_FOUND AND TARGET z3::libz3)
+        set(_z3_found_system TRUE)
+        message(STATUS "Using system Z3 ${Z3_VERSION_STRING} (${Z3_C_INCLUDE_DIRS})")
+        # Create a compatibility alias so downstream targets can use the same
+        # name regardless of how Z3 was resolved.
+        if(NOT TARGET aletheia_z3)
+            add_library(aletheia_z3 ALIAS z3::libz3)
+        endif()
+        # Expose include dirs for targets that reference them explicitly.
+        set(ALETHEIA_Z3_INCLUDE_DIRS ${Z3_C_INCLUDE_DIRS})
+    else()
+        message(STATUS "System Z3 not found — falling back to building from source")
+    endif()
+endif()
+
+if(NOT _z3_found_system)
+    message(STATUS "Building Z3 from source (this will take a while...)")
+    FetchContent_Declare(
+        z3
+        GIT_REPOSITORY https://github.com/Z3Prover/z3.git
+        GIT_TAG        z3-4.16.0
+    )
+
+    set(Z3_BUILD_LIBZ3_SHARED OFF CACHE BOOL "Build static Z3" FORCE)
+    set(Z3_BUILD_EXECUTABLE OFF CACHE BOOL "Skip Z3 executable" FORCE)
+    set(Z3_BUILD_TEST_EXECUTABLES OFF CACHE BOOL "Skip Z3 tests" FORCE)
+    set(Z3_ENABLE_EXAMPLE_TARGETS OFF CACHE BOOL "Skip Z3 examples" FORCE)
+    set(Z3_BUILD_DOCUMENTATION OFF CACHE BOOL "Skip Z3 docs" FORCE)
+    set(WARNINGS_AS_ERRORS OFF CACHE BOOL "Disable warnings as errors" FORCE)
+
+    FetchContent_MakeAvailable(z3)
+
+    # The FetchContent Z3 exposes a target called "libz3" (not z3::libz3).
+    if(NOT TARGET aletheia_z3)
+        add_library(aletheia_z3 ALIAS libz3)
+    endif()
+    set(ALETHEIA_Z3_INCLUDE_DIRS ${z3_SOURCE_DIR}/src/api ${z3_SOURCE_DIR}/src/api/c++)
+endif()
 
 # ── IDA installation (optional — needed for plugin, idalib tests, idump) ─
 # Resolve IDA_INSTALL_DIR from explicit setting, IDADIR env, or well-known
@@ -106,15 +156,21 @@ add_library(logos STATIC
     src/logos/operation_simplifier.cpp
     src/logos/normal_form.cpp
 )
-target_link_libraries(logos PUBLIC libz3)
-target_include_directories(logos PUBLIC src/logos ${IDAX_INC_DIRS} ${z3_SOURCE_DIR}/src/api ${z3_SOURCE_DIR}/src/api/c++)
+target_link_libraries(logos PUBLIC aletheia_z3)
+target_include_directories(logos PUBLIC src/logos ${IDAX_INC_DIRS} ${ALETHEIA_Z3_INCLUDE_DIRS})
+target_compile_options(logos PRIVATE $<$<CONFIG:Release>:-O3>)
 
 add_library(idiomata STATIC
     src/idiomata/idioms.cpp
     src/idiomata/idiom_resolver.cpp
+    src/idiomata/patterns_data.cpp
 )
 target_link_libraries(idiomata PUBLIC idax::idax)
 target_include_directories(idiomata PUBLIC src/idiomata)
+# NOTE: idiomata contains a 37K-line embedded pattern table (patterns.hpp).
+# -O3 causes the compiler to spend 5+ minutes optimizing static data init
+# that gains nothing from optimization. Use -O1 which compiles in seconds.
+target_compile_options(idiomata PRIVATE $<$<CONFIG:Release>:-O1>)
 
 add_library(aletheia STATIC
     src/aletheia/aletheia.cpp
@@ -148,7 +204,8 @@ add_library(aletheia STATIC
     src/aletheia/pipeline/dataflow_analysis/dead_code_elimination.cpp
 )
 target_link_libraries(aletheia PUBLIC idax::idax logos idiomata)
-target_include_directories(aletheia PUBLIC src/aletheia src/common ${z3_SOURCE_DIR}/src/api ${z3_SOURCE_DIR}/src/api/c++)
+target_include_directories(aletheia PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
+target_compile_options(aletheia PRIVATE $<$<CONFIG:Release>:-O3>)
 
 # ── IDA Plugin target (requires IDA installation) ───────────────────────
 if(IDA_INSTALL_DIR AND COMMAND ida_add_plugin)
@@ -192,7 +249,8 @@ add_library(aletheia_core STATIC
     src/aletheia/pipeline/dataflow_analysis/dead_code_elimination.cpp
 )
 target_link_libraries(aletheia_core PUBLIC logos)
-target_include_directories(aletheia_core PUBLIC src/aletheia src/common ${z3_SOURCE_DIR}/src/api ${z3_SOURCE_DIR}/src/api/c++)
+target_include_directories(aletheia_core PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
+target_compile_options(aletheia_core PRIVATE $<$<CONFIG:Release>:-O3>)
 # Provide idax include directories (for headers only) without linking the idax
 # static library (which pulls in IDA kernel symbols like _callui).
 target_include_directories(aletheia_core PUBLIC ${IDAX_INC_DIRS})
@@ -263,4 +321,3 @@ if(IDA_INSTALL_DIR)
         INSTALL_RPATH "${IDA_INSTALL_DIR}"
     )
 endif()
-

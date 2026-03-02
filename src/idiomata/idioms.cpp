@@ -40,7 +40,7 @@ const std::unordered_map<std::string, std::vector<const IdiomPattern*>>& pattern
     static const std::unordered_map<std::string, std::vector<const IdiomPattern*>> index = [] {
         std::unordered_map<std::string, std::vector<const IdiomPattern*>> by_opcode;
         by_opcode.reserve(128);
-        for (const auto& pattern : PATTERNS) {
+        for (const auto& pattern : get_patterns()) {
             if (pattern.sequence.empty()) {
                 continue;
             }

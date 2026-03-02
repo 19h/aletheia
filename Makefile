@@ -1,4 +1,4 @@
-.PHONY: all release debug plugin idump test clean purge
+.PHONY: all release debug plugin idump test clean purge install install-debug
 
 # Default target builds everything in release mode
 all: release
@@ -37,6 +37,43 @@ test: .configure-release
 test-debug: .configure-debug
 	cmake --build --preset debug --target aletheia_tests test_idiom_resolver
 	ctest --preset debug
+
+# ── IDA plugin install ───────────────────────────────────────────────────
+# Resolves the plugin artifact (dylib on macOS, so on Linux) from each build
+# preset, copies it into $HOME/.idapro/plugins/, and on macOS ad-hoc
+# codesigns it so IDA will load it without Gatekeeper complaints.
+
+IDAPRO_PLUGINS_DIR := $(HOME)/.idapro/plugins
+
+# Determine per-platform artifact name produced by ida_add_plugin().
+# On macOS the CMake idax helper names the output aletheia_ida.dylib;
+# on Linux it produces aletheia_ida.so.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    PLUGIN_ARTIFACT := aletheia_ida.dylib
+else
+    PLUGIN_ARTIFACT := aletheia_ida.so
+endif
+
+install: plugin
+	@mkdir -p "$(IDAPRO_PLUGINS_DIR)"
+	@echo "Installing $(PLUGIN_ARTIFACT) -> $(IDAPRO_PLUGINS_DIR)/"
+	@cp "build-release-optimized/$(PLUGIN_ARTIFACT)" "$(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)"
+ifeq ($(UNAME_S),Darwin)
+	@echo "Ad-hoc codesigning $(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)..."
+	@codesign -f -s - "$(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)"
+endif
+	@echo "Done. Plugin installed to $(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)"
+
+install-debug: plugin-debug
+	@mkdir -p "$(IDAPRO_PLUGINS_DIR)"
+	@echo "Installing $(PLUGIN_ARTIFACT) (debug) -> $(IDAPRO_PLUGINS_DIR)/"
+	@cp "build-debug/$(PLUGIN_ARTIFACT)" "$(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)"
+ifeq ($(UNAME_S),Darwin)
+	@echo "Ad-hoc codesigning $(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)..."
+	@codesign -f -s - "$(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)"
+endif
+	@echo "Done. Debug plugin installed to $(IDAPRO_PLUGINS_DIR)/$(PLUGIN_ARTIFACT)"
 
 # Standard clean (keeps CMake cache and fetched dependencies like Z3)
 clean:
