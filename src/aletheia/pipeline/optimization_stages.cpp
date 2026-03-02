@@ -1976,6 +1976,217 @@ Constant* make_simplified_constant(DecompilerTask& task, const Operation* op, ui
     return c;
 }
 
+struct AffineTerm {
+    Variable* base = nullptr;
+    std::int64_t delta = 0;
+    std::size_t size_bytes = 0;
+};
+
+bool add_int64_checked(std::int64_t lhs, std::int64_t rhs, std::int64_t& out) {
+    if ((rhs > 0 && lhs > std::numeric_limits<std::int64_t>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<std::int64_t>::min() - rhs)) {
+        return false;
+    }
+    out = lhs + rhs;
+    return true;
+}
+
+bool constant_to_int64(const Constant* c, std::int64_t& out) {
+    if (!c) return false;
+    if (c->value() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        return false;
+    }
+    out = static_cast<std::int64_t>(c->value());
+    return true;
+}
+
+bool extract_affine_term(Expression* expr,
+                         Variable*& base,
+                         std::int64_t& delta,
+                         std::size_t& size_bytes) {
+    if (!expr) return false;
+
+    if (auto* v = dyn_cast<Variable>(expr)) {
+        base = v;
+        delta = 0;
+        size_bytes = v->size_bytes;
+        return true;
+    }
+
+    auto* op = dyn_cast<Operation>(expr);
+    if (!op || op->operands().size() != 2) {
+        return false;
+    }
+
+    if (op->type() == OperationType::add) {
+        auto* lhs_var = dyn_cast<Variable>(op->operands()[0]);
+        auto* rhs_var = dyn_cast<Variable>(op->operands()[1]);
+        auto* lhs_const = dyn_cast<Constant>(op->operands()[0]);
+        auto* rhs_const = dyn_cast<Constant>(op->operands()[1]);
+
+        std::int64_t cval = 0;
+        if (lhs_var && rhs_const && constant_to_int64(rhs_const, cval)) {
+            base = lhs_var;
+            delta = cval;
+            size_bytes = op->size_bytes;
+            return true;
+        }
+        if (rhs_var && lhs_const && constant_to_int64(lhs_const, cval)) {
+            base = rhs_var;
+            delta = cval;
+            size_bytes = op->size_bytes;
+            return true;
+        }
+        return false;
+    }
+
+    if (op->type() == OperationType::sub) {
+        auto* lhs_var = dyn_cast<Variable>(op->operands()[0]);
+        auto* rhs_const = dyn_cast<Constant>(op->operands()[1]);
+        std::int64_t cval = 0;
+        if (lhs_var && rhs_const && constant_to_int64(rhs_const, cval)) {
+            base = lhs_var;
+            delta = -cval;
+            size_bytes = op->size_bytes;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::optional<AffineTerm> resolve_affine_term(
+    Variable* source,
+    const std::unordered_map<VarKey, AffineTerm, VarKeyHash>& terms) {
+    if (!source) return std::nullopt;
+
+    Variable* base = source;
+    std::int64_t delta = 0;
+    std::size_t size_bytes = source->size_bytes;
+    std::unordered_set<VarKey, VarKeyHash> seen;
+
+    while (base) {
+        VarKey key = var_key(base);
+        if (!seen.insert(key).second) {
+            return std::nullopt;
+        }
+
+        auto it = terms.find(key);
+        if (it == terms.end()) {
+            break;
+        }
+
+        const AffineTerm& term = it->second;
+        if (!term.base) {
+            return std::nullopt;
+        }
+
+        std::int64_t combined = 0;
+        if (!add_int64_checked(delta, term.delta, combined)) {
+            return std::nullopt;
+        }
+        delta = combined;
+
+        if (term.size_bytes != 0) {
+            size_bytes = term.size_bytes;
+        }
+
+        if (term.base == base) {
+            break;
+        }
+        base = term.base;
+    }
+
+    return AffineTerm{base, delta, size_bytes};
+}
+
+Expression* build_affine_expression(DecompilerTask& task,
+                                    Variable* base,
+                                    std::int64_t delta,
+                                    std::size_t size_bytes,
+                                    const TypePtr& ir_type) {
+    if (!base) {
+        return nullptr;
+    }
+    if (delta == 0) {
+        return base;
+    }
+
+    const std::size_t expr_size = size_bytes != 0
+        ? size_bytes
+        : (base->size_bytes != 0 ? base->size_bytes : static_cast<std::size_t>(8));
+
+    const std::uint64_t magnitude = delta < 0
+        ? static_cast<std::uint64_t>(-(delta + 1)) + 1ULL
+        : static_cast<std::uint64_t>(delta);
+
+    auto* c = task.arena().create<Constant>(magnitude, expr_size);
+    auto* rebuilt = task.arena().create<Operation>(
+        delta < 0 ? OperationType::sub : OperationType::add,
+        std::vector<Expression*>{base, c},
+        expr_size);
+    rebuilt->set_ir_type(ir_type);
+    return rebuilt;
+}
+
+bool collapse_linear_offset_chains(DecompilerTask& task, BasicBlock* block) {
+    if (!block) {
+        return false;
+    }
+
+    bool changed = false;
+    std::unordered_map<VarKey, AffineTerm, VarKeyHash> terms;
+
+    for (Instruction* inst : block->mutable_instructions()) {
+        auto* assign = dyn_cast<Assignment>(inst);
+        auto* dest = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+        if (!dest || !assign->value()) {
+            continue;
+        }
+
+        const VarKey dest_key = var_key(dest);
+
+        Variable* source = nullptr;
+        std::int64_t local_delta = 0;
+        std::size_t size_bytes = 0;
+        if (!extract_affine_term(assign->value(), source, local_delta, size_bytes)) {
+            terms.erase(dest_key);
+            continue;
+        }
+
+        auto resolved = resolve_affine_term(source, terms);
+        if (!resolved.has_value() || !resolved->base) {
+            terms.erase(dest_key);
+            continue;
+        }
+
+        std::int64_t total_delta = 0;
+        if (!add_int64_checked(resolved->delta, local_delta, total_delta)) {
+            terms.erase(dest_key);
+            continue;
+        }
+
+        const std::size_t canonical_size =
+            size_bytes != 0 ? size_bytes :
+            (resolved->size_bytes != 0 ? resolved->size_bytes : dest->size_bytes);
+
+        Expression* rebuilt = build_affine_expression(
+            task,
+            resolved->base,
+            total_delta,
+            canonical_size,
+            assign->value()->ir_type());
+        if (rebuilt && rebuilt != assign->value()) {
+            assign->set_value(rebuilt);
+            changed = true;
+        }
+
+        terms[dest_key] = AffineTerm{resolved->base, total_delta, canonical_size};
+    }
+
+    return changed;
+}
+
 std::optional<FoldedConstant> collapse_binary_constants(
     OperationType type,
     const Constant* lhs,
@@ -1984,6 +2195,36 @@ std::optional<FoldedConstant> collapse_binary_constants(
 
 Expression* try_collapse_nested_constants(DecompilerTask& task, Operation* op) {
     if (!op || op->operands().size() != 2) return nullptr;
+    if (op->type() == OperationType::sub) {
+        auto* outer_const = dyn_cast<Constant>(op->operands()[1]);
+        auto* inner = dyn_cast<Operation>(op->operands()[0]);
+        if (!outer_const || !inner || inner->type() != OperationType::sub ||
+            inner->operands().size() != 2) {
+            return nullptr;
+        }
+
+        auto* inner_const = dyn_cast<Constant>(inner->operands()[1]);
+        if (!inner_const) {
+            return nullptr;
+        }
+
+        auto folded = collapse_binary_constants(
+            OperationType::add, inner_const, outer_const, op->size_bytes);
+        if (!folded) {
+            return nullptr;
+        }
+
+        auto* merged_const = task.arena().create<Constant>(folded->value, folded->size_bytes);
+        merged_const->set_ir_type(inner_const->ir_type());
+
+        auto* rebuilt = task.arena().create<Operation>(
+            OperationType::sub,
+            std::vector<Expression*>{inner->operands()[0], merged_const},
+            op->size_bytes);
+        rebuilt->set_ir_type(op->ir_type());
+        return rebuilt;
+    }
+
     if (op->type() != OperationType::add && op->type() != OperationType::mul &&
         op->type() != OperationType::mul_us) {
         return nullptr;
@@ -2148,6 +2389,38 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
 
     for (Expression*& child : op->mutable_operands()) {
         child = simplify_expression_tree(task, child);
+    }
+
+    if (op->operands().size() == 1) {
+        Expression* child_expr = op->operands()[0];
+        if (op->type() == OperationType::logical_not) {
+            // !(A < B) -> A >= B
+            if (auto* cond = dyn_cast<Condition>(child_expr)) {
+                auto negated_op = Condition::negate_comparison(cond->type());
+                return task.arena().create<Condition>(negated_op, cond->lhs(), cond->rhs(), cond->size_bytes);
+            }
+            // !(!A) -> A
+            if (auto* child_op = dyn_cast<Operation>(child_expr)) {
+                if (child_op->type() == OperationType::logical_not && child_op->operands().size() == 1) {
+                    return child_op->operands()[0];
+                }
+                // De Morgan's Laws: !(A && B) -> !A || !B
+                if (child_op->type() == OperationType::logical_and || child_op->type() == OperationType::logical_or) {
+                    auto new_type = (child_op->type() == OperationType::logical_and) 
+                        ? OperationType::logical_or 
+                        : OperationType::logical_and;
+                    
+                    std::vector<Expression*> new_ops;
+                    for (Expression* c : child_op->operands()) {
+                        SmallVector<Expression*, 4> not_ops; not_ops.push_back(c);
+                        auto* not_c = task.arena().create<Operation>(OperationType::logical_not, std::move(not_ops), 1);
+                        new_ops.push_back(simplify_expression_tree(task, not_c)); // Recursive simplification!
+                    }
+                    SmallVector<Expression*, 4> small_new_ops(std::move(new_ops));
+                    return task.arena().create<Operation>(new_type, std::move(small_new_ops), 1);
+                }
+            }
+        }
     }
 
     if (op->operands().size() == 2) {
@@ -2936,6 +3209,7 @@ void ExpressionSimplificationStage::execute(DecompilerTask& task) {
         for (Instruction* inst : block->instructions()) {
             simplify_instruction_constants(task, inst);
         }
+        (void)collapse_linear_offset_chains(task, block);
     }
 }
 
@@ -3179,6 +3453,62 @@ void EdgePrunerStage::execute(DecompilerTask& task) {
             changed = apply_edge_pruner_candidate(task, block, *candidate, temp_counter);
         }
     }
+}
+
+void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
+    if (!task.ast()) return;
+
+    auto simplify_expr = [&](Expression* expr) -> Expression* {
+        if (!expr) return nullptr;
+        Expression* simplified = simplify_expression_tree(task, expr);
+        return simplified;
+    };
+
+    std::function<void(AstNode*)> traverse = [&](AstNode* node) {
+        if (!node) return;
+
+        if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+            if (code->block()) {
+                for (Instruction* inst : code->block()->instructions()) {
+                    simplify_instruction_constants(task, inst);
+                }
+            }
+        } else if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
+            if (auto* expr_ast = ast_dyn_cast<ExprAstNode>(ifn->cond())) {
+                Expression* simpl = simplify_expr(expr_ast->expr());
+                if (simpl != expr_ast->expr()) {
+                    ifn->set_cond(task.arena().create<ExprAstNode>(simpl));
+                }
+            }
+            traverse(ifn->true_branch());
+            traverse(ifn->false_branch());
+        } else if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+            if (auto* wh = ast_dyn_cast<WhileLoopNode>(loop)) {
+                Expression* simpl = simplify_expr(wh->condition());
+                if (simpl != wh->condition()) {
+                    wh->set_condition(simpl);
+                }
+            } else if (auto* dw = ast_dyn_cast<DoWhileLoopNode>(loop)) {
+                Expression* simpl = simplify_expr(dw->condition());
+                if (simpl != dw->condition()) {
+                    dw->set_condition(simpl);
+                }
+            }
+            traverse(loop->body());
+        } else if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+            for (auto* child : seq->nodes()) {
+                traverse(child);
+            }
+        } else if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+            for (auto* case_node : sw->cases()) {
+                if (auto* c = ast_dyn_cast<CaseNode>(case_node)) {
+                    traverse(c->body());
+                }
+            }
+        }
+    };
+
+    if (task.ast()) traverse(task.ast()->root());
 }
 
 } // namespace aletheia

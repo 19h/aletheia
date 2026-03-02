@@ -458,6 +458,70 @@ bool is_comment_line(std::string_view text) {
     return text.starts_with("/*") && text.ends_with("*/");
 }
 
+std::string block_label(BasicBlock* block) {
+    if (!block) {
+        return "bb_null";
+    }
+    return "bb_" + std::to_string(block->id());
+}
+
+std::pair<Edge*, Edge*> pick_true_false_edges(BasicBlock* block) {
+    Edge* true_edge = nullptr;
+    Edge* false_edge = nullptr;
+    if (!block) {
+        return {nullptr, nullptr};
+    }
+
+    for (Edge* edge : block->successors()) {
+        if (!edge) {
+            continue;
+        }
+        if (edge->type() == EdgeType::True) {
+            true_edge = edge;
+        } else if (edge->type() == EdgeType::False) {
+            false_edge = edge;
+        }
+    }
+
+    if ((!true_edge || !false_edge) && block->successors().size() == 2) {
+        if (!true_edge) {
+            true_edge = block->successors()[0];
+        }
+        if (!false_edge) {
+            false_edge = block->successors()[1];
+            if (false_edge == true_edge) {
+                false_edge = block->successors()[0] == true_edge
+                    ? block->successors()[1]
+                    : block->successors()[0];
+            }
+        }
+    }
+
+    return {true_edge, false_edge};
+}
+
+bool is_cfg_fallback_root(AstNode* root) {
+    if (!root) {
+        return false;
+    }
+
+    if (ast_dyn_cast<CodeNode>(root)) {
+        return true;
+    }
+
+    auto* seq = ast_dyn_cast<SeqNode>(root);
+    if (!seq || seq->nodes().empty()) {
+        return false;
+    }
+
+    for (AstNode* child : seq->nodes()) {
+        if (!ast_dyn_cast<CodeNode>(child)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string format_unknown_operation(Operation* o, CExpressionGenerator& gen, std::string_view placeholder_name) {
     std::string rendered = std::string(placeholder_name) + "(";
     if (o != nullptr) {
@@ -836,6 +900,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     lines_.clear();
     current_line_.clear();
     indent_level_ = 0;
+    cfg_fallback_mode_ = false;
 
     // Set up parameter display name mapping for the expression generator.
     {
@@ -902,6 +967,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     }
 
     if (task.ast() && task.ast()->root()) {
+        cfg_fallback_mode_ = is_cfg_fallback_root(task.ast()->root());
         visit_node(task.ast()->root());
     }
 
@@ -920,8 +986,10 @@ std::vector<std::string> CodeVisitor::generate_code(AbstractSyntaxForest* forest
     lines_.clear();
     current_line_.clear();
     indent_level_ = 0;
+    cfg_fallback_mode_ = false;
 
     if (forest && forest->root()) {
+        cfg_fallback_mode_ = is_cfg_fallback_root(forest->root());
         visit_node(forest->root());
     }
 
@@ -938,18 +1006,49 @@ void CodeVisitor::visit_node(AstNode* node) {
     if (CodeNode* cnode = ast_dyn_cast<CodeNode>(node)) {
         BasicBlock* block = cnode->block();
         if (block) {
+            if (cfg_fallback_mode_) {
+                const int label_indent = indent_level_ > 0 ? indent_level_ - 1 : 0;
+                lines_.push_back(std::string(label_indent * 4, ' ') + block_label(block) + ":");
+            }
+
             for (Instruction* inst : block->instructions()) {
                 indent();
 
                 if (auto* branch = dyn_cast<Branch>(inst)) {
-                    current_line_ += "/* branch if (" + expr_gen_.generate(branch->condition()) + ") */";
+                    if (cfg_fallback_mode_) {
+                        auto [true_edge, false_edge] = pick_true_false_edges(block);
+                        const std::string cond = expr_gen_.generate(branch->condition());
+                        if (true_edge && false_edge) {
+                            current_line_ += "if (" + cond + ") goto " + block_label(true_edge->target())
+                                + "; else goto " + block_label(false_edge->target()) + ";";
+                        } else if (true_edge) {
+                            current_line_ += "if (" + cond + ") goto " + block_label(true_edge->target()) + ";";
+                        } else if (false_edge) {
+                            current_line_ += "if (!(" + cond + ")) goto " + block_label(false_edge->target()) + ";";
+                        } else {
+                            current_line_ += "/* branch if (" + cond + ") */";
+                        }
+                    } else {
+                        current_line_ += "/* branch if (" + expr_gen_.generate(branch->condition()) + ") */";
+                    }
                     lines_.push_back(current_line_);
                     current_line_.clear();
                     continue;
                 }
 
                 if (auto* indirect = dyn_cast<IndirectBranch>(inst)) {
-                    current_line_ += "/* indirect branch " + expr_gen_.generate(indirect->expression()) + " */";
+                    current_line_ += "/* indirect branch " + expr_gen_.generate(indirect->expression());
+                    if (cfg_fallback_mode_ && !block->successors().empty()) {
+                        current_line_ += " -> ";
+                        for (std::size_t i = 0; i < block->successors().size(); ++i) {
+                            if (i > 0) {
+                                current_line_ += ", ";
+                            }
+                            Edge* edge = block->successors()[i];
+                            current_line_ += block_label(edge ? edge->target() : nullptr);
+                        }
+                    }
+                    current_line_ += " */";
                     lines_.push_back(current_line_);
                     current_line_.clear();
                     continue;
@@ -963,6 +1062,36 @@ void CodeVisitor::visit_node(AstNode* node) {
                     }
                     lines_.push_back(current_line_);
                     current_line_.clear();
+                }
+            }
+
+            if (cfg_fallback_mode_ && !block->instructions().empty()) {
+                Instruction* tail = block->instructions().back();
+                const bool has_explicit_flow =
+                    isa<Branch>(tail) ||
+                    isa<IndirectBranch>(tail) ||
+                    isa<Return>(tail) ||
+                    isa<BreakInstr>(tail) ||
+                    isa<ContinueInstr>(tail);
+
+                if (!has_explicit_flow) {
+                    Edge* next_edge = nullptr;
+                    for (Edge* edge : block->successors()) {
+                        if (!edge) {
+                            continue;
+                        }
+                        if (edge->type() == EdgeType::Unconditional || edge->type() == EdgeType::Fallthrough) {
+                            next_edge = edge;
+                            break;
+                        }
+                    }
+
+                    if (next_edge) {
+                        indent();
+                        current_line_ += "goto " + block_label(next_edge->target()) + ";";
+                        lines_.push_back(current_line_);
+                        current_line_.clear();
+                    }
                 }
             }
         }

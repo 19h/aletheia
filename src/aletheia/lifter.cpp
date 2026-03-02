@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <unordered_map>
@@ -609,6 +610,81 @@ void Lifter::tag_variable(Variable* var, ida::Address insn_addr) const {
             var->set_stack_offset(offset);
         } catch (...) {}
     }
+}
+
+Variable* Lifter::resolve_sp_relative_slot(ida::Address insn_addr,
+                                           std::int64_t sp_adjust_bytes,
+                                           std::size_t access_size) {
+    const std::size_t width = access_size > 0 ? access_size : static_cast<std::size_t>(8);
+
+    std::int64_t fp_offset = 0;
+    bool have_fp_offset = false;
+
+    if (frame_layout_.valid) {
+        auto sp_delta = ida::function::sp_delta_at(insn_addr);
+        if (sp_delta.has_value()) {
+            const auto fp_base = static_cast<std::int64_t>(
+                frame_layout_.local_size + frame_layout_.regs_size);
+            fp_offset = *sp_delta + sp_adjust_bytes + fp_base;
+            have_fp_offset = true;
+        }
+    }
+
+    std::string slot_name;
+    if (have_fp_offset) {
+        if (auto resolved = resolve_frame_variable(fp_offset, width)) {
+            slot_name = *resolved;
+        }
+    }
+
+    auto abs_i64 = [](std::int64_t value) -> std::uint64_t {
+        return value < 0
+            ? static_cast<std::uint64_t>(-(value + 1)) + 1ULL
+            : static_cast<std::uint64_t>(value);
+    };
+
+    if (slot_name.empty()) {
+        if (have_fp_offset) {
+            const std::uint64_t abs_off = abs_i64(fp_offset);
+            if (fp_offset < 0) {
+                slot_name = "local_" + std::to_string(abs_off);
+            } else if (fp_offset > 0) {
+                slot_name = "arg_" + std::to_string(abs_off);
+            } else {
+                slot_name = "local_0";
+            }
+        } else {
+            std::int64_t sp_key = sp_adjust_bytes;
+            if (auto sp_delta = ida::function::sp_delta_at(insn_addr); sp_delta.has_value()) {
+                sp_key += *sp_delta;
+            }
+            const std::uint64_t abs_off = abs_i64(sp_key);
+            slot_name = sp_key < 0
+                ? "sp_local_" + std::to_string(abs_off)
+                : "sp_arg_" + std::to_string(abs_off);
+        }
+    }
+
+    auto* slot = arena_.create<Variable>(slot_name, width);
+    slot->set_aliased(true);
+
+    if (have_fp_offset) {
+        slot->set_stack_offset(fp_offset);
+        slot->set_kind(fp_offset >= 0 ? VariableKind::StackArgument : VariableKind::StackLocal);
+
+        auto it = frame_layout_.offset_to_var.find(fp_offset);
+        if (it != frame_layout_.offset_to_var.end() && it->second.byte_size > 0) {
+            slot->set_ir_type(std::make_shared<Integer>(it->second.byte_size * 8, false));
+        }
+    } else {
+        slot->set_kind(VariableKind::StackLocal);
+    }
+
+    if (!slot->ir_type()) {
+        slot->set_ir_type(std::make_shared<Integer>(width * 8, false));
+    }
+
+    return slot;
 }
 
 ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
@@ -1410,21 +1486,26 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // x86 PUSH/POP -- stack operations (approximate)
     // =====================================================================
     if (lmnem == "push" && !operands.empty()) {
-        // push src -> [rsp] = src; rsp -= 8
-        // Approximate: just record the assignment to a stack slot
-        auto* rsp = arena_.create<Variable>("rsp", 8);
-        auto* deref = arena_.create<Operation>(OperationType::deref,
-            std::vector<Expression*>{rsp}, operands[0]->size_bytes);
-        auto* assign = arena_.create<Assignment>(deref, operands[0]);
+        // push src writes to [rsp - width] after stack-pointer decrement.
+        // Prefer a named stack slot over raw dereference to reduce `*(rsp)` noise.
+        const std::size_t push_width = operands[0]->size_bytes > 0
+            ? operands[0]->size_bytes
+            : static_cast<std::size_t>(8);
+        auto* slot = resolve_sp_relative_slot(
+            addr,
+            -static_cast<std::int64_t>(push_width),
+            push_width);
+        auto* assign = arena_.create<Assignment>(slot, operands[0]);
         assign->set_address(addr);
         return assign;
     }
     if (lmnem == "pop" && !operands.empty()) {
-        // pop dest -> dest = [rsp]; rsp += 8
-        auto* rsp = arena_.create<Variable>("rsp", 8);
-        auto* deref = arena_.create<Operation>(OperationType::deref,
-            std::vector<Expression*>{rsp}, operands[0]->size_bytes);
-        auto* assign = arena_.create<Assignment>(operands[0], deref);
+        // pop dest reads from [rsp] before stack-pointer increment.
+        const std::size_t pop_width = operands[0]->size_bytes > 0
+            ? operands[0]->size_bytes
+            : static_cast<std::size_t>(8);
+        auto* slot = resolve_sp_relative_slot(addr, 0, pop_width);
+        auto* assign = arena_.create<Assignment>(operands[0], slot);
         assign->set_address(addr);
         return assign;
     }

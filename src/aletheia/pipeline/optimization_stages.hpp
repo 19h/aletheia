@@ -87,4 +87,11 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+
+class AstExpressionSimplificationStage : public PipelineStage {
+public:
+    const char* name() const override { return "AstExpressionSimplification"; }
+    void execute(DecompilerTask& task) override;
+};
+
 } // namespace aletheia

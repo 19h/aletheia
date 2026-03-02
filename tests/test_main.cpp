@@ -1674,7 +1674,17 @@ void test_codegen_fallback_branch_marker() {
         1);
 
     auto* bb = arena.create<aletheia::BasicBlock>(173);
+    auto* bb_true = arena.create<aletheia::BasicBlock>(174);
+    auto* bb_false = arena.create<aletheia::BasicBlock>(175);
+
     bb->add_instruction(arena.create<aletheia::Branch>(cond));
+
+    auto* e_true = arena.create<aletheia::Edge>(bb, bb_true, aletheia::EdgeType::True);
+    auto* e_false = arena.create<aletheia::Edge>(bb, bb_false, aletheia::EdgeType::False);
+    bb->add_successor(e_true);
+    bb->add_successor(e_false);
+    bb_true->add_predecessor(e_true);
+    bb_false->add_predecessor(e_false);
 
     auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
     forest->set_root(arena.create<aletheia::CodeNode>(bb));
@@ -1682,19 +1692,21 @@ void test_codegen_fallback_branch_marker() {
     aletheia::CodeVisitor visitor;
     auto lines = visitor.generate_code(forest);
 
+    bool has_conditional_goto = false;
     bool has_comment_marker = false;
-    bool has_empty_if = false;
     for (const auto& line : lines) {
+        if (line.find("if (") != std::string::npos &&
+            line.find("goto bb_174") != std::string::npos &&
+            line.find("goto bb_175") != std::string::npos) {
+            has_conditional_goto = true;
+        }
         if (line.find("/* branch if (") != std::string::npos) {
             has_comment_marker = true;
         }
-        if (line.find("if (") != std::string::npos && line.find(");") != std::string::npos) {
-            has_empty_if = true;
-        }
     }
 
-    ASSERT_TRUE(has_comment_marker);
-    ASSERT_TRUE(!has_empty_if);
+    ASSERT_TRUE(has_conditional_goto);
+    ASSERT_TRUE(!has_comment_marker);
 
     std::cout << "[+] test_codegen_fallback_branch_marker passed.\n";
 }
@@ -3722,6 +3734,7 @@ void test_expression_simplification_collapse_nested_constants() {
     auto* y = task.arena().create<Variable>("y", 4);
     auto* out_add = task.arena().create<Variable>("out_add", 4);
     auto* out_mul = task.arena().create<Variable>("out_mul", 4);
+    auto* out_sub = task.arena().create<Variable>("out_sub", 4);
 
     auto* inner_add = task.arena().create<Operation>(
         OperationType::add,
@@ -3741,11 +3754,22 @@ void test_expression_simplification_collapse_nested_constants() {
         std::vector<Expression*>{task.arena().create<Constant>(8, 4), inner_mul},
         4);
 
+    auto* inner_sub = task.arena().create<Operation>(
+        OperationType::sub,
+        std::vector<Expression*>{x, task.arena().create<Constant>(3, 4)},
+        4);
+    auto* nested_sub = task.arena().create<Operation>(
+        OperationType::sub,
+        std::vector<Expression*>{inner_sub, task.arena().create<Constant>(5, 4)},
+        4);
+
     auto* add_assign = task.arena().create<Assignment>(out_add, nested_add);
     auto* mul_assign = task.arena().create<Assignment>(out_mul, nested_mul);
+    auto* sub_assign = task.arena().create<Assignment>(out_sub, nested_sub);
 
     bb->add_instruction(add_assign);
     bb->add_instruction(mul_assign);
+    bb->add_instruction(sub_assign);
 
     ExpressionSimplificationStage stage;
     stage.execute(task);
@@ -3766,7 +3790,74 @@ void test_expression_simplification_collapse_nested_constants() {
     ASSERT_TRUE(mul_const != nullptr);
     ASSERT_EQ(mul_const->value(), 32);
 
+    auto* sub_value = dyn_cast<Operation>(sub_assign->value());
+    ASSERT_TRUE(sub_value != nullptr);
+    ASSERT_EQ(sub_value->type(), OperationType::sub);
+    ASSERT_TRUE(sub_value->operands()[0] == x);
+    auto* sub_const = dyn_cast<Constant>(sub_value->operands()[1]);
+    ASSERT_TRUE(sub_const != nullptr);
+    ASSERT_EQ(sub_const->value(), 8);
+
     std::cout << "[+] test_expression_simplification_collapse_nested_constants passed.\n";
+}
+
+void test_expression_simplification_linear_sub_chain() {
+    DecompilerTask task(0x7710);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(741);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* base = task.arena().create<Variable>("rsp_base", 8);
+    auto* t1 = task.arena().create<Variable>("t1", 8);
+    auto* t2 = task.arena().create<Variable>("t2", 8);
+    auto* t3 = task.arena().create<Variable>("t3", 8);
+
+    auto* a1 = task.arena().create<Assignment>(
+        t1,
+        task.arena().create<Operation>(
+            OperationType::sub,
+            std::vector<Expression*>{base, task.arena().create<Constant>(0x40, 8)},
+            8));
+    auto* a2 = task.arena().create<Assignment>(
+        t2,
+        task.arena().create<Operation>(
+            OperationType::sub,
+            std::vector<Expression*>{t1, task.arena().create<Constant>(0x40, 8)},
+            8));
+    auto* a3 = task.arena().create<Assignment>(
+        t3,
+        task.arena().create<Operation>(
+            OperationType::sub,
+            std::vector<Expression*>{t2, task.arena().create<Constant>(0x40, 8)},
+            8));
+
+    bb->add_instruction(a1);
+    bb->add_instruction(a2);
+    bb->add_instruction(a3);
+
+    ExpressionSimplificationStage stage;
+    stage.execute(task);
+
+    auto* t2_value = dyn_cast<Operation>(a2->value());
+    ASSERT_TRUE(t2_value != nullptr);
+    ASSERT_EQ(t2_value->type(), OperationType::sub);
+    ASSERT_TRUE(t2_value->operands()[0] == base);
+    auto* t2_const = dyn_cast<Constant>(t2_value->operands()[1]);
+    ASSERT_TRUE(t2_const != nullptr);
+    ASSERT_EQ(t2_const->value(), 0x80);
+
+    auto* t3_value = dyn_cast<Operation>(a3->value());
+    ASSERT_TRUE(t3_value != nullptr);
+    ASSERT_EQ(t3_value->type(), OperationType::sub);
+    ASSERT_TRUE(t3_value->operands()[0] == base);
+    auto* t3_const = dyn_cast<Constant>(t3_value->operands()[1]);
+    ASSERT_TRUE(t3_const != nullptr);
+    ASSERT_EQ(t3_const->value(), 0xC0);
+
+    std::cout << "[+] test_expression_simplification_linear_sub_chain passed.\n";
 }
 
 void test_dead_component_pruner_stage() {
@@ -5123,6 +5214,7 @@ int main() {
     test_expression_simplification_trivial_bit_arithmetic();
     test_expression_simplification_sub_to_add();
     test_expression_simplification_collapse_nested_constants();
+    test_expression_simplification_linear_sub_chain();
     test_dead_component_pruner_stage();
     test_redundant_casts_elimination_stage();
     test_coherence_stage();

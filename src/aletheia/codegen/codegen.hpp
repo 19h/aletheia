@@ -58,6 +58,7 @@ private:
     std::vector<std::string> lines_;
     std::string current_line_;
     int indent_level_ = 0;
+    bool cfg_fallback_mode_ = false;
     CExpressionGenerator expr_gen_;
 };
 

@@ -1,4 +1,5 @@
 #include "loop_structurer.hpp"
+#include "ast_processor.hpp"
 #include <algorithm>
 #include <unordered_set>
 
@@ -306,7 +307,7 @@ LoopStructuringRule* LoopStructurer::match_rule(LoopNode* loop) {
 }
 
 AstNode* LoopStructurer::refine_loop(DecompilerArena& arena, LoopNode* loop) {
-    AstNode* current = loop;
+    AstNode* current = AstProcessor::preprocess_loop(arena, loop);
 
     // Iterate: apply a matching rule, then re-check. The rule may produce
     // a new root that is still a loop needing further refinement.
@@ -319,7 +320,7 @@ AstNode* LoopStructurer::refine_loop(DecompilerArena& arena, LoopNode* loop) {
         current = rule->restructure(arena, loop_node);
     }
 
-    return current;
+    return AstProcessor::postprocess_loop(arena, current);
 }
 
 } // namespace aletheia

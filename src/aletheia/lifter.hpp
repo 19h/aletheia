@@ -72,6 +72,12 @@ private:
 
     /// Tag a Variable with stack/parameter metadata based on its name and context.
     void tag_variable(Variable* var, ida::Address insn_addr) const;
+
+    /// Resolve an SP-relative implicit stack slot (e.g., push/pop) into a named variable.
+    /// sp_adjust_bytes is applied relative to SP at insn address (negative for push writes).
+    Variable* resolve_sp_relative_slot(ida::Address insn_addr,
+                                       std::int64_t sp_adjust_bytes,
+                                       std::size_t access_size);
 };
 
 } // namespace aletheia

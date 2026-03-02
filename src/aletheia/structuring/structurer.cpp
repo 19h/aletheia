@@ -1,4 +1,5 @@
 #include "structurer.hpp"
+#include "ast_processor.hpp"
 #include "loop_structurer.hpp"
 #include "reachability.hpp"
 #include "../ssa/dominators.hpp"
@@ -621,9 +622,9 @@ void AcyclicRegionRestructurer::restructure_region(TransitionCFG* t_cfg, Transit
     }
 
     // 4. Condition-Based Refinement (CBR) - De Morgan's Law Application & Branch Synthesis
-    AstNode* cbr_root = seq;
+    AstNode* cbr_root = AstProcessor::preprocess_acyclic(arena_, seq);
     if (!env_flag_enabled("ALETHEIA_DISABLE_CBR")) {
-        cbr_root = ConditionBasedRefinement::refine(arena_, ctx, seq, reaching_conditions);
+        cbr_root = ConditionBasedRefinement::refine(arena_, ctx, cbr_root, reaching_conditions);
     }
 
     // 5. Condition-Aware Refinement (CAR) - Switch Statement Extraction
@@ -631,6 +632,8 @@ void AcyclicRegionRestructurer::restructure_region(TransitionCFG* t_cfg, Transit
     if (!env_flag_enabled("ALETHEIA_DISABLE_CAR")) {
         car_root = ConditionAwareRefinement::refine(arena_, ctx, cbr_root, reaching_conditions);
     }
+
+    car_root = AstProcessor::postprocess_acyclic(arena_, car_root);
 
     if (header) {
         header->set_ast_node(car_root);
