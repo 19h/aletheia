@@ -574,18 +574,8 @@ AstNode* refine_sequence_once(
 
                     while (i < nodes.size()) {
                         AstNode* next_node = nodes[i];
-                        TransitionBlock* matching_tb = nullptr;
-
-                        for (const auto& [tb, cond] : reaching_conditions) {
-                            (void)cond;
-                            if (tb == nullptr || next_node == nullptr) {
-                                continue;
-                            }
-                            if (ast_node_matches_transition_block(next_node, tb)) {
-                                matching_tb = tb;
-                                break;
-                            }
-                        }
+                        TransitionBlock* matching_tb =
+                            transition_block_for_ast_node(reaching_conditions, next_node);
 
                         if (matching_tb) {
                             const auto& rc = reaching_conditions.at(matching_tb);
