@@ -791,12 +791,12 @@ void CExpressionGenerator::visit(Operation* o) {
 
 void CExpressionGenerator::visit(Call* c) {
     std::string func = generate(c->target());
-    result_ = func + "(";
+    std::string args;
     for (size_t i = 0; i < c->arg_count(); ++i) {
-        if (i > 0) result_ += ", ";
-        result_ += generate(c->arg(i));
+        if (i > 0) args += ", ";
+        args += generate(c->arg(i));
     }
-    result_ += ")";
+    result_ = func + "(" + args + ")";
 }
 
 void CExpressionGenerator::visit(Condition* c) {

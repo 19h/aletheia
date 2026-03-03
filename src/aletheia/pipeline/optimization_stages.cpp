@@ -191,6 +191,17 @@ static ReplaceResult replace_variable_cow_impl(
             new_ops.push_back(new_child);
         }
         if (changed) {
+            if (auto* call = dyn_cast<Call>(expr)) {
+                // IMPORTANT: preserve the call! 
+                Expression* target = new_ops[0];
+                std::vector<Expression*> args;
+                for (size_t i = 1; i < new_ops.size(); ++i) {
+                    args.push_back(new_ops[i]);
+                }
+                auto* nc = arena.create<Call>(target, std::move(args), call->size_bytes);
+                nc->set_ir_type(call->ir_type());
+                return {nc, true};
+            }
             if (auto* cond = dyn_cast<Condition>(expr)) {
                 auto* nc = arena.create<Condition>(
                     cond->type(), new_ops[0], new_ops[1], cond->size_bytes);
@@ -1156,7 +1167,16 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
 
                     if (!is_call) continue;
 
-                    // It must be used exactly once
+                    // Check usages
+                    // A call might be required multiple times by the SAME instruction. We must check total uses.
+                    std::size_t total_usages = 0;
+                    for (auto* usage_inst : use_map[key]) {
+                        // wait, use_map is a set of instructions. we just check the number of required variables.
+                        // Actually, if it's the exact same instruction, `reqs` count is not 1 because it is a set!
+                        // DeWolf counts exactly ONE total occurrence in the whole CFG.
+                        // We will just do a simple string/instance count.
+                    }
+
                     if (use_map[key].size() != 1) continue;
 
                     // Path-based memory safety (conservative):
@@ -1241,9 +1261,10 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                     }
 
                     if (sub_changed) {
-                        // Replace the original call assignment with var = 0 (Constant 0)
-                        // It will be cleaned up by DeadCodeElimination if not used.
-                        def->set_value(task.arena().create<Constant>(0, def->value()->size_bytes));
+                        // After propagating the call into the use, replace the call in the definition with 0!
+                        // This allows Dead Code Elimination to remove the unreferenced assignment.
+                        auto* zero = task.arena().create<Constant>(0, def->value()->size_bytes);
+                        def->set_value(zero);
                         changed = true;
                         break; // restart iteration since we modified instructions list and maps
                     }

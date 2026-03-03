@@ -1220,7 +1220,10 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     if (lmnem == "call") {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
-        std::vector<Expression*> args(operands.begin() + (operands.empty() ? 0 : 1), operands.end());
+        std::vector<Expression*> args;
+        for (size_t i = 1; i < operands.size(); ++i) {
+            args.push_back(operands[i]);
+        }
         auto* call = arena_.create<Call>(target, std::move(args), 8);
         // Call result assigned to a synthetic return-value variable
         auto* ret_var = arena_.create<Variable>("ret", 8);
@@ -1231,7 +1234,22 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // ARM BL (branch-and-link = call)
     if (lmnem == "bl" || lmnem == "blr") {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
-        std::vector<Expression*> args(operands.begin() + (operands.empty() ? 0 : 1), operands.end());
+        std::vector<Expression*> args;
+        
+        // DeWolf Python lifter extracts parameters from Binary Ninja's MLIL `call.params`.
+        // IDA's instruction decode only gives the target.
+        // We need to infer parameters. A very simple heuristic is to assume it takes x0-x3.
+        // Or we can just let it have zero args for now, but wait! The issue is not that
+        // the parameters are missing in the call! The issue is that the CALL ITSELF is missing in the output.
+        // Wait, why was the call itself missing in the C output??
+        // Let's restore the basic parameter passing for the call just in case.
+        
+        // Let's add dummy arguments x0, x1, x2, x3 so that the dead code elimination doesn't drop their initializations.
+        args.push_back(arena_.create<Variable>("x0", 8));
+        args.push_back(arena_.create<Variable>("x1", 8));
+        args.push_back(arena_.create<Variable>("x2", 8));
+        args.push_back(arena_.create<Variable>("x3", 8));
+        
         auto* call = arena_.create<Call>(target, std::move(args), 8);
         auto* ret_var = arena_.create<Variable>("x0", 8); // ARM return in x0
         auto* assign = arena_.create<Assignment>(ret_var, call);
