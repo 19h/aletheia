@@ -612,13 +612,30 @@ bool is_cfg_fallback_root(AstNode* root) {
         return false;
     }
 
-    if (ast_dyn_cast<CodeNode>(root)) {
+    if (auto* cnode = ast_dyn_cast<CodeNode>(root)) {
+        // A single CodeNode with no successors (straight-line function body)
+        // does not need fallback labels. Only enter fallback mode when the
+        // block has branches requiring goto targets.
+        auto* block = cnode->block();
+        if (block && block->successors().empty()) {
+            return false;
+        }
         return true;
     }
 
     auto* seq = ast_dyn_cast<SeqNode>(root);
     if (!seq || seq->nodes().empty()) {
         return false;
+    }
+
+    // A sequence with a single no-successor CodeNode doesn't need labels either.
+    if (seq->nodes().size() == 1) {
+        if (auto* cnode = ast_dyn_cast<CodeNode>(seq->nodes()[0])) {
+            auto* block = cnode->block();
+            if (block && block->successors().empty()) {
+                return false;
+            }
+        }
     }
 
     for (AstNode* child : seq->nodes()) {

@@ -2811,10 +2811,22 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             case OperationType::bit_or:
                 if (is_constant_value(lhs_expr, 0)) return rhs_expr;
                 if (is_constant_value(rhs_expr, 0)) return lhs_expr;
+                if (is_all_ones_constant(lhs_expr, op->size_bytes) || is_all_ones_constant(rhs_expr, op->size_bytes)) {
+                    return make_simplified_constant(task, op,
+                        (op->size_bytes >= 8) ? ~0ULL : ((1ULL << (op->size_bytes * 8)) - 1));
+                }
+                // x | x -> x (idempotent)
+                if (expr_fingerprint(lhs_expr) == expr_fingerprint(rhs_expr)) {
+                    return lhs_expr;
+                }
                 break;
             case OperationType::bit_xor:
                 if (is_constant_value(lhs_expr, 0)) return rhs_expr;
                 if (is_constant_value(rhs_expr, 0)) return lhs_expr;
+                // x ^ x -> 0 (self-cancellation)
+                if (expr_fingerprint(lhs_expr) == expr_fingerprint(rhs_expr)) {
+                    return make_simplified_constant(task, op, 0);
+                }
                 break;
             default:
                 break;

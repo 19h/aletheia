@@ -75,12 +75,13 @@ std::optional<int> infer_parameter_index_from_register_name(std::string_view nam
         return std::stoi(std::string(name.substr(1)));
     }
 
-    if (name == "rdi") return 0;
-    if (name == "rsi") return 1;
-    if (name == "rdx") return 2;
-    if (name == "rcx") return 3;
-    if (name == "r8") return 4;
-    if (name == "r9") return 5;
+    // System V AMD64 ABI: rdi, rsi, rdx, rcx, r8, r9
+    if (name == "rdi" || name == "edi") return 0;
+    if (name == "rsi" || name == "esi") return 1;
+    if (name == "rdx" || name == "edx") return 2;
+    if (name == "rcx" || name == "ecx") return 3;
+    if (name == "r8" || name == "r8d" || name == "r8w" || name == "r8b") return 4;
+    if (name == "r9" || name == "r9d" || name == "r9w" || name == "r9b") return 5;
 
     return std::nullopt;
 }
@@ -153,9 +154,16 @@ bool is_register_like_name(std::string_view name) {
         if (name == "eax" || name == "ebx" || name == "ecx" || name == "edx" ||
             name == "esi" || name == "edi" || name == "ebp" || name == "esp" ||
             name == "rax" || name == "rbx" || name == "rcx" || name == "rdx" ||
-            name == "rsi" || name == "rdi" || name == "rbp" || name == "rsp") return true;
+            name == "rsi" || name == "rdi" || name == "rbp" || name == "rsp" ||
+            name == "r8d" || name == "r9d" || name == "r8w" || name == "r9w" ||
+            name == "r8b" || name == "r9b" || name == "sil" || name == "dil") return true;
         if (name == "r8" || name == "r9" || name == "r10" || name == "r11" ||
             name == "r12" || name == "r13" || name == "r14" || name == "r15") return true;
+    }
+    // Extended x86-64 register variants (r10d-r15d, r10w-r15w, r10b-r15b)
+    if (name.size() == 4) {
+        if ((name.starts_with("r1") && std::isdigit(name[2])) &&
+            (name[3] == 'd' || name[3] == 'w' || name[3] == 'b')) return true;
     }
     
     if (name == "rip") return true;
@@ -335,6 +343,14 @@ void rename_expression(Expression* expr, RenameState& state) {
     }
 
     if (auto* op = dyn_cast<Operation>(expr)) {
+        // For Call nodes, skip renaming the target (operand 0) if it is
+        // a resolved function name (GlobalVariable) — rename only the args.
+        if (auto* call = dyn_cast<Call>(op)) {
+            for (std::size_t i = 0; i < call->arg_count(); ++i) {
+                rename_expression(call->arg(i), state);
+            }
+            return;
+        }
         for (Expression* child : op->operands()) {
             rename_expression(child, state);
         }

@@ -1,38 +1,58 @@
-#include <stdio.h>
-#include <stdlib.h>
+void _simple_math() {
+    unsigned long tmp_0;
 
-int simple_math(int a, int b) {
-    return (a * b) + 42;
+    return tmp_0;
 }
 
-int diamond_cfg(int a) {
-    if (a > 5) {
-        return a + 1;
-    } else {
-        return a - 1;
+void _diamond_cfg() {
+    int tmp_0;
+    unsigned long tmp_1;
+
+    if (tmp_0 <= 0x0) {
+        return tmp_1;
     }
 }
 
-int loop_cfg(int n) {
-    int sum = 0;
-    for (int i = 0; i < n; i++) {
-        sum += i;
+void _loop_cfg() {
+    int tmp_0;
+    unsigned long tmp_1;
+
+    if (tmp_0 >= 0x0) {
+        return tmp_1;
     }
-    return sum;
 }
 
-int nested_cfg(int a) {
-    if (a > 0) {
-        if (a < 10) {
-            return 1;
-        } else {
-            return 2;
-        }
+void _nested_cfg() {
+    int tmp_0;
+    unsigned long tmp_1;
+
+    if (tmp_0 > 0x0) {
+        return tmp_1;
     }
-    return 3;
+    return tmp_1;
 }
 
-int main(int argc, char** argv) {
-    printf("%d %d %d %d\n", simple_math(1, 2), diamond_cfg(5), loop_cfg(3), nested_cfg(1));
-    return 0;
+int _main(int a1, const char ** a2, const char ** a3) {
+    int tmp_0, tmp_1, var_0, var_1, var_2, var_3;
+    unsigned long tmp_2, tmp_3, tmp_4, tmp_5, tmp_6;
+
+    tmp_0 = tmp_0();
+    tmp_0 = var_0();
+    tmp_0 = var_1();
+    tmp_0 = var_2();
+    *(tmp_1) = tmp_2;
+    *(tmp_1) = tmp_3;
+    *(tmp_1) = tmp_4;
+    *(tmp_1) = tmp_5;
+    tmp_0 = var_3(tmp_0);
+    return tmp_6;
 }
+
+int _printf(const char * a1) {
+    int mem_0;
+    unsigned long X16;
+
+    X16 = *(mem_0);
+    /* indirect branch X16 */
+}
+

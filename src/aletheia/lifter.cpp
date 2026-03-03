@@ -5,6 +5,7 @@
 #include <ida/type.hpp>
 #include <ida/segment.hpp>
 #include <ida/xref.hpp>
+#include <ida/name.hpp>
 #include <array>
 #include <algorithm>
 #include <cctype>
@@ -1788,6 +1789,22 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     if (lmnem == "call" || lmnem == "callq") {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
+        // Resolve constant (address) call targets to symbol names.
+        // Use GlobalVariable so variable renaming won't overwrite the name.
+        if (auto* c = dyn_cast<Constant>(target)) {
+            const auto target_addr = static_cast<ida::Address>(c->value());
+            auto name_res = ida::name::get(target_addr);
+            if (name_res && !name_res->empty()) {
+                target = arena_.create<GlobalVariable>(sanitize_identifier(*name_res), 8,
+                    arena_.create<Constant>(c->value(), 8), false);
+            } else {
+                auto func_name_res = ida::function::name_at(target_addr);
+                if (func_name_res && !func_name_res->empty()) {
+                    target = arena_.create<GlobalVariable>(sanitize_identifier(*func_name_res), 8,
+                        arena_.create<Constant>(c->value(), 8), false);
+                }
+            }
+        }
         std::vector<Expression*> args;
         for (size_t i = 1; i < operands.size(); ++i) {
             args.push_back(operands[i]);
@@ -1802,26 +1819,42 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // ARM BL (branch-and-link = call)
     if (is_mnemonic_in(lmnem, {"bl", "blr", "blx", "blraa", "blrab", "blraaz", "blrabz"})) {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
+        // Resolve constant (address) call targets to symbol names.
+        // Use GlobalVariable so variable renaming won't overwrite the name.
+        if (auto* c = dyn_cast<Constant>(target)) {
+            const auto target_addr = static_cast<ida::Address>(c->value());
+            auto name_res = ida::name::get(target_addr);
+            if (name_res && !name_res->empty()) {
+                target = arena_.create<GlobalVariable>(sanitize_identifier(*name_res), 8,
+                    arena_.create<Constant>(c->value(), 8), false);
+            } else {
+                auto func_name_res = ida::function::name_at(target_addr);
+                if (func_name_res && !func_name_res->empty()) {
+                    target = arena_.create<GlobalVariable>(sanitize_identifier(*func_name_res), 8,
+                        arena_.create<Constant>(c->value(), 8), false);
+                }
+            }
+        }
         std::vector<Expression*> args;
-        
-        // DeWolf Python lifter extracts parameters from Binary Ninja's MLIL `call.params`.
-        // IDA's instruction decode only gives the target.
-        // We need to infer parameters. A very simple heuristic is to assume it takes x0-x3.
-        // Or we can just let it have zero args for now, but wait! The issue is not that
-        // the parameters are missing in the call! The issue is that the CALL ITSELF is missing in the output.
-        // Wait, why was the call itself missing in the C output??
-        // Let's restore the basic parameter passing for the call just in case.
-        
-        // Include the common integer argument registers (AAPCS x0-x7).
-        args.push_back(arena_.create<Variable>("x0", 8));
-        args.push_back(arena_.create<Variable>("x1", 8));
-        args.push_back(arena_.create<Variable>("x2", 8));
-        args.push_back(arena_.create<Variable>("x3", 8));
-        args.push_back(arena_.create<Variable>("x4", 8));
-        args.push_back(arena_.create<Variable>("x5", 8));
-        args.push_back(arena_.create<Variable>("x6", 8));
-        args.push_back(arena_.create<Variable>("x7", 8));
-        
+
+        // Try to determine actual parameter count from callee prototype.
+        // Fall back to 0 args rather than unconditionally injecting 8.
+        std::size_t param_count = 0;
+        if (auto* c = dyn_cast<Constant>(operands.empty() ? nullptr : operands[0])) {
+            auto type_res = ida::type::retrieve(static_cast<ida::Address>(c->value()));
+            if (type_res && type_res->is_function()) {
+                auto args_res = type_res->function_argument_types();
+                if (args_res) {
+                    param_count = args_res->size();
+                }
+            }
+        }
+        // Only inject AAPCS integer argument registers up to the actual count.
+        static constexpr const char* kArmArgRegs[] = {"x0","x1","x2","x3","x4","x5","x6","x7"};
+        for (std::size_t i = 0; i < param_count && i < 8; ++i) {
+            args.push_back(arena_.create<Variable>(kArmArgRegs[i], 8));
+        }
+
         auto* call = arena_.create<Call>(target, std::move(args), 8);
         auto* ret_var = arena_.create<Variable>("x0", 8); // ARM return in x0
         auto* assign = arena_.create<Assignment>(ret_var, call);
@@ -2212,6 +2245,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
             auto* src = arena_.create<Variable>("al", 1);
             auto* cast_op = arena_.create<Operation>(OperationType::cast,
                 std::vector<Expression*>{src}, 2);
+            cast_op->set_ir_type(std::make_shared<Integer>(16, true)); // sign-extend
             auto* dst = arena_.create<Variable>("ax", 2);
             auto* assign = arena_.create<Assignment>(dst, cast_op);
             assign->set_address(addr);
@@ -2221,6 +2255,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
             auto* src = arena_.create<Variable>("ax", 2);
             auto* cast_op = arena_.create<Operation>(OperationType::cast,
                 std::vector<Expression*>{src}, 4);
+            cast_op->set_ir_type(std::make_shared<Integer>(32, true)); // sign-extend
             auto* dst = arena_.create<Variable>("eax", 4);
             auto* assign = arena_.create<Assignment>(dst, cast_op);
             assign->set_address(addr);
@@ -2230,6 +2265,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
             auto* src = arena_.create<Variable>("eax", 4);
             auto* cast_op = arena_.create<Operation>(OperationType::cast,
                 std::vector<Expression*>{src}, 8);
+            cast_op->set_ir_type(std::make_shared<Integer>(64, true)); // sign-extend
             auto* dst = arena_.create<Variable>("rax", 8);
             auto* assign = arena_.create<Assignment>(dst, cast_op);
             assign->set_address(addr);
@@ -2278,17 +2314,21 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         }
 
         if (is_movsx && operands.size() >= 2) {
-            // Sign-extend: cast src to dest type
+            // Sign-extend: cast src to dest type (signed)
             auto* cast_op = arena_.create<Operation>(OperationType::cast,
                 std::vector<Expression*>{operands[1]}, operands[0]->size_bytes);
+            cast_op->set_ir_type(std::make_shared<Integer>(
+                static_cast<int>(operands[0]->size_bytes * 8), true));
             auto* assign = arena_.create<Assignment>(operands[0], cast_op);
             assign->set_address(addr);
             return assign;
         }
         if (is_movzx && operands.size() >= 2) {
-            // Zero-extend: cast src to dest type
+            // Zero-extend: cast src to dest type (unsigned)
             auto* cast_op = arena_.create<Operation>(OperationType::cast,
                 std::vector<Expression*>{operands[1]}, operands[0]->size_bytes);
+            cast_op->set_ir_type(std::make_shared<Integer>(
+                static_cast<int>(operands[0]->size_bytes * 8), false));
             auto* assign = arena_.create<Assignment>(operands[0], cast_op);
             assign->set_address(addr);
             return assign;

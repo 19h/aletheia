@@ -154,10 +154,98 @@ public:
     }
 };
 
+/// Collects GlobalVariables but skips Call targets (function names).
+class GlobalVariableCollector : public DataflowObjectVisitorInterface {
+public:
+    void visit(Constant* c) override {}
+    void visit(Variable* v) override {}
+    void visit(GlobalVariable* gv) override { variables_.insert(gv); }
+    void visit(Operation* o) override {
+        for (auto* op : o->operands()) if (op) op->accept(*this);
+    }
+    void visit(Call* c) override {
+        // Skip the call target — it's a function name, not a data global.
+        // Only visit the call arguments.
+        for (size_t i = 0; i < c->arg_count(); ++i) {
+            if (c->arg(i)) c->arg(i)->accept(*this);
+        }
+    }
+    void visit(ListOperation* lo) override {
+        for (auto* op : lo->operands()) if (op) op->accept(*this);
+    }
+    void visit(Condition* c) override {
+        if (c->lhs()) c->lhs()->accept(*this);
+        if (c->rhs()) c->rhs()->accept(*this);
+    }
+
+    void visit_assignment(Assignment* i) override {
+        if (i->destination()) i->destination()->accept(*this);
+        if (i->value()) i->value()->accept(*this);
+    }
+    void visit_branch(Branch* i) override {
+        if (i->condition()) i->condition()->accept(*this);
+    }
+    void visit_indirect_branch(IndirectBranch* i) override {
+        if (i->expression()) i->expression()->accept(*this);
+    }
+    void visit_return(Return* i) override {
+        for (auto* v : i->values()) if (v) v->accept(*this);
+    }
+    void visit_phi(Phi* i) override {
+        if (i->dest_var()) i->dest_var()->accept(*this);
+        if (i->operand_list()) i->operand_list()->accept(*this);
+    }
+    void visit_relation(Relation* i) override {
+        if (i->destination()) i->destination()->accept(*this);
+        if (i->value()) i->value()->accept(*this);
+    }
+
+    void visit_break(BreakInstr* i) override {}
+    void visit_continue(ContinueInstr* i) override {}
+    void visit_comment(Comment* i) override {}
+
+    void traverse(AstNode* node) {
+        if (!node) return;
+        if (auto* expr_node = ast_dyn_cast<ExprAstNode>(node)) {
+            if (expr_node->expr()) expr_node->expr()->accept(*this);
+        } else if (auto* cnode = ast_dyn_cast<CodeNode>(node)) {
+            if (cnode->block()) {
+                for (auto* inst : cnode->block()->instructions()) {
+                    if (inst) inst->accept(*this);
+                }
+            }
+        } else if (auto* snode = ast_dyn_cast<SeqNode>(node)) {
+            for (auto* child : snode->nodes()) traverse(child);
+        } else if (auto* ifnode = ast_dyn_cast<IfNode>(node)) {
+            if (ifnode->cond()) traverse(ifnode->cond());
+            if (ifnode->true_branch()) traverse(ifnode->true_branch());
+            if (ifnode->false_branch()) traverse(ifnode->false_branch());
+        } else if (auto* loop = ast_dyn_cast<WhileLoopNode>(node)) {
+            if (loop->condition()) loop->condition()->accept(*this);
+            if (loop->body()) traverse(loop->body());
+        } else if (auto* loop = ast_dyn_cast<DoWhileLoopNode>(node)) {
+            if (loop->condition()) loop->condition()->accept(*this);
+            if (loop->body()) traverse(loop->body());
+        } else if (auto* loop = ast_dyn_cast<ForLoopNode>(node)) {
+            if (loop->condition()) loop->condition()->accept(*this);
+            if (loop->body()) traverse(loop->body());
+        } else if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+            if (sw->cond()) traverse(sw->cond());
+            for (auto* c : sw->cases()) traverse(c);
+        } else if (auto* cs = ast_dyn_cast<CaseNode>(node)) {
+            if (cs->body()) traverse(cs->body());
+        }
+    }
+
+    const std::set<Variable*>& variables() const { return variables_; }
+private:
+    std::set<Variable*> variables_;
+};
+
 class GlobalDeclarationGenerator {
 public:
     static std::vector<std::string> generate(DecompilerTask& task) {
-        VariableCollector collector;
+        GlobalVariableCollector collector;
         if (task.ast() && task.ast()->root()) {
             collector.traverse(task.ast()->root());
         }
