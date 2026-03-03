@@ -2804,6 +2804,9 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                 }
                 if (is_all_ones_constant(lhs_expr, op->size_bytes)) return rhs_expr;
                 if (is_all_ones_constant(rhs_expr, op->size_bytes)) return lhs_expr;
+                if (expr_fingerprint(lhs_expr) == expr_fingerprint(rhs_expr)) {
+                    return lhs_expr;
+                }
                 break;
             case OperationType::bit_or:
                 if (is_constant_value(lhs_expr, 0)) return rhs_expr;

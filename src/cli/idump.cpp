@@ -828,9 +828,8 @@ std::vector<std::string> decompile_function(
         }
 
         aletheia::InstructionLengthHandler::apply(task.ast(), task.arena());
-        if (env_flag_enabled("ALETHEIA_IDUMP_RENAME_FALLBACK")) {
-            apply_variable_naming(task);
-        }
+        apply_variable_naming(task);
+        aletheia::VariableNameGeneration::apply_to_cfg(task.cfg());
         ok = true;
         return generate_cfg_fallback_code(task);
     }

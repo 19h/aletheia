@@ -103,6 +103,69 @@ bool has_generated_name_prefix(const std::string& name) {
         || name.starts_with("exit_");
 }
 
+bool is_register_like_name(std::string_view name) {
+    if (name.empty()) return false;
+    
+    if (name.size() >= 2) {
+        if (name[0] == 'r') {
+            if (name[1] == 'a' || name[1] == 'b' || name[1] == 'c' || name[1] == 'd' || name[1] == 's' || name[1] == 'i' || name[1] == 'd') {
+                return name.size() == 3 || (name.size() > 3 && std::isdigit(name[2]));
+            }
+            if (std::isdigit(name[1])) {
+                return true;
+            }
+            if (name[1] == '8' || name[1] == '9') return name.size() == 3;
+        }
+        if (name[0] == 'e' && std::isdigit(name[1])) {
+            return true;
+        }
+        if ((name[0] == 'x' || name[0] == 'w') && name.size() >= 2) {
+            if (std::isdigit(name[1])) {
+                return true;
+            }
+            if (name.size() >= 3 && name[1] == 's' && std::isdigit(name[2])) {
+                return true;
+            }
+        }
+        if (name.size() >= 2) {
+            if (name[0] == 's' && (name == "st0" || name == "st1" || name == "st2" || name == "st3" ||
+                                    name == "st4" || name == "st5" || name == "st6" || name == "st7")) {
+                return true;
+            }
+            if ((name[0] == 'm' || name[0] == 'x' || name[0] == 'y' || name[0] == 'z') && name.size() >= 3) {
+                if (name.substr(0, 2) == "mm" || name.substr(0, 3) == "xmm" || name.substr(0, 3) == "ymm" || name.substr(0, 3) == "zmm") {
+                    if (name.size() >= 4 && std::isdigit(name[name.size() - 1])) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    
+    if (name.size() == 2) {
+        if (name[0] == 'a' && (name[1] == 'h' || name[1] == 'l')) return true;
+        if (name[0] == 'b' && (name[1] == 'h' || name[1] == 'l')) return true;
+        if (name[0] == 'c' && (name[1] == 'h' || name[1] == 'l')) return true;
+        if (name[0] == 'd' && (name[1] == 'h' || name[1] == 'l')) return true;
+        if (name == "si" || name == "di" || name == "bp" || name == "sp") return true;
+    }
+    if (name.size() == 3) {
+        if (name == "eax" || name == "ebx" || name == "ecx" || name == "edx" ||
+            name == "esi" || name == "edi" || name == "ebp" || name == "esp" ||
+            name == "rax" || name == "rbx" || name == "rcx" || name == "rdx" ||
+            name == "rsi" || name == "rdi" || name == "rbp" || name == "rsp") return true;
+        if (name == "r8" || name == "r9" || name == "r10" || name == "r11" ||
+            name == "r12" || name == "r13" || name == "r14" || name == "r15") return true;
+    }
+    
+    if (name == "rip") return true;
+    if (name == "sp" || name == "fp" || name == "pc" || name == "lr" || name == "cpsr") return true;
+    if (name == "cs" || name == "ds" || name == "es" || name == "fs" || name == "gs" || name == "ss") return true;
+    if (name == "eflags" || name == "rflags" || name == "flags") return true;
+    
+    return false;
+}
+
 std::string make_stack_name(const std::string& prefix, std::int64_t offset) {
     if (offset < 0) {
         return prefix + "_m" + std::to_string(-(offset + 1) + 1);
@@ -185,8 +248,9 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
         }
 
         if (lower.starts_with("local_") || lower.starts_with("arg_")
-            || lower.starts_with("sp_local_") || lower.starts_with("sp_arg_")) {
-            return var->name();
+            || lower.starts_with("sp_local_") || lower.starts_with("sp_arg_")
+            || lower.starts_with("mem_") || lower.starts_with("xmm") || lower.starts_with("ymm")) {
+            return "tmp_" + std::to_string(state.prefix_next_id["tmp"]++);
         }
 
         if (auto inferred = infer_parameter_index_from_register_name(lower); inferred.has_value()) {
@@ -194,6 +258,9 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
         }
 
         if (!has_generated_name_prefix(lower) && !lower.empty()) {
+            if (is_register_like_name(lower)) {
+                return "tmp_" + std::to_string(state.prefix_next_id["tmp"]++);
+            }
             return var->name();
         }
 
@@ -355,6 +422,22 @@ void VariableNameGeneration::apply_system_hungarian(AbstractSyntaxForest* forest
     RenameState state;
     state.scheme = RenameState::Scheme::SystemHungarian;
     rename_ast_node(forest->root(), state);
+}
+
+void VariableNameGeneration::apply_to_cfg(ControlFlowGraph* cfg) {
+    if (!cfg) {
+        return;
+    }
+
+    RenameState state;
+    state.scheme = RenameState::Scheme::Default;
+
+    for (BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        for (Instruction* inst : block->instructions()) {
+            rename_instruction(inst, state);
+        }
+    }
 }
 
 } // namespace aletheia

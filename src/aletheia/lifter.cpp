@@ -1641,6 +1641,10 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // Return instructions
     // =====================================================================
     if (is_mnemonic_in(lmnem, {"ret", "retn", "retf", "retaa", "retab", "eret"})) {
+        if (operands.empty()) {
+            auto* ret_reg = arena_.create<Variable>("rax", 8);
+            operands.push_back(ret_reg);
+        }
         auto* ret = arena_.create<Return>(std::move(operands));
         ret->set_address(addr);
         return ret;
