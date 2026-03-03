@@ -505,15 +505,15 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             auto defs = inst->definitions();
             vars.insert(vars.end(), defs.begin(), defs.end());
 
-            VarSet seen;
+            std::unordered_set<Variable*> seen;
             for (Variable* old_var : vars) {
                 if (old_var == nullptr) {
                     continue;
                 }
-                VarKey key = key_of(old_var);
-                if (!seen.insert(key).second) {
+                if (!seen.insert(old_var).second) {
                     continue;
                 }
+                VarKey key = key_of(old_var);
                 auto it = replacement_for.find(key);
                 if (it != replacement_for.end() && it->second != old_var) {
                     inst->substitute(old_var, it->second);

@@ -810,6 +810,31 @@ AstNode* AstProcessor::clean_node(DecompilerArena& arena, AstNode* root) {
                     flattened.push_back(child);
                 }
             }
+
+            for (std::size_t i = 1; i < flattened.size(); ++i) {
+                auto* prev_if = ast_dyn_cast<IfNode>(flattened[i - 1]);
+                AstNode* trailing = flattened[i];
+                if (!prev_if || prev_if->false_branch() != nullptr || !trailing || !trailing->is_break_node()) {
+                    continue;
+                }
+
+                AstNode* true_branch = prev_if->true_branch();
+                if (!true_branch || !true_branch->is_code_node_ending_with_continue()) {
+                    continue;
+                }
+
+                auto* cond_ast = ast_dyn_cast<ExprAstNode>(prev_if->cond());
+                if (!cond_ast || !cond_ast->expr()) {
+                    continue;
+                }
+
+                Expression* negated = negate_condition_expr(arena, cond_ast->expr());
+                prev_if->set_cond(arena.create<ExprAstNode>(negated));
+                prev_if->set_true_branch(trailing);
+                flattened.erase(flattened.begin() + static_cast<long>(i));
+                --i;
+            }
+
             seq->mutable_nodes() = flattened;
             if (seq->empty()) return nullptr;
             if (seq->size() == 1) return seq->first();

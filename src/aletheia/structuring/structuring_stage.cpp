@@ -1,8 +1,10 @@
 #include "../../logos/z3_logic.hpp"
 #include "structuring_stage.hpp"
 #include "condition_handler.hpp"
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <unordered_map>
 
 namespace aletheia {
@@ -14,6 +16,50 @@ bool env_flag_enabled(const char* name) {
     if (!value) return false;
     std::string_view v{value};
     return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES";
+}
+
+std::uint64_t basic_block_order_key(BasicBlock* bb) {
+    if (!bb) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return static_cast<std::uint64_t>(bb->id());
+}
+
+std::vector<BasicBlock*> sorted_basic_blocks_by_id(const std::vector<BasicBlock*>& blocks) {
+    std::vector<BasicBlock*> sorted = blocks;
+    std::stable_sort(sorted.begin(), sorted.end(), [](BasicBlock* lhs, BasicBlock* rhs) {
+        return basic_block_order_key(lhs) < basic_block_order_key(rhs);
+    });
+    return sorted;
+}
+
+std::vector<Edge*> sorted_successor_edges(const std::vector<Edge*>& edges) {
+    std::vector<Edge*> sorted = edges;
+    std::stable_sort(sorted.begin(), sorted.end(), [](Edge* lhs, Edge* rhs) {
+        BasicBlock* lhs_target = lhs ? lhs->target() : nullptr;
+        BasicBlock* rhs_target = rhs ? rhs->target() : nullptr;
+
+        const std::uint64_t lhs_key = basic_block_order_key(lhs_target);
+        const std::uint64_t rhs_key = basic_block_order_key(rhs_target);
+        if (lhs_key != rhs_key) {
+            return lhs_key < rhs_key;
+        }
+
+        const int lhs_type = lhs ? static_cast<int>(lhs->type()) : std::numeric_limits<int>::max();
+        const int rhs_type = rhs ? static_cast<int>(rhs->type()) : std::numeric_limits<int>::max();
+        if (lhs_type != rhs_type) {
+            return lhs_type < rhs_type;
+        }
+
+        const int lhs_kind = lhs ? static_cast<int>(lhs->edge_kind()) : std::numeric_limits<int>::max();
+        const int rhs_kind = rhs ? static_cast<int>(rhs->edge_kind()) : std::numeric_limits<int>::max();
+        if (lhs_kind != rhs_kind) {
+            return lhs_kind < rhs_kind;
+        }
+
+        return false;
+    });
+    return sorted;
 }
 
 Expression* switch_selector_expression(BasicBlock* bb) {
@@ -47,7 +93,7 @@ std::unordered_map<Edge*, logos::LogicCondition> build_switch_edge_tags_for_bloc
     std::vector<Edge*> default_edges;
     z3::expr all_case_expr = task.z3_ctx().bool_val(false);
 
-    for (Edge* edge : bb->successors()) {
+    for (Edge* edge : sorted_successor_edges(bb->successors())) {
         auto* switch_edge = (edge && edge->edge_kind() == EdgeKind::SwitchEdge ? static_cast<SwitchEdge*>(edge) : nullptr);
         if (!switch_edge) {
             continue;
@@ -87,7 +133,7 @@ std::unordered_map<Edge*, logos::LogicCondition> build_switch_edge_tags_for_bloc
     }
 
     // Any untagged switch edges conservatively get true.
-    for (Edge* edge : bb->successors()) {
+    for (Edge* edge : sorted_successor_edges(bb->successors())) {
         if (edge->type() == EdgeType::Switch && !tags.contains(edge)) {
             tags.emplace(edge, logos::LogicCondition(task.z3_ctx().bool_val(true)));
         }
@@ -156,7 +202,9 @@ void PatternIndependentRestructuringStage::build_initial_transition_cfg(Decompil
     std::unordered_map<BasicBlock*, TransitionBlock*> block_map;
 
     // Create a TransitionBlock for every BasicBlock
-    for (BasicBlock* bb : task.cfg()->blocks()) {
+    const std::vector<BasicBlock*> ordered_blocks = sorted_basic_blocks_by_id(task.cfg()->blocks());
+
+    for (BasicBlock* bb : ordered_blocks) {
         CodeNode* cnode = task.arena().create<CodeNode>(bb);
         TransitionBlock* tb = task.arena().create<TransitionBlock>(cnode);
         block_map[bb] = tb;
@@ -169,10 +217,10 @@ void PatternIndependentRestructuringStage::build_initial_transition_cfg(Decompil
 
     // Connect edges with condition-symbol tags.
     ConditionHandler condition_handler(task.z3_ctx());
-    for (BasicBlock* bb : task.cfg()->blocks()) {
+    for (BasicBlock* bb : ordered_blocks) {
         TransitionBlock* src = block_map[bb];
         const auto switch_tags = build_switch_edge_tags_for_block(task, bb, condition_handler);
-        for (Edge* e : bb->successors()) {
+        for (Edge* e : sorted_successor_edges(bb->successors())) {
             if (e->target()) {
                 TransitionBlock* dst = block_map[e->target()];
 

@@ -4,6 +4,7 @@
 #include "../../common/small_vector.hpp"
 #include "../../common/types.hpp"
 #include "types.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -808,14 +809,64 @@ public:
     std::vector<Variable*> definitions() const {
         std::unordered_set<Variable*> s;
         collect_definitions(s);
-        return {s.begin(), s.end()};
+        std::vector<Variable*> out(s.begin(), s.end());
+        std::stable_sort(out.begin(), out.end(), [](const Variable* lhs, const Variable* rhs) {
+            if (lhs == rhs) {
+                return false;
+            }
+            if (!lhs) {
+                return false;
+            }
+            if (!rhs) {
+                return true;
+            }
+            if (lhs->name() != rhs->name()) {
+                return lhs->name() < rhs->name();
+            }
+            if (lhs->ssa_version() != rhs->ssa_version()) {
+                return lhs->ssa_version() < rhs->ssa_version();
+            }
+            if (lhs->size_bytes != rhs->size_bytes) {
+                return lhs->size_bytes < rhs->size_bytes;
+            }
+            if (lhs->is_aliased() != rhs->is_aliased()) {
+                return !lhs->is_aliased() && rhs->is_aliased();
+            }
+            return false;
+        });
+        return out;
     }
 
     // Convenience: get requirements as a vector
     std::vector<Variable*> requirements() const {
         std::unordered_set<Variable*> s;
         collect_requirements(s);
-        return {s.begin(), s.end()};
+        std::vector<Variable*> out(s.begin(), s.end());
+        std::stable_sort(out.begin(), out.end(), [](const Variable* lhs, const Variable* rhs) {
+            if (lhs == rhs) {
+                return false;
+            }
+            if (!lhs) {
+                return false;
+            }
+            if (!rhs) {
+                return true;
+            }
+            if (lhs->name() != rhs->name()) {
+                return lhs->name() < rhs->name();
+            }
+            if (lhs->ssa_version() != rhs->ssa_version()) {
+                return lhs->ssa_version() < rhs->ssa_version();
+            }
+            if (lhs->size_bytes != rhs->size_bytes) {
+                return lhs->size_bytes < rhs->size_bytes;
+            }
+            if (lhs->is_aliased() != rhs->is_aliased()) {
+                return !lhs->is_aliased() && rhs->is_aliased();
+            }
+            return false;
+        });
+        return out;
     }
 
 protected:

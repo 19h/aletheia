@@ -116,15 +116,15 @@ void apply_simple_renamer(DecompilerArena& arena, ControlFlowGraph& cfg) {
             auto defs = inst->definitions();
             vars.insert(vars.end(), defs.begin(), defs.end());
 
-            std::unordered_set<SimpleKey, SimpleKeyHash> seen;
+            std::unordered_set<Variable*> seen;
             for (Variable* old_var : vars) {
                 if (old_var == nullptr) {
                     continue;
                 }
-                SimpleKey key = to_key(old_var);
-                if (!seen.insert(key).second) {
+                if (!seen.insert(old_var).second) {
                     continue;
                 }
+                SimpleKey key = to_key(old_var);
 
                 Variable* replacement = replacement_for_var(old_var);
                 if (replacement != old_var) {
