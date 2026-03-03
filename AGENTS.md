@@ -92,3 +92,60 @@ specific pipeline stage and source location:
 | Self-assignments | `tmp_4 = tmp_4` | Eliminated |
 | Call targets | `rax()` (raw register) | `tmp_3()` (renamed temporary) |
 | ARM x16 | `arg_16` (wrong param) | `tmp_0` (temporary) |
+
+## CYCLE 2: OUTPUT QUALITY IMPROVEMENT (March 04, 2026)
+
+### Issues Addressed
+
+| # | Issue | Root Cause | Fix |
+|---|-------|-----------|-----|
+| 1 | `tmp_4 = tmp_4` self-assignments in `iterate_device` | `remove_self_assignments()` only iterated CFG blocks, not AST-wrapped blocks | Added `remove_self_assignments_ast()` that traverses AST tree to find CodeNode blocks |
+| 2 | Call targets unresolved (`tmp_N()`) for PLT calls | Only resolved `Constant` operands; PLT relocations use different addressing | Added `ida::xref::code_refs_from(addr)` fallback to resolve call targets via cross-references |
+| 3 | `arg_0` undeclared in `grub_cmd_do_search` | `param_display_names_` only keyed by 64-bit register names; 32-bit aliases not mapped | Added `x86_64_sub_register_aliases()` helper; registered edi/esi/edx/ecx/r8d-r9d alongside rdi/rsi/rdx/rcx/r8/r9 |
+| 4 | `__0000000000000748grub_errno__` not stripped | `sanitize_identifier()` didn't call `strip_ida_address_prefix()` | Integrated `strip_ida_address_prefix()` into `sanitize_identifier()` so ALL names are stripped |
+| 5 | `arg_N` not resolved to prototype names (cmd, argc, args) | `param_display_names_` keyed by register names; after rename to `arg_N`, lookup failed | Added `arg_N` → best display name mapping using parameter index; prefer longest (most specific) name per index |
+
+### Implementation Details
+
+1. **Self-assignment elimination (AST-level)**:
+   - Added `VariableNameGeneration::remove_self_assignments_ast(AbstractSyntaxForest*)` in `variable_name_generation.cpp`.
+   - Traverses entire AST tree recursively to find `CodeNode`s and removes self-assignments from their blocks.
+   - Called after `remove_self_assignments(cfg)` in both `idump.cpp` and `plugin.cpp` to catch assignments in AST-wrapped blocks that may differ from the flat CFG block list.
+
+2. **x86-64 sub-register aliases**:
+   - Added `x86_64_sub_register_aliases()` function in `lifter.cpp` that maps 64-bit register names to their 32/16/8-bit variants (rdi→edi/di/dil, r8→r8d/r8w/r8b, etc.).
+   - Used in both prototype-based and fallback parameter mapping loops in `populate_task_signature()`.
+   - Ensures `param_display_names_` has entries for ALL register widths, not just 64-bit.
+
+3. **arg_N → prototype parameter name mapping**:
+   - In codegen.cpp and idump.cpp, when building `param_display_names_`, now also adds `arg_0` → best display name for index 0, `arg_1` → best for index 1, etc.
+   - Uses "longest name wins" heuristic to prefer IDA regvar names (`cmd`) over default names (`a1`).
+
+4. **IDA address-prefix stripping**:
+   - Moved `strip_ida_address_prefix()` call into `sanitize_identifier()` itself.
+   - Now ALL identifier names go through the stripping, regardless of code path.
+   - The `global_name_from_operand()` double-call is idempotent.
+
+5. **xref-based call target resolution**:
+   - Added `ida::xref::code_refs_from(addr)` fallback in both x86 and ARM call handlers.
+   - Checks for `CallNear`/`CallFar` reference types.
+   - Resolves the `.to` address to a symbol name via `ida::name::get()` or `ida::function::name_at()`.
+
+### Progress Notes
+- [x] Fix 1: Self-assignment elimination -- AST-level removal via `remove_self_assignments_ast()`
+- [x] Fix 2: Call target xref fallback -- `ida::xref::code_refs_from()` for PLT/GOT resolution
+- [x] Fix 3: 32-bit register aliases -- `x86_64_sub_register_aliases()` + parameter mapping
+- [x] Fix 4: Address prefix in sanitize_identifier -- integrated into `sanitize_identifier()`
+- [x] Fix 5: arg_N display mapping -- best-per-index lookup in `param_display_names_`
+- [x] All unit tests pass (3/3)
+- [x] `idump testbin` produces 10/10 functions
+
+### Verified Cycle 2 Improvements (Before -> After)
+
+| Issue | Before (Cycle 1) | After (Cycle 2) |
+|-------|-------------------|------------------|
+| Self-assignments | `tmp_4 = tmp_4; tmp_5 = tmp_5;` | Eliminated |
+| Extern mangling | `__0000000000000748grub_errno__` | `grub_errno` |
+| Register vars | `eax, ecx, edx, esi, r8d, rax` | `tmp_N, arg_N, argc, args, cmd` |
+| Param names | `arg_0 = *(tmp_2)` (undeclared) | `cmd = *(tmp_2)` (prototype name) |
+| Parameter refs | `esi, rdi, edx` → `arg_N` | `esi` → `argc`, `rdi` → `cmd`, `edx` → `args` |

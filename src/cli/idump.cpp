@@ -323,6 +323,8 @@ void apply_variable_naming(aletheia::DecompilerTask& task) {
     // Remove self-assignments that become visible after rename collapses
     // different SSA versions of the same register to the same name.
     aletheia::VariableNameGeneration::remove_self_assignments(task.cfg());
+    // Also remove from AST-wrapped blocks (may differ from flat CFG block list).
+    aletheia::VariableNameGeneration::remove_self_assignments_ast(task.ast());
 }
 
 std::string block_label(const aletheia::BasicBlock* block) {
@@ -460,10 +462,19 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
     aletheia::CExpressionGenerator expr_gen;
 
     // Set up parameter display name mapping.
+    // Include both raw register names AND post-rename "arg_N" names.
     {
         std::unordered_map<std::string, std::string> param_names;
+        std::unordered_map<int, std::string> best_per_index;
         for (const auto& [reg, info] : task.parameter_registers()) {
             param_names[reg] = info.name;
+            auto it = best_per_index.find(info.index);
+            if (it == best_per_index.end() || info.name.size() > it->second.size()) {
+                best_per_index[info.index] = info.name;
+            }
+        }
+        for (const auto& [idx, name] : best_per_index) {
+            param_names["arg_" + std::to_string(idx)] = name;
         }
         expr_gen.set_parameter_names(param_names);
     }

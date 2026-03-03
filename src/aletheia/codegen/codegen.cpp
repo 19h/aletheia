@@ -1041,10 +1041,25 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     cfg_fallback_mode_ = false;
 
     // Set up parameter display name mapping for the expression generator.
+    // Include both raw register names AND post-rename "arg_N" names so that
+    // variables renamed by VariableNameGeneration still resolve to the
+    // prototype parameter name (e.g., "arg_0" → "cmd").
     {
         std::unordered_map<std::string, std::string> param_names;
+        // First pass: collect the best display name per parameter index.
+        // Prefer longer (more specific) names over "aN" defaults.
+        std::unordered_map<int, std::string> best_per_index;
         for (const auto& [reg, info] : task.parameter_registers()) {
             param_names[reg] = info.name;
+            auto it = best_per_index.find(info.index);
+            if (it == best_per_index.end() || info.name.size() > it->second.size()) {
+                best_per_index[info.index] = info.name;
+            }
+        }
+        // Second pass: map "arg_N" to the best display name for each index.
+        for (const auto& [idx, name] : best_per_index) {
+            std::string arg_key = "arg_" + std::to_string(idx);
+            param_names[arg_key] = name;
         }
         expr_gen_.set_parameter_names(param_names);
     }

@@ -463,28 +463,76 @@ void VariableNameGeneration::apply_to_cfg(ControlFlowGraph* cfg) {
     }
 }
 
+namespace {
+
+void remove_self_assignments_from_block(BasicBlock* block) {
+    if (!block) return;
+    std::vector<Instruction*> filtered;
+    filtered.reserve(block->instructions().size());
+    for (Instruction* inst : block->instructions()) {
+        if (auto* assign = dyn_cast<Assignment>(inst)) {
+            auto* dst = dyn_cast<Variable>(assign->destination());
+            auto* src = dyn_cast<Variable>(assign->value());
+            if (dst && src
+                && dst->name() == src->name()
+                && dst->ssa_version() == src->ssa_version()) {
+                continue;  // skip self-assignment
+            }
+        }
+        filtered.push_back(inst);
+    }
+    if (filtered.size() != block->instructions().size()) {
+        block->set_instructions(std::move(filtered));
+    }
+}
+
+void remove_self_assignments_from_ast(AstNode* node) {
+    if (!node) return;
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        remove_self_assignments_from_block(code->block());
+        return;
+    }
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            remove_self_assignments_from_ast(child);
+        }
+        return;
+    }
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        remove_self_assignments_from_ast(if_node->cond());
+        remove_self_assignments_from_ast(if_node->true_branch());
+        remove_self_assignments_from_ast(if_node->false_branch());
+        return;
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        remove_self_assignments_from_ast(loop->body());
+        return;
+    }
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        remove_self_assignments_from_ast(sw->cond());
+        for (CaseNode* c : sw->cases()) {
+            remove_self_assignments_from_ast(c);
+        }
+        return;
+    }
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        remove_self_assignments_from_ast(c->body());
+    }
+}
+
+} // namespace (self-assignment helpers)
+
 void VariableNameGeneration::remove_self_assignments(ControlFlowGraph* cfg) {
     if (!cfg) return;
     for (BasicBlock* block : cfg->blocks()) {
-        if (!block) continue;
-        std::vector<Instruction*> filtered;
-        filtered.reserve(block->instructions().size());
-        for (Instruction* inst : block->instructions()) {
-            if (auto* assign = dyn_cast<Assignment>(inst)) {
-                auto* dst = dyn_cast<Variable>(assign->destination());
-                auto* src = dyn_cast<Variable>(assign->value());
-                if (dst && src
-                    && dst->name() == src->name()
-                    && dst->ssa_version() == src->ssa_version()) {
-                    continue;  // skip self-assignment
-                }
-            }
-            filtered.push_back(inst);
-        }
-        if (filtered.size() != block->instructions().size()) {
-            block->set_instructions(std::move(filtered));
-        }
+        remove_self_assignments_from_block(block);
     }
+}
+
+void VariableNameGeneration::remove_self_assignments_ast(AbstractSyntaxForest* forest) {
+    if (!forest || !forest->root()) return;
+    remove_self_assignments_from_ast(forest->root());
 }
 
 } // namespace aletheia

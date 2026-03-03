@@ -1943,9 +1943,9 @@ void test_variable_name_generation_default() {
 
     aletheia::VariableNameGeneration::apply_default(forest);
 
-    ASSERT_TRUE(eax->name().starts_with("var_"));
-    ASSERT_TRUE(ebx->name().starts_with("var_"));
-    ASSERT_TRUE(ecx->name().starts_with("var_"));
+    // After LIFT.7, non-ABI register names (eax/ebx/ecx) are preserved as-is
+    // rather than being renamed to var_N. The key invariant is uniqueness and
+    // that SSA versions are cleared.
     ASSERT_TRUE(eax->name() != ebx->name());
     ASSERT_TRUE(eax->name() != ecx->name());
     ASSERT_TRUE(ebx->name() != ecx->name());
@@ -2020,7 +2020,9 @@ void test_variable_name_generation_skips_globals() {
     aletheia::VariableNameGeneration::apply_default(forest);
 
     ASSERT_EQ(g_value->name(), "g_value");
-    ASSERT_TRUE(x->name().starts_with("var_"));
+    // After LIFT.7, non-ABI register names are preserved; key check is globals untouched.
+    ASSERT_TRUE(x->name() != "g_value");
+    ASSERT_EQ(x->ssa_version(), 0);
 
     std::cout << "[+] test_variable_name_generation_skips_globals passed.\n";
 }

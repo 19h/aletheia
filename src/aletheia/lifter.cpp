@@ -31,6 +31,8 @@ std::string hex_address_name(ida::Address ea) {
     return "g_" + oss.str();
 }
 
+std::string strip_ida_address_prefix(const std::string& name);
+
 std::string sanitize_identifier(std::string text) {
     text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) {
         return c < 32 || c > 126;
@@ -62,6 +64,11 @@ std::string sanitize_identifier(std::string text) {
     if (std::isdigit(first)) {
         text = "g_" + text;
     }
+
+    // Strip IDA's auto-generated address-prefix names (e.g.
+    // __0000000000000748grub_errno__ → grub_errno) everywhere.
+    text = strip_ida_address_prefix(text);
+
     return text;
 }
 
@@ -922,6 +929,34 @@ constexpr std::string_view kX86_64_Win_IntRegs[] = {"rcx", "rdx", "r8", "r9"};
 /// ARM64 (AAPCS): x0-x7
 constexpr std::string_view kARM64_IntRegs[] = {"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"};
 
+/// Return all x86-64 sub-register aliases for a 64-bit register name.
+/// E.g. "rdi" → {"edi", "di", "dil"}, "r8" → {"r8d", "r8w", "r8b"}.
+std::vector<std::string> x86_64_sub_register_aliases(std::string_view reg64) {
+    // Named registers: rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp
+    struct NamedAlias { std::string_view r64; std::string_view r32; std::string_view r16; std::string_view r8; };
+    static constexpr NamedAlias kNamedAliases[] = {
+        {"rax", "eax", "ax",  "al" },
+        {"rbx", "ebx", "bx",  "bl" },
+        {"rcx", "ecx", "cx",  "cl" },
+        {"rdx", "edx", "dx",  "dl" },
+        {"rsi", "esi", "si",  "sil"},
+        {"rdi", "edi", "di",  "dil"},
+        {"rbp", "ebp", "bp",  "bpl"},
+        {"rsp", "esp", "sp",  "spl"},
+    };
+    for (const auto& a : kNamedAliases) {
+        if (reg64 == a.r64) {
+            return {std::string(a.r32), std::string(a.r16), std::string(a.r8)};
+        }
+    }
+    // Extended registers: r8-r15 → r8d/r8w/r8b, etc.
+    if (reg64.size() >= 2 && reg64[0] == 'r' && std::isdigit(static_cast<unsigned char>(reg64[1]))) {
+        std::string base(reg64);
+        return {base + "d", base + "w", base + "b"};
+    }
+    return {};
+}
+
 /// Detect the architecture from the processor name. Returns "x86_64", "arm64", or "".
 std::string detect_arch() {
     auto proc = ida::database::processor_name();
@@ -1003,29 +1038,35 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
             if (reg_table) {
                 for (std::size_t i = 0; i < param_count && i < reg_count; ++i) {
                     std::string reg_name(reg_table[i]);
-                    param_register_map_[reg_name] = static_cast<int>(i);
+                    const int idx = static_cast<int>(i);
+                    const std::string display = "a" + std::to_string(i + 1);
+                    const TypePtr ptype = (i < params.size()) ? params[i] : nullptr;
 
-                    // ARM64 alias: map Wn alongside Xn for 32-bit uses.
-                    if (reg_name.size() >= 2 && reg_name[0] == 'x') {
-                        std::string w_alias = reg_name;
-                        w_alias[0] = 'w';
-                        param_register_map_[w_alias] = static_cast<int>(i);
-                    }
-                    
+                    param_register_map_[reg_name] = idx;
+
                     DecompilerTask::ParameterInfo info;
-                    info.name = "a" + std::to_string(i + 1);
-                    info.index = static_cast<int>(i);
-                    info.type = (i < params.size()) ? params[i] : nullptr;
+                    info.name = display;
+                    info.index = idx;
+                    info.type = ptype;
                     task.set_parameter_register(reg_name, std::move(info));
 
+                    // Register all sub-register aliases so codegen can map
+                    // e.g. "edi" → same display name as "rdi".
+                    // ARM64: xN → wN.
                     if (reg_name.size() >= 2 && reg_name[0] == 'x') {
-                        DecompilerTask::ParameterInfo alias_info;
-                        alias_info.name = "a" + std::to_string(i + 1);
-                        alias_info.index = static_cast<int>(i);
-                        alias_info.type = (i < params.size()) ? params[i] : nullptr;
                         std::string w_alias = reg_name;
                         w_alias[0] = 'w';
-                        task.set_parameter_register(w_alias, std::move(alias_info));
+                        param_register_map_[w_alias] = idx;
+                        DecompilerTask::ParameterInfo ai;
+                        ai.name = display; ai.index = idx; ai.type = ptype;
+                        task.set_parameter_register(w_alias, std::move(ai));
+                    }
+                    // x86-64: rdi → edi/di/dil, r8 → r8d/r8w/r8b, etc.
+                    for (const auto& alias : x86_64_sub_register_aliases(reg_name)) {
+                        param_register_map_[alias] = idx;
+                        DecompilerTask::ParameterInfo ai;
+                        ai.name = display; ai.index = idx; ai.type = ptype;
+                        task.set_parameter_register(alias, std::move(ai));
                     }
                 }
             }
@@ -1065,28 +1106,32 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
             const std::size_t fallback_count = std::min<std::size_t>(reg_count, 6);
             for (std::size_t i = 0; i < fallback_count; ++i) {
                 std::string reg_name(reg_table[i]);
-                param_register_map_[reg_name] = static_cast<int>(i);
+                const int idx = static_cast<int>(i);
+                const std::string display = "arg_" + std::to_string(i);
 
-                if (reg_name.size() >= 2 && reg_name[0] == 'x') {
-                    std::string w_alias = reg_name;
-                    w_alias[0] = 'w';
-                    param_register_map_[w_alias] = static_cast<int>(i);
-                }
+                param_register_map_[reg_name] = idx;
 
                 DecompilerTask::ParameterInfo info;
-                info.name = "arg_" + std::to_string(i);
-                info.index = static_cast<int>(i);
+                info.name = display;
+                info.index = idx;
                 info.type = nullptr;
                 task.set_parameter_register(reg_name, std::move(info));
 
+                // ARM64: xN → wN
                 if (reg_name.size() >= 2 && reg_name[0] == 'x') {
-                    DecompilerTask::ParameterInfo alias_info;
-                    alias_info.name = "arg_" + std::to_string(i);
-                    alias_info.index = static_cast<int>(i);
-                    alias_info.type = nullptr;
                     std::string w_alias = reg_name;
                     w_alias[0] = 'w';
-                    task.set_parameter_register(w_alias, std::move(alias_info));
+                    param_register_map_[w_alias] = idx;
+                    DecompilerTask::ParameterInfo ai;
+                    ai.name = display; ai.index = idx; ai.type = nullptr;
+                    task.set_parameter_register(w_alias, std::move(ai));
+                }
+                // x86-64: rdi → edi/di/dil, etc.
+                for (const auto& alias : x86_64_sub_register_aliases(reg_name)) {
+                    param_register_map_[alias] = idx;
+                    DecompilerTask::ParameterInfo ai;
+                    ai.name = display; ai.index = idx; ai.type = nullptr;
+                    task.set_parameter_register(alias, std::move(ai));
                 }
             }
         }
@@ -1810,6 +1855,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     if (lmnem == "call" || lmnem == "callq") {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
+        bool resolved = false;
         // Resolve constant (address) call targets to symbol names.
         // Use GlobalVariable so variable renaming won't overwrite the name.
         if (auto* c = dyn_cast<Constant>(target)) {
@@ -1818,11 +1864,42 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
             if (name_res && !name_res->empty()) {
                 target = arena_.create<GlobalVariable>(sanitize_identifier(*name_res), 8,
                     arena_.create<Constant>(c->value(), 8), false);
+                resolved = true;
             } else {
                 auto func_name_res = ida::function::name_at(target_addr);
                 if (func_name_res && !func_name_res->empty()) {
                     target = arena_.create<GlobalVariable>(sanitize_identifier(*func_name_res), 8,
                         arena_.create<Constant>(c->value(), 8), false);
+                    resolved = true;
+                }
+            }
+        }
+        // Fallback: use IDA cross-references to resolve the call target.
+        // This handles PLT/GOT-style calls in relocatable objects where the
+        // operand is a register but IDA knows the actual destination.
+        if (!resolved) {
+            auto xrefs = ida::xref::code_refs_from(addr);
+            if (xrefs) {
+                for (const auto& ref : *xrefs) {
+                    if (ref.type == ida::xref::ReferenceType::CallNear ||
+                        ref.type == ida::xref::ReferenceType::CallFar) {
+                        auto callee_name = ida::name::get(ref.to);
+                        if (callee_name && !callee_name->empty()) {
+                            target = arena_.create<GlobalVariable>(
+                                sanitize_identifier(*callee_name), 8,
+                                arena_.create<Constant>(static_cast<std::uint64_t>(ref.to), 8), false);
+                            resolved = true;
+                            break;
+                        }
+                        auto callee_func = ida::function::name_at(ref.to);
+                        if (callee_func && !callee_func->empty()) {
+                            target = arena_.create<GlobalVariable>(
+                                sanitize_identifier(*callee_func), 8,
+                                arena_.create<Constant>(static_cast<std::uint64_t>(ref.to), 8), false);
+                            resolved = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1840,6 +1917,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // ARM BL (branch-and-link = call)
     if (is_mnemonic_in(lmnem, {"bl", "blr", "blx", "blraa", "blrab", "blraaz", "blrabz"})) {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
+        bool resolved_arm = false;
         // Resolve constant (address) call targets to symbol names.
         // Use GlobalVariable so variable renaming won't overwrite the name.
         if (auto* c = dyn_cast<Constant>(target)) {
@@ -1848,11 +1926,40 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
             if (name_res && !name_res->empty()) {
                 target = arena_.create<GlobalVariable>(sanitize_identifier(*name_res), 8,
                     arena_.create<Constant>(c->value(), 8), false);
+                resolved_arm = true;
             } else {
                 auto func_name_res = ida::function::name_at(target_addr);
                 if (func_name_res && !func_name_res->empty()) {
                     target = arena_.create<GlobalVariable>(sanitize_identifier(*func_name_res), 8,
                         arena_.create<Constant>(c->value(), 8), false);
+                    resolved_arm = true;
+                }
+            }
+        }
+        // Fallback: use IDA cross-references for PLT/relocation resolution.
+        if (!resolved_arm) {
+            auto xrefs = ida::xref::code_refs_from(addr);
+            if (xrefs) {
+                for (const auto& ref : *xrefs) {
+                    if (ref.type == ida::xref::ReferenceType::CallNear ||
+                        ref.type == ida::xref::ReferenceType::CallFar) {
+                        auto callee_name = ida::name::get(ref.to);
+                        if (callee_name && !callee_name->empty()) {
+                            target = arena_.create<GlobalVariable>(
+                                sanitize_identifier(*callee_name), 8,
+                                arena_.create<Constant>(static_cast<std::uint64_t>(ref.to), 8), false);
+                            resolved_arm = true;
+                            break;
+                        }
+                        auto callee_func = ida::function::name_at(ref.to);
+                        if (callee_func && !callee_func->empty()) {
+                            target = arena_.create<GlobalVariable>(
+                                sanitize_identifier(*callee_func), 8,
+                                arena_.create<Constant>(static_cast<std::uint64_t>(ref.to), 8), false);
+                            resolved_arm = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
