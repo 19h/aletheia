@@ -6,6 +6,188 @@ namespace aletheia {
 
 namespace {
 
+bool same_if_condition(AstNode* lhs_cond, AstNode* rhs_cond) {
+    if (lhs_cond == rhs_cond) {
+        return true;
+    }
+
+    auto* lhs_expr = ast_dyn_cast<ExprAstNode>(lhs_cond);
+    auto* rhs_expr = ast_dyn_cast<ExprAstNode>(rhs_cond);
+    if (!lhs_expr || !rhs_expr || !lhs_expr->expr() || !rhs_expr->expr()) {
+        return false;
+    }
+
+    return expression_fingerprint_hash(lhs_expr->expr()) == expression_fingerprint_hash(rhs_expr->expr());
+}
+
+enum class CompareDomain : std::uint8_t {
+    Any,
+    Signed,
+    Unsigned,
+};
+
+enum class CompareFamily : std::uint8_t {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Neq,
+    Unknown,
+};
+
+struct CompareInfo {
+    OperationType op = OperationType::unknown;
+    Expression* lhs = nullptr;
+    Expression* rhs = nullptr;
+};
+
+CompareDomain compare_domain(OperationType op) {
+    switch (op) {
+        case OperationType::lt:
+        case OperationType::le:
+        case OperationType::gt:
+        case OperationType::ge:
+            return CompareDomain::Signed;
+        case OperationType::lt_us:
+        case OperationType::le_us:
+        case OperationType::gt_us:
+        case OperationType::ge_us:
+            return CompareDomain::Unsigned;
+        case OperationType::eq:
+        case OperationType::neq:
+            return CompareDomain::Any;
+        default:
+            return CompareDomain::Any;
+    }
+}
+
+CompareFamily compare_family(OperationType op) {
+    switch (op) {
+        case OperationType::lt:
+        case OperationType::lt_us:
+            return CompareFamily::Lt;
+        case OperationType::le:
+        case OperationType::le_us:
+            return CompareFamily::Le;
+        case OperationType::gt:
+        case OperationType::gt_us:
+            return CompareFamily::Gt;
+        case OperationType::ge:
+        case OperationType::ge_us:
+            return CompareFamily::Ge;
+        case OperationType::eq:
+            return CompareFamily::Eq;
+        case OperationType::neq:
+            return CompareFamily::Neq;
+        default:
+            return CompareFamily::Unknown;
+    }
+}
+
+OperationType flipped_compare(OperationType op) {
+    switch (op) {
+        case OperationType::lt: return OperationType::gt;
+        case OperationType::le: return OperationType::ge;
+        case OperationType::gt: return OperationType::lt;
+        case OperationType::ge: return OperationType::le;
+        case OperationType::lt_us: return OperationType::gt_us;
+        case OperationType::le_us: return OperationType::ge_us;
+        case OperationType::gt_us: return OperationType::lt_us;
+        case OperationType::ge_us: return OperationType::le_us;
+        case OperationType::eq:
+        case OperationType::neq:
+            return op;
+        default:
+            return OperationType::unknown;
+    }
+}
+
+bool extract_compare(Expression* expr, CompareInfo& out) {
+    if (!expr) {
+        return false;
+    }
+
+    if (auto* cond = dyn_cast<Condition>(expr)) {
+        if (compare_family(cond->type()) == CompareFamily::Unknown) {
+            return false;
+        }
+        out.op = cond->type();
+        out.lhs = cond->lhs();
+        out.rhs = cond->rhs();
+        return true;
+    }
+
+    auto* op = dyn_cast<Operation>(expr);
+    if (!op || op->operands().size() != 2 || compare_family(op->type()) == CompareFamily::Unknown) {
+        return false;
+    }
+
+    out.op = op->type();
+    out.lhs = op->operands()[0];
+    out.rhs = op->operands()[1];
+    return true;
+}
+
+bool compare_ops_contradict(OperationType outer_op, OperationType inner_op) {
+    const CompareFamily outer = compare_family(outer_op);
+    const CompareFamily inner = compare_family(inner_op);
+    if (outer == CompareFamily::Unknown || inner == CompareFamily::Unknown) {
+        return false;
+    }
+
+    const CompareDomain outer_domain = compare_domain(outer_op);
+    const CompareDomain inner_domain = compare_domain(inner_op);
+    if (outer_domain != CompareDomain::Any && inner_domain != CompareDomain::Any && outer_domain != inner_domain) {
+        return false;
+    }
+
+    switch (outer) {
+        case CompareFamily::Lt:
+            return inner == CompareFamily::Gt || inner == CompareFamily::Ge || inner == CompareFamily::Eq;
+        case CompareFamily::Le:
+            return inner == CompareFamily::Gt;
+        case CompareFamily::Gt:
+            return inner == CompareFamily::Lt || inner == CompareFamily::Le || inner == CompareFamily::Eq;
+        case CompareFamily::Ge:
+            return inner == CompareFamily::Lt;
+        case CompareFamily::Eq:
+            return inner == CompareFamily::Lt || inner == CompareFamily::Gt || inner == CompareFamily::Neq;
+        case CompareFamily::Neq:
+            return inner == CompareFamily::Eq;
+        case CompareFamily::Unknown:
+            return false;
+    }
+    return false;
+}
+
+bool conditions_contradict(Expression* outer_expr, Expression* inner_expr) {
+    CompareInfo outer;
+    CompareInfo inner;
+    if (!extract_compare(outer_expr, outer) || !extract_compare(inner_expr, inner)) {
+        return false;
+    }
+
+    const std::uint64_t outer_lhs_fp = expression_fingerprint_hash(outer.lhs);
+    const std::uint64_t outer_rhs_fp = expression_fingerprint_hash(outer.rhs);
+    const std::uint64_t inner_lhs_fp = expression_fingerprint_hash(inner.lhs);
+    const std::uint64_t inner_rhs_fp = expression_fingerprint_hash(inner.rhs);
+
+    OperationType aligned_inner_op = OperationType::unknown;
+    if (outer_lhs_fp == inner_lhs_fp && outer_rhs_fp == inner_rhs_fp) {
+        aligned_inner_op = inner.op;
+    } else if (outer_lhs_fp == inner_rhs_fp && outer_rhs_fp == inner_lhs_fp) {
+        aligned_inner_op = flipped_compare(inner.op);
+    } else {
+        return false;
+    }
+
+    if (aligned_inner_op == OperationType::unknown) {
+        return false;
+    }
+    return compare_ops_contradict(outer.op, aligned_inner_op);
+}
+
 template<typename Func>
 AstNode* rewrite_ast(DecompilerArena& arena, AstNode* node, Func f) {
     if (!node) return nullptr;
@@ -125,6 +307,15 @@ AstNode* AstProcessor::clean_node(DecompilerArena& arena, AstNode* root) {
             if (!ifn->true_branch() && ifn->false_branch()) {
                 switch_branches(arena, ifn);
             }
+
+            if (!ifn->false_branch()) {
+                if (auto* nested_if = ast_dyn_cast<IfNode>(ifn->true_branch())) {
+                    if (!nested_if->false_branch() && same_if_condition(ifn->cond(), nested_if->cond())) {
+                        ifn->set_true_branch(nested_if->true_branch());
+                    }
+                }
+            }
+
             if (!ifn->true_branch() && !ifn->false_branch()) return nullptr;
             return ifn;
         }
@@ -142,6 +333,29 @@ AstNode* AstProcessor::clean_node(DecompilerArena& arena, AstNode* root) {
             if (seq->empty()) return nullptr;
             if (seq->size() == 1) return seq->first();
             return seq;
+        }
+
+        if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+            auto* body_seq = ast_dyn_cast<SeqNode>(loop->body());
+            if (!loop->condition() || !body_seq || body_seq->empty()) {
+                return loop;
+            }
+
+            auto* lead_if = ast_dyn_cast<IfNode>(body_seq->first());
+            if (!lead_if || !lead_if->is_break_condition()) {
+                return loop;
+            }
+
+            auto* cond_ast = ast_dyn_cast<ExprAstNode>(lead_if->cond());
+            if (!cond_ast || !cond_ast->expr()) {
+                return loop;
+            }
+
+            if (conditions_contradict(loop->condition(), cond_ast->expr())) {
+                auto& nodes = body_seq->mutable_nodes();
+                nodes.erase(nodes.begin());
+            }
+            return loop;
         }
 
         return node;

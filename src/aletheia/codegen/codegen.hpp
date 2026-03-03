@@ -53,6 +53,7 @@ public:
 private:
     void visit_node(AstNode* node);
     void visit_if_chain(IfNode* inode, bool else_if_prefix);
+    bool node_emits_code(AstNode* node);
     void indent();
 
     std::vector<std::string> lines_;

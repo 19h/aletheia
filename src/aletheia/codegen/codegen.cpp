@@ -814,7 +814,21 @@ void CExpressionGenerator::visit(Condition* c) {
         case OperationType::ge_us: op_str = " >= "; break;
         default: op_str = " ?? "; break;
     }
-    result_ = generate(c->lhs()) + op_str + generate(c->rhs());
+
+    const int parent_prec = precedence_for_operation(c->type());
+    auto render_operand = [&](Expression* operand, bool is_rhs) {
+        std::string rendered = generate(operand);
+        const int child_prec = precedence_for_expression(operand);
+        const bool needs_brackets =
+            (child_prec < parent_prec) ||
+            (is_rhs && child_prec == parent_prec && needs_parentheses_for_equal_precedence_rhs(c->type()));
+        if (needs_brackets) {
+            return "(" + rendered + ")";
+        }
+        return rendered;
+    };
+
+    result_ = render_operand(c->lhs(), false) + op_str + render_operand(c->rhs(), true);
 }
 
 void CExpressionGenerator::visit_assignment(Assignment* i) {
@@ -1028,11 +1042,13 @@ void CodeVisitor::visit_node(AstNode* node) {
                         } else {
                             current_line_ += "/* branch if (" + cond + ") */";
                         }
+
+                        if (!current_line_.empty()) {
+                            lines_.push_back(current_line_);
+                            current_line_.clear();
+                        }
                     }
-                    if (!current_line_.empty()) {
-                        lines_.push_back(current_line_);
-                        current_line_.clear();
-                    }
+                    current_line_.clear();
                     continue;
                 }
 
@@ -1214,7 +1230,21 @@ void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
 
     AstNode* true_branch = inode->true_branch();
     AstNode* false_branch = inode->false_branch();
-    if (should_swap_if_branches(inode)) {
+    const bool true_emits = node_emits_code(true_branch);
+    const bool false_emits = node_emits_code(false_branch);
+
+    if (!true_emits && !false_emits) {
+        return;
+    }
+
+    bool swapped_for_emission = false;
+    if (!true_emits && false_emits) {
+        std::swap(true_branch, false_branch);
+        cond_str = negate_condition_string(cond_str);
+        swapped_for_emission = true;
+    }
+
+    if (!swapped_for_emission && should_swap_if_branches(inode)) {
         std::swap(true_branch, false_branch);
         cond_str = negate_condition_string(cond_str);
     }
@@ -1234,7 +1264,7 @@ void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
         return;
     }
 
-    if (false_branch != nullptr) {
+    if (false_branch != nullptr && node_emits_code(false_branch)) {
         indent();
         current_line_ += "} else {";
         lines_.push_back(current_line_);
@@ -1249,6 +1279,68 @@ void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
     current_line_ += "}";
     lines_.push_back(current_line_);
     current_line_.clear();
+}
+
+bool CodeVisitor::node_emits_code(AstNode* node) {
+    if (!node) {
+        return false;
+    }
+
+    if (auto* cnode = ast_dyn_cast<CodeNode>(node)) {
+        BasicBlock* block = cnode->block();
+        if (!block) {
+            return false;
+        }
+
+        if (cfg_fallback_mode_) {
+            return true;
+        }
+
+        for (Instruction* inst : block->instructions()) {
+            if (!inst || isa<Branch>(inst)) {
+                continue;
+            }
+            if (isa<IndirectBranch>(inst)) {
+                return true;
+            }
+            if (!expr_gen_.generate(inst).empty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            if (node_emits_code(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
+        return node_emits_code(ifn->true_branch()) || node_emits_code(ifn->false_branch());
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return node_emits_code(loop->body());
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->cases()) {
+            if (node_emits_code(case_node)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        return node_emits_code(case_node->body());
+    }
+
+    return true;
 }
 
 void CodeVisitor::indent() {
