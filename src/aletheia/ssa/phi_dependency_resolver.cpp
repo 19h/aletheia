@@ -4,10 +4,24 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdint>
+#include <tuple>
 
 namespace aletheia {
 
 namespace {
+    std::tuple<std::string, std::size_t, std::uintptr_t> phi_order_key(Phi* phi) {
+        if (!phi || !phi->dest_var()) {
+            return std::make_tuple(std::string(""), std::size_t{0}, reinterpret_cast<std::uintptr_t>(phi));
+        }
+        Variable* dst = phi->dest_var();
+        return std::make_tuple(dst->name(), dst->ssa_version(), reinterpret_cast<std::uintptr_t>(phi));
+    }
+
+    bool phi_less(Phi* lhs, Phi* rhs) {
+        return phi_order_key(lhs) < phi_order_key(rhs);
+    }
+
     struct PhiGraph {
         std::vector<Phi*> nodes;
         std::unordered_map<Phi*, std::vector<Phi*>> edges;
@@ -20,7 +34,10 @@ namespace {
     // Performs DFS to output nodes in post-order.
     void dfs_postorder(Phi* u, PhiGraph& graph, std::unordered_set<Phi*>& visited, std::vector<Phi*>& postorder) {
         visited.insert(u);
-        for (Phi* v : graph.edges[u]) {
+        auto succs = graph.edges[u];
+        std::sort(succs.begin(), succs.end(), phi_less);
+        succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
+        for (Phi* v : succs) {
             if (visited.find(v) == visited.end()) {
                 dfs_postorder(v, graph, visited, postorder);
             }
@@ -45,6 +62,7 @@ void PhiDependencyResolver::resolve(DecompilerArena& arena, ControlFlowGraph& cf
         if (phis.empty()) {
             continue;
         }
+        std::sort(phis.begin(), phis.end(), phi_less);
 
         bool cycle_broken = true;
         std::vector<Assignment*> added_copies;
@@ -70,6 +88,11 @@ void PhiDependencyResolver::resolve(DecompilerArena& arena, ControlFlowGraph& cf
                         graph.add_edge(u, it->second);
                     }
                 }
+            }
+
+            for (auto& [phi, succs] : graph.edges) {
+                std::sort(succs.begin(), succs.end(), phi_less);
+                succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
             }
 
             // Compute topological order via DFS post-order reversal
@@ -105,7 +128,7 @@ void PhiDependencyResolver::resolve(DecompilerArena& arena, ControlFlowGraph& cf
             if (!directed_fvs.empty()) {
                 cycle_broken = true;
                 // Break cycle for the first FVS node and restart
-                Phi* fvs_node = *directed_fvs.begin();
+                Phi* fvs_node = *std::min_element(directed_fvs.begin(), directed_fvs.end(), phi_less);
                 Variable* orig_var = fvs_node->dest_var();
                 
                 auto* copy_var = arena.create<Variable>("copy_" + orig_var->name(), orig_var->size_bytes);

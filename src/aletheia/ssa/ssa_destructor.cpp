@@ -6,11 +6,13 @@
 #include "../pipeline/pipeline.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <limits>
 
 namespace aletheia {
 
@@ -35,6 +37,34 @@ struct SimpleKeyHash {
 
 SimpleKey to_key(const Variable* var) {
     return SimpleKey{var->name(), var->ssa_version()};
+}
+
+std::uint64_t block_order_key(BasicBlock* block) {
+    if (!block) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return static_cast<std::uint64_t>(block->id());
+}
+
+std::vector<BasicBlock*> sorted_blocks_by_id(const std::vector<BasicBlock*>& blocks) {
+    std::vector<BasicBlock*> sorted = blocks;
+    std::stable_sort(sorted.begin(), sorted.end(), [](BasicBlock* lhs, BasicBlock* rhs) {
+        return block_order_key(lhs) < block_order_key(rhs);
+    });
+    return sorted;
+}
+
+std::vector<std::pair<BasicBlock*, Expression*>> sorted_phi_origins(const std::unordered_map<BasicBlock*, Expression*>& origin_block) {
+    std::vector<std::pair<BasicBlock*, Expression*>> sorted;
+    sorted.reserve(origin_block.size());
+    for (const auto& [pred, value] : origin_block) {
+        sorted.emplace_back(pred, value);
+    }
+
+    std::stable_sort(sorted.begin(), sorted.end(), [](const auto& lhs, const auto& rhs) {
+        return block_order_key(lhs.first) < block_order_key(rhs.first);
+    });
+    return sorted;
 }
 
 void remove_identity_assignments(ControlFlowGraph& cfg) {
@@ -186,7 +216,7 @@ void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph
         next_block_id = std::max(next_block_id, block->id() + 1);
     }
 
-    const std::vector<BasicBlock*> original_blocks = cfg.blocks();
+    const std::vector<BasicBlock*> original_blocks = sorted_blocks_by_id(cfg.blocks());
     for (BasicBlock* bb : original_blocks) {
         std::vector<Instruction*> new_insts;
         std::unordered_map<BasicBlock*, BasicBlock*> split_block_for_pred;
@@ -284,7 +314,7 @@ void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph
 
             // Use origin_block if available, otherwise fall back to positional matching.
             if (!phi->origin_block().empty()) {
-                for (auto& [pred_block, source_expr] : phi->origin_block()) {
+                for (const auto& [pred_block, source_expr] : sorted_phi_origins(phi->origin_block())) {
                     if (!pred_block || !source_expr) continue;
 
                     bool interference = liveness.live_out(pred_block).contains(target->name());

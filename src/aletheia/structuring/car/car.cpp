@@ -1040,6 +1040,156 @@ std::int64_t sign_extend_bits(std::uint64_t value, std::size_t bit_width) {
     return static_cast<std::int64_t>(truncated);
 }
 
+std::uint64_t bit_mask_for_width(std::size_t bit_width) {
+    if (bit_width == 0 || bit_width >= 64) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return (std::uint64_t{1} << bit_width) - 1;
+}
+
+std::uint64_t truncate_to_width(std::uint64_t value, std::size_t bit_width) {
+    return value & bit_mask_for_width(bit_width);
+}
+
+using ConstantEnvironment = std::unordered_map<std::string, std::uint64_t>;
+
+std::optional<std::uint64_t> evaluate_constant_expression(
+    Expression* expr,
+    const ConstantEnvironment& constants,
+    std::size_t bit_width
+) {
+    if (!expr) {
+        return std::nullopt;
+    }
+
+    if (auto* c = dyn_cast<Constant>(expr)) {
+        return truncate_to_width(c->value(), bit_width);
+    }
+
+    if (auto* v = dyn_cast<Variable>(expr)) {
+        auto it = constants.find(variable_key(v));
+        if (it == constants.end()) {
+            return std::nullopt;
+        }
+        return truncate_to_width(it->second, bit_width);
+    }
+
+    auto* op = dyn_cast<Operation>(expr);
+    if (!op) {
+        return std::nullopt;
+    }
+
+    const auto& operands = op->operands();
+    auto eval_operand = [&](std::size_t index) -> std::optional<std::uint64_t> {
+        if (index >= operands.size()) {
+            return std::nullopt;
+        }
+        return evaluate_constant_expression(operands[index], constants, bit_width);
+    };
+
+    switch (op->type()) {
+        case OperationType::add:
+        case OperationType::sub:
+        case OperationType::mul:
+        case OperationType::mul_us:
+        case OperationType::bit_and:
+        case OperationType::bit_or:
+        case OperationType::bit_xor:
+        case OperationType::shl:
+        case OperationType::shr:
+        case OperationType::shr_us:
+        case OperationType::sar:
+        case OperationType::logical_and:
+        case OperationType::logical_or: {
+            auto lhs = eval_operand(0);
+            auto rhs = eval_operand(1);
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+
+            const std::uint64_t lhs_v = *lhs;
+            const std::uint64_t rhs_v = *rhs;
+            switch (op->type()) {
+                case OperationType::add: return truncate_to_width(lhs_v + rhs_v, bit_width);
+                case OperationType::sub: return truncate_to_width(lhs_v - rhs_v, bit_width);
+                case OperationType::mul:
+                case OperationType::mul_us: return truncate_to_width(lhs_v * rhs_v, bit_width);
+                case OperationType::bit_and: return truncate_to_width(lhs_v & rhs_v, bit_width);
+                case OperationType::bit_or: return truncate_to_width(lhs_v | rhs_v, bit_width);
+                case OperationType::bit_xor: return truncate_to_width(lhs_v ^ rhs_v, bit_width);
+                case OperationType::shl: {
+                    const std::uint64_t shift = rhs_v & 63;
+                    return truncate_to_width(lhs_v << shift, bit_width);
+                }
+                case OperationType::shr:
+                case OperationType::sar: {
+                    const std::uint64_t shift = rhs_v & 63;
+                    const std::int64_t signed_lhs = sign_extend_bits(lhs_v, bit_width);
+                    return truncate_to_width(static_cast<std::uint64_t>(signed_lhs >> shift), bit_width);
+                }
+                case OperationType::shr_us: {
+                    const std::uint64_t shift = rhs_v & 63;
+                    return truncate_to_width(lhs_v >> shift, bit_width);
+                }
+                case OperationType::logical_and: return (lhs_v != 0 && rhs_v != 0) ? 1 : 0;
+                case OperationType::logical_or: return (lhs_v != 0 || rhs_v != 0) ? 1 : 0;
+                default: break;
+            }
+            break;
+        }
+        case OperationType::negate:
+        case OperationType::bit_not:
+        case OperationType::logical_not:
+        case OperationType::cast:
+        case OperationType::low: {
+            auto value = eval_operand(0);
+            if (!value) {
+                return std::nullopt;
+            }
+            switch (op->type()) {
+                case OperationType::negate: return truncate_to_width(static_cast<std::uint64_t>(-static_cast<std::int64_t>(*value)), bit_width);
+                case OperationType::bit_not: return truncate_to_width(~(*value), bit_width);
+                case OperationType::logical_not: return *value == 0 ? 1 : 0;
+                case OperationType::cast:
+                case OperationType::low: return truncate_to_width(*value, bit_width);
+                default: break;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    return std::nullopt;
+}
+
+void collect_constants_before_initializer(CodeNode* init_code, Assignment* initializer, ConstantEnvironment& constants) {
+    if (!init_code || !init_code->block() || !initializer) {
+        return;
+    }
+
+    for (Instruction* inst : init_code->block()->instructions()) {
+        if (inst == initializer) {
+            break;
+        }
+
+        auto* assign = dyn_cast<Assignment>(inst);
+        auto* destination = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+        if (!destination) {
+            continue;
+        }
+
+        const std::size_t width = destination->size_bytes == 0 ? 64 : std::min<std::size_t>(destination->size_bytes * 8, 64);
+        auto value = evaluate_constant_expression(assign->value(), constants, width);
+        const std::string key = variable_key(destination);
+        if (value.has_value()) {
+            constants[key] = *value;
+        } else {
+            constants.erase(key);
+        }
+    }
+}
+
 bool evaluate_comparison(
     OperationType op,
     std::uint64_t lhs,
@@ -1061,14 +1211,21 @@ bool evaluate_comparison(
     }
 }
 
-bool first_iteration_condition_provable_true(Expression* condition, Assignment* initializer) {
-    if (!condition || !initializer) {
+bool first_iteration_condition_provable_true(Expression* condition, CodeNode* init_code, Assignment* initializer) {
+    if (!condition || !initializer || !init_code) {
         return false;
     }
 
     auto* init_var = dyn_cast<Variable>(initializer->destination());
-    auto* init_const = dyn_cast<Constant>(initializer->value());
-    if (!init_var || !init_const) {
+    if (!init_var) {
+        return false;
+    }
+
+    const std::size_t bit_width = init_var->size_bytes == 0 ? 64 : std::min<std::size_t>(init_var->size_bytes * 8, 64);
+    ConstantEnvironment constants;
+    collect_constants_before_initializer(init_code, initializer, constants);
+    auto init_value = evaluate_constant_expression(initializer->value(), constants, bit_width);
+    if (!init_value.has_value()) {
         return false;
     }
 
@@ -1083,8 +1240,8 @@ bool first_iteration_condition_provable_true(Expression* condition, Assignment* 
         return false;
     }
 
-    const std::size_t bit_width = cond_var->size_bytes == 0 ? 64 : std::min<std::size_t>(cond_var->size_bytes * 8, 64);
-    return evaluate_comparison(cond_op, init_const->value(), cond_const, bit_width);
+    const std::size_t cond_width = cond_var->size_bytes == 0 ? bit_width : std::min<std::size_t>(cond_var->size_bytes * 8, 64);
+    return evaluate_comparison(cond_op, *init_value, cond_const, cond_width);
 }
 
 void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
@@ -1158,7 +1315,7 @@ void rewrite_do_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
             continue;
         }
 
-        if (!first_iteration_condition_provable_true(do_node->condition(), init_assign)) {
+        if (!first_iteration_condition_provable_true(do_node->condition(), init_code, init_assign)) {
             continue;
         }
 

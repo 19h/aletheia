@@ -1,11 +1,74 @@
 #include "ssa_constructor.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <queue>
 #include <stack>
 
 namespace aletheia {
 
+namespace {
+
+std::uint64_t block_order_key(BasicBlock* block) {
+    if (!block) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return static_cast<std::uint64_t>(block->id());
+}
+
+std::vector<BasicBlock*> sorted_blocks_by_id(const std::vector<BasicBlock*>& blocks) {
+    std::vector<BasicBlock*> sorted = blocks;
+    std::stable_sort(sorted.begin(), sorted.end(), [](BasicBlock* lhs, BasicBlock* rhs) {
+        return block_order_key(lhs) < block_order_key(rhs);
+    });
+    return sorted;
+}
+
+std::vector<Edge*> sorted_successor_edges(const std::vector<Edge*>& edges) {
+    std::vector<Edge*> sorted = edges;
+    std::stable_sort(sorted.begin(), sorted.end(), [](Edge* lhs, Edge* rhs) {
+        BasicBlock* lhs_target = lhs ? lhs->target() : nullptr;
+        BasicBlock* rhs_target = rhs ? rhs->target() : nullptr;
+
+        const std::uint64_t lhs_key = block_order_key(lhs_target);
+        const std::uint64_t rhs_key = block_order_key(rhs_target);
+        if (lhs_key != rhs_key) {
+            return lhs_key < rhs_key;
+        }
+
+        const int lhs_type = lhs ? static_cast<int>(lhs->type()) : std::numeric_limits<int>::max();
+        const int rhs_type = rhs ? static_cast<int>(rhs->type()) : std::numeric_limits<int>::max();
+        if (lhs_type != rhs_type) {
+            return lhs_type < rhs_type;
+        }
+
+        const int lhs_kind = lhs ? static_cast<int>(lhs->edge_kind()) : std::numeric_limits<int>::max();
+        const int rhs_kind = rhs ? static_cast<int>(rhs->edge_kind()) : std::numeric_limits<int>::max();
+        if (lhs_kind != rhs_kind) {
+            return lhs_kind < rhs_kind;
+        }
+
+        return false;
+    });
+    return sorted;
+}
+
+std::vector<std::string> sorted_var_names(const std::unordered_map<std::string, std::vector<BasicBlock*>>& defs) {
+    std::vector<std::string> names;
+    names.reserve(defs.size());
+    for (const auto& [name, _] : defs) {
+        names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+} // namespace
+
 void SsaConstructor::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
+    var_defs_.clear();
+    phi_nodes_.clear();
     DominatorTree dom_tree(*task.cfg());
     gather_definitions(*task.cfg());
     insert_phi_nodes(task.arena(), *task.cfg(), dom_tree);
@@ -13,7 +76,7 @@ void SsaConstructor::execute(DecompilerTask& task) {
 }
 
 void SsaConstructor::gather_definitions(ControlFlowGraph& cfg) {
-    for (BasicBlock* block : cfg.blocks()) {
+    for (BasicBlock* block : sorted_blocks_by_id(cfg.blocks())) {
         for (Instruction* inst : block->instructions()) {
             // Use the new Assignment type to identify definitions
             if (auto* assign = dyn_cast<Assignment>(inst)) {
@@ -26,7 +89,13 @@ void SsaConstructor::gather_definitions(ControlFlowGraph& cfg) {
 }
 
 void SsaConstructor::insert_phi_nodes(DecompilerArena& arena, ControlFlowGraph& cfg, const DominatorTree& dom_tree) {
-    for (const auto& [var_name, def_blocks] : var_defs_) {
+    for (const std::string& var_name : sorted_var_names(var_defs_)) {
+        std::vector<BasicBlock*> def_blocks = var_defs_[var_name];
+        std::stable_sort(def_blocks.begin(), def_blocks.end(), [](BasicBlock* lhs, BasicBlock* rhs) {
+            return block_order_key(lhs) < block_order_key(rhs);
+        });
+        def_blocks.erase(std::unique(def_blocks.begin(), def_blocks.end()), def_blocks.end());
+
         std::unordered_set<BasicBlock*> in_worklist;
         std::unordered_set<BasicBlock*> has_phi;
         std::queue<BasicBlock*> worklist;
@@ -66,9 +135,9 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
     std::unordered_map<std::string, std::stack<std::size_t>> counters;
     std::unordered_map<std::string, std::size_t> counts;
 
-    for (const auto& pair : var_defs_) {
-        counters[pair.first].push(0);
-        counts[pair.first] = 0;
+    for (const std::string& var_name : sorted_var_names(var_defs_)) {
+        counters[var_name].push(0);
+        counts[var_name] = 0;
     }
 
     // Recursively update SSA versions on Variable uses within an Expression tree.
@@ -137,7 +206,10 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
         }
 
         // Add phi operands in successor blocks
-        for (Edge* edge : block->successors()) {
+        for (Edge* edge : sorted_successor_edges(block->successors())) {
+            if (!edge) {
+                continue;
+            }
             BasicBlock* succ = edge->target();
             if (phi_nodes_.contains(succ)) {
                 for (std::size_t i = 0; i < phi_nodes_[succ].size(); ++i) {
@@ -166,7 +238,16 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
         }
 
         // Pop the SSA version counters pushed in this block
+        std::vector<std::pair<std::string, int>> pushed;
+        pushed.reserve(pushed_in_this_block.size());
         for (const auto& [var_name, pushes] : pushed_in_this_block) {
+            pushed.emplace_back(var_name, pushes);
+        }
+        std::sort(pushed.begin(), pushed.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.first < rhs.first;
+        });
+
+        for (const auto& [var_name, pushes] : pushed) {
             for (int i = 0; i < pushes; ++i) {
                 counters[var_name].pop();
             }
@@ -178,7 +259,11 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
     }
 
     // Insert phi nodes into the actual block instruction lists (at the front)
-    for (auto& [block, phis] : phi_nodes_) {
+    for (BasicBlock* block : sorted_blocks_by_id(cfg.blocks())) {
+        if (!phi_nodes_.contains(block)) {
+            continue;
+        }
+        auto& phis = phi_nodes_[block];
         auto& insts = block->mutable_instructions();
         // Phi* is-a Instruction* but vector iterators differ, so copy explicitly
         std::vector<Instruction*> phi_insts(phis.begin(), phis.end());
