@@ -2466,7 +2466,89 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
         }
     }
 
+
+    if (op->operands().size() == 3) {
+        if (op->type() == OperationType::ternary) {
+            Expression* cond = op->operands()[0];
+            Expression* t_branch = op->operands()[1];
+            Expression* f_branch = op->operands()[2];
+
+
+            std::string cond_fp = expr_fingerprint(cond);
+
+            std::string not_cond_fp;
+            if (auto* cond_op = dyn_cast<Condition>(cond)) {
+                auto negated_op = Condition::negate_comparison(cond_op->type());
+                auto* negated_cond = task.arena().create<Condition>(negated_op, cond_op->lhs(), cond_op->rhs(), cond_op->size_bytes);
+                not_cond_fp = expr_fingerprint(negated_cond);
+            } else if (auto* op_cond = dyn_cast<Operation>(cond)) {
+                if (op_cond->type() == OperationType::logical_not && op_cond->operands().size() == 1) {
+                    not_cond_fp = expr_fingerprint(op_cond->operands()[0]);
+                } else {
+                    auto* negated = task.arena().create<Operation>(OperationType::logical_not, std::vector<Expression*>{cond}, cond->size_bytes);
+                    not_cond_fp = expr_fingerprint(negated);
+                }
+            } else {
+                auto* negated = task.arena().create<Operation>(OperationType::logical_not, std::vector<Expression*>{cond}, cond->size_bytes);
+                not_cond_fp = expr_fingerprint(negated);
+            }
+
+            // cond ? X : X -> X
+            if (expr_fingerprint(t_branch) == expr_fingerprint(f_branch)) {
+                return t_branch;
+            }
+
+            // cond ? t_branch : (cond ? X : Y) -> cond ? t_branch : Y
+            // cond ? t_branch : (!cond ? X : Y) -> cond ? t_branch : X
+            if (auto* f_ternary = dyn_cast<Operation>(f_branch)) {
+                if (f_ternary->type() == OperationType::ternary && f_ternary->operands().size() == 3) {
+                    std::string f_cond_fp = expr_fingerprint(f_ternary->operands()[0]);
+                    if (cond_fp == f_cond_fp) {
+                        auto* new_ternary = task.arena().create<Operation>(
+                            OperationType::ternary,
+                            std::vector<Expression*>{cond, t_branch, f_ternary->operands()[2]},
+                            op->size_bytes);
+                        new_ternary->set_ir_type(op->ir_type());
+                        return simplify_expression_tree(task, new_ternary);
+                    } else if (not_cond_fp == f_cond_fp) {
+                        auto* new_ternary = task.arena().create<Operation>(
+                            OperationType::ternary,
+                            std::vector<Expression*>{cond, t_branch, f_ternary->operands()[1]},
+                            op->size_bytes);
+                        new_ternary->set_ir_type(op->ir_type());
+                        return simplify_expression_tree(task, new_ternary);
+                    }
+                }
+            }
+
+            // cond ? (cond ? X : Y) : f_branch -> cond ? X : f_branch
+            // cond ? (!cond ? X : Y) : f_branch -> cond ? Y : f_branch
+            if (auto* t_ternary = dyn_cast<Operation>(t_branch)) {
+                if (t_ternary->type() == OperationType::ternary && t_ternary->operands().size() == 3) {
+                    std::string t_cond_fp = expr_fingerprint(t_ternary->operands()[0]);
+                    if (cond_fp == t_cond_fp) {
+                        auto* new_ternary = task.arena().create<Operation>(
+                            OperationType::ternary,
+                            std::vector<Expression*>{cond, t_ternary->operands()[1], f_branch},
+                            op->size_bytes);
+                        new_ternary->set_ir_type(op->ir_type());
+                        return simplify_expression_tree(task, new_ternary);
+                    } else if (not_cond_fp == t_cond_fp) {
+                        auto* new_ternary = task.arena().create<Operation>(
+                            OperationType::ternary,
+                            std::vector<Expression*>{cond, t_ternary->operands()[2], f_branch},
+                            op->size_bytes);
+                        new_ternary->set_ir_type(op->ir_type());
+                        return simplify_expression_tree(task, new_ternary);
+                    }
+                }
+            }
+
+        }
+    }
+
     if (op->operands().size() == 2) {
+
         Expression* lhs_expr = op->operands()[0];
         Expression* rhs_expr = op->operands()[1];
 
