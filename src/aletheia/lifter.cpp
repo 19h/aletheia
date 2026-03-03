@@ -5,14 +5,18 @@
 #include <ida/type.hpp>
 #include <ida/segment.hpp>
 #include <ida/xref.hpp>
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <iostream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include "pipeline/pipeline.hpp"
 #include "structures/types.hpp"
 
@@ -34,6 +38,7 @@ std::string sanitize_identifier(std::string text) {
     if (auto ptr_pos = text.find("ptr "); ptr_pos != std::string::npos) {
         text = text.substr(ptr_pos + 4);
     }
+
     if (auto colon_pos = text.rfind(':'); colon_pos != std::string::npos) {
         text = text.substr(colon_pos + 1);
     }
@@ -135,6 +140,97 @@ bool contains_register_token(std::string_view text, std::string_view token) {
             return true;
         }
         pos = text.find(token, pos + 1);
+    }
+    return false;
+}
+
+constexpr std::array<std::string_view, 16> kArmConditionSuffixes = {
+    "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl",
+    "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le"
+};
+
+bool arm_mnemonic_matches_variant(
+    std::string_view mnemonic,
+    std::string_view base,
+    bool allow_flag_suffix,
+    std::optional<std::string_view>* condition_out = nullptr,
+    bool* sets_flags_out = nullptr) {
+    auto emit = [&](std::optional<std::string_view> condition, bool sets_flags) {
+        if (condition_out) {
+            *condition_out = condition;
+        }
+        if (sets_flags_out) {
+            *sets_flags_out = sets_flags;
+        }
+        return true;
+    };
+
+    if (mnemonic == base) {
+        return emit(std::nullopt, false);
+    }
+
+    if (allow_flag_suffix
+        && mnemonic.size() == base.size() + 1
+        && mnemonic.starts_with(base)
+        && mnemonic.back() == 's') {
+        return emit(std::nullopt, true);
+    }
+
+    for (auto cond : kArmConditionSuffixes) {
+        const std::size_t cond_len = cond.size();
+        if (mnemonic.size() == base.size() + cond_len
+            && mnemonic.starts_with(base)
+            && mnemonic.substr(base.size()) == cond) {
+            return emit(cond, false);
+        }
+
+        if (!allow_flag_suffix) {
+            continue;
+        }
+
+        // ARM assemblers/decoders may present either mnemonic{cond}{s}
+        // or mnemonic{s}{cond} spellings.
+        if (mnemonic.size() == base.size() + cond_len + 1
+            && mnemonic.starts_with(base)
+            && mnemonic.substr(base.size(), cond_len) == cond
+            && mnemonic.back() == 's') {
+            return emit(cond, true);
+        }
+
+        if (mnemonic.size() == base.size() + 1 + cond_len
+            && mnemonic.starts_with(base)
+            && mnemonic[base.size()] == 's'
+            && mnemonic.substr(base.size() + 1) == cond) {
+            return emit(cond, true);
+        }
+    }
+
+    return false;
+}
+
+bool arm_mnemonic_in(
+    std::string_view mnemonic,
+    std::initializer_list<std::string_view> bases,
+    bool allow_flag_suffix,
+    std::string_view* matched_base = nullptr,
+    std::optional<std::string_view>* condition_out = nullptr,
+    bool* sets_flags_out = nullptr) {
+    for (auto base : bases) {
+        std::optional<std::string_view> cond;
+        bool sets_flags = false;
+        if (!arm_mnemonic_matches_variant(mnemonic, base, allow_flag_suffix, &cond, &sets_flags)) {
+            continue;
+        }
+        if (matched_base) {
+            *matched_base = base;
+        }
+        if (condition_out) {
+            *condition_out = cond;
+        }
+        if (sets_flags_out) {
+            *sets_flags_out = sets_flags;
+        }
+        return true;
     }
     return false;
 }
@@ -294,24 +390,279 @@ std::optional<std::string> stack_slot_name_from_operand_text(std::string operand
 }
 
 bool is_conditional_branch_mnemonic(std::string_view mnemonic) {
-    static constexpr std::string_view kX86Jcc[] = {
-        "je", "jz", "jne", "jnz", "jg", "jnle", "jge", "jnl", "jl", "jnge", "jle", "jng",
-        "ja", "jnbe", "jae", "jnb", "jb", "jnae", "jbe", "jna", "js", "jns", "jo", "jno",
-        "jp", "jpe", "jnp", "jpo"
+    auto x86_cc_from_suffix = [](std::string_view cc) -> bool {
+        static constexpr std::array<std::string_view, 33> kX86ConditionSuffixes = {
+            "o", "no", "b", "nae", "c", "ae", "nb", "nc",
+            "e", "z", "ne", "nz", "be", "na", "a", "nbe",
+            "s", "ns", "p", "pe", "np", "po", "l", "nge",
+            "ge", "nl", "le", "ng", "g", "nle", "cxz", "ecxz",
+            "rcxz"
+        };
+        for (auto suffix : kX86ConditionSuffixes) {
+            if (cc == suffix) {
+                return true;
+            }
+        }
+        return false;
     };
-    for (auto m : kX86Jcc) {
-        if (mnemonic == m) {
+
+    if (mnemonic == "cbz" || mnemonic == "cbnz" || mnemonic == "tbz" || mnemonic == "tbnz"
+        || mnemonic == "loop" || mnemonic == "loope" || mnemonic == "loopz"
+        || mnemonic == "loopne" || mnemonic == "loopnz") {
+        return true;
+    }
+
+    if (mnemonic.starts_with("j") && mnemonic != "jmp" && mnemonic != "jmpq") {
+        if (x86_cc_from_suffix(mnemonic.substr(1))) {
             return true;
         }
     }
 
-    if (mnemonic == "cbz" || mnemonic == "cbnz" || mnemonic == "tbz" || mnemonic == "tbnz") {
-        return true;
-    }
     if (mnemonic.size() > 2 && mnemonic[0] == 'b' && mnemonic[1] == '.') {
         return true;
     }
+
+    if (mnemonic.starts_with("b") && mnemonic != "b" && mnemonic != "bl" && mnemonic != "blr"
+        && mnemonic != "blx" && mnemonic != "br" && mnemonic != "bx") {
+        std::string_view suffix = mnemonic.substr(1);
+        for (auto cond : kArmConditionSuffixes) {
+            if (suffix == cond) {
+                return true;
+            }
+        }
+    }
+
+    std::optional<std::string_view> bx_cond;
+    if (arm_mnemonic_matches_variant(mnemonic, "bx", false, &bx_cond, nullptr)
+        && bx_cond.has_value()) {
+        return true;
+    }
+
     return false;
+}
+
+std::optional<OperationType> x86_condition_to_operation(std::string_view cc) {
+    if (cc == "e" || cc == "z") return OperationType::eq;
+    if (cc == "ne" || cc == "nz") return OperationType::neq;
+    if (cc == "l" || cc == "nge") return OperationType::lt;
+    if (cc == "le" || cc == "ng") return OperationType::le;
+    if (cc == "g" || cc == "nle") return OperationType::gt;
+    if (cc == "ge" || cc == "nl") return OperationType::ge;
+
+    if (cc == "b" || cc == "nae" || cc == "c") return OperationType::lt_us;
+    if (cc == "be" || cc == "na") return OperationType::le_us;
+    if (cc == "a" || cc == "nbe") return OperationType::gt_us;
+    if (cc == "ae" || cc == "nb" || cc == "nc") return OperationType::ge_us;
+
+    if (cc == "s") return OperationType::lt;
+    if (cc == "ns") return OperationType::ge;
+
+    if (cc == "o") return OperationType::neq;
+    if (cc == "no") return OperationType::eq;
+
+    if (cc == "p" || cc == "pe") return OperationType::eq;
+    if (cc == "np" || cc == "po") return OperationType::neq;
+
+    return std::nullopt;
+}
+
+std::optional<OperationType> arm_condition_to_operation(std::string_view cc) {
+    if (cc == "eq") return OperationType::eq;
+    if (cc == "ne") return OperationType::neq;
+    if (cc == "lt") return OperationType::lt;
+    if (cc == "le") return OperationType::le;
+    if (cc == "gt") return OperationType::gt;
+    if (cc == "ge") return OperationType::ge;
+
+    if (cc == "lo" || cc == "cc") return OperationType::lt_us;
+    if (cc == "ls") return OperationType::le_us;
+    if (cc == "hi") return OperationType::gt_us;
+    if (cc == "hs" || cc == "cs") return OperationType::ge_us;
+
+    if (cc == "mi") return OperationType::lt;
+    if (cc == "pl") return OperationType::ge;
+
+    if (cc == "vs") return OperationType::neq;
+    if (cc == "vc") return OperationType::eq;
+
+    return std::nullopt;
+}
+
+std::optional<OperationType> x86_branch_condition(std::string_view mnemonic) {
+    if (mnemonic == "jcxz" || mnemonic == "jecxz" || mnemonic == "jrcxz") {
+        return OperationType::eq;
+    }
+    if (!mnemonic.starts_with('j') || mnemonic == "jmp" || mnemonic == "jmpq") {
+        return std::nullopt;
+    }
+    return x86_condition_to_operation(mnemonic.substr(1));
+}
+
+std::optional<OperationType> arm_branch_condition(std::string_view mnemonic) {
+    if (mnemonic == "cbz") return OperationType::eq;
+    if (mnemonic == "cbnz") return OperationType::neq;
+    if (mnemonic == "tbz") return OperationType::eq;
+    if (mnemonic == "tbnz") return OperationType::neq;
+
+    if (mnemonic.starts_with("b.")) {
+        return arm_condition_to_operation(mnemonic.substr(2));
+    }
+
+    if (mnemonic.starts_with('b') && mnemonic != "b" && mnemonic != "bl" && mnemonic != "blr"
+        && mnemonic != "blx" && mnemonic != "br" && !mnemonic.starts_with("bx")) {
+        return arm_condition_to_operation(mnemonic.substr(1));
+    }
+
+    std::optional<std::string_view> bx_cond;
+    if (arm_mnemonic_matches_variant(mnemonic, "bx", false, &bx_cond, nullptr)
+        && bx_cond.has_value()) {
+        return arm_condition_to_operation(*bx_cond);
+    }
+
+    return std::nullopt;
+}
+
+std::optional<OperationType> x86_setcc_condition(std::string_view mnemonic) {
+    if (!mnemonic.starts_with("set")) {
+        return std::nullopt;
+    }
+    return x86_condition_to_operation(mnemonic.substr(3));
+}
+
+std::optional<OperationType> x86_cmov_condition(std::string_view mnemonic) {
+    if (!mnemonic.starts_with("cmov")) {
+        return std::nullopt;
+    }
+    return x86_condition_to_operation(mnemonic.substr(4));
+}
+
+bool is_mnemonic_in(std::string_view mnemonic, std::initializer_list<std::string_view> set) {
+    for (auto item : set) {
+        if (mnemonic == item) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<OperationType> integer_binary_operation_for(std::string_view mnemonic) {
+    auto arm_match = [&](std::initializer_list<std::string_view> bases, bool allow_flag_suffix) {
+        return arm_mnemonic_in(mnemonic, bases, allow_flag_suffix, nullptr, nullptr, nullptr);
+    };
+
+    if (is_mnemonic_in(mnemonic, {"add", "adds"}) || arm_match({"add"}, true)) {
+        return OperationType::add;
+    }
+    if (is_mnemonic_in(mnemonic, {"adc", "adcs", "adcx", "adox"}) || arm_match({"adc"}, true)) {
+        return OperationType::add_with_carry;
+    }
+    if (is_mnemonic_in(mnemonic, {"sub", "subs"}) || arm_match({"sub"}, true)) {
+        return OperationType::sub;
+    }
+    if (is_mnemonic_in(mnemonic, {"sbb", "sbc", "sbcs"}) || arm_match({"sbc"}, true)) {
+        return OperationType::sub_with_carry;
+    }
+
+    if (is_mnemonic_in(mnemonic, {"imul", "muls", "smull"}) || arm_match({"muls", "smull"}, false)) {
+        return OperationType::mul;
+    }
+    if (is_mnemonic_in(mnemonic, {"mul", "umull", "mulx"}) || arm_match({"mul", "umull"}, false)) {
+        return OperationType::mul_us;
+    }
+    if (is_mnemonic_in(mnemonic, {"idiv", "sdiv"}) || arm_match({"sdiv"}, false)) {
+        return OperationType::div;
+    }
+    if (is_mnemonic_in(mnemonic, {"div", "udiv"}) || arm_match({"udiv"}, false)) {
+        return OperationType::div_us;
+    }
+
+    if (is_mnemonic_in(mnemonic, {"and", "ands", "tst"}) || arm_match({"and", "tst"}, true)) {
+        return OperationType::bit_and;
+    }
+    if (is_mnemonic_in(mnemonic, {"or", "orr"}) || arm_match({"orr"}, true)) {
+        return OperationType::bit_or;
+    }
+    if (is_mnemonic_in(mnemonic, {"xor", "eor", "teq"}) || arm_match({"eor", "teq"}, true)) {
+        return OperationType::bit_xor;
+    }
+
+    if (is_mnemonic_in(mnemonic, {"shl", "sal", "lsl", "lslv", "shlx"})
+        || arm_match({"lsl", "lslv"}, false)) {
+        return OperationType::shl;
+    }
+    if (is_mnemonic_in(mnemonic, {"shr", "lsr", "lsrv", "shrx"})
+        || arm_match({"lsr", "lsrv"}, false)) {
+        return OperationType::shr_us;
+    }
+    if (is_mnemonic_in(mnemonic, {"sar", "asr", "asrv", "sarx"})
+        || arm_match({"asr", "asrv"}, false)) {
+        return OperationType::shr;
+    }
+
+    if (is_mnemonic_in(mnemonic, {"rol"})) return OperationType::left_rotate;
+    if (is_mnemonic_in(mnemonic, {"ror", "rorv", "rorx"}) || arm_match({"ror", "rorv"}, false)) {
+        return OperationType::right_rotate;
+    }
+    if (is_mnemonic_in(mnemonic, {"rcl"})) return OperationType::left_rotate_carry;
+    if (is_mnemonic_in(mnemonic, {"rcr"})) return OperationType::right_rotate_carry;
+
+    return std::nullopt;
+}
+
+std::optional<OperationType> float_binary_operation_for(std::string_view mnemonic) {
+    if (is_mnemonic_in(mnemonic, {
+            "fadd", "fadds", "faddp", "addss", "addsd", "addps", "addpd",
+            "vaddss", "vaddsd", "vaddps", "vaddpd"
+        })) {
+        return OperationType::add_float;
+    }
+    if (is_mnemonic_in(mnemonic, {
+            "fsub", "fsubs", "fsubp", "subss", "subsd", "subps", "subpd",
+            "vsubss", "vsubsd", "vsubps", "vsubpd"
+        })) {
+        return OperationType::sub_float;
+    }
+    if (is_mnemonic_in(mnemonic, {
+            "fmul", "fmuls", "fmulp", "mulss", "mulsd", "mulps", "mulpd",
+            "vmulss", "vmulsd", "vmulps", "vmulpd"
+        })) {
+        return OperationType::mul_float;
+    }
+    if (is_mnemonic_in(mnemonic, {
+            "fdiv", "fdivs", "fdivp", "divss", "divsd", "divps", "divpd",
+            "vdivss", "vdivsd", "vdivps", "vdivpd"
+        })) {
+        return OperationType::div_float;
+    }
+
+    return std::nullopt;
+}
+
+bool unknown_mnemonic_trace_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ALETHEIA_LIFTER_TRACE_UNKNOWN_MNEMONICS");
+        if (!value) {
+            return false;
+        }
+        std::string_view v{value};
+        return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES";
+    }();
+    return enabled;
+}
+
+void trace_unknown_mnemonic_once(std::string_view mnemonic) {
+    if (!unknown_mnemonic_trace_enabled()) {
+        return;
+    }
+
+    static std::unordered_set<std::string> seen;
+    static std::mutex seen_mutex;
+    std::lock_guard<std::mutex> guard(seen_mutex);
+    if (!seen.emplace(mnemonic).second) {
+        return;
+    }
+
+    std::cerr << "aletheia-lifter: unknown mnemonic '" << mnemonic << "'\n";
 }
 
 std::optional<ida::Address> branch_target_from_instruction(const ida::instruction::Instruction& insn) {
@@ -1083,93 +1434,80 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     // Return instructions
     // =====================================================================
-    if (lmnem == "ret" || lmnem == "retn" || lmnem == "retf") {
+    if (is_mnemonic_in(lmnem, {"ret", "retn", "retf", "retaa", "retab", "eret"})) {
         auto* ret = arena_.create<Return>(std::move(operands));
         ret->set_address(addr);
         return ret;
     }
 
     // =====================================================================
-    // x86 conditional branch (Jcc)
+    // x86 conditional branches (Jcc / JCXZ / LOOP*)
     // =====================================================================
-    {
-        OperationType cmp = OperationType::unknown;
-        // Signed comparisons
-        if (lmnem == "je" || lmnem == "jz")       cmp = OperationType::eq;
-        else if (lmnem == "jne" || lmnem == "jnz") cmp = OperationType::neq;
-        else if (lmnem == "jl" || lmnem == "jnge") cmp = OperationType::lt;
-        else if (lmnem == "jle" || lmnem == "jng") cmp = OperationType::le;
-        else if (lmnem == "jg" || lmnem == "jnle") cmp = OperationType::gt;
-        else if (lmnem == "jge" || lmnem == "jnl") cmp = OperationType::ge;
-        // Unsigned comparisons
-        else if (lmnem == "jb" || lmnem == "jnae" || lmnem == "jc")  cmp = OperationType::lt_us;
-        else if (lmnem == "jbe" || lmnem == "jna")                    cmp = OperationType::le_us;
-        else if (lmnem == "ja" || lmnem == "jnbe")                    cmp = OperationType::gt_us;
-        else if (lmnem == "jae" || lmnem == "jnb" || lmnem == "jnc") cmp = OperationType::ge_us;
-        // Sign/overflow/parity (approximate as comparisons with flags)
-        else if (lmnem == "js")  cmp = OperationType::lt;   // SF=1 ~ negative
-        else if (lmnem == "jns") cmp = OperationType::ge;   // SF=0 ~ non-negative
-        else if (lmnem == "jo")  cmp = OperationType::neq;  // OF=1 (approximate)
-        else if (lmnem == "jno") cmp = OperationType::eq;   // OF=0 (approximate)
-        else if (lmnem == "jp" || lmnem == "jpe")  cmp = OperationType::eq;   // PF=1 (approximate)
-        else if (lmnem == "jnp" || lmnem == "jpo") cmp = OperationType::neq;  // PF=0 (approximate)
+    if (is_mnemonic_in(lmnem, {"loop", "loope", "loopz", "loopne", "loopnz"})) {
+        // LOOP-family semantics include implicit RCX/CX decrement and optional ZF checks.
+        // Keep this O(1) approximation branchable as a counter predicate.
+        auto* counter = arena_.create<Variable>("rcx", 8);
+        auto* zero = arena_.create<Constant>(0, 8);
+        auto* cond = arena_.create<Condition>(OperationType::neq, counter, zero);
+        auto* branch = arena_.create<Branch>(cond);
+        branch->set_address(addr);
+        return branch;
+    }
 
-        if (cmp != OperationType::unknown) {
-            // x86 Jcc operands are branch targets, not compared values.
-            // Model as condition over synthetic flags.
-            Expression* lhs = arena_.create<Variable>("flags", 1);
-            Expression* rhs = arena_.create<Constant>(0, 1);
-            auto* cond = arena_.create<Condition>(cmp, lhs, rhs);
-            auto* branch = arena_.create<Branch>(cond);
-            branch->set_address(addr);
-            return branch;
+    if (auto cmp = x86_branch_condition(lmnem); cmp.has_value()) {
+        Expression* lhs = arena_.create<Variable>("flags", 1);
+        Expression* rhs = arena_.create<Constant>(0, 1);
+
+        if (lmnem == "jcxz") {
+            lhs = arena_.create<Variable>("cx", 2);
+            rhs = arena_.create<Constant>(0, 2);
+        } else if (lmnem == "jecxz") {
+            lhs = arena_.create<Variable>("ecx", 4);
+            rhs = arena_.create<Constant>(0, 4);
+        } else if (lmnem == "jrcxz") {
+            lhs = arena_.create<Variable>("rcx", 8);
+            rhs = arena_.create<Constant>(0, 8);
         }
+
+        auto* cond = arena_.create<Condition>(*cmp, lhs, rhs);
+        auto* branch = arena_.create<Branch>(cond);
+        branch->set_address(addr);
+        return branch;
     }
 
     // =====================================================================
     // ARM conditional branch instructions
     // =====================================================================
-    {
-        OperationType cmp = OperationType::unknown;
-        if (lmnem == "b.le" || lmnem == "ble") cmp = OperationType::le;
-        else if (lmnem == "b.lt" || lmnem == "blt") cmp = OperationType::lt;
-        else if (lmnem == "b.ge" || lmnem == "bge") cmp = OperationType::ge;
-        else if (lmnem == "b.gt" || lmnem == "bgt") cmp = OperationType::gt;
-        else if (lmnem == "b.eq" || lmnem == "beq") cmp = OperationType::eq;
-        else if (lmnem == "b.ne" || lmnem == "bne") cmp = OperationType::neq;
-        // ARM unsigned comparisons
-        else if (lmnem == "b.lo" || lmnem == "b.cc") cmp = OperationType::lt_us;
-        else if (lmnem == "b.ls") cmp = OperationType::le_us;
-        else if (lmnem == "b.hi") cmp = OperationType::gt_us;
-        else if (lmnem == "b.hs" || lmnem == "b.cs") cmp = OperationType::ge_us;
-        // ARM CBZ/CBNZ (compare and branch)
-        else if (lmnem == "cbz")  cmp = OperationType::eq;
-        else if (lmnem == "cbnz") cmp = OperationType::neq;
-        // ARM TBZ/TBNZ (test bit and branch) -- approximate
-        else if (lmnem == "tbz")  cmp = OperationType::eq;
-        else if (lmnem == "tbnz") cmp = OperationType::neq;
+    if (auto cmp = arm_branch_condition(lmnem); cmp.has_value()) {
+        Expression* lhs = nullptr;
+        Expression* rhs = nullptr;
 
-        if (cmp != OperationType::unknown) {
-            Expression* lhs = nullptr;
-            Expression* rhs = nullptr;
-
-            if (lmnem == "cbz" || lmnem == "cbnz") {
-                lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
-                rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
-            } else if (lmnem == "tbz" || lmnem == "tbnz") {
-                lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
-                rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
+        if (lmnem == "cbz" || lmnem == "cbnz") {
+            lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
+            rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
+        } else if (lmnem == "tbz" || lmnem == "tbnz") {
+            if (operands.size() >= 2) {
+                const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 8U;
+                auto* one = arena_.create<Constant>(1, width);
+                auto* mask = arena_.create<Operation>(OperationType::shl,
+                    std::vector<Expression*>{one, operands[1]}, width);
+                lhs = arena_.create<Operation>(OperationType::bit_and,
+                    std::vector<Expression*>{operands[0], mask}, width);
+                rhs = arena_.create<Constant>(0, width);
             } else {
-                // ARM B.cond takes target operand only; compare flags register.
-                lhs = arena_.create<Variable>("flags", 1);
-                rhs = arena_.create<Constant>(0, 1);
+                lhs = !operands.empty() ? operands[0] : arena_.create<Variable>("flags", 1);
+                rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
             }
-
-            auto* cond = arena_.create<Condition>(cmp, lhs, rhs);
-            auto* branch = arena_.create<Branch>(cond);
-            branch->set_address(addr);
-            return branch;
+        } else {
+            // ARM B.cond / Bcc: branch uses flags predicate.
+            lhs = arena_.create<Variable>("flags", 1);
+            rhs = arena_.create<Constant>(0, 1);
         }
+
+        auto* cond = arena_.create<Condition>(*cmp, lhs, rhs);
+        auto* branch = arena_.create<Branch>(cond);
+        branch->set_address(addr);
+        return branch;
     }
 
     // =====================================================================
@@ -1180,7 +1518,10 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         return nullptr;
     }
 
-    if (lmnem == "jmp" || lmnem == "br") {
+    std::optional<std::string_view> bx_cond;
+    const bool is_bx_variant = arm_mnemonic_matches_variant(lmnem, "bx", false, &bx_cond, nullptr);
+    if (is_mnemonic_in(lmnem, {"jmp", "jmpq", "jmpf", "br", "braa", "brab", "braaz", "brabz"})
+        || (is_bx_variant && !bx_cond.has_value())) {
         // Direct jumps are represented by CFG edges; keep only computed/indirect
         // jumps as explicit IR.
         if (operands.empty()) {
@@ -1198,18 +1539,35 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     // CMP / TEST -- flag-setting without storing result
     // =====================================================================
-    if (lmnem == "cmp" && operands.size() >= 2) {
+    std::string_view cmp_base;
+    const bool is_cmp_like = arm_mnemonic_in(lmnem, {"cmp", "cmn"}, false, &cmp_base, nullptr, nullptr);
+    if (is_cmp_like && operands.size() >= 2) {
+        const OperationType op_type = (cmp_base == "cmn") ? OperationType::add : OperationType::sub;
         auto* op = arena_.create<Operation>(OperationType::sub,
             std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
+        op->set_type(op_type);
         auto* flags = arena_.create<Variable>("flags", operands[0]->size_bytes);
         auto* assign = arena_.create<Assignment>(flags, op);
         assign->set_address(addr);
         return assign;
     }
-    if (lmnem == "test" && operands.size() >= 2) {
+    std::string_view test_base;
+    const bool is_test_like = arm_mnemonic_in(lmnem, {"test", "tst", "teq"}, false, &test_base, nullptr, nullptr);
+    if (is_test_like && operands.size() >= 2) {
+        const OperationType op_type = (test_base == "teq") ? OperationType::bit_xor : OperationType::bit_and;
         auto* op = arena_.create<Operation>(OperationType::bit_and,
             std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
+        op->set_type(op_type);
         auto* flags = arena_.create<Variable>("flags", operands[0]->size_bytes);
+        auto* assign = arena_.create<Assignment>(flags, op);
+        assign->set_address(addr);
+        return assign;
+    }
+    if (is_mnemonic_in(lmnem, {"fcmp", "fcmpe", "comiss", "ucomiss", "comisd", "ucomisd"})
+        && operands.size() >= 2) {
+        auto* op = arena_.create<Operation>(OperationType::sub_float,
+            std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
+        auto* flags = arena_.create<Variable>("flags", operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1);
         auto* assign = arena_.create<Assignment>(flags, op);
         assign->set_address(addr);
         return assign;
@@ -1218,7 +1576,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     // x86 CALL instruction
     // =====================================================================
-    if (lmnem == "call") {
+    if (lmnem == "call" || lmnem == "callq") {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
         std::vector<Expression*> args;
         for (size_t i = 1; i < operands.size(); ++i) {
@@ -1232,7 +1590,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         return assign;
     }
     // ARM BL (branch-and-link = call)
-    if (lmnem == "bl" || lmnem == "blr") {
+    if (is_mnemonic_in(lmnem, {"bl", "blr", "blx", "blraa", "blrab", "blraaz", "blrabz"})) {
         Expression* target = !operands.empty() ? operands[0] : arena_.create<Variable>("unknown_func", 8);
         std::vector<Expression*> args;
         
@@ -1244,11 +1602,15 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         // Wait, why was the call itself missing in the C output??
         // Let's restore the basic parameter passing for the call just in case.
         
-        // Let's add dummy arguments x0, x1, x2, x3 so that the dead code elimination doesn't drop their initializations.
+        // Include the common integer argument registers (AAPCS x0-x7).
         args.push_back(arena_.create<Variable>("x0", 8));
         args.push_back(arena_.create<Variable>("x1", 8));
         args.push_back(arena_.create<Variable>("x2", 8));
         args.push_back(arena_.create<Variable>("x3", 8));
+        args.push_back(arena_.create<Variable>("x4", 8));
+        args.push_back(arena_.create<Variable>("x5", 8));
+        args.push_back(arena_.create<Variable>("x6", 8));
+        args.push_back(arena_.create<Variable>("x7", 8));
         
         auto* call = arena_.create<Call>(target, std::move(args), 8);
         auto* ret_var = arena_.create<Variable>("x0", 8); // ARM return in x0
@@ -1258,56 +1620,152 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     }
 
     // =====================================================================
+    // ARM system/coproc/barrier operations
+    // =====================================================================
+    if (is_mnemonic_in(lmnem, {"dmb", "dsb", "isb"})) {
+        auto* note = arena_.create<Comment>("barrier: " + lmnem);
+        note->set_address(addr);
+        return note;
+    }
+    if (is_mnemonic_in(lmnem, {"mrs", "vmrs"}) && operands.size() >= 2) {
+        const std::string intrinsic_name = "__" + lmnem;
+        auto* target = arena_.create<Variable>(intrinsic_name, 8);
+        auto* call = arena_.create<Call>(target,
+            std::vector<Expression*>{operands[1]}, operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1);
+        auto* assign = arena_.create<Assignment>(operands[0], call);
+        assign->set_address(addr);
+        return assign;
+    }
+    if (is_mnemonic_in(lmnem, {"msr", "vmsr", "mrc", "mcr"})) {
+        const std::string intrinsic_name = "__" + lmnem;
+        auto* target = arena_.create<Variable>(intrinsic_name, 8);
+        std::vector<Expression*> args;
+        args.reserve(operands.size());
+        for (auto* op : operands) {
+            args.push_back(op);
+        }
+        const std::size_t width = !operands.empty() && operands[0]->size_bytes > 0
+            ? operands[0]->size_bytes
+            : static_cast<std::size_t>(1);
+        auto* call = arena_.create<Call>(target, std::move(args), width);
+        auto* sink = arena_.create<Variable>("sysreg_state", width);
+        auto* assign = arena_.create<Assignment>(sink, call);
+        assign->set_address(addr);
+        return assign;
+    }
+
+    // =====================================================================
     // Arithmetic / Logic (binary operations)
     // =====================================================================
     {
-        OperationType arith = OperationType::unknown;
-        // x86 arithmetic
-        if      (lmnem == "add")  arith = OperationType::add;
-        else if (lmnem == "adc")  arith = OperationType::add_with_carry;
-        else if (lmnem == "sub")  arith = OperationType::sub;
-        else if (lmnem == "sbb")  arith = OperationType::sub_with_carry;
-        else if (lmnem == "imul") arith = OperationType::mul;
-        else if (lmnem == "and")  arith = OperationType::bit_and;
-        else if (lmnem == "or")   arith = OperationType::bit_or;
-        else if (lmnem == "xor")  arith = OperationType::bit_xor;
-        // x86 shifts
-        else if (lmnem == "shl" || lmnem == "sal") arith = OperationType::shl;
-        else if (lmnem == "shr")  arith = OperationType::shr_us;
-        else if (lmnem == "sar")  arith = OperationType::shr;
-        // x86 rotates
-        else if (lmnem == "rol")  arith = OperationType::left_rotate;
-        else if (lmnem == "ror")  arith = OperationType::right_rotate;
-        else if (lmnem == "rcl")  arith = OperationType::left_rotate_carry;
-        else if (lmnem == "rcr")  arith = OperationType::right_rotate_carry;
-        // ARM arithmetic
-        else if (lmnem == "adds") arith = OperationType::add;
-        else if (lmnem == "subs") arith = OperationType::sub;
-        else if (lmnem == "mul")  arith = OperationType::mul;
-        else if (lmnem == "sdiv") arith = OperationType::div;
-        else if (lmnem == "udiv") arith = OperationType::div_us;
-        // ARM logic
-        else if (lmnem == "ands" || lmnem == "tst") arith = OperationType::bit_and;
-        else if (lmnem == "orr")  arith = OperationType::bit_or;
-        else if (lmnem == "eor")  arith = OperationType::bit_xor;
-        // ARM shifts
-        else if (lmnem == "lsl")  arith = OperationType::shl;
-        else if (lmnem == "lsr")  arith = OperationType::shr_us;
-        else if (lmnem == "asr")  arith = OperationType::shr;
-        else if (lmnem == "ror" /* ARM ror */) arith = OperationType::right_rotate;
-        // ARM multiply-add/sub
-        else if (lmnem == "madd" && operands.size() >= 4) {
+        // ARM/X86 bit-clear forms.
+        if (arm_mnemonic_in(lmnem, {"bic"}, true, nullptr, nullptr, nullptr) && operands.size() >= 2) {
+            const bool three_operand = operands.size() >= 3;
+            Expression* lhs = three_operand ? operands[1] : operands[0];
+            Expression* rhs = three_operand ? operands[2] : operands[1];
+            auto* not_rhs = arena_.create<Operation>(OperationType::bit_not,
+                std::vector<Expression*>{rhs}, lhs->size_bytes);
+            auto* masked = arena_.create<Operation>(OperationType::bit_and,
+                std::vector<Expression*>{lhs, not_rhs}, lhs->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], masked);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (lmnem == "andn" && operands.size() >= 3) {
+            // BMI1 ANDN dst, src1, src2 = (~src1) & src2
+            auto* not_src = arena_.create<Operation>(OperationType::bit_not,
+                std::vector<Expression*>{operands[1]}, operands[0]->size_bytes);
+            auto* anded = arena_.create<Operation>(OperationType::bit_and,
+                std::vector<Expression*>{not_src, operands[2]}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], anded);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (arm_mnemonic_in(lmnem, {"orn"}, true, nullptr, nullptr, nullptr) && operands.size() >= 2) {
+            const bool three_operand = operands.size() >= 3;
+            Expression* lhs = three_operand ? operands[1] : operands[0];
+            Expression* rhs = three_operand ? operands[2] : operands[1];
+            auto* not_rhs = arena_.create<Operation>(OperationType::bit_not,
+                std::vector<Expression*>{rhs}, lhs->size_bytes);
+            auto* ored = arena_.create<Operation>(OperationType::bit_or,
+                std::vector<Expression*>{lhs, not_rhs}, lhs->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], ored);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (arm_mnemonic_in(lmnem, {"eon"}, true, nullptr, nullptr, nullptr) && operands.size() >= 2) {
+            // EON dst, lhs, rhs == lhs ^ (~rhs)
+            const bool three_operand = operands.size() >= 3;
+            Expression* lhs = three_operand ? operands[1] : operands[0];
+            Expression* rhs = three_operand ? operands[2] : operands[1];
+            auto* not_rhs = arena_.create<Operation>(OperationType::bit_not,
+                std::vector<Expression*>{rhs}, lhs->size_bytes);
+            auto* xored = arena_.create<Operation>(OperationType::bit_xor,
+                std::vector<Expression*>{lhs, not_rhs}, lhs->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], xored);
+            assign->set_address(addr);
+            return assign;
+        }
+
+        // ARM reverse-subtract forms.
+        if (arm_mnemonic_in(lmnem, {"rsb"}, true, nullptr, nullptr, nullptr) && operands.size() >= 2) {
+            const bool three_operand = operands.size() >= 3;
+            Expression* lhs = three_operand ? operands[2] : arena_.create<Constant>(0, operands[0]->size_bytes);
+            Expression* rhs = three_operand ? operands[1] : operands[1];
+            auto* value = arena_.create<Operation>(OperationType::sub,
+                std::vector<Expression*>{lhs, rhs}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], value);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (arm_mnemonic_in(lmnem, {"rsc"}, true, nullptr, nullptr, nullptr) && operands.size() >= 2) {
+            const bool three_operand = operands.size() >= 3;
+            Expression* lhs = three_operand ? operands[2] : arena_.create<Constant>(0, operands[0]->size_bytes);
+            Expression* rhs = three_operand ? operands[1] : operands[1];
+            auto* value = arena_.create<Operation>(OperationType::sub_with_carry,
+                std::vector<Expression*>{lhs, rhs}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], value);
+            assign->set_address(addr);
+            return assign;
+        }
+
+        // ARM multiply-add/sub (including widened forms).
+        if ((lmnem == "madd" || lmnem == "smaddl" || lmnem == "umaddl") && operands.size() >= 4) {
             // MADD Xd, Xn, Xm, Xa -> Xd = Xa + Xn * Xm
+            const OperationType mul_type = (lmnem == "umaddl") ? OperationType::mul_us : OperationType::mul;
             auto* product = arena_.create<Operation>(OperationType::mul,
                 std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
+            product->set_type(mul_type);
             auto* sum = arena_.create<Operation>(OperationType::add,
                 std::vector<Expression*>{operands[3], product}, operands[0]->size_bytes);
             auto* assign = arena_.create<Assignment>(operands[0], sum);
             assign->set_address(addr);
             return assign;
         }
-        else if (lmnem == "msub" && operands.size() >= 4) {
+        if ((lmnem == "msub" || lmnem == "smsubl" || lmnem == "umsubl") && operands.size() >= 4) {
             // MSUB Xd, Xn, Xm, Xa -> Xd = Xa - Xn * Xm
+            const OperationType mul_type = (lmnem == "umsubl") ? OperationType::mul_us : OperationType::mul;
+            auto* product = arena_.create<Operation>(OperationType::mul,
+                std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
+            product->set_type(mul_type);
+            auto* diff = arena_.create<Operation>(OperationType::sub,
+                std::vector<Expression*>{operands[3], product}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], diff);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (arm_mnemonic_in(lmnem, {"mla"}, true, nullptr, nullptr, nullptr) && operands.size() >= 4) {
+            // MLA Rd, Rm, Rs, Rn -> Rd = (Rm * Rs) + Rn
+            auto* product = arena_.create<Operation>(OperationType::mul,
+                std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
+            auto* sum = arena_.create<Operation>(OperationType::add,
+                std::vector<Expression*>{product, operands[3]}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], sum);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (arm_mnemonic_in(lmnem, {"mls"}, true, nullptr, nullptr, nullptr) && operands.size() >= 4) {
+            // MLS Rd, Rn, Rm, Ra -> Rd = Ra - (Rn * Rm)
             auto* product = arena_.create<Operation>(OperationType::mul,
                 std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
             auto* diff = arena_.create<Operation>(OperationType::sub,
@@ -1316,11 +1774,80 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
             assign->set_address(addr);
             return assign;
         }
+        if (lmnem == "mneg" && operands.size() >= 3) {
+            auto* product = arena_.create<Operation>(OperationType::mul,
+                std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
+            auto* neg = arena_.create<Operation>(OperationType::negate,
+                std::vector<Expression*>{product}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], neg);
+            assign->set_address(addr);
+            return assign;
+        }
+        if ((lmnem == "smnegl" || lmnem == "umnegl") && operands.size() >= 3) {
+            const OperationType mul_type = (lmnem == "umnegl") ? OperationType::mul_us : OperationType::mul;
+            auto* product = arena_.create<Operation>(OperationType::mul,
+                std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
+            product->set_type(mul_type);
+            auto* neg = arena_.create<Operation>(OperationType::negate,
+                std::vector<Expression*>{product}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], neg);
+            assign->set_address(addr);
+            return assign;
+        }
+        if ((lmnem == "smulh" || lmnem == "umulh") && operands.size() >= 3) {
+            // High-half multiplication.
+            const OperationType mul_type = (lmnem == "umulh") ? OperationType::mul_us : OperationType::mul;
+            auto* product = arena_.create<Operation>(OperationType::mul,
+                std::vector<Expression*>{operands[1], operands[2]}, operands[0]->size_bytes);
+            product->set_type(mul_type);
+            auto* shift = arena_.create<Constant>(operands[0]->size_bytes * 8, operands[0]->size_bytes);
+            auto* high_half = arena_.create<Operation>(OperationType::shr_us,
+                std::vector<Expression*>{product, shift}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], high_half);
+            assign->set_address(addr);
+            return assign;
+        }
+        if ((lmnem == "smulbb" || lmnem == "smlabb") && operands.size() >= 3) {
+            // ARM DSP multiply helpers are preserved as intrinsics.
+            const std::string intrinsic_name = "__" + lmnem;
+            auto* target = arena_.create<Variable>(intrinsic_name, 8);
+            std::vector<Expression*> args;
+            for (std::size_t i = 1; i < operands.size(); ++i) {
+                args.push_back(operands[i]);
+            }
+            auto* call = arena_.create<Call>(target, std::move(args), operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], call);
+            assign->set_address(addr);
+            return assign;
+        }
 
-        if (arith != OperationType::unknown) {
-            auto* result = make_binary_assign(arith, operands, addr);
+        if (auto arith = integer_binary_operation_for(lmnem); arith.has_value()) {
+            auto* result = make_binary_assign(*arith, operands, addr);
             if (result) return result;
         }
+        if (auto farith = float_binary_operation_for(lmnem); farith.has_value()) {
+            auto* result = make_binary_assign(*farith, operands, addr);
+            if (result) return result;
+        }
+    }
+
+    // =====================================================================
+    // Bitfield / extraction helpers
+    // =====================================================================
+    std::string_view bitfield_base;
+    if (arm_mnemonic_in(lmnem, {"ubfx", "sbfx", "bfxil", "bfi", "bfc", "extr"},
+                        true, &bitfield_base, nullptr, nullptr)
+        && operands.size() >= 2) {
+        const std::string intrinsic_name = "__" + std::string(bitfield_base);
+        auto* target = arena_.create<Variable>(intrinsic_name, 8);
+        std::vector<Expression*> args;
+        for (std::size_t i = 1; i < operands.size(); ++i) {
+            args.push_back(operands[i]);
+        }
+        auto* call = arena_.create<Call>(target, std::move(args), operands[0]->size_bytes);
+        auto* assign = arena_.create<Assignment>(operands[0], call);
+        assign->set_address(addr);
+        return assign;
     }
 
     // =====================================================================
@@ -1329,7 +1856,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     if (lmnem == "not" && !operands.empty()) {
         return make_unary_assign(OperationType::bit_not, operands, addr);
     }
-    if (lmnem == "neg" && !operands.empty()) {
+    if ((lmnem == "neg" || lmnem == "negs") && !operands.empty()) {
         return make_unary_assign(OperationType::negate, operands, addr);
     }
     if ((lmnem == "inc") && !operands.empty()) {
@@ -1349,10 +1876,26 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         return assign;
     }
     // ARM MVN (bitwise NOT)
-    if (lmnem == "mvn" && operands.size() >= 2) {
+    if (arm_mnemonic_in(lmnem, {"mvn"}, true, nullptr, nullptr, nullptr) && operands.size() >= 2) {
         auto* rhs = arena_.create<Operation>(OperationType::bit_not,
             std::vector<Expression*>{operands[1]}, operands[0]->size_bytes);
         auto* assign = arena_.create<Assignment>(operands[0], rhs);
+        assign->set_address(addr);
+        return assign;
+    }
+    std::string_view unary_intrinsic_base;
+    if ((is_mnemonic_in(lmnem, {"fneg", "fabs", "rev16", "rev32", "rbit", "lzcnt", "tzcnt", "popcnt"})
+         || arm_mnemonic_in(lmnem, {"rev", "clz", "cls", "fneg", "fabs"},
+                            true, &unary_intrinsic_base, nullptr, nullptr))
+        && operands.size() >= 2) {
+        // Map to explicit intrinsic-like calls to preserve side effects semantically.
+        const std::string intrinsic_name = unary_intrinsic_base.empty()
+            ? ("__" + lmnem)
+            : ("__" + std::string(unary_intrinsic_base));
+        auto* target = arena_.create<Variable>(intrinsic_name, 8);
+        auto* call = arena_.create<Call>(target,
+            std::vector<Expression*>{operands[1]}, operands[0]->size_bytes);
+        auto* assign = arena_.create<Assignment>(operands[0], call);
         assign->set_address(addr);
         return assign;
     }
@@ -1375,19 +1918,154 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     }
 
     // =====================================================================
+    // ARM multiple-register transfer (LDM/STM families)
+    // =====================================================================
+    std::string_view ldm_base;
+    if (arm_mnemonic_in(lmnem, {"ldm", "ldmdb", "ldmfd", "ldmib"}, false,
+                        &ldm_base, nullptr, nullptr)
+        && operands.size() >= 2) {
+        const std::string intrinsic_name = "__" + std::string(ldm_base);
+        auto* target = arena_.create<Variable>(intrinsic_name, 8);
+        std::vector<Expression*> args;
+        args.reserve(operands.size());
+        for (auto* op : operands) {
+            args.push_back(op);
+        }
+        auto* call = arena_.create<Call>(target, std::move(args), operands[1]->size_bytes);
+        auto* assign = arena_.create<Assignment>(operands[1], call);
+        assign->set_address(addr);
+        return assign;
+    }
+    std::string_view stm_base;
+    if (arm_mnemonic_in(lmnem, {"stm", "stmea", "stmfa", "stmib"}, false,
+                        &stm_base, nullptr, nullptr)
+        && !operands.empty()) {
+        const std::string intrinsic_name = "__" + std::string(stm_base);
+        auto* target = arena_.create<Variable>(intrinsic_name, 8);
+        std::vector<Expression*> args;
+        args.reserve(operands.size());
+        for (auto* op : operands) {
+            args.push_back(op);
+        }
+        auto* call = arena_.create<Call>(target, std::move(args), operands[0]->size_bytes);
+        auto* sink = arena_.create<Variable>("mem_state", operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1);
+        auto* assign = arena_.create<Assignment>(sink, call);
+        assign->set_address(addr);
+        return assign;
+    }
+
+    // =====================================================================
     // Data movement: MOV, MOVSX, MOVZX, LDR, STR, etc.
     // =====================================================================
     {
-        bool is_mov = (lmnem == "mov" || lmnem == "movabs");
-        bool is_load = (lmnem == "ldr" || lmnem == "ldur" || lmnem == "ldrb" ||
-                        lmnem == "ldrh" || lmnem == "ldrsb" || lmnem == "ldrsh" ||
-                        lmnem == "ldrsw");
-        bool is_store = (lmnem == "str" || lmnem == "stur" || lmnem == "strb" ||
-                         lmnem == "strh");
-        bool is_movsx = (lmnem == "movsx" || lmnem == "movsxd" || lmnem == "cwde" ||
-                         lmnem == "cdqe" || lmnem == "cbw");
-        bool is_movzx = (lmnem == "movzx");
-        bool is_xchg = (lmnem == "xchg");
+        std::string_view arm_mov_base;
+        const bool is_arm_mov = arm_mnemonic_in(lmnem, {"mov", "movw"}, true,
+                                                &arm_mov_base, nullptr, nullptr);
+        std::string_view arm_load_base;
+        const bool is_arm_load = arm_mnemonic_in(lmnem, {
+            "ldr", "ldur", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrsw", "ldrd",
+            "ldtr", "ldtrb", "ldtrh", "ldtrsb", "ldtrsh", "ldtrsw",
+            "ldurb", "ldurh", "ldursb", "ldursh", "ldursw"
+        }, false, &arm_load_base, nullptr, nullptr);
+        std::string_view arm_store_base;
+        const bool is_arm_store = arm_mnemonic_in(lmnem, {
+            "str", "stur", "strb", "strh", "strd", "sttr", "sttrb", "sttrh", "sturb", "sturh"
+        }, false, &arm_store_base, nullptr, nullptr);
+        std::string_view arm_movsx_base;
+        const bool is_arm_movsx = arm_mnemonic_in(lmnem, {"sxtb", "sxth", "sxtw"},
+                                                  true, &arm_movsx_base, nullptr, nullptr);
+        std::string_view arm_movzx_base;
+        const bool is_arm_movzx = arm_mnemonic_in(lmnem, {"uxtb", "uxth", "uxtw"},
+                                                  true, &arm_movzx_base, nullptr, nullptr);
+
+        bool is_mov = is_mnemonic_in(lmnem, {
+            "mov", "movabs", "movbe", "fmov", "movd", "movq", "movss", "movsd"
+        }) || is_arm_mov;
+        bool is_load = is_mnemonic_in(lmnem, {
+            "ldr", "ldur", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrsw", "ldrd",
+            "ldtr", "ldtrb", "ldtrh", "ldtrsb", "ldtrsh", "ldtrsw",
+            "ldursb", "ldursh", "ldursw", "ldurb", "ldurh"
+        }) || is_arm_load;
+        bool is_store = is_mnemonic_in(lmnem, {
+            "str", "stur", "strb", "strh", "strd", "sttr", "sttrb", "sttrh", "sturb", "sturh"
+        }) || is_arm_store;
+        bool is_movsx = is_mnemonic_in(lmnem, {
+            "movsx", "movsxd", "cwde", "cdqe", "cbw",
+            "sxtb", "sxth", "sxtw"
+        }) || is_arm_movsx;
+        bool is_movzx = is_mnemonic_in(lmnem, {
+            "movzx", "uxtb", "uxth", "uxtw"
+        }) || is_arm_movzx;
+        bool is_xchg = is_mnemonic_in(lmnem, {"xchg", "xchgq", "xchgl"});
+
+        if (lmnem == "cbw") {
+            auto* src = arena_.create<Variable>("al", 1);
+            auto* cast_op = arena_.create<Operation>(OperationType::cast,
+                std::vector<Expression*>{src}, 2);
+            auto* dst = arena_.create<Variable>("ax", 2);
+            auto* assign = arena_.create<Assignment>(dst, cast_op);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (lmnem == "cwde") {
+            auto* src = arena_.create<Variable>("ax", 2);
+            auto* cast_op = arena_.create<Operation>(OperationType::cast,
+                std::vector<Expression*>{src}, 4);
+            auto* dst = arena_.create<Variable>("eax", 4);
+            auto* assign = arena_.create<Assignment>(dst, cast_op);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (lmnem == "cdqe") {
+            auto* src = arena_.create<Variable>("eax", 4);
+            auto* cast_op = arena_.create<Operation>(OperationType::cast,
+                std::vector<Expression*>{src}, 8);
+            auto* dst = arena_.create<Variable>("rax", 8);
+            auto* assign = arena_.create<Assignment>(dst, cast_op);
+            assign->set_address(addr);
+            return assign;
+        }
+
+        if (lmnem == "movk" && operands.size() >= 2) {
+            auto* target = arena_.create<Variable>("__movk", 8);
+            std::vector<Expression*> args;
+            args.push_back(operands[0]);
+            args.push_back(operands[1]);
+            if (operands.size() >= 3) {
+                args.push_back(operands[2]);
+            }
+            auto* call = arena_.create<Call>(target, std::move(args), operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], call);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (lmnem == "movz" && operands.size() >= 2) {
+            Expression* value = operands[1];
+            if (operands.size() >= 3) {
+                value = arena_.create<Operation>(OperationType::shl,
+                    std::vector<Expression*>{value, operands[2]}, operands[0]->size_bytes);
+            }
+            auto* assign = arena_.create<Assignment>(operands[0], value);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (lmnem == "movn" && operands.size() >= 2) {
+            Expression* value = operands[1];
+            if (operands.size() >= 3) {
+                value = arena_.create<Operation>(OperationType::shl,
+                    std::vector<Expression*>{value, operands[2]}, operands[0]->size_bytes);
+            }
+            auto* not_imm = arena_.create<Operation>(OperationType::bit_not,
+                std::vector<Expression*>{value}, operands[0]->size_bytes);
+            auto* assign = arena_.create<Assignment>(operands[0], not_imm);
+            assign->set_address(addr);
+            return assign;
+        }
+        if (arm_mnemonic_in(lmnem, {"movw"}, true, nullptr, nullptr, nullptr) && operands.size() >= 2) {
+            auto* assign = arena_.create<Assignment>(operands[0], operands[1]);
+            assign->set_address(addr);
+            return assign;
+        }
 
         if (is_movsx && operands.size() >= 2) {
             // Sign-extend: cast src to dest type
@@ -1453,7 +2131,8 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     // ARM ADR/ADRP
     // =====================================================================
-    if ((lmnem == "adr" || lmnem == "adrp") && operands.size() >= 2) {
+    if (arm_mnemonic_in(lmnem, {"adr", "adrp", "adrl"}, false, nullptr, nullptr, nullptr)
+        && operands.size() >= 2) {
         auto* assign = arena_.create<Assignment>(operands[0], operands[1]);
         assign->set_address(addr);
         return assign;
@@ -1472,10 +2151,51 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         assign->set_address(addr);
         return assign;
     }
+    if (lmnem == "csetm" && operands.size() >= 2) {
+        // CSETM Xd, cond -> Xd = (cond ? -1 : 0)
+        auto* all_ones = arena_.create<Constant>(std::numeric_limits<std::uint64_t>::max(), operands[0]->size_bytes);
+        auto* zero = arena_.create<Constant>(0, operands[0]->size_bytes);
+        auto* ternary = arena_.create<Operation>(OperationType::ternary,
+            std::vector<Expression*>{operands[1], all_ones, zero}, operands[0]->size_bytes);
+        auto* assign = arena_.create<Assignment>(operands[0], ternary);
+        assign->set_address(addr);
+        return assign;
+    }
     if (lmnem == "csel" && operands.size() >= 4) {
         // CSEL Xd, Xn, Xm, cond -> Xd = (cond ? Xn : Xm)
         auto* ternary = arena_.create<Operation>(OperationType::ternary,
             std::vector<Expression*>{operands[3], operands[1], operands[2]}, operands[0]->size_bytes);
+        auto* assign = arena_.create<Assignment>(operands[0], ternary);
+        assign->set_address(addr);
+        return assign;
+    }
+    if (lmnem == "csinc" && operands.size() >= 4) {
+        // CSINC Xd, Xn, Xm, cond -> Xd = cond ? Xn : Xm + 1
+        auto* one = arena_.create<Constant>(1, operands[0]->size_bytes);
+        auto* plus_one = arena_.create<Operation>(OperationType::add,
+            std::vector<Expression*>{operands[2], one}, operands[0]->size_bytes);
+        auto* ternary = arena_.create<Operation>(OperationType::ternary,
+            std::vector<Expression*>{operands[3], operands[1], plus_one}, operands[0]->size_bytes);
+        auto* assign = arena_.create<Assignment>(operands[0], ternary);
+        assign->set_address(addr);
+        return assign;
+    }
+    if (lmnem == "csinv" && operands.size() >= 4) {
+        // CSINV Xd, Xn, Xm, cond -> Xd = cond ? Xn : ~Xm
+        auto* inv = arena_.create<Operation>(OperationType::bit_not,
+            std::vector<Expression*>{operands[2]}, operands[0]->size_bytes);
+        auto* ternary = arena_.create<Operation>(OperationType::ternary,
+            std::vector<Expression*>{operands[3], operands[1], inv}, operands[0]->size_bytes);
+        auto* assign = arena_.create<Assignment>(operands[0], ternary);
+        assign->set_address(addr);
+        return assign;
+    }
+    if (lmnem == "csneg" && operands.size() >= 4) {
+        // CSNEG Xd, Xn, Xm, cond -> Xd = cond ? Xn : -Xm
+        auto* neg = arena_.create<Operation>(OperationType::negate,
+            std::vector<Expression*>{operands[2]}, operands[0]->size_bytes);
+        auto* ternary = arena_.create<Operation>(OperationType::ternary,
+            std::vector<Expression*>{operands[3], operands[1], neg}, operands[0]->size_bytes);
         auto* assign = arena_.create<Assignment>(operands[0], ternary);
         assign->set_address(addr);
         return assign;
@@ -1503,7 +2223,8 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     // x86 PUSH/POP -- stack operations (approximate)
     // =====================================================================
-    if (lmnem == "push" && !operands.empty()) {
+    if ((lmnem == "push" || arm_mnemonic_in(lmnem, {"push"}, false, nullptr, nullptr, nullptr))
+        && !operands.empty()) {
         // push src writes to [rsp - width] after stack-pointer decrement.
         // Prefer a named stack slot over raw dereference to reduce `*(rsp)` noise.
         const std::size_t push_width = operands[0]->size_bytes > 0
@@ -1517,7 +2238,8 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         assign->set_address(addr);
         return assign;
     }
-    if (lmnem == "pop" && !operands.empty()) {
+    if ((lmnem == "pop" || arm_mnemonic_in(lmnem, {"pop"}, false, nullptr, nullptr, nullptr))
+        && !operands.empty()) {
         // pop dest reads from [rsp] before stack-pointer increment.
         const std::size_t pop_width = operands[0]->size_bytes > 0
             ? operands[0]->size_bytes
@@ -1575,25 +2297,11 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // x86 CMOVcc -- conditional moves
     // =====================================================================
     {
-        OperationType cmov_cmp = OperationType::unknown;
-        if      (lmnem == "cmove" || lmnem == "cmovz")       cmov_cmp = OperationType::eq;
-        else if (lmnem == "cmovne" || lmnem == "cmovnz")     cmov_cmp = OperationType::neq;
-        else if (lmnem == "cmovl" || lmnem == "cmovnge")     cmov_cmp = OperationType::lt;
-        else if (lmnem == "cmovle" || lmnem == "cmovng")     cmov_cmp = OperationType::le;
-        else if (lmnem == "cmovg" || lmnem == "cmovnle")     cmov_cmp = OperationType::gt;
-        else if (lmnem == "cmovge" || lmnem == "cmovnl")     cmov_cmp = OperationType::ge;
-        else if (lmnem == "cmovb" || lmnem == "cmovnae" || lmnem == "cmovc")  cmov_cmp = OperationType::lt_us;
-        else if (lmnem == "cmovbe" || lmnem == "cmovna")     cmov_cmp = OperationType::le_us;
-        else if (lmnem == "cmova" || lmnem == "cmovnbe")     cmov_cmp = OperationType::gt_us;
-        else if (lmnem == "cmovae" || lmnem == "cmovnb" || lmnem == "cmovnc") cmov_cmp = OperationType::ge_us;
-        else if (lmnem == "cmovs")  cmov_cmp = OperationType::lt;
-        else if (lmnem == "cmovns") cmov_cmp = OperationType::ge;
-
-        if (cmov_cmp != OperationType::unknown && operands.size() >= 2) {
+        if (auto cmov_cmp = x86_cmov_condition(lmnem); cmov_cmp.has_value() && operands.size() >= 2) {
             // CMOVcc dest, src -> dest = (flags cmp 0) ? src : dest
             auto* flags = arena_.create<Variable>("flags", 1);
             auto* zero = arena_.create<Constant>(0, 1);
-            auto* cond = arena_.create<Condition>(cmov_cmp, flags, zero);
+            auto* cond = arena_.create<Condition>(*cmov_cmp, flags, zero);
             auto* ternary = arena_.create<Operation>(OperationType::ternary,
                 std::vector<Expression*>{cond, operands[1], operands[0]}, operands[0]->size_bytes);
             auto* assign = arena_.create<Assignment>(operands[0], ternary);
@@ -1606,25 +2314,11 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // x86 SETcc -- set byte on condition
     // =====================================================================
     {
-        OperationType set_cmp = OperationType::unknown;
-        if      (lmnem == "sete" || lmnem == "setz")       set_cmp = OperationType::eq;
-        else if (lmnem == "setne" || lmnem == "setnz")     set_cmp = OperationType::neq;
-        else if (lmnem == "setl" || lmnem == "setnge")     set_cmp = OperationType::lt;
-        else if (lmnem == "setle" || lmnem == "setng")     set_cmp = OperationType::le;
-        else if (lmnem == "setg" || lmnem == "setnle")     set_cmp = OperationType::gt;
-        else if (lmnem == "setge" || lmnem == "setnl")     set_cmp = OperationType::ge;
-        else if (lmnem == "setb" || lmnem == "setnae" || lmnem == "setc")  set_cmp = OperationType::lt_us;
-        else if (lmnem == "setbe" || lmnem == "setna")     set_cmp = OperationType::le_us;
-        else if (lmnem == "seta" || lmnem == "setnbe")     set_cmp = OperationType::gt_us;
-        else if (lmnem == "setae" || lmnem == "setnb" || lmnem == "setnc") set_cmp = OperationType::ge_us;
-        else if (lmnem == "sets")  set_cmp = OperationType::lt;
-        else if (lmnem == "setns") set_cmp = OperationType::ge;
-
-        if (set_cmp != OperationType::unknown && !operands.empty()) {
+        if (auto set_cmp = x86_setcc_condition(lmnem); set_cmp.has_value() && !operands.empty()) {
             // SETcc dest -> dest = (flags cmp 0) ? 1 : 0
             auto* flags = arena_.create<Variable>("flags", 1);
             auto* zero = arena_.create<Constant>(0, 1);
-            auto* cond = arena_.create<Condition>(set_cmp, flags, zero);
+            auto* cond = arena_.create<Condition>(*set_cmp, flags, zero);
             auto* one = arena_.create<Constant>(1, 1);
             auto* zero_val = arena_.create<Constant>(0, 1);
             auto* ternary = arena_.create<Operation>(OperationType::ternary,
@@ -1671,6 +2365,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     // Fallback: wrap as unknown Operation inside an Assignment
     // =====================================================================
+    trace_unknown_mnemonic_once(lmnem);
     auto* op = arena_.create<Operation>(OperationType::unknown, std::move(operands), insn.size());
     auto* mnem_var = arena_.create<Variable>(lmnem, insn.size());
     auto* assign = arena_.create<Assignment>(mnem_var, op);

@@ -5,6 +5,7 @@
 #include "../structures/types.hpp"
 #include "../../idiomata/idioms.hpp"
 #include <memory>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -137,6 +138,11 @@ public:
     virtual std::vector<std::string> dependencies() const { return {}; }
 };
 
+using StageBoundaryObserver = std::function<void(
+    const char* stage_name,
+    bool before_stage,
+    DecompilerTask& task)>;
+
 class DecompilerPipeline {
 public:
     DecompilerPipeline() = default;
@@ -145,7 +151,7 @@ public:
         stages_.push_back(std::move(stage));
     }
 
-    void run(DecompilerTask& task) {
+    void run(DecompilerTask& task, const StageBoundaryObserver& observer = {}) {
         task.clear_pipeline_status();
 
         std::unordered_set<std::string> completed;
@@ -180,6 +186,9 @@ public:
             }
 
             try {
+                if (observer) {
+                    observer(stage_name.c_str(), true, task);
+                }
                 stage->execute(task);
                 completed.insert(stage_name);
                 task.record_stage(StageExecutionRecord{
@@ -187,6 +196,9 @@ public:
                     StageExecutionStatus::Success,
                     {},
                 });
+                if (observer) {
+                    observer(stage_name.c_str(), false, task);
+                }
             } catch (const std::exception& ex) {
                 const std::string message = ex.what();
                 task.record_stage(StageExecutionRecord{

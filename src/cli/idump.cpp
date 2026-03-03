@@ -23,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -32,6 +33,7 @@ struct CliOptions {
     std::string input_binary;
     std::string output_path;
     bool explicit_headless = false;
+    bool trace_pass_pseudocode = false;
 };
 
 bool env_flag_enabled(const char* name) {
@@ -190,7 +192,7 @@ std::size_t count_cfg_non_control_instructions(const aletheia::ControlFlowGraph*
 }
 
 void print_usage() {
-    std::cerr << "Usage: idump <binary> [-o <output.c>] [--headless]\n";
+    std::cerr << "Usage: idump <binary> [-o <output.c>] [--headless] [--trace-pass-pseudocode]\n";
 }
 
 bool parse_args(int argc, char** argv, CliOptions& options) {
@@ -202,6 +204,10 @@ bool parse_args(int argc, char** argv, CliOptions& options) {
         const std::string arg = argv[i];
         if (arg == "--headless") {
             options.explicit_headless = true;
+            continue;
+        }
+        if (arg == "--trace-pass-pseudocode") {
+            options.trace_pass_pseudocode = true;
             continue;
         }
         if (arg == "-o") {
@@ -225,6 +231,19 @@ bool parse_args(int argc, char** argv, CliOptions& options) {
 bool detect_headless(const CliOptions& options) {
     if (options.explicit_headless) return true;
     if (env_flag_enabled("ALETHEIA_HEADLESS")) return true;
+    return false;
+}
+
+bool should_trace_pass_pseudocode(const CliOptions& options) {
+    if (options.trace_pass_pseudocode) {
+        return true;
+    }
+    if (env_flag_enabled("ALETHEIA_IDUMP_TRACE_PASS_PSEUDOCODE")) {
+        return true;
+    }
+    if (env_flag_enabled("ALETHEIA_IDUMP_TRACE_PASSES")) {
+        return true;
+    }
     return false;
 }
 
@@ -515,6 +534,79 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
     return lines;
 }
 
+std::string join_snapshot_lines(const std::vector<std::string>& lines) {
+    std::size_t total_size = 0;
+    for (const auto& line : lines) {
+        total_size += line.size() + 1;
+    }
+
+    std::string joined;
+    joined.reserve(total_size);
+    for (const auto& line : lines) {
+        joined += line;
+        joined.push_back('\n');
+    }
+    return joined;
+}
+
+class PassPseudocodeTracer {
+public:
+    PassPseudocodeTracer(ida::Address function_ea, bool enabled)
+        : function_ea_(function_ea), enabled_(enabled) {}
+
+    bool enabled() const { return enabled_; }
+
+    void emit_stage_snapshot(
+        const char* pipeline_name,
+        const char* stage_name,
+        bool before_stage,
+        aletheia::DecompilerTask& task) {
+        if (!enabled_) {
+            return;
+        }
+
+        std::vector<std::string> lines = build_snapshot(task);
+        std::string snapshot_text = join_snapshot_lines(lines);
+
+        auto existing = snapshot_ids_.find(snapshot_text);
+        if (existing != snapshot_ids_.end()) {
+            std::cerr << "idump: " << pipeline_name << " " << (before_stage ? "before" : "after")
+                      << " '" << stage_name << "' @0x" << std::hex << function_ea_ << std::dec
+                      << " -> snapshot#" << existing->second << " (duplicate)\n";
+            return;
+        }
+
+        const std::size_t snapshot_id = next_snapshot_id_++;
+        snapshot_ids_.emplace(std::move(snapshot_text), snapshot_id);
+
+        std::cerr << "idump: " << pipeline_name << " " << (before_stage ? "before" : "after")
+                  << " '" << stage_name << "' @0x" << std::hex << function_ea_ << std::dec
+                  << " -> snapshot#" << snapshot_id << "\n";
+        if (lines.empty()) {
+            std::cerr << "/* empty snapshot */\n\n";
+            return;
+        }
+        for (const auto& line : lines) {
+            std::cerr << line << '\n';
+        }
+        std::cerr << '\n';
+    }
+
+private:
+    static std::vector<std::string> build_snapshot(aletheia::DecompilerTask& task) {
+        if (task.ast() && task.ast()->root()) {
+            aletheia::CodeVisitor visitor;
+            return visitor.generate_code(task);
+        }
+        return generate_cfg_fallback_code(task);
+    }
+
+    ida::Address function_ea_;
+    bool enabled_ = false;
+    std::size_t next_snapshot_id_ = 1;
+    std::unordered_map<std::string, std::size_t> snapshot_ids_;
+};
+
 aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
     aletheia::DecompilerPipeline pipeline;
     pipeline.add_stage(std::make_unique<aletheia::CompilerIdiomHandlingStage>());
@@ -562,7 +654,8 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
 
 std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     ida::Address ea,
-    idiomata::IdiomMatcher& matcher) {
+    idiomata::IdiomMatcher& matcher,
+    PassPseudocodeTracer* pass_tracer) {
     aletheia::DecompilerTask fallback_task(ea);
     configure_out_of_ssa_mode(fallback_task);
 
@@ -579,7 +672,15 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     fallback_task.set_idiom_tags(std::move(idiom_tags));
 
     auto fallback_pipeline = build_pipeline(false);
-    fallback_pipeline.run(fallback_task);
+    if (pass_tracer && pass_tracer->enabled()) {
+        fallback_pipeline.run(
+            fallback_task,
+            [pass_tracer](const char* stage_name, bool before_stage, aletheia::DecompilerTask& observed_task) {
+                pass_tracer->emit_stage_snapshot("fallback-pass", stage_name, before_stage, observed_task);
+            });
+    } else {
+        fallback_pipeline.run(fallback_task);
+    }
 
     auto fallback_ast = std::make_unique<aletheia::AbstractSyntaxForest>();
     auto* seq = fallback_task.arena().create<aletheia::SeqNode>();
@@ -603,11 +704,13 @@ std::vector<std::string> decompile_function(
     ida::Address ea,
     idiomata::IdiomMatcher& matcher,
     bool& ok,
-    std::string& error_message) {
+    std::string& error_message,
+    bool trace_pass_pseudocode) {
     ok = false;
     error_message.clear();
 
     aletheia::DecompilerTask task(ea);
+    PassPseudocodeTracer pass_tracer(ea, trace_pass_pseudocode);
     configure_out_of_ssa_mode(task);
 
     aletheia::Lifter lifter(task.arena(), matcher);
@@ -629,7 +732,15 @@ std::vector<std::string> decompile_function(
     const bool enable_structuring = should_enable_structuring();
     const bool force_structured_output = env_flag_enabled("ALETHEIA_IDUMP_FORCE_STRUCTURED_OUTPUT");
     auto pipeline = build_pipeline(enable_structuring);
-    pipeline.run(task);
+    if (pass_tracer.enabled()) {
+        pipeline.run(
+            task,
+            [&pass_tracer](const char* stage_name, bool before_stage, aletheia::DecompilerTask& observed_task) {
+                pass_tracer.emit_stage_snapshot("pipeline-pass", stage_name, before_stage, observed_task);
+            });
+    } else {
+        pipeline.run(task);
+    }
 
     if (task.failed()) {
         std::cerr << "idump: pipeline stopped at stage '" << task.failure_stage() << "'";
@@ -658,7 +769,7 @@ std::vector<std::string> decompile_function(
 
     if (using_cfg_fallback) {
         if (enable_structuring && !force_structured_output) {
-            if (auto rebuilt = regenerate_conservative_fallback(ea, matcher); rebuilt.has_value()) {
+            if (auto rebuilt = regenerate_conservative_fallback(ea, matcher, &pass_tracer); rebuilt.has_value()) {
                 ok = true;
                 return *rebuilt;
             }
@@ -687,7 +798,7 @@ std::vector<std::string> decompile_function(
             }
         }
         std::cerr << "FALLING BACK FOR FUNCTION " << std::hex << ea << std::dec << std::endl;
-        if (auto rebuilt = regenerate_conservative_fallback(ea, matcher); rebuilt.has_value()) {
+        if (auto rebuilt = regenerate_conservative_fallback(ea, matcher, &pass_tracer); rebuilt.has_value()) {
             ok = true;
             return *rebuilt;
         }
@@ -705,6 +816,8 @@ int main(int argc, char** argv) {
         print_usage();
         return 1;
     }
+
+    const bool trace_pass_pseudocode = should_trace_pass_pseudocode(options);
 
     if (!detect_headless(options)) {
         std::cerr << "idump: headless mode not explicit; proceeding (set --headless or ALETHEIA_HEADLESS=1).\n";
@@ -744,7 +857,7 @@ int main(int argc, char** argv) {
         ++total_functions;
         bool ok = false;
         std::string error_message;
-        auto lines = decompile_function(fn.start(), matcher, ok, error_message);
+        auto lines = decompile_function(fn.start(), matcher, ok, error_message, trace_pass_pseudocode);
 
         if (!ok) {
             out << "/* decompilation failed at " << std::hex << fn.start() << std::dec << ": "
