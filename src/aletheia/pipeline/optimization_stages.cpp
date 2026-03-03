@@ -420,22 +420,45 @@ static bool definition_can_be_propagated(Assignment* def, Instruction* target) {
 // =============================================================================
 // If flags = a - b and we have if (flags CMP 0), fold to if (a CMP b).
 
+static Condition* fold_flags_comparison_condition(DecompilerArena& arena, Condition* cond) {
+    if (!cond) {
+        return nullptr;
+    }
+
+    auto* rhs_zero = dyn_cast<Constant>(cond->rhs());
+    if (!rhs_zero || rhs_zero->value() != 0) {
+        return cond;
+    }
+
+    auto* lhs_op = dyn_cast<Operation>(cond->lhs());
+    if (!lhs_op || lhs_op->operands().size() != 2) {
+        return cond;
+    }
+
+    // Common compare canonical form after propagation: (a - b) CMP 0
+    if (lhs_op->type() != OperationType::sub && lhs_op->type() != OperationType::sub_float) {
+        return cond;
+    }
+
+    return arena.create<Condition>(
+        cond->type(), lhs_op->operands()[0], lhs_op->operands()[1], cond->size_bytes);
+}
+
+static Expression* fold_flags_comparison_expression(DecompilerArena& arena, Expression* expr) {
+    auto* cond = dyn_cast<Condition>(expr);
+    if (!cond) {
+        return expr;
+    }
+    return fold_flags_comparison_condition(arena, cond);
+}
+
 static void try_fold_cmp_branch(DecompilerArena& arena, Branch* branch) {
     Condition* cond = branch->condition();
-    Expression* lhs = cond->lhs();
-    Expression* rhs = cond->rhs();
-
-    if (auto* sub_op = dyn_cast<Operation>(lhs)) {
-        if (sub_op->type() == OperationType::sub && sub_op->operands().size() == 2) {
-            if (auto* zero = dyn_cast<Constant>(rhs)) {
-                if (zero->value() == 0) {
-                    auto* new_cond = arena.create<Condition>(
-                        cond->type(), sub_op->operands()[0], sub_op->operands()[1], cond->size_bytes);
-                    branch->set_condition(new_cond);
-                }
-            }
-        }
+    if (!cond) {
+        return;
     }
+
+    branch->set_condition(fold_flags_comparison_condition(arena, cond));
 }
 
 // =============================================================================
@@ -2494,6 +2517,9 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             Expression* t_branch = op->operands()[1];
             Expression* f_branch = op->operands()[2];
 
+            cond = fold_flags_comparison_expression(task.arena(), cond);
+            op->mutable_operands()[0] = cond;
+
 
             std::string cond_fp = expr_fingerprint(cond);
 
@@ -2786,6 +2812,7 @@ void simplify_instruction_constants(DecompilerTask& task, Instruction* inst) {
         }
 
         branch->set_condition(rebuilt);
+        try_fold_cmp_branch(task.arena(), branch);
         return;
     }
 

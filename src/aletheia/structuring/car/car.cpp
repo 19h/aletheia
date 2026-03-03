@@ -358,11 +358,11 @@ Variable* extract_condition_variable(Expression* expr) {
     return nullptr;
 }
 
-Assignment* extract_single_assignment(CodeNode* node) {
+Assignment* extract_initializer_assignment(CodeNode* node) {
     if (!node || !node->block()) return nullptr;
     const auto& insts = node->block()->instructions();
-    if (insts.size() != 1) return nullptr;
-    return dyn_cast<Assignment>(insts[0]);
+    if (insts.empty()) return nullptr;
+    return dyn_cast<Assignment>(insts.back());
 }
 
 Assignment* extract_trailing_assignment(AstNode* body, CodeNode** owner_code) {
@@ -412,7 +412,7 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
         }
 
         auto* init_code = ast_dyn_cast<CodeNode>(nodes[i - 1]);
-        auto* init_assign = extract_single_assignment(init_code);
+        auto* init_assign = extract_initializer_assignment(init_code);
         if (!init_assign) continue;
 
         auto* init_var = dyn_cast<Variable>(init_assign->destination());
@@ -431,6 +431,7 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
         if (mod_owner) {
             mod_owner->remove_last_instruction();
         }
+        init_code->remove_last_instruction();
 
         auto* for_node = arena.create<ForLoopNode>(
             while_node->body(),
@@ -439,9 +440,11 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
             mod_assign);
 
         nodes[i] = for_node;
-        nodes.erase(nodes.begin() + static_cast<long>(i - 1));
-        if (i > 1) {
-            --i;
+        if (init_code->block()->instructions().empty()) {
+            nodes.erase(nodes.begin() + static_cast<long>(i - 1));
+            if (i > 1) {
+                --i;
+            }
         }
     }
 }
@@ -502,6 +505,63 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
     return node;
 }
 
+AstNode* refine_condition_aware_recursive(DecompilerArena& arena, AstNode* node) {
+    if (!node) {
+        return nullptr;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode*& child : seq->mutable_nodes()) {
+            child = refine_condition_aware_recursive(arena, child);
+        }
+
+        InitialSwitchNodeConstructor::run(arena, seq);
+        MissingCaseFinderCondition::run(arena, seq);
+        SwitchExtractor::run(arena, seq);
+        MissingCaseFinderSequence::run(arena, seq);
+        MissingCaseFinderIntersectingConstants::run(arena, seq);
+
+        for (AstNode* child : seq->mutable_nodes()) {
+            if (auto* sw = ast_dyn_cast<SwitchNode>(child)) {
+                sw->mutable_cases() = CaseDependencyGraph::order_cases(sw->cases());
+            }
+        }
+
+        AstNode* rewritten = rewrite_guarded_do_while(arena, seq);
+        if (rewritten != node) {
+            return refine_condition_aware_recursive(arena, rewritten);
+        }
+        return rewritten;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        if_node->set_cond(refine_condition_aware_recursive(arena, if_node->cond()));
+        if_node->set_true_branch(refine_condition_aware_recursive(arena, if_node->true_branch()));
+        if_node->set_false_branch(refine_condition_aware_recursive(arena, if_node->false_branch()));
+        return if_node;
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        loop->set_body(refine_condition_aware_recursive(arena, loop->body()));
+        return loop;
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* c : sw->mutable_cases()) {
+            c->set_body(refine_condition_aware_recursive(arena, c->body()));
+        }
+        sw->mutable_cases() = CaseDependencyGraph::order_cases(sw->cases());
+        return sw;
+    }
+
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        c->set_body(refine_condition_aware_recursive(arena, c->body()));
+        return c;
+    }
+
+    return node;
+}
+
 } // namespace
 
 AstNode* ConditionAwareRefinement::refine(
@@ -510,26 +570,9 @@ AstNode* ConditionAwareRefinement::refine(
     AstNode* root,
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
 ) {
-    if (auto* seq = ast_dyn_cast<SeqNode>(root)) {
-        (void)ctx;
-        (void)reaching_conditions;
-
-        InitialSwitchNodeConstructor::run(arena, seq);
-        MissingCaseFinderCondition::run(arena, seq);
-        SwitchExtractor::run(arena, seq);
-        MissingCaseFinderSequence::run(arena, seq);
-        MissingCaseFinderIntersectingConstants::run(arena, seq);
-
-        for (AstNode* node : seq->mutable_nodes()) {
-            if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-                sw->mutable_cases() = CaseDependencyGraph::order_cases(sw->cases());
-            }
-        }
-
-        return rewrite_guarded_do_while(arena, seq);
-    }
-
-    return root;
+    (void)ctx;
+    (void)reaching_conditions;
+    return refine_condition_aware_recursive(arena, root);
 }
 
 } // namespace aletheia

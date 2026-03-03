@@ -1,6 +1,9 @@
 #include "variable_name_generation.hpp"
 
+#include <cctype>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace aletheia {
@@ -55,9 +58,134 @@ std::string type_prefix_for(const TypePtr& type) {
     return "v";
 }
 
+bool is_all_digits(std::string_view text) {
+    if (text.empty()) {
+        return false;
+    }
+    for (char c : text) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<int> infer_parameter_index_from_register_name(std::string_view name) {
+    if ((name.starts_with("x") || name.starts_with("w")) && is_all_digits(name.substr(1))) {
+        return std::stoi(std::string(name.substr(1)));
+    }
+
+    if (name == "rdi") return 0;
+    if (name == "rsi") return 1;
+    if (name == "rdx") return 2;
+    if (name == "rcx") return 3;
+    if (name == "r8") return 4;
+    if (name == "r9") return 5;
+
+    return std::nullopt;
+}
+
+std::string lower_ascii(std::string text) {
+    for (char& c : text) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return text;
+}
+
+bool has_generated_name_prefix(const std::string& name) {
+    return name.starts_with("var_")
+        || name.starts_with("tmp_")
+        || name.starts_with("arg_")
+        || name.starts_with("local_")
+        || name.starts_with("sp_local_")
+        || name.starts_with("sp_arg_");
+}
+
+std::string make_stack_name(const std::string& prefix, std::int64_t offset) {
+    if (offset < 0) {
+        return prefix + "_m" + std::to_string(-(offset + 1) + 1);
+    }
+    return prefix + "_" + std::to_string(offset);
+}
+
+VarKey canonical_key_for(const Variable* var) {
+    if (!var) {
+        return {"<null>", 0};
+    }
+
+    if (var->is_parameter()) {
+        int index = var->parameter_index();
+        if (index < 0) {
+            auto inferred = infer_parameter_index_from_register_name(lower_ascii(var->name()));
+            if (inferred.has_value()) {
+                index = *inferred;
+            }
+        }
+        if (index >= 0) {
+            return {"param_" + std::to_string(index), 0};
+        }
+    }
+
+    if (var->kind() == VariableKind::StackLocal || var->kind() == VariableKind::StackArgument) {
+        return {"stack_" + std::to_string(var->stack_offset()), 0};
+    }
+
+    return {var->name(), var->ssa_version()};
+}
+
 std::string allocate_name_for_variable(const Variable* var, RenameState& state) {
     if (state.scheme == RenameState::Scheme::Default) {
-        return "var_" + std::to_string(state.next_id++);
+        if (!var) {
+            return "var_" + std::to_string(state.next_id++);
+        }
+
+        if (var->is_parameter()) {
+            int index = var->parameter_index();
+            if (index < 0) {
+                auto inferred = infer_parameter_index_from_register_name(lower_ascii(var->name()));
+                if (inferred.has_value()) {
+                    index = *inferred;
+                }
+            }
+            if (index >= 0) {
+                return "arg_" + std::to_string(index);
+            }
+            return "arg_" + std::to_string(state.prefix_next_id["arg"]++);
+        }
+
+        if (var->kind() == VariableKind::StackArgument) {
+            if (var->stack_offset() > 0) {
+                return make_stack_name("arg", var->stack_offset());
+            }
+            return "arg_" + std::to_string(state.prefix_next_id["arg"]++);
+        }
+
+        if (var->kind() == VariableKind::StackLocal) {
+            if (var->stack_offset() != 0) {
+                return make_stack_name("local", var->stack_offset());
+            }
+            return "local_" + std::to_string(state.prefix_next_id["local"]++);
+        }
+
+        if (var->kind() == VariableKind::Temporary) {
+            return "tmp_" + std::to_string(state.prefix_next_id["tmp"]++);
+        }
+
+        std::string lower = lower_ascii(var->name());
+        if (lower.starts_with("local_") || lower.starts_with("arg_")
+            || lower.starts_with("sp_local_") || lower.starts_with("sp_arg_")) {
+            return var->name();
+        }
+
+        if (auto inferred = infer_parameter_index_from_register_name(lower); inferred.has_value()) {
+            return "arg_" + std::to_string(*inferred);
+        }
+
+        if (!has_generated_name_prefix(lower) && !lower.empty()) {
+            return var->name();
+        }
+
+        return "tmp_" + std::to_string(state.prefix_next_id["tmp"]++);
     }
 
     const std::string prefix = type_prefix_for(var ? var->ir_type() : nullptr);
@@ -75,7 +203,7 @@ void rename_variable(Variable* var, RenameState& state) {
         return;
     }
 
-    const VarKey key{var->name(), var->ssa_version()};
+    const VarKey key = canonical_key_for(var);
     auto it = state.canonical_name.find(key);
     if (it == state.canonical_name.end()) {
         const std::string assigned = allocate_name_for_variable(var, state);

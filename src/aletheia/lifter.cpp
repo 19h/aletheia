@@ -488,6 +488,159 @@ std::optional<OperationType> arm_condition_to_operation(std::string_view cc) {
     return std::nullopt;
 }
 
+bool is_arm_condition_code(std::string_view cc) {
+    for (auto cond : kArmConditionSuffixes) {
+        if (cc == cond) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<std::string> normalize_arm_condition_token(std::string token) {
+    if (token.empty()) {
+        return std::nullopt;
+    }
+
+    token = to_lower_ascii(std::move(token));
+
+    auto trim = [](std::string& t) {
+        while (!t.empty() && std::isspace(static_cast<unsigned char>(t.front()))) {
+            t.erase(t.begin());
+        }
+        while (!t.empty() && (std::isspace(static_cast<unsigned char>(t.back())) || t.back() == ',')) {
+            t.pop_back();
+        }
+    };
+    trim(token);
+
+    if (!token.empty() && token.front() == '#') {
+        token.erase(token.begin());
+        trim(token);
+    }
+
+    if (token.size() >= 2 && ((token.front() == '[' && token.back() == ']')
+        || (token.front() == '{' && token.back() == '}')
+        || (token.front() == '(' && token.back() == ')'))) {
+        token = token.substr(1, token.size() - 2);
+        trim(token);
+    }
+
+    if (!is_arm_condition_code(token)) {
+        return std::nullopt;
+    }
+    return token;
+}
+
+std::optional<std::string> arm_condition_code_from_expression(Expression* expr) {
+    auto* var = dyn_cast<Variable>(expr);
+    if (!var) {
+        return std::nullopt;
+    }
+    return normalize_arm_condition_token(var->name());
+}
+
+std::optional<std::string> arm_condition_code_from_instruction(
+    const ida::instruction::Instruction& insn,
+    std::size_t preferred_operand_index) {
+    const auto& raw_ops = insn.operands();
+    if (raw_ops.empty()) {
+        return std::nullopt;
+    }
+
+    auto parse_at_index = [&](std::size_t idx) -> std::optional<std::string> {
+        if (idx >= raw_ops.size()) {
+            return std::nullopt;
+        }
+        auto text = ida::instruction::operand_text(insn.address(), raw_ops[idx].index());
+        if (!text) {
+            return std::nullopt;
+        }
+        return normalize_arm_condition_token(*text);
+    };
+
+    if (auto preferred = parse_at_index(preferred_operand_index)) {
+        return preferred;
+    }
+
+    for (std::size_t idx = 0; idx < raw_ops.size(); ++idx) {
+        if (idx == preferred_operand_index) {
+            continue;
+        }
+        if (auto parsed = parse_at_index(idx)) {
+            return parsed;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::uint64_t all_ones_for_width(std::size_t width_bytes) {
+    if (width_bytes == 0 || width_bytes >= sizeof(std::uint64_t)) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    const unsigned int bits = static_cast<unsigned int>(width_bytes * 8U);
+    return (static_cast<std::uint64_t>(1) << bits) - 1ULL;
+}
+
+Expression* arm_condition_expression_from_code(DecompilerArena& arena, std::string_view cc) {
+    auto cmp = arm_condition_to_operation(cc);
+    if (!cmp.has_value()) {
+        auto* flags = arena.create<Variable>("flags", 1);
+        auto* zero = arena.create<Constant>(0, 1);
+        return arena.create<Condition>(OperationType::neq, flags, zero, 1);
+    }
+
+    auto* flags = arena.create<Variable>("flags", 1);
+    auto* zero = arena.create<Constant>(0, 1);
+    return arena.create<Condition>(*cmp, flags, zero, 1);
+}
+
+Expression* resolve_arm_select_condition(
+    DecompilerArena& arena,
+    const ida::instruction::Instruction& insn,
+    const std::vector<Expression*>& operands,
+    std::size_t lifted_condition_index,
+    std::size_t preferred_operand_text_index) {
+    if (lifted_condition_index < operands.size()) {
+        Expression* lifted = operands[lifted_condition_index];
+        if (auto cc = arm_condition_code_from_expression(lifted)) {
+            return arm_condition_expression_from_code(arena, *cc);
+        }
+        if (isa<Condition>(lifted)) {
+            return lifted;
+        }
+        if (auto* op = dyn_cast<Operation>(lifted)) {
+            switch (op->type()) {
+                case OperationType::logical_not:
+                case OperationType::logical_and:
+                case OperationType::logical_or:
+                case OperationType::eq:
+                case OperationType::neq:
+                case OperationType::lt:
+                case OperationType::le:
+                case OperationType::gt:
+                case OperationType::ge:
+                case OperationType::lt_us:
+                case OperationType::le_us:
+                case OperationType::gt_us:
+                case OperationType::ge_us:
+                    return lifted;
+                default:
+                    break;
+            }
+        }
+    }
+
+    if (auto cc = arm_condition_code_from_instruction(insn, preferred_operand_text_index)) {
+        return arm_condition_expression_from_code(arena, *cc);
+    }
+
+    auto* flags = arena.create<Variable>("flags", 1);
+    auto* zero = arena.create<Constant>(0, 1);
+    return arena.create<Condition>(OperationType::neq, flags, zero, 1);
+}
+
 std::optional<OperationType> x86_branch_condition(std::string_view mnemonic) {
     if (mnemonic == "jcxz" || mnemonic == "jecxz" || mnemonic == "jrcxz") {
         return OperationType::eq;
@@ -829,12 +982,29 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
                 for (std::size_t i = 0; i < param_count && i < reg_count; ++i) {
                     std::string reg_name(reg_table[i]);
                     param_register_map_[reg_name] = static_cast<int>(i);
+
+                    // ARM64 alias: map Wn alongside Xn for 32-bit uses.
+                    if (reg_name.size() >= 2 && reg_name[0] == 'x') {
+                        std::string w_alias = reg_name;
+                        w_alias[0] = 'w';
+                        param_register_map_[w_alias] = static_cast<int>(i);
+                    }
                     
                     DecompilerTask::ParameterInfo info;
                     info.name = "a" + std::to_string(i + 1);
                     info.index = static_cast<int>(i);
                     info.type = (i < params.size()) ? params[i] : nullptr;
                     task.set_parameter_register(reg_name, std::move(info));
+
+                    if (reg_name.size() >= 2 && reg_name[0] == 'x') {
+                        DecompilerTask::ParameterInfo alias_info;
+                        alias_info.name = "a" + std::to_string(i + 1);
+                        alias_info.index = static_cast<int>(i);
+                        alias_info.type = (i < params.size()) ? params[i] : nullptr;
+                        std::string w_alias = reg_name;
+                        w_alias[0] = 'w';
+                        task.set_parameter_register(w_alias, std::move(alias_info));
+                    }
                 }
             }
         } else {
@@ -859,6 +1029,42 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
                     info.index = it->second;
                     info.type = nullptr; // Already set from function type.
                     task.set_parameter_register(canonical, std::move(info));
+                }
+            }
+        }
+    }
+
+    // Bare objects often have no recovered prototype. Seed a conservative ABI
+    // parameter map so naming and declaration stages can avoid var_N noise.
+    if (param_register_map_.empty()) {
+        auto [reg_table, reg_count] = param_register_table();
+        if (reg_table && reg_count > 0) {
+            // Keep this conservative to limit false positives on leaf helpers.
+            const std::size_t fallback_count = std::min<std::size_t>(reg_count, 6);
+            for (std::size_t i = 0; i < fallback_count; ++i) {
+                std::string reg_name(reg_table[i]);
+                param_register_map_[reg_name] = static_cast<int>(i);
+
+                if (reg_name.size() >= 2 && reg_name[0] == 'x') {
+                    std::string w_alias = reg_name;
+                    w_alias[0] = 'w';
+                    param_register_map_[w_alias] = static_cast<int>(i);
+                }
+
+                DecompilerTask::ParameterInfo info;
+                info.name = "arg_" + std::to_string(i);
+                info.index = static_cast<int>(i);
+                info.type = nullptr;
+                task.set_parameter_register(reg_name, std::move(info));
+
+                if (reg_name.size() >= 2 && reg_name[0] == 'x') {
+                    DecompilerTask::ParameterInfo alias_info;
+                    alias_info.name = "arg_" + std::to_string(i);
+                    alias_info.index = static_cast<int>(i);
+                    alias_info.type = nullptr;
+                    std::string w_alias = reg_name;
+                    w_alias[0] = 'w';
+                    task.set_parameter_register(w_alias, std::move(alias_info));
                 }
             }
         }
@@ -2139,64 +2345,112 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     }
 
     // =====================================================================
-    // ARM CSET / CSEL
+    // ARM conditional-select / conditional-compare families
     // =====================================================================
-    if (lmnem == "cset" && operands.size() >= 2) {
-        // CSET Xd, cond -> Xd = (cond ? 1 : 0)
-        auto* one = arena_.create<Constant>(1, operands[0]->size_bytes);
-        auto* zero = arena_.create<Constant>(0, operands[0]->size_bytes);
+    if (lmnem == "cset" && !operands.empty()) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 1, 1);
+        auto* one = arena_.create<Constant>(1, width);
+        auto* zero = arena_.create<Constant>(0, width);
         auto* ternary = arena_.create<Operation>(OperationType::ternary,
-            std::vector<Expression*>{operands[1], one, zero}, operands[0]->size_bytes);
+            std::vector<Expression*>{cond_expr, one, zero}, width);
         auto* assign = arena_.create<Assignment>(operands[0], ternary);
         assign->set_address(addr);
         return assign;
     }
-    if (lmnem == "csetm" && operands.size() >= 2) {
-        // CSETM Xd, cond -> Xd = (cond ? -1 : 0)
-        auto* all_ones = arena_.create<Constant>(std::numeric_limits<std::uint64_t>::max(), operands[0]->size_bytes);
-        auto* zero = arena_.create<Constant>(0, operands[0]->size_bytes);
+    if (lmnem == "csetm" && !operands.empty()) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 1, 1);
+        auto* all_ones = arena_.create<Constant>(all_ones_for_width(width), width);
+        auto* zero = arena_.create<Constant>(0, width);
         auto* ternary = arena_.create<Operation>(OperationType::ternary,
-            std::vector<Expression*>{operands[1], all_ones, zero}, operands[0]->size_bytes);
+            std::vector<Expression*>{cond_expr, all_ones, zero}, width);
         auto* assign = arena_.create<Assignment>(operands[0], ternary);
         assign->set_address(addr);
         return assign;
     }
-    if (lmnem == "csel" && operands.size() >= 4) {
-        // CSEL Xd, Xn, Xm, cond -> Xd = (cond ? Xn : Xm)
+    if (lmnem == "csel" && operands.size() >= 3) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 3, 3);
         auto* ternary = arena_.create<Operation>(OperationType::ternary,
-            std::vector<Expression*>{operands[3], operands[1], operands[2]}, operands[0]->size_bytes);
+            std::vector<Expression*>{cond_expr, operands[1], operands[2]}, width);
         auto* assign = arena_.create<Assignment>(operands[0], ternary);
         assign->set_address(addr);
         return assign;
     }
-    if (lmnem == "csinc" && operands.size() >= 4) {
-        // CSINC Xd, Xn, Xm, cond -> Xd = cond ? Xn : Xm + 1
-        auto* one = arena_.create<Constant>(1, operands[0]->size_bytes);
+    if (lmnem == "csinc" && operands.size() >= 3) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 3, 3);
+        auto* one = arena_.create<Constant>(1, width);
         auto* plus_one = arena_.create<Operation>(OperationType::add,
-            std::vector<Expression*>{operands[2], one}, operands[0]->size_bytes);
+            std::vector<Expression*>{operands[2], one}, width);
         auto* ternary = arena_.create<Operation>(OperationType::ternary,
-            std::vector<Expression*>{operands[3], operands[1], plus_one}, operands[0]->size_bytes);
+            std::vector<Expression*>{cond_expr, operands[1], plus_one}, width);
         auto* assign = arena_.create<Assignment>(operands[0], ternary);
         assign->set_address(addr);
         return assign;
     }
-    if (lmnem == "csinv" && operands.size() >= 4) {
-        // CSINV Xd, Xn, Xm, cond -> Xd = cond ? Xn : ~Xm
+    if (lmnem == "csinv" && operands.size() >= 3) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 3, 3);
         auto* inv = arena_.create<Operation>(OperationType::bit_not,
-            std::vector<Expression*>{operands[2]}, operands[0]->size_bytes);
+            std::vector<Expression*>{operands[2]}, width);
         auto* ternary = arena_.create<Operation>(OperationType::ternary,
-            std::vector<Expression*>{operands[3], operands[1], inv}, operands[0]->size_bytes);
+            std::vector<Expression*>{cond_expr, operands[1], inv}, width);
         auto* assign = arena_.create<Assignment>(operands[0], ternary);
         assign->set_address(addr);
         return assign;
     }
-    if (lmnem == "csneg" && operands.size() >= 4) {
-        // CSNEG Xd, Xn, Xm, cond -> Xd = cond ? Xn : -Xm
+    if (lmnem == "csneg" && operands.size() >= 3) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 3, 3);
         auto* neg = arena_.create<Operation>(OperationType::negate,
-            std::vector<Expression*>{operands[2]}, operands[0]->size_bytes);
+            std::vector<Expression*>{operands[2]}, width);
         auto* ternary = arena_.create<Operation>(OperationType::ternary,
-            std::vector<Expression*>{operands[3], operands[1], neg}, operands[0]->size_bytes);
+            std::vector<Expression*>{cond_expr, operands[1], neg}, width);
         auto* assign = arena_.create<Assignment>(operands[0], ternary);
+        assign->set_address(addr);
+        return assign;
+    }
+    if (lmnem == "cinc" && operands.size() >= 2) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 2, 2);
+        auto* one = arena_.create<Constant>(1, width);
+        auto* plus_one = arena_.create<Operation>(OperationType::add,
+            std::vector<Expression*>{operands[1], one}, width);
+        auto* ternary = arena_.create<Operation>(OperationType::ternary,
+            std::vector<Expression*>{cond_expr, plus_one, operands[1]}, width);
+        auto* assign = arena_.create<Assignment>(operands[0], ternary);
+        assign->set_address(addr);
+        return assign;
+    }
+    if (lmnem == "cneg" && operands.size() >= 2) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 2, 2);
+        auto* neg = arena_.create<Operation>(OperationType::negate,
+            std::vector<Expression*>{operands[1]}, width);
+        auto* ternary = arena_.create<Operation>(OperationType::ternary,
+            std::vector<Expression*>{cond_expr, neg, operands[1]}, width);
+        auto* assign = arena_.create<Assignment>(operands[0], ternary);
+        assign->set_address(addr);
+        return assign;
+    }
+    if ((lmnem == "ccmp" || lmnem == "ccmn") && operands.size() >= 2) {
+        const std::size_t width = operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1U;
+        Expression* cond_expr = resolve_arm_select_condition(arena_, insn, operands, 3, 3);
+        const OperationType cmp_type = (lmnem == "ccmn") ? OperationType::add : OperationType::sub;
+        auto* compare = arena_.create<Operation>(cmp_type,
+            std::vector<Expression*>{operands[0], operands[1]}, width);
+
+        Expression* fallback_flags = arena_.create<Constant>(0, width);
+        if (operands.size() >= 3 && operands[2] != nullptr) {
+            fallback_flags = operands[2];
+        }
+
+        auto* merged = arena_.create<Operation>(OperationType::ternary,
+            std::vector<Expression*>{cond_expr, compare, fallback_flags}, width);
+        auto* flags = arena_.create<Variable>("flags", width);
+        auto* assign = arena_.create<Assignment>(flags, merged);
         assign->set_address(addr);
         return assign;
     }
