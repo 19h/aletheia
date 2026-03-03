@@ -36,24 +36,55 @@ std::string expr_fingerprint(Expression* expr) {
     return "E:unknown";
 }
 
-bool decode_switch_case_condition(Expression* expr, Expression*& selector, std::string& selector_fp, std::uint64_t& value) {
-    auto* cond = dyn_cast<Condition>(expr);
-    if (!cond || cond->type() != OperationType::eq) return false;
-
-    auto* lhs_const = dyn_cast<Constant>(cond->lhs());
-    auto* rhs_const = dyn_cast<Constant>(cond->rhs());
+bool decode_switch_case_operands(Expression* lhs, Expression* rhs,
+                                 Expression*& selector, std::string& selector_fp,
+                                 std::uint64_t& value) {
+    auto* lhs_const = dyn_cast<Constant>(lhs);
+    auto* rhs_const = dyn_cast<Constant>(rhs);
     if (lhs_const && !rhs_const) {
-        selector = cond->rhs();
+        selector = rhs;
         selector_fp = expr_fingerprint(selector);
         value = lhs_const->value();
         return true;
     }
     if (rhs_const && !lhs_const) {
-        selector = cond->lhs();
+        selector = lhs;
         selector_fp = expr_fingerprint(selector);
         value = rhs_const->value();
         return true;
     }
+    return false;
+}
+
+bool decode_switch_case_condition(Expression* expr, Expression*& selector, std::string& selector_fp, std::uint64_t& value) {
+    auto* cond = dyn_cast<Condition>(expr);
+    if (cond && cond->type() == OperationType::eq) {
+        return decode_switch_case_operands(cond->lhs(), cond->rhs(), selector, selector_fp, value);
+    }
+
+    auto* op = dyn_cast<Operation>(expr);
+    if (!op) {
+        return false;
+    }
+
+    if (op->type() == OperationType::eq && op->operands().size() == 2) {
+        return decode_switch_case_operands(op->operands()[0], op->operands()[1], selector, selector_fp, value);
+    }
+
+    if (op->type() == OperationType::logical_not && op->operands().size() == 1) {
+        Expression* inner = op->operands()[0];
+
+        if (auto* inner_cond = dyn_cast<Condition>(inner);
+            inner_cond && inner_cond->type() == OperationType::neq) {
+            return decode_switch_case_operands(inner_cond->lhs(), inner_cond->rhs(), selector, selector_fp, value);
+        }
+
+        if (auto* inner_op = dyn_cast<Operation>(inner);
+            inner_op && inner_op->type() == OperationType::neq && inner_op->operands().size() == 2) {
+            return decode_switch_case_operands(inner_op->operands()[0], inner_op->operands()[1], selector, selector_fp, value);
+        }
+    }
+
     return false;
 }
 

@@ -207,6 +207,10 @@ bool should_swap_if_branches(IfNode* inode) {
     return false;
 }
 
+int precedence_for_operation(OperationType type);
+int precedence_for_expression(Expression* expr);
+bool needs_parentheses_for_equal_precedence_rhs(OperationType parent_type);
+
 std::string negate_condition_string(std::string cond) {
     if (cond.empty()) {
         return "!(/* condition */)";
@@ -215,6 +219,109 @@ std::string negate_condition_string(std::string cond) {
         return cond.substr(2, cond.size() - 3);
     }
     return "!(" + cond + ")";
+}
+
+bool is_comparison_operation(OperationType type) {
+    switch (type) {
+        case OperationType::eq:
+        case OperationType::neq:
+        case OperationType::lt:
+        case OperationType::le:
+        case OperationType::gt:
+        case OperationType::ge:
+        case OperationType::lt_us:
+        case OperationType::le_us:
+        case OperationType::gt_us:
+        case OperationType::ge_us:
+            return true;
+        default:
+            return false;
+    }
+}
+
+OperationType negate_comparison_operation(OperationType type) {
+    switch (type) {
+        case OperationType::eq:    return OperationType::neq;
+        case OperationType::neq:   return OperationType::eq;
+        case OperationType::lt:
+        case OperationType::lt_us: return OperationType::ge;
+        case OperationType::le:
+        case OperationType::le_us: return OperationType::gt;
+        case OperationType::gt:
+        case OperationType::gt_us: return OperationType::le;
+        case OperationType::ge:
+        case OperationType::ge_us: return OperationType::lt;
+        default:                   return OperationType::unknown;
+    }
+}
+
+const char* comparison_symbol(OperationType type) {
+    switch (type) {
+        case OperationType::eq:    return " == ";
+        case OperationType::neq:   return " != ";
+        case OperationType::lt:
+        case OperationType::lt_us: return " < ";
+        case OperationType::le:
+        case OperationType::le_us: return " <= ";
+        case OperationType::gt:
+        case OperationType::gt_us: return " > ";
+        case OperationType::ge:
+        case OperationType::ge_us: return " >= ";
+        default:                   return nullptr;
+    }
+}
+
+std::string render_comparison_expression(
+    CExpressionGenerator& gen,
+    OperationType op_type,
+    Expression* lhs,
+    Expression* rhs) {
+    const char* op_str = comparison_symbol(op_type);
+    if (!op_str) {
+        return "/* condition */";
+    }
+
+    const int parent_prec = precedence_for_operation(op_type);
+    auto render_operand = [&](Expression* operand, bool is_rhs) {
+        std::string rendered = gen.generate(operand);
+        const int child_prec = precedence_for_expression(operand);
+        const bool needs_brackets =
+            (child_prec < parent_prec) ||
+            (is_rhs && child_prec == parent_prec && needs_parentheses_for_equal_precedence_rhs(op_type));
+        if (needs_brackets) {
+            return "(" + rendered + ")";
+        }
+        return rendered;
+    };
+
+    return render_operand(lhs, false) + op_str + render_operand(rhs, true);
+}
+
+std::string render_negated_condition(Expression* condition, CExpressionGenerator& gen) {
+    if (!condition) {
+        return "!(/* condition */)";
+    }
+
+    if (auto* cond = dyn_cast<Condition>(condition)) {
+        const OperationType negated = negate_comparison_operation(cond->type());
+        if (negated != OperationType::unknown) {
+            return render_comparison_expression(gen, negated, cond->lhs(), cond->rhs());
+        }
+    }
+
+    if (auto* op = dyn_cast<Operation>(condition)) {
+        if (op->type() == OperationType::logical_not && op->operands().size() == 1) {
+            return gen.generate(op->operands()[0]);
+        }
+        if (is_comparison_operation(op->type()) && op->operands().size() == 2) {
+            const OperationType negated = negate_comparison_operation(op->type());
+            if (negated != OperationType::unknown) {
+                return render_comparison_expression(gen, negated, op->operands()[0], op->operands()[1]);
+            }
+        }
+    }
+
+    return negate_condition_string(gen.generate(condition));
 }
 
 char nibble_to_hex(unsigned value) {
@@ -1029,9 +1136,9 @@ void CodeVisitor::visit_node(AstNode* node) {
                 indent();
 
                 if (auto* branch = dyn_cast<Branch>(inst)) {
+                    const std::string cond = expr_gen_.generate(branch->condition());
                     if (cfg_fallback_mode_) {
                         auto [true_edge, false_edge] = pick_true_false_edges(block);
-                        const std::string cond = expr_gen_.generate(branch->condition());
                         if (true_edge && false_edge) {
                             current_line_ += "if (" + cond + ") goto " + block_label(true_edge->target())
                                 + "; else goto " + block_label(false_edge->target()) + ";";
@@ -1047,6 +1154,10 @@ void CodeVisitor::visit_node(AstNode* node) {
                             lines_.push_back(current_line_);
                             current_line_.clear();
                         }
+                    } else {
+                        current_line_ += "/* branch if (" + cond + ") */";
+                        lines_.push_back(current_line_);
+                        current_line_.clear();
                     }
                     current_line_.clear();
                     continue;
@@ -1222,9 +1333,11 @@ void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
     }
 
     std::string cond_str = "/* condition */";
+    Expression* cond_expr = nullptr;
     if (inode->cond()) {
         if (auto* expr_ast = ast_dyn_cast<ExprAstNode>(inode->cond())) {
-            cond_str = expr_gen_.generate(expr_ast->expr());
+            cond_expr = expr_ast->expr();
+            cond_str = expr_gen_.generate(cond_expr);
         }
     }
 
@@ -1240,13 +1353,13 @@ void CodeVisitor::visit_if_chain(IfNode* inode, bool else_if_prefix) {
     bool swapped_for_emission = false;
     if (!true_emits && false_emits) {
         std::swap(true_branch, false_branch);
-        cond_str = negate_condition_string(cond_str);
+        cond_str = cond_expr ? render_negated_condition(cond_expr, expr_gen_) : negate_condition_string(cond_str);
         swapped_for_emission = true;
     }
 
     if (!swapped_for_emission && should_swap_if_branches(inode)) {
         std::swap(true_branch, false_branch);
-        cond_str = negate_condition_string(cond_str);
+        cond_str = cond_expr ? render_negated_condition(cond_expr, expr_gen_) : negate_condition_string(cond_str);
     }
 
     indent();
@@ -1297,8 +1410,11 @@ bool CodeVisitor::node_emits_code(AstNode* node) {
         }
 
         for (Instruction* inst : block->instructions()) {
-            if (!inst || isa<Branch>(inst)) {
+            if (!inst) {
                 continue;
+            }
+            if (isa<Branch>(inst)) {
+                return true;
             }
             if (isa<IndirectBranch>(inst)) {
                 return true;

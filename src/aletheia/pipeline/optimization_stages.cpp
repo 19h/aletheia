@@ -2488,6 +2488,23 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             }
             // !(!A) -> A
             if (auto* child_op = dyn_cast<Operation>(child_expr)) {
+                // !(A CMP B) where CMP is encoded as an Operation -> Condition(!CMP)
+                if (child_op->operands().size() == 2) {
+                    const OperationType child_type = child_op->type();
+                    if (child_type == OperationType::eq || child_type == OperationType::neq ||
+                        child_type == OperationType::lt || child_type == OperationType::le ||
+                        child_type == OperationType::gt || child_type == OperationType::ge ||
+                        child_type == OperationType::lt_us || child_type == OperationType::le_us ||
+                        child_type == OperationType::gt_us || child_type == OperationType::ge_us) {
+                        auto negated_op = Condition::negate_comparison(child_type);
+                        return task.arena().create<Condition>(
+                            negated_op,
+                            child_op->operands()[0],
+                            child_op->operands()[1],
+                            child_op->size_bytes);
+                    }
+                }
+
                 if (child_op->type() == OperationType::logical_not && child_op->operands().size() == 1) {
                     return child_op->operands()[0];
                 }
@@ -3732,6 +3749,95 @@ void EdgePrunerStage::execute(DecompilerTask& task) {
                 break;
             }
             changed = apply_edge_pruner_candidate(task, block, *candidate, temp_counter);
+        }
+    }
+}
+
+namespace {
+
+bool same_variable_identity(const Variable* lhs, const Variable* rhs) {
+    if (!lhs || !rhs) {
+        return false;
+    }
+    return lhs->name() == rhs->name() && lhs->ssa_version() == rhs->ssa_version();
+}
+
+bool assignment_safe_for_dedup(const Assignment* assign) {
+    if (!assign) {
+        return false;
+    }
+
+    auto* dst_var = dyn_cast<Variable>(assign->destination());
+    if (!dst_var || dst_var->is_aliased()) {
+        return false;
+    }
+
+    Expression* value = assign->value();
+    if (!value) {
+        return false;
+    }
+
+    if (contains_dereference(value) || contains_call_expression(value)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool assignments_are_identical(const Assignment* lhs, const Assignment* rhs) {
+    if (!lhs || !rhs) {
+        return false;
+    }
+
+    auto* lhs_dst = dyn_cast<Variable>(lhs->destination());
+    auto* rhs_dst = dyn_cast<Variable>(rhs->destination());
+    if (!same_variable_identity(lhs_dst, rhs_dst)) {
+        return false;
+    }
+
+    if (!lhs->value() || !rhs->value()) {
+        return false;
+    }
+
+    return expression_fingerprint_hash(lhs->value()) == expression_fingerprint_hash(rhs->value());
+}
+
+} // namespace
+
+void RedundantAssignmentEliminationStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) {
+        return;
+    }
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!block) {
+            continue;
+        }
+
+        const auto& insts = block->instructions();
+        if (insts.size() < 2) {
+            continue;
+        }
+
+        std::vector<Instruction*> compacted;
+        compacted.reserve(insts.size());
+
+        const Assignment* previous_assignment = nullptr;
+        for (Instruction* inst : insts) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            if (assign && previous_assignment &&
+                assignment_safe_for_dedup(assign) &&
+                assignment_safe_for_dedup(previous_assignment) &&
+                assignments_are_identical(previous_assignment, assign)) {
+                continue;
+            }
+
+            compacted.push_back(inst);
+            previous_assignment = assign;
+        }
+
+        if (compacted.size() != insts.size()) {
+            block->set_instructions(std::move(compacted));
         }
     }
 }

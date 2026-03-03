@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cstdlib>
+#include <optional>
 #include "ast_processor.hpp"
 
 namespace aletheia {
@@ -40,6 +41,12 @@ struct CompareInfo {
     OperationType op = OperationType::unknown;
     Expression* lhs = nullptr;
     Expression* rhs = nullptr;
+};
+
+struct CompareWithConstant {
+    OperationType op = OperationType::unknown;
+    Expression* expr = nullptr;
+    Constant* constant = nullptr;
 };
 
 CompareDomain compare_domain(OperationType op) {
@@ -129,6 +136,57 @@ bool extract_compare(Expression* expr, CompareInfo& out) {
     return true;
 }
 
+bool normalize_compare_with_constant(const CompareInfo& in, CompareWithConstant& out) {
+    auto* lhs_const = dyn_cast<Constant>(in.lhs);
+    auto* rhs_const = dyn_cast<Constant>(in.rhs);
+
+    if (lhs_const && !rhs_const) {
+        out.op = flipped_compare(in.op);
+        out.expr = in.rhs;
+        out.constant = lhs_const;
+        return out.op != OperationType::unknown;
+    }
+    if (rhs_const && !lhs_const) {
+        out.op = in.op;
+        out.expr = in.lhs;
+        out.constant = rhs_const;
+        return out.op != OperationType::unknown;
+    }
+    return false;
+}
+
+std::optional<bool> compare_with_constant_implication(const CompareWithConstant& outer, const CompareWithConstant& inner) {
+    if (!outer.expr || !inner.expr || !outer.constant || !inner.constant) {
+        return std::nullopt;
+    }
+    if (expression_fingerprint_hash(outer.expr) != expression_fingerprint_hash(inner.expr)) {
+        return std::nullopt;
+    }
+
+    const std::uint64_t outer_value = outer.constant->value();
+    const std::uint64_t inner_value = inner.constant->value();
+
+    if (outer.op == OperationType::eq) {
+        if (inner.op == OperationType::eq) {
+            return outer_value == inner_value;
+        }
+        if (inner.op == OperationType::neq) {
+            return outer_value != inner_value;
+        }
+    }
+
+    if (outer.op == OperationType::neq && outer_value == inner_value) {
+        if (inner.op == OperationType::eq) {
+            return false;
+        }
+        if (inner.op == OperationType::neq) {
+            return true;
+        }
+    }
+
+    return std::nullopt;
+}
+
 bool compare_ops_contradict(OperationType outer_op, OperationType inner_op) {
     const CompareFamily outer = compare_family(outer_op);
     const CompareFamily inner = compare_family(inner_op);
@@ -161,6 +219,92 @@ bool compare_ops_contradict(OperationType outer_op, OperationType inner_op) {
     return false;
 }
 
+std::optional<bool> compare_ops_implication(OperationType outer_op, OperationType inner_op) {
+    const CompareFamily outer = compare_family(outer_op);
+    const CompareFamily inner = compare_family(inner_op);
+    if (outer == CompareFamily::Unknown || inner == CompareFamily::Unknown) {
+        return std::nullopt;
+    }
+
+    const CompareDomain outer_domain = compare_domain(outer_op);
+    const CompareDomain inner_domain = compare_domain(inner_op);
+    if (outer_domain != CompareDomain::Any && inner_domain != CompareDomain::Any && outer_domain != inner_domain) {
+        return std::nullopt;
+    }
+
+    switch (outer) {
+        case CompareFamily::Eq:
+            switch (inner) {
+                case CompareFamily::Eq:
+                case CompareFamily::Le:
+                case CompareFamily::Ge:
+                    return true;
+                case CompareFamily::Neq:
+                case CompareFamily::Lt:
+                case CompareFamily::Gt:
+                    return false;
+                case CompareFamily::Unknown:
+                    return std::nullopt;
+            }
+            break;
+        case CompareFamily::Neq:
+            switch (inner) {
+                case CompareFamily::Neq:
+                    return true;
+                case CompareFamily::Eq:
+                    return false;
+                default:
+                    return std::nullopt;
+            }
+        case CompareFamily::Lt:
+            switch (inner) {
+                case CompareFamily::Lt:
+                case CompareFamily::Le:
+                case CompareFamily::Neq:
+                    return true;
+                case CompareFamily::Eq:
+                case CompareFamily::Ge:
+                    return false;
+                default:
+                    return std::nullopt;
+            }
+        case CompareFamily::Le:
+            switch (inner) {
+                case CompareFamily::Le:
+                    return true;
+                case CompareFamily::Gt:
+                    return false;
+                default:
+                    return std::nullopt;
+            }
+        case CompareFamily::Gt:
+            switch (inner) {
+                case CompareFamily::Gt:
+                case CompareFamily::Ge:
+                case CompareFamily::Neq:
+                    return true;
+                case CompareFamily::Eq:
+                case CompareFamily::Le:
+                    return false;
+                default:
+                    return std::nullopt;
+            }
+        case CompareFamily::Ge:
+            switch (inner) {
+                case CompareFamily::Ge:
+                    return true;
+                case CompareFamily::Lt:
+                    return false;
+                default:
+                    return std::nullopt;
+            }
+        case CompareFamily::Unknown:
+            return std::nullopt;
+    }
+
+    return std::nullopt;
+}
+
 bool conditions_contradict(Expression* outer_expr, Expression* inner_expr) {
     CompareInfo outer;
     CompareInfo inner;
@@ -186,6 +330,43 @@ bool conditions_contradict(Expression* outer_expr, Expression* inner_expr) {
         return false;
     }
     return compare_ops_contradict(outer.op, aligned_inner_op);
+}
+
+std::optional<bool> condition_truth_under_outer(Expression* outer_expr, Expression* inner_expr) {
+    CompareInfo outer;
+    CompareInfo inner;
+    if (!extract_compare(outer_expr, outer) || !extract_compare(inner_expr, inner)) {
+        return std::nullopt;
+    }
+
+    CompareWithConstant outer_const;
+    CompareWithConstant inner_const;
+    if (normalize_compare_with_constant(outer, outer_const) &&
+        normalize_compare_with_constant(inner, inner_const)) {
+        std::optional<bool> implied = compare_with_constant_implication(outer_const, inner_const);
+        if (implied.has_value()) {
+            return implied;
+        }
+    }
+
+    const std::uint64_t outer_lhs_fp = expression_fingerprint_hash(outer.lhs);
+    const std::uint64_t outer_rhs_fp = expression_fingerprint_hash(outer.rhs);
+    const std::uint64_t inner_lhs_fp = expression_fingerprint_hash(inner.lhs);
+    const std::uint64_t inner_rhs_fp = expression_fingerprint_hash(inner.rhs);
+
+    OperationType aligned_inner_op = OperationType::unknown;
+    if (outer_lhs_fp == inner_lhs_fp && outer_rhs_fp == inner_rhs_fp) {
+        aligned_inner_op = inner.op;
+    } else if (outer_lhs_fp == inner_rhs_fp && outer_rhs_fp == inner_lhs_fp) {
+        aligned_inner_op = flipped_compare(inner.op);
+    } else {
+        return std::nullopt;
+    }
+
+    if (aligned_inner_op == OperationType::unknown) {
+        return std::nullopt;
+    }
+    return compare_ops_implication(outer.op, aligned_inner_op);
 }
 
 template<typename Func>
@@ -312,6 +493,54 @@ AstNode* AstProcessor::clean_node(DecompilerArena& arena, AstNode* root) {
                 if (auto* nested_if = ast_dyn_cast<IfNode>(ifn->true_branch())) {
                     if (!nested_if->false_branch() && same_if_condition(ifn->cond(), nested_if->cond())) {
                         ifn->set_true_branch(nested_if->true_branch());
+                    } else if (auto* outer_cond_ast = ast_dyn_cast<ExprAstNode>(ifn->cond());
+                               outer_cond_ast && outer_cond_ast->expr()) {
+                        if (auto* inner_cond_ast = ast_dyn_cast<ExprAstNode>(nested_if->cond());
+                            inner_cond_ast && inner_cond_ast->expr()) {
+                            std::optional<bool> implied =
+                                condition_truth_under_outer(outer_cond_ast->expr(), inner_cond_ast->expr());
+                            if (implied.has_value()) {
+                                if (implied.value()) {
+                                    ifn->set_true_branch(nested_if->true_branch());
+                                } else {
+                                    ifn->set_true_branch(nested_if->false_branch());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (auto* true_seq = ast_dyn_cast<SeqNode>(ifn->true_branch());
+                    true_seq && !true_seq->empty()) {
+                    auto* head_if = ast_dyn_cast<IfNode>(true_seq->first());
+                    if (head_if && !head_if->false_branch()) {
+                        if (auto* outer_cond_ast = ast_dyn_cast<ExprAstNode>(ifn->cond());
+                            outer_cond_ast && outer_cond_ast->expr()) {
+                            if (auto* inner_cond_ast = ast_dyn_cast<ExprAstNode>(head_if->cond());
+                                inner_cond_ast && inner_cond_ast->expr()) {
+                                std::optional<bool> implied =
+                                    condition_truth_under_outer(outer_cond_ast->expr(), inner_cond_ast->expr());
+                                if (implied.has_value()) {
+                                    if (implied.value()) {
+                                        AstNode* inner_true = head_if->true_branch();
+                                        if (inner_true &&
+                                            (inner_true->does_end_with_return() ||
+                                             inner_true->does_end_with_break() ||
+                                             inner_true->does_end_with_continue())) {
+                                            ifn->set_true_branch(inner_true);
+                                        }
+                                    } else {
+                                        auto& seq_nodes = true_seq->mutable_nodes();
+                                        seq_nodes.erase(seq_nodes.begin());
+                                        if (true_seq->empty()) {
+                                            ifn->set_true_branch(nullptr);
+                                        } else if (true_seq->size() == 1) {
+                                            ifn->set_true_branch(true_seq->first());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

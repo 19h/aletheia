@@ -81,6 +81,12 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class RedundantAssignmentEliminationStage : public PipelineStage {
+public:
+    const char* name() const override { return "RedundantAssignmentElimination"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class CommonSubexpressionEliminationStage : public PipelineStage {
 public:
     const char* name() const override { return "CommonSubexpressionElimination"; }

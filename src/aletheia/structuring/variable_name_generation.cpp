@@ -98,7 +98,9 @@ bool has_generated_name_prefix(const std::string& name) {
         || name.starts_with("arg_")
         || name.starts_with("local_")
         || name.starts_with("sp_local_")
-        || name.starts_with("sp_arg_");
+        || name.starts_with("sp_arg_")
+        || name.starts_with("entry_")
+        || name.starts_with("exit_");
 }
 
 std::string make_stack_name(const std::string& prefix, std::int64_t offset) {
@@ -168,10 +170,20 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
         }
 
         if (var->kind() == VariableKind::Temporary) {
+            if (var->ir_type() && var->ir_type()->is_boolean()) {
+                return "flag_" + std::to_string(state.prefix_next_id["flag"]++);
+            }
             return "tmp_" + std::to_string(state.prefix_next_id["tmp"]++);
         }
 
         std::string lower = lower_ascii(var->name());
+        if (lower.starts_with("entry_")) {
+            return "entry_flag_" + std::to_string(state.prefix_next_id["entry_flag"]++);
+        }
+        if (lower.starts_with("exit_")) {
+            return "exit_flag_" + std::to_string(state.prefix_next_id["exit_flag"]++);
+        }
+
         if (lower.starts_with("local_") || lower.starts_with("arg_")
             || lower.starts_with("sp_local_") || lower.starts_with("sp_arg_")) {
             return var->name();
