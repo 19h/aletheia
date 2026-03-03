@@ -8,7 +8,11 @@
 #include "reaching_conditions/reaching_conditions.hpp"
 #include "cbr/cbr.hpp"
 #include "car/car.hpp"
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
+#include <optional>
 #include <unordered_set>
 #include <string>
 
@@ -21,6 +25,101 @@ bool env_flag_enabled(const char* name) {
     if (!value) return false;
     std::string v(value);
     return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES";
+}
+
+void collect_original_block_ids(AstNode* node, std::vector<std::uint64_t>& ids) {
+    if (!node) {
+        return;
+    }
+
+    if (BasicBlock* bb = node->get_original_block()) {
+        ids.push_back(static_cast<std::uint64_t>(bb->id()));
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            collect_original_block_ids(child, ids);
+        }
+        return;
+    }
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        collect_original_block_ids(if_node->true_branch(), ids);
+        collect_original_block_ids(if_node->false_branch(), ids);
+        return;
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        collect_original_block_ids(loop->body(), ids);
+        return;
+    }
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->cases()) {
+            collect_original_block_ids(case_node->body(), ids);
+        }
+        return;
+    }
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        collect_original_block_ids(case_node->body(), ids);
+    }
+}
+
+std::uint64_t transition_block_order_key(TransitionBlock* node) {
+    if (!node || !node->ast_node()) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+
+    if (BasicBlock* bb = node->ast_node()->get_original_block()) {
+        return static_cast<std::uint64_t>(bb->id());
+    }
+
+    std::vector<std::uint64_t> ids;
+    collect_original_block_ids(node->ast_node(), ids);
+    if (!ids.empty()) {
+        return *std::min_element(ids.begin(), ids.end());
+    }
+
+    const auto kind_bias = static_cast<std::uint64_t>(node->ast_node()->ast_kind());
+    return std::numeric_limits<std::uint64_t>::max() - kind_bias;
+}
+
+std::string transition_block_signature(TransitionBlock* node) {
+    if (!node || !node->ast_node()) {
+        return "<null>";
+    }
+
+    std::vector<std::uint64_t> ids;
+    collect_original_block_ids(node->ast_node(), ids);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    std::string out = "k" + std::to_string(static_cast<int>(node->ast_node()->ast_kind())) + ":";
+    if (ids.empty()) {
+        out += "none";
+    } else {
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (i != 0) {
+                out += ",";
+            }
+            out += std::to_string(ids[i]);
+        }
+    }
+    return out;
+}
+
+void sort_transition_blocks_deterministically(std::vector<TransitionBlock*>& blocks) {
+    std::stable_sort(blocks.begin(), blocks.end(), [](TransitionBlock* lhs, TransitionBlock* rhs) {
+        const std::uint64_t lhs_key = transition_block_order_key(lhs);
+        const std::uint64_t rhs_key = transition_block_order_key(rhs);
+        if (lhs_key != rhs_key) {
+            return lhs_key < rhs_key;
+        }
+        return transition_block_signature(lhs) < transition_block_signature(rhs);
+    });
+}
+
+std::vector<TransitionBlock*> sorted_transition_blocks(const std::vector<TransitionBlock*>& blocks) {
+    std::vector<TransitionBlock*> sorted = blocks;
+    sort_transition_blocks_deterministically(sorted);
+    return sorted;
 }
 
 std::unordered_set<TransitionBlock*> compute_dominated_region(TransitionCFG& cfg, TransitionBlock* header) {
@@ -142,7 +241,9 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         }
         if (has_retreating) {
             std::unordered_map<TransitionBlock*, std::vector<TransitionEdge*>> entry_edges;
-            for (auto* node : region_set) {
+            std::vector<TransitionBlock*> sorted_region_nodes(region_set.begin(), region_set.end());
+            sort_transition_blocks_deterministically(sorted_region_nodes);
+            for (auto* node : sorted_region_nodes) {
                 if (!node) {
                     continue;
                 }
@@ -166,11 +267,14 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             if (entry_edges.contains(head)) {
                 ordered_entries.push_back(head);
             }
+            std::vector<TransitionBlock*> non_head_entries;
             for (auto& pair : entry_edges) {
-                if (pair.first != head) {
-                    ordered_entries.push_back(pair.first);
+                if (pair.first && pair.first != head) {
+                    non_head_entries.push_back(pair.first);
                 }
             }
+            sort_transition_blocks_deterministically(non_head_entries);
+            ordered_entries.insert(ordered_entries.end(), non_head_entries.begin(), non_head_entries.end());
 
             if (ordered_entries.empty()) {
                 goto skip_abnormal_entry;
@@ -302,7 +406,7 @@ skip_abnormal_entry:
         // 3. Compute Loop Successors
         std::vector<TransitionBlock*> loop_successors;
         std::unordered_set<TransitionBlock*> succ_set;
-        for (auto* node : loop_region->blocks()) {
+        for (auto* node : sorted_transition_blocks(loop_region->blocks())) {
             if (!node) {
                 continue;
             }
@@ -316,6 +420,7 @@ skip_abnormal_entry:
                 }
             }
         }
+        sort_transition_blocks_deterministically(loop_successors);
 
         // 4. Restructure Abnormal Exit (TODO)
         if (loop_successors.size() > 1) {
@@ -358,6 +463,7 @@ skip_abnormal_entry:
             }
 
             std::vector<TransitionBlock*> sorted_successors = loop_successors; // python topological sorts them
+            sort_transition_blocks_deterministically(sorted_successors);
 
             std::vector<std::pair<TransitionBlock*, logos::LogicCondition>> ext_conds = condition_nodes;
             if (!condition_nodes.empty()) {
@@ -397,7 +503,7 @@ skip_abnormal_entry:
         // 5. Restructure acyclic loop body
         auto* loop_cfg = arena_.create<TransitionCFG>(arena_);
         std::unordered_map<TransitionBlock*, TransitionBlock*> block_map;
-        for (auto* node : loop_region->blocks()) {
+        for (auto* node : sorted_transition_blocks(loop_region->blocks())) {
             if (!node) {
                 continue;
             }
@@ -410,7 +516,7 @@ skip_abnormal_entry:
         }
         loop_cfg->set_entry(block_map[head]);
 
-        for (auto* node : loop_region->blocks()) {
+        for (auto* node : sorted_transition_blocks(loop_region->blocks())) {
             if (!node) {
                 continue;
             }

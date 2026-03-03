@@ -176,6 +176,65 @@ std::uint64_t transition_block_order_key(TransitionBlock* tb) {
     return std::numeric_limits<std::uint64_t>::max() - kind_bias;
 }
 
+void collect_original_block_ids(AstNode* node, std::vector<std::uint64_t>& ids) {
+    if (!node) {
+        return;
+    }
+
+    if (BasicBlock* bb = node->get_original_block()) {
+        ids.push_back(static_cast<std::uint64_t>(bb->id()));
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            collect_original_block_ids(child, ids);
+        }
+        return;
+    }
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        collect_original_block_ids(if_node->true_branch(), ids);
+        collect_original_block_ids(if_node->false_branch(), ids);
+        return;
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        collect_original_block_ids(loop->body(), ids);
+        return;
+    }
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->cases()) {
+            collect_original_block_ids(case_node->body(), ids);
+        }
+        return;
+    }
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        collect_original_block_ids(case_node->body(), ids);
+    }
+}
+
+std::string transition_block_signature(TransitionBlock* tb) {
+    if (!tb || !tb->ast_node()) {
+        return "<null>";
+    }
+
+    std::vector<std::uint64_t> ids;
+    collect_original_block_ids(tb->ast_node(), ids);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    std::string out = "k" + std::to_string(static_cast<int>(tb->ast_node()->ast_kind())) + ":";
+    if (ids.empty()) {
+        out += "none";
+    } else {
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (i != 0) {
+                out += ",";
+            }
+            out += std::to_string(ids[i]);
+        }
+    }
+    return out;
+}
+
 bool cbr_debug_enabled() {
     const char* value = std::getenv("ALETHEIA_CBR_DEBUG");
     if (!value) return false;
@@ -228,6 +287,7 @@ TransitionBlock* transition_block_for_ast_node(
     TransitionBlock* best = nullptr;
     int best_score = 0;
     std::uint64_t best_key = std::numeric_limits<std::uint64_t>::max();
+    std::string best_signature;
 
     for (const auto& [tb, cond] : reaching_conditions) {
         (void)cond;
@@ -241,10 +301,14 @@ TransitionBlock* transition_block_for_ast_node(
         }
 
         const std::uint64_t key = transition_block_order_key(tb);
-        if (!best || score > best_score || (score == best_score && key < best_key)) {
+        const std::string signature = transition_block_signature(tb);
+        if (!best || score > best_score
+            || (score == best_score &&
+                (key < best_key || (key == best_key && signature < best_signature)))) {
             best = tb;
             best_score = score;
             best_key = key;
+            best_signature = signature;
         }
     }
 

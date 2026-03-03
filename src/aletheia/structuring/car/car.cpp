@@ -1,5 +1,6 @@
 #include "car.hpp"
 #include "../reachability.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -192,6 +193,65 @@ std::uint64_t transition_block_order_key(TransitionBlock* tb) {
     return std::numeric_limits<std::uint64_t>::max() - kind_bias;
 }
 
+void collect_original_block_ids(AstNode* node, std::vector<std::uint64_t>& ids) {
+    if (!node) {
+        return;
+    }
+
+    if (BasicBlock* bb = node->get_original_block()) {
+        ids.push_back(static_cast<std::uint64_t>(bb->id()));
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            collect_original_block_ids(child, ids);
+        }
+        return;
+    }
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        collect_original_block_ids(if_node->true_branch(), ids);
+        collect_original_block_ids(if_node->false_branch(), ids);
+        return;
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        collect_original_block_ids(loop->body(), ids);
+        return;
+    }
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->cases()) {
+            collect_original_block_ids(case_node->body(), ids);
+        }
+        return;
+    }
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        collect_original_block_ids(case_node->body(), ids);
+    }
+}
+
+std::string transition_block_signature(TransitionBlock* tb) {
+    if (!tb || !tb->ast_node()) {
+        return "<null>";
+    }
+
+    std::vector<std::uint64_t> ids;
+    collect_original_block_ids(tb->ast_node(), ids);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    std::string out = "k" + std::to_string(static_cast<int>(tb->ast_node()->ast_kind())) + ":";
+    if (ids.empty()) {
+        out += "none";
+    } else {
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (i != 0) {
+                out += ",";
+            }
+            out += std::to_string(ids[i]);
+        }
+    }
+    return out;
+}
+
 const logos::LogicCondition* reaching_condition_for_ast_node(
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions,
     AstNode* node
@@ -203,6 +263,7 @@ const logos::LogicCondition* reaching_condition_for_ast_node(
     const logos::LogicCondition* best = nullptr;
     int best_score = 0;
     std::uint64_t best_key = std::numeric_limits<std::uint64_t>::max();
+    std::string best_signature;
 
     for (const auto& [tb, cond] : reaching_conditions) {
         if (!tb) {
@@ -215,10 +276,14 @@ const logos::LogicCondition* reaching_condition_for_ast_node(
         }
 
         const std::uint64_t key = transition_block_order_key(tb);
-        if (!best || score > best_score || (score == best_score && key < best_key)) {
+        const std::string signature = transition_block_signature(tb);
+        if (!best || score > best_score
+            || (score == best_score &&
+                (key < best_key || (key == best_key && signature < best_signature)))) {
             best = &cond;
             best_score = score;
             best_key = key;
+            best_signature = signature;
         }
     }
 
@@ -871,6 +936,157 @@ bool is_induction_update(Assignment* assign, Variable* variable) {
     return same_variable(lhs_var, variable) || same_variable(rhs_var, variable);
 }
 
+bool is_comparison_operation(OperationType op) {
+    switch (op) {
+        case OperationType::eq:
+        case OperationType::neq:
+        case OperationType::lt:
+        case OperationType::le:
+        case OperationType::gt:
+        case OperationType::ge:
+        case OperationType::lt_us:
+        case OperationType::le_us:
+        case OperationType::gt_us:
+        case OperationType::ge_us:
+            return true;
+        default:
+            return false;
+    }
+}
+
+OperationType flip_comparison(OperationType op) {
+    switch (op) {
+        case OperationType::lt: return OperationType::gt;
+        case OperationType::le: return OperationType::ge;
+        case OperationType::gt: return OperationType::lt;
+        case OperationType::ge: return OperationType::le;
+        case OperationType::lt_us: return OperationType::gt_us;
+        case OperationType::le_us: return OperationType::ge_us;
+        case OperationType::gt_us: return OperationType::lt_us;
+        case OperationType::ge_us: return OperationType::le_us;
+        case OperationType::eq:
+        case OperationType::neq:
+            return op;
+        default:
+            return OperationType::unknown;
+    }
+}
+
+bool extract_variable_constant_comparison(
+    Expression* expr,
+    Variable*& out_var,
+    OperationType& out_op,
+    std::uint64_t& out_const
+) {
+    Expression* lhs = nullptr;
+    Expression* rhs = nullptr;
+    OperationType op = OperationType::unknown;
+
+    if (auto* cond = dyn_cast<Condition>(expr)) {
+        op = cond->type();
+        lhs = cond->lhs();
+        rhs = cond->rhs();
+    } else if (auto* operation = dyn_cast<Operation>(expr)) {
+        if (operation->operands().size() != 2) {
+            return false;
+        }
+        op = operation->type();
+        lhs = operation->operands()[0];
+        rhs = operation->operands()[1];
+    } else {
+        return false;
+    }
+
+    if (!is_comparison_operation(op)) {
+        return false;
+    }
+
+    auto* lhs_var = dyn_cast<Variable>(lhs);
+    auto* rhs_var = dyn_cast<Variable>(rhs);
+    auto* lhs_const = dyn_cast<Constant>(lhs);
+    auto* rhs_const = dyn_cast<Constant>(rhs);
+
+    if (lhs_var && rhs_const) {
+        out_var = lhs_var;
+        out_op = op;
+        out_const = rhs_const->value();
+        return true;
+    }
+    if (rhs_var && lhs_const) {
+        const OperationType flipped = flip_comparison(op);
+        if (flipped == OperationType::unknown) {
+            return false;
+        }
+        out_var = rhs_var;
+        out_op = flipped;
+        out_const = lhs_const->value();
+        return true;
+    }
+
+    return false;
+}
+
+std::int64_t sign_extend_bits(std::uint64_t value, std::size_t bit_width) {
+    if (bit_width == 0 || bit_width >= 64) {
+        return static_cast<std::int64_t>(value);
+    }
+
+    const std::uint64_t mask = (std::uint64_t{1} << bit_width) - 1;
+    std::uint64_t truncated = value & mask;
+    const std::uint64_t sign_bit = std::uint64_t{1} << (bit_width - 1);
+    if (truncated & sign_bit) {
+        truncated |= ~mask;
+    }
+    return static_cast<std::int64_t>(truncated);
+}
+
+bool evaluate_comparison(
+    OperationType op,
+    std::uint64_t lhs,
+    std::uint64_t rhs,
+    std::size_t bit_width
+) {
+    switch (op) {
+        case OperationType::eq: return lhs == rhs;
+        case OperationType::neq: return lhs != rhs;
+        case OperationType::lt: return sign_extend_bits(lhs, bit_width) < sign_extend_bits(rhs, bit_width);
+        case OperationType::le: return sign_extend_bits(lhs, bit_width) <= sign_extend_bits(rhs, bit_width);
+        case OperationType::gt: return sign_extend_bits(lhs, bit_width) > sign_extend_bits(rhs, bit_width);
+        case OperationType::ge: return sign_extend_bits(lhs, bit_width) >= sign_extend_bits(rhs, bit_width);
+        case OperationType::lt_us: return lhs < rhs;
+        case OperationType::le_us: return lhs <= rhs;
+        case OperationType::gt_us: return lhs > rhs;
+        case OperationType::ge_us: return lhs >= rhs;
+        default: return false;
+    }
+}
+
+bool first_iteration_condition_provable_true(Expression* condition, Assignment* initializer) {
+    if (!condition || !initializer) {
+        return false;
+    }
+
+    auto* init_var = dyn_cast<Variable>(initializer->destination());
+    auto* init_const = dyn_cast<Constant>(initializer->value());
+    if (!init_var || !init_const) {
+        return false;
+    }
+
+    Variable* cond_var = nullptr;
+    OperationType cond_op = OperationType::unknown;
+    std::uint64_t cond_const = 0;
+    if (!extract_variable_constant_comparison(condition, cond_var, cond_op, cond_const)) {
+        return false;
+    }
+
+    if (!same_variable(init_var, cond_var)) {
+        return false;
+    }
+
+    const std::size_t bit_width = cond_var->size_bytes == 0 ? 64 : std::min<std::size_t>(cond_var->size_bytes * 8, 64);
+    return evaluate_comparison(cond_op, init_const->value(), cond_const, bit_width);
+}
+
 void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
     if (!seq) return;
     auto& nodes = seq->mutable_nodes();
@@ -907,6 +1123,65 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
         auto* for_node = arena.create<ForLoopNode>(
             while_node->body(),
             while_node->condition(),
+            init_assign,
+            mod_assign);
+
+        nodes[i] = for_node;
+        if (init_code->block()->instructions().empty()) {
+            nodes.erase(nodes.begin() + static_cast<long>(i - 1));
+            if (i > 1) {
+                --i;
+            }
+        }
+    }
+}
+
+void rewrite_do_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
+    if (!seq) {
+        return;
+    }
+
+    auto& nodes = seq->mutable_nodes();
+    if (nodes.size() < 2) {
+        return;
+    }
+
+    for (std::size_t i = 1; i < nodes.size(); ++i) {
+        auto* do_node = ast_dyn_cast<DoWhileLoopNode>(nodes[i]);
+        if (!do_node || !do_node->condition() || !do_node->body()) {
+            continue;
+        }
+
+        auto* init_code = ast_dyn_cast<CodeNode>(nodes[i - 1]);
+        auto* init_assign = extract_initializer_assignment(init_code);
+        if (!init_assign) {
+            continue;
+        }
+
+        if (!first_iteration_condition_provable_true(do_node->condition(), init_assign)) {
+            continue;
+        }
+
+        CodeNode* mod_owner = nullptr;
+        auto* mod_assign = extract_trailing_assignment(do_node->body(), &mod_owner);
+        if (!mod_assign) {
+            continue;
+        }
+
+        auto* init_var = dyn_cast<Variable>(init_assign->destination());
+        auto* mod_var = dyn_cast<Variable>(mod_assign->destination());
+        if (!same_variable(init_var, mod_var) || !is_induction_update(mod_assign, init_var)) {
+            continue;
+        }
+
+        if (mod_owner) {
+            mod_owner->remove_last_instruction();
+        }
+        init_code->remove_last_instruction();
+
+        auto* for_node = arena.create<ForLoopNode>(
+            do_node->body(),
+            do_node->condition(),
             init_assign,
             mod_assign);
 
@@ -994,6 +1269,7 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
             child = rewrite_guarded_do_while(arena, child);
         }
         rewrite_tail_driven_endless_loops(arena, seq);
+        rewrite_do_while_to_for_in_sequence(arena, seq);
         rewrite_while_to_for_in_sequence(arena, seq);
         return seq;
     }
