@@ -34,6 +34,16 @@ static Expression* extract_break_condition_expr(AstNode* node) {
     return ifn->condition_expr();
 }
 
+/// Check if a node is a "broad break condition": an IfNode with no false branch
+/// whose true branch ends_with_break (may contain other code before the break).
+static bool is_broad_break_condition(AstNode* node) {
+    auto* ifn = ast_dyn_cast<IfNode>(node);
+    if (!ifn) return false;
+    if (ifn->false_branch() != nullptr) return false;
+    if (!ifn->true_branch()) return false;
+    return ifn->true_branch()->does_end_with_break();
+}
+
 /// Check that all code nodes interrupting the ancestor loop are in the
 /// given end_nodes set.
 static bool has_only_loop_interruptions_in(
@@ -69,12 +79,16 @@ bool WhileLoopRule::can_be_applied(LoopNode* loop) const {
     AstNode* body = loop->body();
     if (!body) return false;
 
-    // Case 1: body itself is a break-condition
-    if (body->is_break_condition()) return true;
+    // Case 1: body itself is a break-condition (strict or broad)
+    if (body->is_break_condition() || is_broad_break_condition(body)) return true;
 
     // Case 2: body is a SeqNode whose first child is a break-condition
     if (auto* seq = ast_dyn_cast<SeqNode>(body)) {
-        if (!seq->nodes().empty() && seq->first()->is_break_condition()) return true;
+        if (!seq->nodes().empty()) {
+            auto* first = seq->first();
+            if (first->is_break_condition() || is_broad_break_condition(first))
+                return true;
+        }
     }
     return false;
 }
@@ -82,33 +96,67 @@ bool WhileLoopRule::can_be_applied(LoopNode* loop) const {
 AstNode* WhileLoopRule::restructure(DecompilerArena& arena, LoopNode* loop) {
     AstNode* body = loop->body();
 
-    // Case 1: body IS the break-condition
+    // Case 1: body IS a strict break-condition (if(cond) break;)
     // while(true) { if(cond) break; } -> while(!cond) {}
     if (body->is_break_condition()) {
         Expression* break_cond = extract_break_condition_expr(body);
         Expression* negated = negate_condition_expr(arena, break_cond);
         loop->set_condition(negated);
-        // Remove the break-condition from body -> body becomes empty
         loop->set_body(nullptr);
         return loop;
     }
 
-    // Case 2: body is SeqNode, first child is break-condition
-    auto* seq = ast_dyn_cast<SeqNode>(body);
-    AstNode* first = seq->first();
-    Expression* break_cond = extract_break_condition_expr(first);
-    Expression* negated = negate_condition_expr(arena, break_cond);
-    loop->set_condition(negated);
+    // Case 1b: body IS a broad break-condition (if(cond) { ...; break; })
+    // while(true) { if(cond) { B; break; } } -> while(!cond) {}; B
+    if (is_broad_break_condition(body)) {
+        auto* ifn = ast_dyn_cast<IfNode>(body);
+        Expression* cond_expr = ifn->condition_expr();
+        Expression* negated = negate_condition_expr(arena, cond_expr);
 
-    // Remove the first child (the break-condition) from the sequence
-    seq->remove_node(first);
+        // Strip the break from the true branch, keep remaining code as suffix
+        AstNode* suffix = ifn->true_branch();
+        delete_break_statements(suffix);
 
-    // If only one child remains, unwrap the SeqNode
-    if (seq->size() == 1) {
-        loop->set_body(seq->first());
+        loop->set_condition(negated);
+        loop->set_body(nullptr);
+
+        auto* result = arena.create<SeqNode>();
+        result->add_node(loop);
+        if (suffix) result->add_node(suffix);
+        return result->size() == 1 ? result->first() : static_cast<AstNode*>(result);
     }
 
-    return loop;
+    // Case 2: body is SeqNode, first child is a break-condition
+    auto* seq = ast_dyn_cast<SeqNode>(body);
+    AstNode* first = seq->first();
+
+    // Case 2a: strict break-condition (if(cond) break;)
+    if (first->is_break_condition()) {
+        Expression* break_cond = extract_break_condition_expr(first);
+        Expression* negated = negate_condition_expr(arena, break_cond);
+        loop->set_condition(negated);
+        seq->remove_node(first);
+        if (seq->size() == 1) loop->set_body(seq->first());
+        return loop;
+    }
+
+    // Case 2b: broad break-condition (if(cond) { ...; break; })
+    // while(true) { if(cond) { B; break; }; A } -> while(!cond) { A }; B
+    auto* ifn = ast_dyn_cast<IfNode>(first);
+    Expression* cond_expr = ifn->condition_expr();
+    Expression* negated = negate_condition_expr(arena, cond_expr);
+
+    AstNode* suffix = ifn->true_branch();
+    delete_break_statements(suffix);
+
+    seq->remove_node(first);
+    if (seq->size() == 1) loop->set_body(seq->first());
+    loop->set_condition(negated);
+
+    auto* result = arena.create<SeqNode>();
+    result->add_node(loop);
+    if (suffix) result->add_node(suffix);
+    return result;
 }
 
 // =============================================================================
@@ -198,7 +246,14 @@ AstNode* NestedDoWhileLoopRule::restructure(DecompilerArena& arena, LoopNode* lo
 
 bool SequenceRule::can_be_applied(LoopNode* loop) const {
     if (!loop->is_endless()) return false;
-    auto* seq = ast_dyn_cast<SeqNode>(loop->body());
+
+    AstNode* body = loop->body();
+    if (!body) return false;
+
+    // Handle single CodeNode body (after clean_node unwraps single-element SeqNodes)
+    if (body->is_code_node_ending_with_break()) return true;
+
+    auto* seq = ast_dyn_cast<SeqNode>(body);
     if (!seq) return false;
 
     // All end-nodes must be code-nodes ending with break
