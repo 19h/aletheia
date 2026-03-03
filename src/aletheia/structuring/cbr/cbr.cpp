@@ -1,6 +1,8 @@
 #include "cbr.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -93,6 +95,87 @@ bool ast_node_matches_transition_block(AstNode* node, TransitionBlock* tb) {
     return false;
 }
 
+int ast_node_transition_match_score(AstNode* node, TransitionBlock* tb) {
+    if (!node || !tb) {
+        return 0;
+    }
+
+    AstNode* tb_node = tb->ast_node();
+    if (!tb_node) {
+        return 0;
+    }
+
+    int score = 0;
+
+    if (tb_node == node) {
+        score = std::max(score, 100);
+    }
+
+    if (ast_contains(tb_node, node) || ast_contains(node, tb_node)) {
+        score = std::max(score, 80);
+    }
+
+    BasicBlock* tb_orig = tb_node->get_original_block();
+    BasicBlock* node_orig = node->get_original_block();
+    if (tb_orig && node_orig && tb_orig == node_orig) {
+        score = std::max(score, 90);
+    }
+    if (tb_orig && ast_contains_original_block(node, tb_orig)) {
+        score = std::max(score, 70);
+    }
+
+    return score;
+}
+
+std::uint64_t transition_block_order_key(TransitionBlock* tb) {
+    if (!tb || !tb->ast_node()) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+
+    auto min_original_block_id = [&](AstNode* node, auto& self) -> std::optional<std::uint64_t> {
+        if (!node) {
+            return std::nullopt;
+        }
+        if (BasicBlock* bb = node->get_original_block()) {
+            return static_cast<std::uint64_t>(bb->id());
+        }
+
+        std::optional<std::uint64_t> best;
+        auto take_best = [&](AstNode* child) {
+            auto child_id = self(child, self);
+            if (child_id.has_value() && (!best.has_value() || child_id.value() < best.value())) {
+                best = child_id;
+            }
+        };
+
+        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+            for (AstNode* child : seq->nodes()) {
+                take_best(child);
+            }
+        } else if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+            take_best(if_node->true_branch());
+            take_best(if_node->false_branch());
+        } else if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+            take_best(loop->body());
+        } else if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+            for (CaseNode* case_node : sw->cases()) {
+                take_best(case_node->body());
+            }
+        } else if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+            take_best(case_node->body());
+        }
+
+        return best;
+    };
+
+    if (auto min_id = min_original_block_id(tb->ast_node(), min_original_block_id); min_id.has_value()) {
+        return min_id.value();
+    }
+
+    const auto kind_bias = static_cast<std::uint64_t>(tb->ast_node()->ast_kind());
+    return std::numeric_limits<std::uint64_t>::max() - kind_bias;
+}
+
 bool cbr_debug_enabled() {
     const char* value = std::getenv("ALETHEIA_CBR_DEBUG");
     if (!value) return false;
@@ -133,6 +216,62 @@ std::optional<bool> classify_node_by_ast_condition(
     }
 
     return std::nullopt;
+}
+
+TransitionBlock* transition_block_for_ast_node(
+    const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions,
+    AstNode* node
+) {
+    if (!node) {
+        return nullptr;
+    }
+    TransitionBlock* best = nullptr;
+    int best_score = 0;
+    std::uint64_t best_key = std::numeric_limits<std::uint64_t>::max();
+
+    for (const auto& [tb, cond] : reaching_conditions) {
+        (void)cond;
+        if (!tb) {
+            continue;
+        }
+
+        const int score = ast_node_transition_match_score(node, tb);
+        if (score <= 0) {
+            continue;
+        }
+
+        const std::uint64_t key = transition_block_order_key(tb);
+        if (!best || score > best_score || (score == best_score && key < best_key)) {
+            best = tb;
+            best_score = score;
+            best_key = key;
+        }
+    }
+
+    return best;
+}
+
+bool ast_node_is_terminal(AstNode* node) {
+    if (!node) {
+        return false;
+    }
+    return node->does_end_with_return() || node->does_end_with_break() || node->does_end_with_continue();
+}
+
+bool ast_node_appears_later(const std::vector<AstNode*>& nodes, std::size_t start, AstNode* needle) {
+    if (!needle) {
+        return false;
+    }
+    for (std::size_t i = start; i < nodes.size(); ++i) {
+        AstNode* candidate = nodes[i];
+        if (!candidate) {
+            continue;
+        }
+        if (candidate == needle || ast_contains(candidate, needle) || ast_contains(needle, candidate)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string expr_fingerprint(Expression* expr) {
@@ -490,14 +629,67 @@ AstNode* refine_sequence_once(
                         rebuilt_nodes.push_back(if_node);
                         changed = true;
                     } else {
-                        auto restored = block->instructions();
-                        restored.push_back(removed_branch);
-                        block->set_instructions(std::move(restored));
-                        const std::size_t consumed = i - inner_start;
-                        i = inner_start;
-                        if (cbr_debug_enabled()) {
-                            std::cerr << "[CBR Debug] IfNode was empty, dropped! Rewinding "
-                                      << consumed << " consumed nodes." << std::endl;
+                        bool synthesized_tail_if = false;
+
+                        TransitionBlock* branch_tb = transition_block_for_ast_node(reaching_conditions, node);
+                        if (branch_tb != nullptr) {
+                            AstNode* true_tail = nullptr;
+                            AstNode* false_tail = nullptr;
+
+                            for (TransitionEdge* edge : branch_tb->successors()) {
+                                if (!edge || !edge->sink()) {
+                                    continue;
+                                }
+
+                                AstNode* succ_node = edge->sink()->ast_node();
+                                if (!succ_node || succ_node == node) {
+                                    continue;
+                                }
+
+                                if (!ast_node_is_terminal(succ_node)) {
+                                    continue;
+                                }
+
+                                if (ast_node_appears_later(nodes, inner_start, succ_node)) {
+                                    continue;
+                                }
+
+                                const logos::LogicCondition edge_cond = edge->tag();
+                                if ((edge_cond.does_imply(extracted_cond) || extracted_cond.does_imply(edge_cond))
+                                    && true_tail == nullptr) {
+                                    true_tail = succ_node;
+                                    continue;
+                                }
+                                if (edge_cond.is_complementary_to(extracted_cond) && false_tail == nullptr) {
+                                    false_tail = succ_node;
+                                }
+                            }
+
+                            if (true_tail != nullptr || false_tail != nullptr) {
+                                AstNode* true_branch_node = true_tail;
+                                AstNode* false_branch_node = false_tail;
+                                if (true_branch_node == nullptr && false_branch_node != nullptr) {
+                                    std::swap(true_branch_node, false_branch_node);
+                                }
+
+                                if (true_branch_node != nullptr) {
+                                    rebuilt_nodes.push_back(arena.create<IfNode>(branch_cond, true_branch_node, false_branch_node));
+                                    changed = true;
+                                    synthesized_tail_if = true;
+                                }
+                            }
+                        }
+
+                        if (!synthesized_tail_if) {
+                            auto restored = block->instructions();
+                            restored.push_back(removed_branch);
+                            block->set_instructions(std::move(restored));
+                            const std::size_t consumed = i - inner_start;
+                            i = inner_start;
+                            if (cbr_debug_enabled()) {
+                                std::cerr << "[CBR Debug] IfNode was empty, dropped! Rewinding "
+                                          << consumed << " consumed nodes." << std::endl;
+                            }
                         }
                     }
 

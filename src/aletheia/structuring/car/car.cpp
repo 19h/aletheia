@@ -1,5 +1,8 @@
 #include "car.hpp"
 #include "../reachability.hpp"
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -109,6 +112,85 @@ bool ast_contains_original_block(AstNode* node, BasicBlock* target) {
     return false;
 }
 
+int ast_node_transition_match_score(AstNode* node, TransitionBlock* tb) {
+    if (!node || !tb) {
+        return 0;
+    }
+
+    AstNode* tb_node = tb->ast_node();
+    if (!tb_node) {
+        return 0;
+    }
+
+    int score = 0;
+    if (tb_node == node) {
+        score = std::max(score, 100);
+    }
+    if (ast_contains_node(tb_node, node) || ast_contains_node(node, tb_node)) {
+        score = std::max(score, 80);
+    }
+
+    BasicBlock* tb_orig = tb_node->get_original_block();
+    BasicBlock* node_orig = node->get_original_block();
+    if (tb_orig && node_orig && tb_orig == node_orig) {
+        score = std::max(score, 90);
+    }
+    if (tb_orig && ast_contains_original_block(node, tb_orig)) {
+        score = std::max(score, 70);
+    }
+
+    return score;
+}
+
+std::uint64_t transition_block_order_key(TransitionBlock* tb) {
+    if (!tb || !tb->ast_node()) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+
+    auto min_original_block_id = [&](AstNode* node, auto& self) -> std::optional<std::uint64_t> {
+        if (!node) {
+            return std::nullopt;
+        }
+        if (BasicBlock* bb = node->get_original_block()) {
+            return static_cast<std::uint64_t>(bb->id());
+        }
+
+        std::optional<std::uint64_t> best;
+        auto take_best = [&](AstNode* child) {
+            auto child_id = self(child, self);
+            if (child_id.has_value() && (!best.has_value() || child_id.value() < best.value())) {
+                best = child_id;
+            }
+        };
+
+        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+            for (AstNode* child : seq->nodes()) {
+                take_best(child);
+            }
+        } else if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+            take_best(if_node->true_branch());
+            take_best(if_node->false_branch());
+        } else if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+            take_best(loop->body());
+        } else if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+            for (CaseNode* case_node : sw->cases()) {
+                take_best(case_node->body());
+            }
+        } else if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+            take_best(case_node->body());
+        }
+
+        return best;
+    };
+
+    if (auto min_id = min_original_block_id(tb->ast_node(), min_original_block_id); min_id.has_value()) {
+        return min_id.value();
+    }
+
+    const auto kind_bias = static_cast<std::uint64_t>(tb->ast_node()->ast_kind());
+    return std::numeric_limits<std::uint64_t>::max() - kind_bias;
+}
+
 const logos::LogicCondition* reaching_condition_for_ast_node(
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions,
     AstNode* node
@@ -117,30 +199,29 @@ const logos::LogicCondition* reaching_condition_for_ast_node(
         return nullptr;
     }
 
+    const logos::LogicCondition* best = nullptr;
+    int best_score = 0;
+    std::uint64_t best_key = std::numeric_limits<std::uint64_t>::max();
+
     for (const auto& [tb, cond] : reaching_conditions) {
         if (!tb) {
             continue;
         }
-        AstNode* tb_node = tb->ast_node();
-        if (!tb_node) {
+
+        const int score = ast_node_transition_match_score(node, tb);
+        if (score <= 0) {
             continue;
         }
 
-        if (tb_node == node || ast_contains_node(tb_node, node) || ast_contains_node(node, tb_node)) {
-            return &cond;
-        }
-
-        BasicBlock* tb_orig = tb_node->get_original_block();
-        BasicBlock* node_orig = node->get_original_block();
-        if (tb_orig && node_orig && tb_orig == node_orig) {
-            return &cond;
-        }
-        if (tb_orig && ast_contains_original_block(node, tb_orig)) {
-            return &cond;
+        const std::uint64_t key = transition_block_order_key(tb);
+        if (!best || score > best_score || (score == best_score && key < best_key)) {
+            best = &cond;
+            best_score = score;
+            best_key = key;
         }
     }
 
-    return nullptr;
+    return best;
 }
 
 bool condition_can_belong_to_switch(
