@@ -208,6 +208,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
 
     cfg.refresh_edge_properties();
     auto loop_heads = cfg.get_loop_heads();
+    sort_transition_blocks_deterministically(loop_heads);
 
     while (!loop_heads.empty()) {
         TransitionBlock* head = loop_heads.back();
@@ -281,7 +282,8 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
             }
 
             const size_t num_entries = ordered_entries.size();
-            std::string var_name = "entry_" + std::to_string(reinterpret_cast<uintptr_t>(head));
+            const std::uint64_t head_key = transition_block_order_key(head);
+            std::string var_name = "entry_" + std::to_string(head_key);
             auto* entry_var = arena_.create<Variable>(var_name, 4); entry_var->set_ir_type(Integer::int32_t());
 
             std::vector<std::pair<TransitionBlock*, logos::LogicCondition>> condition_nodes;
@@ -425,7 +427,8 @@ skip_abnormal_entry:
         // 4. Restructure Abnormal Exit (TODO)
         if (loop_successors.size() > 1) {
             size_t num_exits = loop_successors.size();
-            std::string var_name = "exit_" + std::to_string(reinterpret_cast<uintptr_t>(head));
+            const std::uint64_t head_key = transition_block_order_key(head);
+            std::string var_name = "exit_" + std::to_string(head_key);
             auto* exit_var = arena_.create<Variable>(var_name, 4); exit_var->set_ir_type(Integer::int32_t());
 
             std::vector<std::pair<TransitionBlock*, logos::LogicCondition>> condition_nodes;

@@ -4,22 +4,33 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <cstdint>
 #include <tuple>
 
 namespace aletheia {
 
 namespace {
-    std::tuple<std::string, std::size_t, std::uintptr_t> phi_order_key(Phi* phi) {
+    std::string phi_var_key(const Variable* var) {
+        if (!var) {
+            return "";
+        }
+        return var->name() + "#" + std::to_string(var->ssa_version());
+    }
+
+    std::tuple<std::string, std::size_t> phi_order_key(Phi* phi) {
         if (!phi || !phi->dest_var()) {
-            return std::make_tuple(std::string(""), std::size_t{0}, reinterpret_cast<std::uintptr_t>(phi));
+            return std::make_tuple(std::string(""), std::size_t{0});
         }
         Variable* dst = phi->dest_var();
-        return std::make_tuple(dst->name(), dst->ssa_version(), reinterpret_cast<std::uintptr_t>(phi));
+        return std::make_tuple(dst->name(), dst->ssa_version());
     }
 
     bool phi_less(Phi* lhs, Phi* rhs) {
-        return phi_order_key(lhs) < phi_order_key(rhs);
+        const auto lhs_key = phi_order_key(lhs);
+        const auto rhs_key = phi_order_key(rhs);
+        if (lhs_key != rhs_key) {
+            return lhs_key < rhs_key;
+        }
+        return false;
     }
 
     struct PhiGraph {
@@ -72,18 +83,18 @@ void PhiDependencyResolver::resolve(DecompilerArena& arena, ControlFlowGraph& cf
             PhiGraph graph;
             graph.nodes = phis;
 
-            // Map defined variable names to their Phi instructions
+            // Map fully-versioned definitions to their Phi instructions.
             std::unordered_map<std::string, Phi*> def_map;
             for (Phi* phi : phis) {
                 if (phi->dest_var()) {
-                    def_map[phi->dest_var()->name()] = phi;
+                    def_map[phi_var_key(phi->dest_var())] = phi;
                 }
             }
 
             // Add edges: u -> v if u requires what v defines
             for (Phi* u : phis) {
                 for (Variable* req : u->requirements()) {
-                    auto it = def_map.find(req->name());
+                    auto it = def_map.find(phi_var_key(req));
                     if (it != def_map.end() && it->second != u) {
                         graph.add_edge(u, it->second);
                     }

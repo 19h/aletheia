@@ -2460,6 +2460,44 @@ std::optional<FoldedConstant> collapse_binary_constants(
     }
 }
 
+Expression* negate_ternary_condition(DecompilerTask& task, Expression* cond) {
+    if (!cond) {
+        return nullptr;
+    }
+
+    if (auto* cond_node = dyn_cast<Condition>(cond)) {
+        const auto negated = Condition::negate_comparison(cond_node->type());
+        return task.arena().create<Condition>(negated, cond_node->lhs(), cond_node->rhs(), cond_node->size_bytes);
+    }
+
+    if (auto* cond_op = dyn_cast<Operation>(cond)) {
+        if (cond_op->type() == OperationType::logical_not && cond_op->operands().size() == 1) {
+            return cond_op->operands()[0];
+        }
+        if (cond_op->operands().size() == 2) {
+            const OperationType type = cond_op->type();
+            if (type == OperationType::eq || type == OperationType::neq ||
+                type == OperationType::lt || type == OperationType::le ||
+                type == OperationType::gt || type == OperationType::ge ||
+                type == OperationType::lt_us || type == OperationType::le_us ||
+                type == OperationType::gt_us || type == OperationType::ge_us) {
+                const auto negated = Condition::negate_comparison(type);
+                return task.arena().create<Condition>(
+                    negated,
+                    cond_op->operands()[0],
+                    cond_op->operands()[1],
+                    cond_op->size_bytes);
+            }
+        }
+    }
+
+    const std::size_t cond_size = cond->size_bytes == 0 ? 1 : cond->size_bytes;
+    return task.arena().create<Operation>(
+        OperationType::logical_not,
+        std::vector<Expression*>{cond},
+        cond_size);
+}
+
 Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
     if (!expr) return nullptr;
     if (isa<Constant>(expr) || isa<Variable>(expr)) return expr;
@@ -2538,27 +2576,32 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             op->mutable_operands()[0] = cond;
 
 
-            std::string cond_fp = expr_fingerprint(cond);
+            auto recompute_condition_fingerprints = [&](Expression* current_cond, std::string& cond_fp_out, std::string& not_cond_fp_out) {
+                cond_fp_out = expr_fingerprint(current_cond);
+                Expression* negated_cond = negate_ternary_condition(task, current_cond);
+                not_cond_fp_out = expr_fingerprint(negated_cond);
+            };
 
+            std::string cond_fp;
             std::string not_cond_fp;
-            if (auto* cond_op = dyn_cast<Condition>(cond)) {
-                auto negated_op = Condition::negate_comparison(cond_op->type());
-                auto* negated_cond = task.arena().create<Condition>(negated_op, cond_op->lhs(), cond_op->rhs(), cond_op->size_bytes);
-                not_cond_fp = expr_fingerprint(negated_cond);
-            } else if (auto* op_cond = dyn_cast<Operation>(cond)) {
-                if (op_cond->type() == OperationType::logical_not && op_cond->operands().size() == 1) {
-                    not_cond_fp = expr_fingerprint(op_cond->operands()[0]);
-                } else {
-                    auto* negated = task.arena().create<Operation>(OperationType::logical_not, std::vector<Expression*>{cond}, cond->size_bytes);
-                    not_cond_fp = expr_fingerprint(negated);
-                }
-            } else {
-                auto* negated = task.arena().create<Operation>(OperationType::logical_not, std::vector<Expression*>{cond}, cond->size_bytes);
-                not_cond_fp = expr_fingerprint(negated);
+            recompute_condition_fingerprints(cond, cond_fp, not_cond_fp);
+
+            std::string t_fp = expr_fingerprint(t_branch);
+            std::string f_fp = expr_fingerprint(f_branch);
+            if (t_fp > f_fp) {
+                cond = negate_ternary_condition(task, cond);
+                std::swap(t_branch, f_branch);
+                op->mutable_operands()[0] = cond;
+                op->mutable_operands()[1] = t_branch;
+                op->mutable_operands()[2] = f_branch;
+
+                recompute_condition_fingerprints(cond, cond_fp, not_cond_fp);
+                t_fp = expr_fingerprint(t_branch);
+                f_fp = expr_fingerprint(f_branch);
             }
 
             // cond ? X : X -> X
-            if (expr_fingerprint(t_branch) == expr_fingerprint(f_branch)) {
+            if (t_fp == f_fp) {
                 return t_branch;
             }
 

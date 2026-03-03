@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +40,9 @@ struct VarInfo {
 using VarSet = std::unordered_set<VarKey, VarKeyHash>;
 using Adjacency = std::unordered_map<VarKey, VarSet, VarKeyHash>;
 
+std::vector<VarKey> sorted_var_keys(const VarSet& vars);
+std::vector<VarKey> sorted_var_keys(const std::vector<VarKey>& vars);
+
 VarKey key_of(const Variable* var) {
     return VarKey{var->name(), var->ssa_version()};
 }
@@ -73,7 +78,7 @@ void add_edge(Adjacency& graph, const VarKey& a, const VarKey& b) {
 }
 
 void add_clique(Adjacency& graph, const VarSet& vars) {
-    std::vector<VarKey> items(vars.begin(), vars.end());
+    std::vector<VarKey> items = sorted_var_keys(vars);
     for (std::size_t i = 0; i < items.size(); ++i) {
         add_vertex_if_missing(graph, items[i]);
         for (std::size_t j = i + 1; j < items.size(); ++j) {
@@ -84,7 +89,7 @@ void add_clique(Adjacency& graph, const VarSet& vars) {
 
 std::string compatibility_group_of(const VarKey& key, const VarInfo& info) {
     if (info.aliased) {
-        return "alias:" + key.name;
+        return "alias:" + key.name + "#" + std::to_string(key.version);
     }
     if (info.type) {
         return "type:" + info.type->to_string();
@@ -109,26 +114,98 @@ bool key_less(const VarKey& lhs, const VarKey& rhs) {
     return lhs.version < rhs.version;
 }
 
+std::uint64_t block_order_key(BasicBlock* block) {
+    if (!block) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return static_cast<std::uint64_t>(block->id());
+}
+
+std::vector<BasicBlock*> sorted_blocks_by_id(const std::vector<BasicBlock*>& blocks) {
+    std::vector<BasicBlock*> ordered = blocks;
+    std::stable_sort(ordered.begin(), ordered.end(), [](BasicBlock* lhs, BasicBlock* rhs) {
+        return block_order_key(lhs) < block_order_key(rhs);
+    });
+    return ordered;
+}
+
+std::vector<Edge*> sorted_successor_edges(const std::vector<Edge*>& edges) {
+    std::vector<Edge*> ordered = edges;
+    std::stable_sort(ordered.begin(), ordered.end(), [](Edge* lhs, Edge* rhs) {
+        BasicBlock* lhs_target = lhs ? lhs->target() : nullptr;
+        BasicBlock* rhs_target = rhs ? rhs->target() : nullptr;
+
+        const std::uint64_t lhs_key = block_order_key(lhs_target);
+        const std::uint64_t rhs_key = block_order_key(rhs_target);
+        if (lhs_key != rhs_key) {
+            return lhs_key < rhs_key;
+        }
+
+        const int lhs_type = lhs ? static_cast<int>(lhs->type()) : std::numeric_limits<int>::max();
+        const int rhs_type = rhs ? static_cast<int>(rhs->type()) : std::numeric_limits<int>::max();
+        if (lhs_type != rhs_type) {
+            return lhs_type < rhs_type;
+        }
+
+        const int lhs_kind = lhs ? static_cast<int>(lhs->edge_kind()) : std::numeric_limits<int>::max();
+        const int rhs_kind = rhs ? static_cast<int>(rhs->edge_kind()) : std::numeric_limits<int>::max();
+        if (lhs_kind != rhs_kind) {
+            return lhs_kind < rhs_kind;
+        }
+
+        return false;
+    });
+    return ordered;
+}
+
+std::vector<VarKey> sorted_var_keys(const VarSet& vars) {
+    std::vector<VarKey> ordered(vars.begin(), vars.end());
+    std::stable_sort(ordered.begin(), ordered.end(), key_less);
+    return ordered;
+}
+
+std::vector<VarKey> sorted_var_keys(const std::vector<VarKey>& vars) {
+    std::vector<VarKey> ordered = vars;
+    std::stable_sort(ordered.begin(), ordered.end(), key_less);
+    return ordered;
+}
+
 std::vector<VarKey> reverse_lex_bfs(const std::vector<VarKey>& vertices, const Adjacency& graph) {
     std::unordered_map<VarKey, std::vector<int>, VarKeyHash> labels;
     VarSet unnumbered(vertices.begin(), vertices.end());
+    std::vector<VarKey> candidate_order = sorted_var_keys(vertices);
     std::vector<VarKey> order;
     order.reserve(vertices.size());
 
+    const auto label_for = [&](const VarKey& key) -> const std::vector<int>& {
+        static const std::vector<int> empty_label;
+        auto it = labels.find(key);
+        return it != labels.end() ? it->second : empty_label;
+    };
+
     int step = static_cast<int>(vertices.size());
     while (!unnumbered.empty()) {
-        auto it = unnumbered.begin();
-        VarKey best = *it;
-
-        ++it;
-        for (; it != unnumbered.end(); ++it) {
-            const VarKey& candidate = *it;
-            const auto& cand_label = labels[candidate];
-            const auto& best_label = labels[best];
+        bool first = true;
+        VarKey best{};
+        for (const VarKey& candidate : candidate_order) {
+            if (!unnumbered.contains(candidate)) {
+                continue;
+            }
+            if (first) {
+                best = candidate;
+                first = false;
+                continue;
+            }
+            const auto& cand_label = label_for(candidate);
+            const auto& best_label = label_for(best);
             if (label_greater(cand_label, best_label)
                 || (!label_greater(best_label, cand_label) && key_less(candidate, best))) {
                 best = candidate;
             }
+        }
+
+        if (first) {
+            break;
         }
 
         unnumbered.erase(best);
@@ -136,7 +213,7 @@ std::vector<VarKey> reverse_lex_bfs(const std::vector<VarKey>& vertices, const A
 
         auto neigh_it = graph.find(best);
         if (neigh_it != graph.end()) {
-            for (const VarKey& neigh : neigh_it->second) {
+            for (const VarKey& neigh : sorted_var_keys(neigh_it->second)) {
                 if (unnumbered.contains(neigh)) {
                     labels[neigh].push_back(step);
                 }
@@ -149,7 +226,7 @@ std::vector<VarKey> reverse_lex_bfs(const std::vector<VarKey>& vertices, const A
 }
 
 void remove_identity_assignments(ControlFlowGraph& cfg) {
-    for (BasicBlock* block : cfg.blocks()) {
+    for (BasicBlock* block : sorted_blocks_by_id(cfg.blocks())) {
         std::vector<Instruction*> rewritten;
         rewritten.reserve(block->instructions().size());
         for (Instruction* inst : block->instructions()) {
@@ -176,6 +253,7 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
     std::unordered_map<BasicBlock*, VarSet> live_in;
     std::unordered_map<BasicBlock*, VarSet> live_out;
     Adjacency interference;
+    const std::vector<BasicBlock*> ordered_blocks = sorted_blocks_by_id(cfg.blocks());
 
     auto record_var = [&](Variable* var) {
         if (var == nullptr) {
@@ -187,18 +265,26 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             info.sample = var;
             info.size_bytes = var->size_bytes;
             info.aliased = var->is_aliased();
-            info.type = var->ir_type();
         } else {
             info.aliased = info.aliased || var->is_aliased();
             info.size_bytes = std::max(info.size_bytes, var->size_bytes);
-            if (!info.type && var->ir_type()) {
-                info.type = var->ir_type();
+        }
+
+        if (TypePtr candidate_type = var->ir_type()) {
+            if (!info.type) {
+                info.type = candidate_type;
+            } else {
+                const std::string current_sig = info.type->to_string();
+                const std::string candidate_sig = candidate_type->to_string();
+                if (candidate_sig < current_sig) {
+                    info.type = candidate_type;
+                }
             }
         }
         add_vertex_if_missing(interference, key);
     };
 
-    for (BasicBlock* block : cfg.blocks()) {
+    for (BasicBlock* block : ordered_blocks) {
         VarSet uses;
         VarSet defs;
 
@@ -229,6 +315,9 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
 
     bool changed = true;
     auto order = cfg.reverse_post_order();
+    std::stable_sort(order.begin(), order.end(), [](BasicBlock* lhs, BasicBlock* rhs) {
+        return block_order_key(lhs) < block_order_key(rhs);
+    });
     while (changed) {
         changed = false;
 
@@ -236,7 +325,7 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             BasicBlock* block = *it;
 
             VarSet out;
-            for (Edge* edge : block->successors()) {
+            for (Edge* edge : sorted_successor_edges(block->successors())) {
                 if (edge != nullptr && edge->target() != nullptr) {
                     const VarSet& succ_in = live_in[edge->target()];
                     out.insert(succ_in.begin(), succ_in.end());
@@ -245,7 +334,7 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
 
             VarSet in = uses_block[block];
             VarSet out_minus_def = out;
-            for (const VarKey& d : defs_block[block]) {
+            for (const VarKey& d : sorted_var_keys(defs_block[block])) {
                 out_minus_def.erase(d);
             }
             in.insert(out_minus_def.begin(), out_minus_def.end());
@@ -258,7 +347,7 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
         }
     }
 
-    for (BasicBlock* block : cfg.blocks()) {
+    for (BasicBlock* block : ordered_blocks) {
         add_clique(interference, live_in[block]);
         add_clique(interference, live_out[block]);
 
@@ -275,12 +364,14 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
                 reqs.insert(k);
             }
 
-            for (const VarKey& d : defs) {
-                for (const VarKey& live : current) {
+            const std::vector<VarKey> sorted_defs = sorted_var_keys(defs);
+            const std::vector<VarKey> sorted_current = sorted_var_keys(current);
+            for (const VarKey& d : sorted_defs) {
+                for (const VarKey& live : sorted_current) {
                     add_edge(interference, d, live);
                 }
             }
-            for (const VarKey& d : defs) {
+            for (const VarKey& d : sorted_defs) {
                 current.erase(d);
             }
             current.insert(reqs.begin(), reqs.end());
@@ -292,12 +383,19 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
         groups[compatibility_group_of(key, info)].push_back(key);
     }
 
+    std::vector<std::string> group_names;
+    group_names.reserve(groups.size());
+    for (const auto& [name, _] : groups) {
+        group_names.push_back(name);
+    }
+    std::sort(group_names.begin(), group_names.end());
+
     std::unordered_map<VarKey, int, VarKeyHash> class_of;
     std::unordered_map<int, std::vector<VarKey>> members_of;
     int next_class = 0;
 
-    for (auto& [group_name, vertices] : groups) {
-        (void)group_name;
+    for (const std::string& group_name : group_names) {
+        std::vector<VarKey> vertices = sorted_var_keys(groups[group_name]);
         auto order_in_group = reverse_lex_bfs(vertices, interference);
 
         std::unordered_map<VarKey, int, VarKeyHash> color_of;
@@ -308,7 +406,7 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             std::unordered_set<int> blocked;
             auto neigh_it = interference.find(var);
             if (neigh_it != interference.end()) {
-                for (const VarKey& neigh : neigh_it->second) {
+                for (const VarKey& neigh : sorted_var_keys(neigh_it->second)) {
                     auto c_it = color_of.find(neigh);
                     if (c_it != color_of.end()) {
                         blocked.insert(c_it->second);
@@ -355,7 +453,12 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             name_color_count[var.name][chosen]++;
         }
 
-        for (const auto& [var, color] : color_of) {
+        for (const VarKey& var : order_in_group) {
+            auto color_it = color_of.find(var);
+            if (color_it == color_of.end()) {
+                continue;
+            }
+            const int color = color_it->second;
             const int global_class = next_class + color;
             class_of[var] = global_class;
             members_of[global_class].push_back(var);
@@ -365,15 +468,28 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
 
     std::unordered_map<VarKey, Variable*, VarKeyHash> replacement_for;
     int fresh_name = 0;
-    for (auto& [klass, members] : members_of) {
-        (void)klass;
+    std::vector<int> class_ids;
+    class_ids.reserve(members_of.size());
+    for (const auto& [klass, _] : members_of) {
+        class_ids.push_back(klass);
+    }
+    std::sort(class_ids.begin(), class_ids.end());
+
+    for (int klass : class_ids) {
+        auto& members = members_of[klass];
         if (members.empty()) {
             continue;
         }
 
+        std::stable_sort(members.begin(), members.end(), key_less);
+
         const VarInfo& info = var_info[members.front()];
+        if (info.aliased) {
+            continue;
+        }
         const std::size_t size = info.size_bytes > 0 ? info.size_bytes : 4;
-        auto* replacement = arena.create<Variable>("var_" + std::to_string(fresh_name++), size);
+        std::string replacement_name = "var_" + std::to_string(fresh_name++);
+        auto* replacement = arena.create<Variable>(replacement_name, size);
         replacement->set_ssa_version(0);
         replacement->set_aliased(info.aliased);
         replacement->set_ir_type(info.type);
@@ -383,7 +499,7 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
         }
     }
 
-    for (BasicBlock* block : cfg.blocks()) {
+    for (BasicBlock* block : ordered_blocks) {
         for (Instruction* inst : block->instructions()) {
             std::vector<Variable*> vars = inst->requirements();
             auto defs = inst->definitions();
