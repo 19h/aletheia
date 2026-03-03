@@ -21,6 +21,119 @@ bool same_if_condition(AstNode* lhs_cond, AstNode* rhs_cond) {
     return expression_fingerprint_hash(lhs_expr->expr()) == expression_fingerprint_hash(rhs_expr->expr());
 }
 
+std::string variable_key(const Variable* v) {
+    if (!v) {
+        return "";
+    }
+    return v->name() + "#" + std::to_string(v->ssa_version());
+}
+
+void collect_condition_variable_keys(Expression* expr, std::unordered_set<std::string>& keys) {
+    if (!expr) {
+        return;
+    }
+    std::unordered_set<Variable*> required;
+    expr->collect_requirements(required);
+    for (Variable* var : required) {
+        if (var) {
+            keys.insert(variable_key(var));
+        }
+    }
+}
+
+bool ast_writes_any_condition_variable(AstNode* node, const std::unordered_set<std::string>& keys) {
+    if (!node || keys.empty()) {
+        return false;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) {
+            return false;
+        }
+        for (Instruction* inst : code->block()->instructions()) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+            if (dst && keys.contains(variable_key(dst))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            if (ast_writes_any_condition_variable(child, keys)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        return ast_writes_any_condition_variable(if_node->true_branch(), keys)
+            || ast_writes_any_condition_variable(if_node->false_branch(), keys);
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return ast_writes_any_condition_variable(loop->body(), keys);
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->cases()) {
+            if (ast_writes_any_condition_variable(case_node->body(), keys)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        return ast_writes_any_condition_variable(case_node->body(), keys);
+    }
+
+    return false;
+}
+
+AstNode* strip_terminal_flow(AstNode* node, bool strip_continue) {
+    if (!node) {
+        return nullptr;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if ((strip_continue && code->does_end_with_continue()) ||
+            (!strip_continue && code->does_end_with_break())) {
+            code->remove_last_instruction();
+        }
+        if (code->block() && code->block()->instructions().empty()) {
+            return nullptr;
+        }
+        return code;
+    }
+
+    auto* seq = ast_dyn_cast<SeqNode>(node);
+    if (!seq || seq->empty()) {
+        return node;
+    }
+
+    AstNode* stripped_tail = strip_terminal_flow(seq->last(), strip_continue);
+    if (!stripped_tail) {
+        seq->mutable_nodes().pop_back();
+    } else {
+        seq->mutable_nodes().back() = stripped_tail;
+    }
+
+    if (seq->empty()) {
+        return nullptr;
+    }
+    if (seq->size() == 1) {
+        return seq->first();
+    }
+    return seq;
+}
+
+template<typename Func>
+AstNode* rewrite_ast(DecompilerArena& arena, AstNode* node, Func f);
+
 enum class CompareDomain : std::uint8_t {
     Any,
     Signed,
@@ -369,6 +482,139 @@ std::optional<bool> condition_truth_under_outer(Expression* outer_expr, Expressi
     return compare_ops_implication(outer.op, aligned_inner_op);
 }
 
+AstNode* simplify_branch_with_outer_condition(
+    DecompilerArena& arena,
+    AstNode* node,
+    Expression* outer_condition
+) {
+    if (!node || !outer_condition) {
+        return node;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        if (auto* cond_ast = ast_dyn_cast<ExprAstNode>(if_node->cond()); cond_ast && cond_ast->expr()) {
+            std::optional<bool> implied =
+                condition_truth_under_outer(outer_condition, cond_ast->expr());
+            if (implied.has_value()) {
+                AstNode* chosen = implied.value() ? if_node->true_branch() : if_node->false_branch();
+                if (!chosen) {
+                    return nullptr;
+                }
+                return simplify_branch_with_outer_condition(arena, chosen, outer_condition);
+            }
+        }
+
+        if_node->set_true_branch(simplify_branch_with_outer_condition(arena, if_node->true_branch(), outer_condition));
+        if_node->set_false_branch(simplify_branch_with_outer_condition(arena, if_node->false_branch(), outer_condition));
+        if (!if_node->true_branch() && !if_node->false_branch()) {
+            return nullptr;
+        }
+        return if_node;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        std::vector<AstNode*> rewritten;
+        rewritten.reserve(seq->size());
+        for (AstNode* child : seq->nodes()) {
+            AstNode* reduced = simplify_branch_with_outer_condition(arena, child, outer_condition);
+            if (!reduced) {
+                continue;
+            }
+            if (auto* child_seq = ast_dyn_cast<SeqNode>(reduced)) {
+                for (AstNode* nested : child_seq->nodes()) {
+                    if (nested) {
+                        rewritten.push_back(nested);
+                    }
+                }
+            } else {
+                rewritten.push_back(reduced);
+            }
+        }
+        seq->mutable_nodes() = std::move(rewritten);
+        if (seq->empty()) {
+            return nullptr;
+        }
+        if (seq->size() == 1) {
+            return seq->first();
+        }
+        return seq;
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        loop->set_body(simplify_branch_with_outer_condition(arena, loop->body(), outer_condition));
+        return loop;
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->mutable_cases()) {
+            case_node->set_body(simplify_branch_with_outer_condition(arena, case_node->body(), outer_condition));
+        }
+        return sw;
+    }
+
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        case_node->set_body(simplify_branch_with_outer_condition(arena, case_node->body(), outer_condition));
+        return case_node;
+    }
+
+    return node;
+}
+
+AstNode* canonicalize_tail_induction_loops(DecompilerArena& arena, AstNode* root) {
+    return rewrite_ast(arena, root, [&](AstNode* node) -> AstNode* {
+        auto* loop = ast_dyn_cast<WhileLoopNode>(node);
+        if (!loop || !loop->is_endless() || !loop->body()) {
+            return node;
+        }
+
+        auto* body_seq = ast_dyn_cast<SeqNode>(loop->body());
+        if (!body_seq || body_seq->size() < 2) {
+            return node;
+        }
+
+        auto& body_nodes = body_seq->mutable_nodes();
+        AstNode* tail_break = body_nodes.back();
+        auto* tail_if = ast_dyn_cast<IfNode>(body_nodes[body_nodes.size() - 2]);
+        if (!tail_if || tail_if->false_branch() != nullptr) {
+            return node;
+        }
+        if (!tail_if->true_branch() || !tail_if->true_branch()->does_end_with_continue()) {
+            return node;
+        }
+        if (!tail_break->does_end_with_break()) {
+            return node;
+        }
+
+        auto* cond_ast = ast_dyn_cast<ExprAstNode>(tail_if->cond());
+        Expression* cond_expr = cond_ast ? cond_ast->expr() : nullptr;
+        if (!cond_expr) {
+            return node;
+        }
+
+        std::unordered_set<std::string> cond_keys;
+        collect_condition_variable_keys(cond_expr, cond_keys);
+        if (cond_keys.empty() || !ast_writes_any_condition_variable(body_seq, cond_keys)) {
+            return node;
+        }
+
+        AstNode* true_body = strip_terminal_flow(tail_if->true_branch(), /*strip_continue=*/true);
+        if (!true_body) {
+            return node;
+        }
+        AstNode* false_body = strip_terminal_flow(tail_break, /*strip_continue=*/false);
+
+        AstNode* replacement_tail = arena.create<IfNode>(tail_if->cond(), true_body, false_body);
+        body_nodes[body_nodes.size() - 2] = replacement_tail;
+        body_nodes.pop_back();
+
+        AstNode* do_body = body_seq;
+        if (body_seq->size() == 1) {
+            do_body = body_seq->first();
+        }
+        return arena.create<DoWhileLoopNode>(do_body, cond_expr);
+    });
+}
+
 template<typename Func>
 AstNode* rewrite_ast(DecompilerArena& arena, AstNode* node, Func f) {
     if (!node) return nullptr;
@@ -487,6 +733,12 @@ AstNode* AstProcessor::clean_node(DecompilerArena& arena, AstNode* root) {
 
             if (!ifn->true_branch() && ifn->false_branch()) {
                 switch_branches(arena, ifn);
+            }
+
+            if (auto* outer_cond_ast = ast_dyn_cast<ExprAstNode>(ifn->cond());
+                outer_cond_ast && outer_cond_ast->expr()) {
+                ifn->set_true_branch(
+                    simplify_branch_with_outer_condition(arena, ifn->true_branch(), outer_cond_ast->expr()));
             }
 
             if (!ifn->false_branch()) {
@@ -728,6 +980,7 @@ AstNode* AstProcessor::postprocess_acyclic(DecompilerArena& arena, AstNode* root
     root = extract_conditional_breaks(arena, root);
     root = extract_conditional_returns(arena, root);
     root = sort_sequence_node_children_while_over_do_while(arena, root);
+    root = canonicalize_tail_induction_loops(arena, root);
     return clean_node(arena, root);
 }
 

@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace aletheia {
 
@@ -643,6 +644,178 @@ bool same_variable(const Variable* lhs, const Variable* rhs) {
     return lhs->name() == rhs->name() && lhs->ssa_version() == rhs->ssa_version();
 }
 
+std::string variable_key(const Variable* v) {
+    if (!v) {
+        return "";
+    }
+    return v->name() + "#" + std::to_string(v->ssa_version());
+}
+
+bool expression_has_side_effects(Expression* expr) {
+    if (!expr) {
+        return false;
+    }
+
+    if (isa<Call>(expr)) {
+        return true;
+    }
+
+    auto* op = dyn_cast<Operation>(expr);
+    if (!op) {
+        return false;
+    }
+
+    if (op->type() == OperationType::deref || op->type() == OperationType::call) {
+        return true;
+    }
+
+    for (Expression* child : op->operands()) {
+        if (expression_has_side_effects(child)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void collect_condition_variable_keys(Expression* expr, std::unordered_set<std::string>& keys) {
+    if (!expr) {
+        return;
+    }
+
+    std::unordered_set<Variable*> required;
+    expr->collect_requirements(required);
+    for (Variable* var : required) {
+        if (var) {
+            keys.insert(variable_key(var));
+        }
+    }
+}
+
+bool ast_writes_any_variable(AstNode* node, const std::unordered_set<std::string>& keys) {
+    if (!node || keys.empty()) {
+        return false;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) {
+            return false;
+        }
+        for (Instruction* inst : code->block()->instructions()) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+            if (dst && keys.contains(variable_key(dst))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            if (ast_writes_any_variable(child, keys)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        return ast_writes_any_variable(if_node->true_branch(), keys)
+            || ast_writes_any_variable(if_node->false_branch(), keys);
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return ast_writes_any_variable(loop->body(), keys);
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->cases()) {
+            if (ast_writes_any_variable(case_node->body(), keys)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        return ast_writes_any_variable(case_node->body(), keys);
+    }
+
+    return false;
+}
+
+AstNode* strip_terminal_continue(AstNode* node) {
+    if (!node) {
+        return nullptr;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (code->does_end_with_continue()) {
+            code->remove_last_instruction();
+        }
+        if (code->block() && code->block()->instructions().empty()) {
+            return nullptr;
+        }
+        return code;
+    }
+
+    auto* seq = ast_dyn_cast<SeqNode>(node);
+    if (!seq || seq->empty()) {
+        return node;
+    }
+
+    AstNode* stripped_tail = strip_terminal_continue(seq->last());
+    if (!stripped_tail) {
+        seq->mutable_nodes().pop_back();
+    } else {
+        seq->mutable_nodes().back() = stripped_tail;
+    }
+
+    if (seq->empty()) {
+        return nullptr;
+    }
+    if (seq->size() == 1) {
+        return seq->first();
+    }
+    return seq;
+}
+
+AstNode* strip_terminal_break(AstNode* node) {
+    if (!node) {
+        return nullptr;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (code->does_end_with_break()) {
+            code->remove_last_instruction();
+        }
+        if (code->block() && code->block()->instructions().empty()) {
+            return nullptr;
+        }
+        return code;
+    }
+
+    auto* seq = ast_dyn_cast<SeqNode>(node);
+    if (!seq || seq->empty()) {
+        return node;
+    }
+
+    AstNode* stripped_tail = strip_terminal_break(seq->last());
+    if (!stripped_tail) {
+        seq->mutable_nodes().pop_back();
+    } else {
+        seq->mutable_nodes().back() = stripped_tail;
+    }
+
+    if (seq->empty()) {
+        return nullptr;
+    }
+    if (seq->size() == 1) {
+        return seq->first();
+    }
+    return seq;
+}
+
 Variable* extract_condition_variable(Expression* expr) {
     auto* cond = dyn_cast<Condition>(expr);
     if (!cond) return nullptr;
@@ -747,6 +920,72 @@ void rewrite_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
     }
 }
 
+void rewrite_tail_driven_endless_loops(DecompilerArena& arena, SeqNode* seq) {
+    if (!seq) {
+        return;
+    }
+
+    auto& nodes = seq->mutable_nodes();
+    for (AstNode*& node : nodes) {
+        auto* while_node = ast_dyn_cast<WhileLoopNode>(node);
+        if (!while_node || !while_node->is_endless() || !while_node->body()) {
+            continue;
+        }
+
+        auto* body_seq = ast_dyn_cast<SeqNode>(while_node->body());
+        if (!body_seq || body_seq->size() < 2) {
+            continue;
+        }
+
+        auto& body_nodes = body_seq->mutable_nodes();
+        AstNode* tail_break = body_nodes.back();
+        auto* tail_if = ast_dyn_cast<IfNode>(body_nodes[body_nodes.size() - 2]);
+        if (!tail_if || tail_if->false_branch() != nullptr) {
+            continue;
+        }
+
+        Expression* cond_expr = tail_if->condition_expr();
+        if (!cond_expr || expression_has_side_effects(cond_expr)) {
+            continue;
+        }
+
+        if (!tail_if->true_branch() || !tail_if->true_branch()->does_end_with_continue()) {
+            continue;
+        }
+        if (!tail_break->does_end_with_break()) {
+            continue;
+        }
+
+        std::unordered_set<std::string> cond_keys;
+        collect_condition_variable_keys(cond_expr, cond_keys);
+        const bool body_updates_cond = ast_writes_any_variable(body_seq, cond_keys);
+        if (cond_keys.empty() || !body_updates_cond) {
+            continue;
+        }
+
+        AstNode* true_body = strip_terminal_continue(tail_if->true_branch());
+        if (!true_body) {
+            continue;
+        }
+        AstNode* false_body = strip_terminal_break(tail_break);
+
+        AstNode* replacement_tail = true_body;
+        if (false_body) {
+            replacement_tail = arena.create<IfNode>(tail_if->cond(), true_body, false_body);
+        }
+
+        body_nodes[body_nodes.size() - 2] = replacement_tail;
+        body_nodes.pop_back();
+
+        AstNode* do_body = body_seq;
+        if (body_seq->size() == 1) {
+            do_body = body_seq->first();
+        }
+
+        node = arena.create<DoWhileLoopNode>(do_body, cond_expr);
+    }
+}
+
 AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
     if (!node) return nullptr;
 
@@ -754,6 +993,7 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
         for (AstNode*& child : seq->mutable_nodes()) {
             child = rewrite_guarded_do_while(arena, child);
         }
+        rewrite_tail_driven_endless_loops(arena, seq);
         rewrite_while_to_for_in_sequence(arena, seq);
         return seq;
     }
