@@ -47,6 +47,20 @@ bool env_var_present(const char* name) {
     return std::getenv(name) != nullptr;
 }
 
+std::size_t env_size_t_or_default(const char* name, std::size_t fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw || *raw == '\0') {
+        return fallback;
+    }
+
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(raw, &end, 10);
+    if (!end || end == raw || *end != '\0') {
+        return fallback;
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
 bool should_enable_structuring() {
     if (env_flag_enabled("ALETHEIA_IDUMP_DISABLE_STRUCTURING")) {
         return false;
@@ -155,21 +169,58 @@ std::size_t count_emitted_executable_lines(const std::vector<std::string>& lines
     return count;
 }
 
+std::size_t count_unresolved_control_markers(const std::vector<std::string>& lines) {
+    std::size_t unresolved = 0;
+    for (const std::string& line : lines) {
+        if (line.find("goto bb_") != std::string::npos || line.find("/* branch if") != std::string::npos) {
+            ++unresolved;
+        }
+    }
+    return unresolved;
+}
+
+std::size_t count_structured_control_lines(const std::vector<std::string>& lines) {
+    std::size_t structured = 0;
+    for (const std::string& line : lines) {
+        std::string_view view = trim_ascii(line);
+        if (view.starts_with("if (") || view.starts_with("else if (") || view.starts_with("while (")
+            || view.starts_with("for (") || view.starts_with("switch (") || view.starts_with("do {")
+            || view.starts_with("case ") || view.starts_with("default:")) {
+            ++structured;
+        }
+    }
+    return structured;
+}
+
 bool generated_output_too_lossy(std::size_t lifted_non_control_count, const std::vector<std::string>& lines) {
     if (lifted_non_control_count < 6) {
         return false;
     }
+
     const std::size_t emitted = count_emitted_executable_lines(lines);
     if (emitted == 0) {
         return true;
     }
-    int goto_count = 0;
-    for (const auto& line : lines) {
-        if (line.find("goto bb_") != std::string::npos || line.find("/* branch if") != std::string::npos) goto_count++;
+
+    const std::size_t unresolved = count_unresolved_control_markers(lines);
+    if (unresolved == 0) {
+        return false;
     }
-    if (goto_count > 0 && goto_count * 5 > emitted) return true;
-    if (goto_count > 10) return true;
-    return false;
+
+    // Aggressive structured-first defaults: preserve mostly-structured output
+    // unless unresolved control flow is both dense and frequent.
+    const std::size_t min_markers = env_size_t_or_default("ALETHEIA_IDUMP_LOSSY_MIN_MARKERS", 6);
+    const std::size_t max_unresolved_pct = env_size_t_or_default("ALETHEIA_IDUMP_LOSSY_MAX_UNRESOLVED_PCT", 25);
+    const std::size_t min_structured_lines = env_size_t_or_default("ALETHEIA_IDUMP_LOSSY_MIN_STRUCTURED_LINES", 2);
+    const std::size_t structured = count_structured_control_lines(lines);
+
+    if (unresolved < min_markers) {
+        return false;
+    }
+
+    const bool dense_unresolved = unresolved * 100 >= max_unresolved_pct * emitted;
+    const bool weak_structured_signal = structured < min_structured_lines;
+    return dense_unresolved || weak_structured_signal;
 }
 
 std::size_t count_cfg_non_control_instructions(const aletheia::ControlFlowGraph* cfg) {

@@ -1,6 +1,7 @@
 #include "cbr.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,6 +30,69 @@ bool ast_contains(AstNode* parent, AstNode* target) {
     return false;
 }
 
+bool ast_contains_original_block(AstNode* node, BasicBlock* target) {
+    if (!node || !target) {
+        return false;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        return code->block() == target;
+    }
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            if (ast_contains_original_block(child, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
+        return ast_contains_original_block(ifn->true_branch(), target)
+            || ast_contains_original_block(ifn->false_branch(), target);
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return ast_contains_original_block(loop->body(), target);
+    }
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* case_node : sw->cases()) {
+            if (ast_contains_original_block(case_node, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        return ast_contains_original_block(case_node->body(), target);
+    }
+    return false;
+}
+
+bool ast_node_matches_transition_block(AstNode* node, TransitionBlock* tb) {
+    if (!node || !tb) {
+        return false;
+    }
+
+    AstNode* tb_node = tb->ast_node();
+    if (!tb_node) {
+        return false;
+    }
+
+    if (tb_node == node || ast_contains(tb_node, node) || ast_contains(node, tb_node)) {
+        return true;
+    }
+
+    BasicBlock* tb_orig = tb_node->get_original_block();
+    BasicBlock* node_orig = node->get_original_block();
+    if (tb_orig && node_orig && tb_orig == node_orig) {
+        return true;
+    }
+    if (tb_orig && ast_contains_original_block(node, tb_orig)) {
+        return true;
+    }
+
+    return false;
+}
+
 bool cbr_debug_enabled() {
     const char* value = std::getenv("ALETHEIA_CBR_DEBUG");
     if (!value) return false;
@@ -42,6 +106,33 @@ Expression* if_condition_expr(IfNode* node) {
         return expr_ast->expr();
     }
     return nullptr;
+}
+
+std::optional<bool> classify_node_by_ast_condition(
+    z3::context& ctx,
+    AstNode* node,
+    const logos::LogicCondition& extracted_cond
+) {
+    auto* if_node = ast_dyn_cast<IfNode>(node);
+    if (!if_node) {
+        return std::nullopt;
+    }
+
+    Expression* cond_expr = if_condition_expr(if_node);
+    if (!cond_expr) {
+        return std::nullopt;
+    }
+
+    logos::Z3Converter conv(ctx);
+    logos::LogicCondition node_cond = conv.convert_to_condition(cond_expr);
+    if (node_cond.does_imply(extracted_cond) || extracted_cond.does_imply(node_cond)) {
+        return true;
+    }
+    if (node_cond.is_complementary_to(extracted_cond)) {
+        return false;
+    }
+
+    return std::nullopt;
 }
 
 std::string expr_fingerprint(Expression* expr) {
@@ -285,6 +376,222 @@ void apply_cnf_subexpression_grouping(DecompilerArena& arena, std::vector<AstNod
     }
 }
 
+bool sequence_nodes_changed(const std::vector<AstNode*>& before, const std::vector<AstNode*>& after) {
+    if (before.size() != after.size()) {
+        return true;
+    }
+    for (std::size_t i = 0; i < before.size(); ++i) {
+        if (before[i] != after[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+AstNode* refine_sequence_once(
+    DecompilerArena& arena,
+    z3::context& ctx,
+    SeqNode* seq,
+    const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+) {
+    if (!seq) {
+        return nullptr;
+    }
+
+    std::vector<AstNode*> nodes = seq->nodes();
+    if (nodes.empty()) {
+        return seq;
+    }
+
+    std::vector<AstNode*> rebuilt_nodes;
+    rebuilt_nodes.reserve(nodes.size() + 1);
+    bool changed = false;
+
+    for (std::size_t i = 0; i < nodes.size();) {
+        AstNode* node = nodes[i];
+
+        if (CodeNode* cnode = ast_dyn_cast<CodeNode>(node)) {
+            BasicBlock* block = cnode->block();
+            if (block && !block->instructions().empty()) {
+                Instruction* last_inst = block->instructions().back();
+
+                if (auto* branch = dyn_cast<Branch>(last_inst)) {
+                    AstNode* branch_cond = arena.create<ExprAstNode>(branch->condition());
+                    Instruction* removed_branch = last_inst;
+
+                    auto insts = block->instructions();
+                    insts.pop_back();
+                    block->set_instructions(std::move(insts));
+
+                    logos::Z3Converter conv(ctx);
+                    logos::LogicCondition extracted_cond = conv.convert_to_condition(branch->condition());
+
+                    rebuilt_nodes.push_back(node);
+                    ++i;
+
+                    const std::size_t inner_start = i;
+                    SeqNode* true_branch = arena.create<SeqNode>();
+                    SeqNode* false_branch = arena.create<SeqNode>();
+
+                    while (i < nodes.size()) {
+                        AstNode* next_node = nodes[i];
+                        TransitionBlock* matching_tb = nullptr;
+
+                        for (const auto& [tb, cond] : reaching_conditions) {
+                            (void)cond;
+                            if (tb == nullptr || next_node == nullptr) {
+                                continue;
+                            }
+                            if (ast_node_matches_transition_block(next_node, tb)) {
+                                matching_tb = tb;
+                                break;
+                            }
+                        }
+
+                        if (matching_tb) {
+                            const auto& rc = reaching_conditions.at(matching_tb);
+                            if (rc.does_imply(extracted_cond) || extracted_cond.does_imply(rc)) {
+                                true_branch->add_node(next_node);
+                            } else if (rc.is_complementary_to(extracted_cond)) {
+                                false_branch->add_node(next_node);
+                            } else {
+                                if (cbr_debug_enabled()) {
+                                    std::cerr << "[CBR Debug] Node " << i
+                                              << " broke out! Condition did not imply/complement." << std::endl;
+                                    std::cerr << "rc: " << rc.expression()
+                                              << " | extracted: " << extracted_cond.expression() << std::endl;
+                                }
+                                break;
+                            }
+                        } else {
+                            std::optional<bool> ast_classification =
+                                classify_node_by_ast_condition(ctx, next_node, extracted_cond);
+                            if (ast_classification.has_value()) {
+                                if (*ast_classification) {
+                                    true_branch->add_node(next_node);
+                                } else {
+                                    false_branch->add_node(next_node);
+                                }
+                            } else {
+                                if (cbr_debug_enabled()) {
+                                    std::cerr << "[CBR Debug] Node " << i << " broke out! No matching_tb found!" << std::endl;
+                                }
+                                break;
+                            }
+                        }
+                        ++i;
+                    }
+
+                    if (!true_branch->nodes().empty() || !false_branch->nodes().empty()) {
+                        IfNode* if_node = arena.create<IfNode>(
+                            branch_cond,
+                            true_branch,
+                            false_branch->nodes().empty() ? nullptr : false_branch);
+                        rebuilt_nodes.push_back(if_node);
+                        changed = true;
+                    } else {
+                        auto restored = block->instructions();
+                        restored.push_back(removed_branch);
+                        block->set_instructions(std::move(restored));
+                        const std::size_t consumed = i - inner_start;
+                        i = inner_start;
+                        if (cbr_debug_enabled()) {
+                            std::cerr << "[CBR Debug] IfNode was empty, dropped! Rewinding "
+                                      << consumed << " consumed nodes." << std::endl;
+                        }
+                    }
+
+                    continue;
+                }
+            }
+        }
+
+        rebuilt_nodes.push_back(node);
+        ++i;
+    }
+
+    const std::vector<AstNode*> before_grouping = rebuilt_nodes;
+    apply_complementary_condition_pairing(arena, ctx, rebuilt_nodes);
+    apply_cnf_subexpression_grouping(arena, rebuilt_nodes);
+
+    changed = changed || sequence_nodes_changed(nodes, rebuilt_nodes)
+        || sequence_nodes_changed(before_grouping, rebuilt_nodes);
+    if (!changed) {
+        return seq;
+    }
+
+    SeqNode* final_seq = arena.create<SeqNode>();
+    for (AstNode* n : rebuilt_nodes) {
+        final_seq->add_node(n);
+    }
+    return final_seq;
+}
+
+AstNode* refine_recursive(
+    DecompilerArena& arena,
+    z3::context& ctx,
+    AstNode* root,
+    const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions,
+    std::size_t depth = 0
+) {
+    if (!root || depth > 64) {
+        return root;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(root)) {
+        for (AstNode*& child : seq->mutable_nodes()) {
+            child = refine_recursive(arena, ctx, child, reaching_conditions, depth + 1);
+        }
+
+        AstNode* current = seq;
+        constexpr std::size_t kMaxLocalIterations = 4;
+        for (std::size_t iter = 0; iter < kMaxLocalIterations; ++iter) {
+            auto* current_seq = ast_dyn_cast<SeqNode>(current);
+            if (!current_seq) {
+                break;
+            }
+
+            AstNode* next = refine_sequence_once(arena, ctx, current_seq, reaching_conditions);
+            if (next == current) {
+                break;
+            }
+
+            current = next;
+            if (auto* next_seq = ast_dyn_cast<SeqNode>(current)) {
+                for (AstNode*& child : next_seq->mutable_nodes()) {
+                    child = refine_recursive(arena, ctx, child, reaching_conditions, depth + 1);
+                }
+            }
+        }
+        return current;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(root)) {
+        if_node->set_true_branch(refine_recursive(arena, ctx, if_node->true_branch(), reaching_conditions, depth + 1));
+        if_node->set_false_branch(refine_recursive(arena, ctx, if_node->false_branch(), reaching_conditions, depth + 1));
+        return if_node;
+    }
+
+    if (auto* loop_node = ast_dyn_cast<LoopNode>(root)) {
+        loop_node->set_body(refine_recursive(arena, ctx, loop_node->body(), reaching_conditions, depth + 1));
+        return loop_node;
+    }
+
+    if (auto* switch_node = ast_dyn_cast<SwitchNode>(root)) {
+        for (CaseNode* case_node : switch_node->mutable_cases()) {
+            case_node->set_body(refine_recursive(arena, ctx, case_node->body(), reaching_conditions, depth + 1));
+        }
+        return switch_node;
+    }
+
+    if (auto* case_node = ast_dyn_cast<CaseNode>(root)) {
+        case_node->set_body(refine_recursive(arena, ctx, case_node->body(), reaching_conditions, depth + 1));
+        return case_node;
+    }
+
+    return root;
+}
+
 } // namespace
 
 namespace aletheia {
@@ -295,146 +602,7 @@ AstNode* ConditionBasedRefinement::refine(
     AstNode* root,
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
 ) {
-    if (auto* seq = ast_dyn_cast<SeqNode>(root)) {
-        std::vector<AstNode*> nodes = seq->nodes();
-        if (nodes.empty()) return root;
-
-        SeqNode* new_seq = arena.create<SeqNode>();
-
-        for (size_t i = 0; i < nodes.size(); ) {
-            AstNode* node = nodes[i];
-            
-            AstNode* branch_cond = nullptr;
-            if (CodeNode* cnode = ast_dyn_cast<CodeNode>(node)) {
-                BasicBlock* block = cnode->block();
-                if (!block) {
-                    new_seq->add_node(node);
-                    i++;
-                    continue;
-                }
-
-                if (!block->instructions().empty()) {
-                    Instruction* last_inst = block->instructions().back();
-                    
-                    // Check if the last instruction is a Branch (conditional)
-                    if (auto* branch = dyn_cast<Branch>(last_inst)) {
-                        branch_cond = arena.create<ExprAstNode>(branch->condition());
-                        Instruction* removed_branch = last_inst;
-                        
-                        // Remove the branch instruction from the block
-                        auto insts = block->instructions();
-                        insts.pop_back();
-                        block->set_instructions(std::move(insts));
-                        
-                        logos::Z3Converter conv(ctx);
-                        logos::LogicCondition extracted_cond = conv.convert_to_condition(branch->condition());
-                        
-                        new_seq->add_node(node);
-                        i++;
-
-                        // Remember where the inner loop starts consuming
-                        // nodes so we can rewind if the IfNode synthesis fails.
-                        size_t inner_start = i;
-
-                        SeqNode* true_branch = arena.create<SeqNode>();
-                        SeqNode* false_branch = arena.create<SeqNode>();
-                        static int if_count = 0;
-                        if (getenv("DEBUG_EXTRACT")) {
-                            std::cerr << "CBR created IfNode " << ++if_count << "\n";
-                        }
-                        
-                        while (i < nodes.size()) {
-                            AstNode* next_node = nodes[i];
-                            TransitionBlock* matching_tb = nullptr;
-                            for (const auto& [tb, cond] : reaching_conditions) {
-                                if (tb == nullptr || next_node == nullptr) {
-                                    continue;
-                                }
-
-                                AstNode* tb_node = tb->ast_node();
-                                if (tb_node == nullptr) {
-                                    continue;
-                                }
-
-                                if (tb_node == next_node) {
-                                    matching_tb = tb;
-                                    break;
-                                }
-
-                                BasicBlock* tb_orig = tb_node->get_original_block();
-                                BasicBlock* next_orig = next_node->get_original_block();
-                                if (tb_orig != nullptr && next_orig != nullptr && tb_orig == next_orig) {
-                                    matching_tb = tb;
-                                    break;
-                                }
-                                if (ast_contains(tb_node, next_node)) {
-                                    matching_tb = tb;
-                                    break;
-                                }
-                            }
-
-                            if (matching_tb) {
-                                auto& rc = reaching_conditions.at(matching_tb);
-                                if (rc.does_imply(extracted_cond) || extracted_cond.does_imply(rc)) {
-                                    true_branch->add_node(next_node);
-                                } else if (rc.is_complementary_to(extracted_cond)) {
-                                    false_branch->add_node(next_node);
-                                } else {
-                                    if (cbr_debug_enabled()) {
-                                        std::cerr << "[CBR Debug] Node " << i << " broke out! Condition did not imply/complement." << std::endl;
-                                        std::cerr << "rc: " << rc.expression() << " | extracted: " << extracted_cond.expression() << std::endl;
-                                    }
-                                    break;
-                                }
-                            } else {
-                                if (cbr_debug_enabled()) {
-                                    std::cerr << "[CBR Debug] Node " << i << " broke out! No matching_tb found!" << std::endl;
-                                }
-                                break;
-                            }
-                            i++;
-                        }
-
-                        if (!true_branch->nodes().empty() || !false_branch->nodes().empty()) {
-                            IfNode* if_node = arena.create<IfNode>(branch_cond, true_branch, false_branch->nodes().empty() ? nullptr : false_branch);
-                            new_seq->add_node(if_node);
-                        } else {
-                            // IfNode synthesis failed: no nodes were classified
-                            // into true/false branches. Restore the branch
-                            // instruction and rewind the index so the consumed
-                            // nodes are re-emitted as sequential statements.
-                            auto restored = block->instructions();
-                            restored.push_back(removed_branch);
-                            block->set_instructions(std::move(restored));
-                            i = inner_start;
-                            if (cbr_debug_enabled()) {
-                                std::cerr << "[CBR Debug] IfNode was empty, dropped! Rewinding " << (i - inner_start) << " consumed nodes." << std::endl;
-                            }
-                        }
-                        
-                        continue;
-                    }
-                }
-            }
-
-            new_seq->add_node(node);
-            i++;
-        }
-        
-        std::vector<AstNode*> refined_nodes = new_seq->nodes();
-
-        apply_complementary_condition_pairing(arena, ctx, refined_nodes);
-        apply_cnf_subexpression_grouping(arena, refined_nodes);
-
-        SeqNode* final_seq = arena.create<SeqNode>();
-        for (AstNode* n : refined_nodes) {
-            final_seq->add_node(n);
-        }
-
-        return final_seq;
-    }
-
-    return root;
+    return refine_recursive(arena, ctx, root, reaching_conditions);
 }
 
 } // namespace aletheia

@@ -429,14 +429,14 @@ skip_abnormal_entry:
                     cont_block->add_instruction(arena_.create<ContinueInstr>());
                     auto* cont_trans = arena_.create<TransitionBlock>(arena_.create<CodeNode>(cont_block));
                     loop_cfg->add_block(cont_trans);
-                    loop_cfg->add_edge(clone_src, cont_trans, logos::LogicCondition(task_.z3_ctx().bool_val(true)), EdgeProperty::NonLoop);
+                    loop_cfg->add_edge(clone_src, cont_trans, e->tag(), EdgeProperty::NonLoop);
                 } else if (!region_set.contains(succ)) {
                     // Exit edge -> Break node
                     auto* brk_block = arena_.create<BasicBlock>(9998);
                     brk_block->add_instruction(arena_.create<BreakInstr>());
                     auto* brk_trans = arena_.create<TransitionBlock>(arena_.create<CodeNode>(brk_block));
                     loop_cfg->add_block(brk_trans);
-                    loop_cfg->add_edge(clone_src, brk_trans, logos::LogicCondition(task_.z3_ctx().bool_val(true)), EdgeProperty::NonLoop);
+                    loop_cfg->add_edge(clone_src, brk_trans, e->tag(), EdgeProperty::NonLoop);
                 } else if (block_map.contains(succ)) {
                     auto* clone_dst = block_map[succ];
                     if (clone_dst) {

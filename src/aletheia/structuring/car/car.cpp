@@ -2,6 +2,7 @@
 #include "../reachability.hpp"
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 namespace aletheia {
 
@@ -34,6 +35,125 @@ std::string expr_fingerprint(Expression* expr) {
         return out;
     }
     return "E:unknown";
+}
+
+bool ast_contains_node(AstNode* parent, AstNode* target) {
+    if (!parent || !target) {
+        return false;
+    }
+    if (parent == target) {
+        return true;
+    }
+    if (auto* seq = ast_dyn_cast<SeqNode>(parent)) {
+        for (AstNode* child : seq->nodes()) {
+            if (ast_contains_node(child, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* if_node = ast_dyn_cast<IfNode>(parent)) {
+        return ast_contains_node(if_node->true_branch(), target)
+            || ast_contains_node(if_node->false_branch(), target);
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(parent)) {
+        return ast_contains_node(loop->body(), target);
+    }
+    if (auto* sw = ast_dyn_cast<SwitchNode>(parent)) {
+        for (CaseNode* c : sw->cases()) {
+            if (ast_contains_node(c, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* c = ast_dyn_cast<CaseNode>(parent)) {
+        return ast_contains_node(c->body(), target);
+    }
+    return false;
+}
+
+bool ast_contains_original_block(AstNode* node, BasicBlock* target) {
+    if (!node || !target) {
+        return false;
+    }
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        return code->block() == target;
+    }
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            if (ast_contains_original_block(child, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        return ast_contains_original_block(if_node->true_branch(), target)
+            || ast_contains_original_block(if_node->false_branch(), target);
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return ast_contains_original_block(loop->body(), target);
+    }
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* c : sw->cases()) {
+            if (ast_contains_original_block(c, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        return ast_contains_original_block(c->body(), target);
+    }
+    return false;
+}
+
+const logos::LogicCondition* reaching_condition_for_ast_node(
+    const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions,
+    AstNode* node
+) {
+    if (!node) {
+        return nullptr;
+    }
+
+    for (const auto& [tb, cond] : reaching_conditions) {
+        if (!tb) {
+            continue;
+        }
+        AstNode* tb_node = tb->ast_node();
+        if (!tb_node) {
+            continue;
+        }
+
+        if (tb_node == node || ast_contains_node(tb_node, node) || ast_contains_node(node, tb_node)) {
+            return &cond;
+        }
+
+        BasicBlock* tb_orig = tb_node->get_original_block();
+        BasicBlock* node_orig = node->get_original_block();
+        if (tb_orig && node_orig && tb_orig == node_orig) {
+            return &cond;
+        }
+        if (tb_orig && ast_contains_original_block(node, tb_orig)) {
+            return &cond;
+        }
+    }
+
+    return nullptr;
+}
+
+bool condition_can_belong_to_switch(
+    const logos::LogicCondition* switch_reaching,
+    const logos::LogicCondition* case_reaching
+) {
+    if (!switch_reaching || !case_reaching) {
+        return true;
+    }
+    return case_reaching->does_imply(*switch_reaching)
+        || switch_reaching->does_imply(*case_reaching)
+        || case_reaching->is_complementary_to(*switch_reaching)
+        || switch_reaching->is_complementary_to(*case_reaching);
 }
 
 bool decode_switch_case_operands(Expression* lhs, Expression* rhs,
@@ -104,13 +224,20 @@ bool switch_has_default_case(SwitchNode* sw) {
 
 class InitialSwitchNodeConstructor {
 public:
-    static void run(DecompilerArena& arena, SeqNode* seq) {
+    static void run(
+        DecompilerArena& arena,
+        SeqNode* seq,
+        const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+    ) {
         if (!seq) return;
         std::vector<AstNode*>& nodes = seq->mutable_nodes();
 
         for (AstNode*& node : nodes) {
             auto* if_node = ast_dyn_cast<IfNode>(node);
             if (!if_node) continue;
+
+            const logos::LogicCondition* chain_reaching =
+                reaching_condition_for_ast_node(reaching_conditions, if_node);
 
             Expression* selector = nullptr;
             std::string selector_fp;
@@ -121,6 +248,13 @@ public:
             bool valid_chain = true;
 
             while (cursor) {
+                const logos::LogicCondition* cursor_reaching =
+                    reaching_condition_for_ast_node(reaching_conditions, cursor);
+                if (!condition_can_belong_to_switch(chain_reaching, cursor_reaching)) {
+                    valid_chain = false;
+                    break;
+                }
+
                 Expression* cond_expr = extract_cond_expr(cursor->cond());
                 Expression* curr_selector = nullptr;
                 std::string curr_selector_fp;
@@ -166,11 +300,18 @@ public:
 
 class MissingCaseFinderCondition {
 public:
-    static void run(DecompilerArena& arena, SeqNode* seq) {
+    static void run(
+        DecompilerArena& arena,
+        SeqNode* seq,
+        const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+    ) {
         if (!seq) return;
         for (AstNode* node : seq->mutable_nodes()) {
             auto* sw = ast_dyn_cast<SwitchNode>(node);
             if (!sw) continue;
+
+            const logos::LogicCondition* switch_reaching =
+                reaching_condition_for_ast_node(reaching_conditions, sw);
 
             Expression* switch_expr = extract_cond_expr(sw->cond());
             if (!switch_expr) continue;
@@ -180,6 +321,12 @@ public:
             for (CaseNode* c : sw->cases()) {
                 auto* nested_if = ast_dyn_cast<IfNode>(c->body());
                 if (!nested_if) continue;
+
+                const logos::LogicCondition* nested_reaching =
+                    reaching_condition_for_ast_node(reaching_conditions, nested_if);
+                if (!condition_can_belong_to_switch(switch_reaching, nested_reaching)) {
+                    continue;
+                }
 
                 Expression* nested_selector = nullptr;
                 std::string nested_fp;
@@ -209,11 +356,18 @@ public:
 
 class SwitchExtractor {
 public:
-    static void run(DecompilerArena& arena, SeqNode* seq) {
+    static void run(
+        DecompilerArena& arena,
+        SeqNode* seq,
+        const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+    ) {
         if (!seq) return;
         for (AstNode*& node : seq->mutable_nodes()) {
             auto* wrapper_if = ast_dyn_cast<IfNode>(node);
             if (!wrapper_if) continue;
+
+            const logos::LogicCondition* wrapper_reaching =
+                reaching_condition_for_ast_node(reaching_conditions, wrapper_if);
 
             Expression* selector = nullptr;
             std::string selector_fp;
@@ -224,6 +378,12 @@ public:
 
             auto* inner_switch = ast_dyn_cast<SwitchNode>(wrapper_if->false_branch());
             if (!inner_switch) continue;
+
+            const logos::LogicCondition* switch_reaching =
+                reaching_condition_for_ast_node(reaching_conditions, inner_switch);
+            if (!condition_can_belong_to_switch(switch_reaching, wrapper_reaching)) {
+                continue;
+            }
 
             Expression* inner_selector = extract_cond_expr(inner_switch->cond());
             if (!inner_selector || expr_fingerprint(inner_selector) != selector_fp) continue;
@@ -245,13 +405,20 @@ public:
 
 class MissingCaseFinderIntersectingConstants {
 public:
-    static void run(DecompilerArena& arena, SeqNode* seq) {
+    static void run(
+        DecompilerArena& arena,
+        SeqNode* seq,
+        const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+    ) {
         if (!seq) return;
         std::vector<AstNode*>& nodes = seq->mutable_nodes();
         
         for (std::size_t i = 0; i < nodes.size(); ++i) {
             auto* sw = ast_dyn_cast<SwitchNode>(nodes[i]);
             if (!sw) continue;
+
+            const logos::LogicCondition* switch_reaching =
+                reaching_condition_for_ast_node(reaching_conditions, sw);
 
             Expression* switch_expr = extract_cond_expr(sw->cond());
             if (!switch_expr) continue;
@@ -266,6 +433,12 @@ public:
             while (j < nodes.size()) {
                 auto* if_node = ast_dyn_cast<IfNode>(nodes[j]);
                 if (!if_node) break;
+
+                const logos::LogicCondition* case_reaching =
+                    reaching_condition_for_ast_node(reaching_conditions, if_node);
+                if (!condition_can_belong_to_switch(switch_reaching, case_reaching)) {
+                    break;
+                }
                 
                 // If it is checking the same switch_expr via multiple OR conditions
                 // we can recover it. We need to check if the condition checks the same variable.
@@ -332,13 +505,20 @@ private:
 
 class MissingCaseFinderSequence {
 public:
-    static void run(DecompilerArena& arena, SeqNode* seq) {
+    static void run(
+        DecompilerArena& arena,
+        SeqNode* seq,
+        const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+    ) {
         if (!seq) return;
         std::vector<AstNode*>& nodes = seq->mutable_nodes();
 
         for (std::size_t i = 0; i < nodes.size(); ++i) {
             auto* sw = ast_dyn_cast<SwitchNode>(nodes[i]);
             if (!sw) continue;
+
+            const logos::LogicCondition* switch_reaching =
+                reaching_condition_for_ast_node(reaching_conditions, sw);
 
             Expression* switch_expr = extract_cond_expr(sw->cond());
             if (!switch_expr) continue;
@@ -348,6 +528,12 @@ public:
             while (j < nodes.size()) {
                 auto* if_node = ast_dyn_cast<IfNode>(nodes[j]);
                 if (!if_node) break;
+
+                const logos::LogicCondition* case_reaching =
+                    reaching_condition_for_ast_node(reaching_conditions, if_node);
+                if (!condition_can_belong_to_switch(switch_reaching, case_reaching)) {
+                    break;
+                }
 
                 Expression* selector = nullptr;
                 std::string selector_fp;
@@ -536,21 +722,25 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
     return node;
 }
 
-AstNode* refine_condition_aware_recursive(DecompilerArena& arena, AstNode* node) {
+AstNode* refine_condition_aware_recursive(
+    DecompilerArena& arena,
+    AstNode* node,
+    const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+) {
     if (!node) {
         return nullptr;
     }
 
     if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
         for (AstNode*& child : seq->mutable_nodes()) {
-            child = refine_condition_aware_recursive(arena, child);
+            child = refine_condition_aware_recursive(arena, child, reaching_conditions);
         }
 
-        InitialSwitchNodeConstructor::run(arena, seq);
-        MissingCaseFinderCondition::run(arena, seq);
-        SwitchExtractor::run(arena, seq);
-        MissingCaseFinderSequence::run(arena, seq);
-        MissingCaseFinderIntersectingConstants::run(arena, seq);
+        InitialSwitchNodeConstructor::run(arena, seq, reaching_conditions);
+        MissingCaseFinderCondition::run(arena, seq, reaching_conditions);
+        SwitchExtractor::run(arena, seq, reaching_conditions);
+        MissingCaseFinderSequence::run(arena, seq, reaching_conditions);
+        MissingCaseFinderIntersectingConstants::run(arena, seq, reaching_conditions);
 
         for (AstNode* child : seq->mutable_nodes()) {
             if (auto* sw = ast_dyn_cast<SwitchNode>(child)) {
@@ -560,33 +750,33 @@ AstNode* refine_condition_aware_recursive(DecompilerArena& arena, AstNode* node)
 
         AstNode* rewritten = rewrite_guarded_do_while(arena, seq);
         if (rewritten != node) {
-            return refine_condition_aware_recursive(arena, rewritten);
+            return refine_condition_aware_recursive(arena, rewritten, reaching_conditions);
         }
         return rewritten;
     }
 
     if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        if_node->set_cond(refine_condition_aware_recursive(arena, if_node->cond()));
-        if_node->set_true_branch(refine_condition_aware_recursive(arena, if_node->true_branch()));
-        if_node->set_false_branch(refine_condition_aware_recursive(arena, if_node->false_branch()));
+        if_node->set_cond(refine_condition_aware_recursive(arena, if_node->cond(), reaching_conditions));
+        if_node->set_true_branch(refine_condition_aware_recursive(arena, if_node->true_branch(), reaching_conditions));
+        if_node->set_false_branch(refine_condition_aware_recursive(arena, if_node->false_branch(), reaching_conditions));
         return if_node;
     }
 
     if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        loop->set_body(refine_condition_aware_recursive(arena, loop->body()));
+        loop->set_body(refine_condition_aware_recursive(arena, loop->body(), reaching_conditions));
         return loop;
     }
 
     if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
         for (CaseNode* c : sw->mutable_cases()) {
-            c->set_body(refine_condition_aware_recursive(arena, c->body()));
+            c->set_body(refine_condition_aware_recursive(arena, c->body(), reaching_conditions));
         }
         sw->mutable_cases() = CaseDependencyGraph::order_cases(sw->cases());
         return sw;
     }
 
     if (auto* c = ast_dyn_cast<CaseNode>(node)) {
-        c->set_body(refine_condition_aware_recursive(arena, c->body()));
+        c->set_body(refine_condition_aware_recursive(arena, c->body(), reaching_conditions));
         return c;
     }
 
@@ -602,8 +792,7 @@ AstNode* ConditionAwareRefinement::refine(
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
 ) {
     (void)ctx;
-    (void)reaching_conditions;
-    return refine_condition_aware_recursive(arena, root);
+    return refine_condition_aware_recursive(arena, root, reaching_conditions);
 }
 
 } // namespace aletheia
