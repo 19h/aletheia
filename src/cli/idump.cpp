@@ -320,6 +320,9 @@ void apply_variable_naming(aletheia::DecompilerTask& task) {
     }
     aletheia::LoopNameGenerator::apply_for_loop_counters(task.ast());
     aletheia::LoopNameGenerator::apply_while_loop_counters(task.ast());
+    // Remove self-assignments that become visible after rename collapses
+    // different SSA versions of the same register to the same name.
+    aletheia::VariableNameGeneration::remove_self_assignments(task.cfg());
 }
 
 std::string block_label(const aletheia::BasicBlock* block) {
@@ -745,9 +748,7 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     fallback_task.set_ast(std::move(fallback_ast));
 
     aletheia::InstructionLengthHandler::apply(fallback_task.ast(), fallback_task.arena());
-    if (env_flag_enabled("ALETHEIA_IDUMP_RENAME_FALLBACK")) {
-        apply_variable_naming(fallback_task);
-    }
+    apply_variable_naming(fallback_task);
 
     return generate_cfg_fallback_code(fallback_task);
 }

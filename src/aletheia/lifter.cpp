@@ -65,12 +65,33 @@ std::string sanitize_identifier(std::string text) {
     return text;
 }
 
+// Strip IDA's auto-generated address-prefix naming convention.
+// Pattern: __<8+ hex digits><name>__  →  <name>
+// Example: __0000000000000748grub_errno__  →  grub_errno
+std::string strip_ida_address_prefix(const std::string& name) {
+    if (name.size() < 6) return name;
+    if (name[0] != '_' || name[1] != '_') return name;
+    if (name.size() < 4 || name[name.size() - 1] != '_' || name[name.size() - 2] != '_') return name;
+
+    // Count hex digits after the leading "__"
+    std::size_t i = 2;
+    while (i < name.size() && std::isxdigit(static_cast<unsigned char>(name[i]))) ++i;
+
+    // Must have consumed at least 8 hex digits, and remaining is <name>__
+    const std::size_t hex_count = i - 2;
+    if (hex_count >= 8 && i < name.size() - 2) {
+        std::string inner = name.substr(i, name.size() - i - 2);  // strip trailing __
+        if (!inner.empty()) return inner;
+    }
+    return name;
+}
+
 std::string global_name_from_operand(const ida::instruction::Operand& op, ida::Address insn_addr) {
     auto op_text = ida::instruction::operand_text(insn_addr, op.index());
     if (op_text) {
         std::string sanitized = sanitize_identifier(*op_text);
         if (!sanitized.empty()) {
-            return sanitized;
+            return strip_ida_address_prefix(sanitized);
         }
     }
     return hex_address_name(op.value());

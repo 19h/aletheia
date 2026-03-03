@@ -234,7 +234,9 @@ void remove_identity_assignments(ControlFlowGraph& cfg) {
             if (assign != nullptr) {
                 auto* dst = dyn_cast<Variable>(assign->destination());
                 auto* src = dyn_cast<Variable>(assign->value());
-                if (dst != nullptr && src != nullptr && dst == src) {
+                if (dst != nullptr && src != nullptr
+                    && (dst == src || (dst->name() == src->name()
+                                      && dst->ssa_version() == src->ssa_version()))) {
                     continue;
                 }
             }

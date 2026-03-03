@@ -68,6 +68,11 @@ specific pipeline stage and source location:
 - [x] Fix 4: bb_0 suppression -- no labels for single-block straight-line functions
 - [x] Fix 5: ARM arg count -- prototype-based arg injection, 0 fallback
 - [x] Fix 6: Variable naming -- extended register coverage, parameter inference
+- [x] Fix 7: Conservative fallback rename -- removed env var gate, always rename
+- [x] Fix 8: IDA address-prefix stripping -- `__0000000000000748grub_errno__` -> `grub_errno`
+- [x] Fix 9: Self-assignment elimination -- post-rename + post-simplification + SSA identity fix
+- [x] Fix 10: Call target rename scoping -- only GlobalVariable targets skip rename
+- [x] Fix 11: ARM param register bound -- x0-x7 only, x8+ treated as temporaries
 - [x] All unit tests pass (3/3)
 - [x] `idump testbin` produces 10/10 functions
 - [x] `idump tests/targets/test_binary` produces 6/6 functions, no bb_0 on simple functions
@@ -81,4 +86,9 @@ specific pipeline stage and source location:
 | Cast types | `(cast)*(tmp_3)` | `(unsigned int)*(tmp_3)` |
 | bb_0 labels | `bb_0:` on simple functions | No label on single-block functions |
 | ARM args | `func(x0,x1,x2,x3,x4,x5,x6,x7)` | `func()` or `func(tmp_0)` |
-| Self-OR | `tmp_5 ^= tmp_1` | `tmp_5 = tmp_5` (then further simplified) |
+| Self-OR | `x \| x` in expressions | Simplified to `x` |
+| Register names | `eax, ecx, edx, esi, r8d, rax` | `tmp_N, arg_N` |
+| Extern mangling | `__0000000000000748grub_errno__` | `grub_errno` |
+| Self-assignments | `tmp_4 = tmp_4` | Eliminated |
+| Call targets | `rax()` (raw register) | `tmp_3()` (renamed temporary) |
+| ARM x16 | `arg_16` (wrong param) | `tmp_0` (temporary) |

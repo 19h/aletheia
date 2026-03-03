@@ -71,8 +71,11 @@ bool is_all_digits(std::string_view text) {
 }
 
 std::optional<int> infer_parameter_index_from_register_name(std::string_view name) {
+    // AArch64 AAPCS: x0-x7 / w0-w7 are parameter registers.
     if ((name.starts_with("x") || name.starts_with("w")) && is_all_digits(name.substr(1))) {
-        return std::stoi(std::string(name.substr(1)));
+        int index = std::stoi(std::string(name.substr(1)));
+        if (index <= 7) return index;
+        return std::nullopt;  // x8+ / w8+ are not parameter registers
     }
 
     // System V AMD64 ABI: rdi, rsi, rdx, rcx, r8, r9
@@ -343,9 +346,13 @@ void rename_expression(Expression* expr, RenameState& state) {
     }
 
     if (auto* op = dyn_cast<Operation>(expr)) {
-        // For Call nodes, skip renaming the target (operand 0) if it is
-        // a resolved function name (GlobalVariable) — rename only the args.
+        // For Call nodes, skip renaming the target (operand 0) only if it is
+        // a resolved function name (GlobalVariable). Rename regular Variable
+        // targets (indirect calls through registers) normally.
         if (auto* call = dyn_cast<Call>(op)) {
+            if (!isa<GlobalVariable>(call->target())) {
+                rename_expression(call->target(), state);
+            }
             for (std::size_t i = 0; i < call->arg_count(); ++i) {
                 rename_expression(call->arg(i), state);
             }
@@ -452,6 +459,30 @@ void VariableNameGeneration::apply_to_cfg(ControlFlowGraph* cfg) {
         if (!block) continue;
         for (Instruction* inst : block->instructions()) {
             rename_instruction(inst, state);
+        }
+    }
+}
+
+void VariableNameGeneration::remove_self_assignments(ControlFlowGraph* cfg) {
+    if (!cfg) return;
+    for (BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        std::vector<Instruction*> filtered;
+        filtered.reserve(block->instructions().size());
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                auto* dst = dyn_cast<Variable>(assign->destination());
+                auto* src = dyn_cast<Variable>(assign->value());
+                if (dst && src
+                    && dst->name() == src->name()
+                    && dst->ssa_version() == src->ssa_version()) {
+                    continue;  // skip self-assignment
+                }
+            }
+            filtered.push_back(inst);
+        }
+        if (filtered.size() != block->instructions().size()) {
+            block->set_instructions(std::move(filtered));
         }
     }
 }

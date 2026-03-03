@@ -3566,6 +3566,26 @@ void ExpressionSimplificationStage::execute(DecompilerTask& task) {
             simplify_instruction_constants(task, inst);
         }
         (void)collapse_linear_offset_chains(task, block);
+
+        // Remove self-assignments created by simplification (e.g. x|x -> x
+        // produces "x = x" which is dead code).
+        std::vector<Instruction*> filtered;
+        filtered.reserve(block->instructions().size());
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                auto* dst = dyn_cast<Variable>(assign->destination());
+                auto* src = dyn_cast<Variable>(assign->value());
+                if (dst && src
+                    && dst->name() == src->name()
+                    && dst->ssa_version() == src->ssa_version()) {
+                    continue;  // skip self-assignment
+                }
+            }
+            filtered.push_back(inst);
+        }
+        if (filtered.size() != block->instructions().size()) {
+            block->set_instructions(std::move(filtered));
+        }
     }
 }
 
