@@ -33,19 +33,19 @@ unsigned long _nested_cfg() {
 }
 
 int _main(int a1, const char ** a2, const char ** a3) {
-    int tmp_0, tmp_1, tmp_2, tmp_3, tmp_4, tmp_9;
-    unsigned long tmp_10, tmp_5, tmp_6, tmp_7, tmp_8;
+    int tmp_0, tmp_1, tmp_10, tmp_2, tmp_3, tmp_4, tmp_5;
+    unsigned long tmp_11, tmp_6, tmp_7, tmp_8, tmp_9;
 
-    tmp_0 = tmp_0();
     tmp_0 = tmp_1();
     tmp_0 = tmp_2();
     tmp_0 = tmp_3();
-    *(tmp_4) = tmp_5;
-    *(tmp_4) = tmp_6;
-    *(tmp_4) = tmp_7;
-    *(tmp_4) = tmp_8;
-    tmp_0 = tmp_9(tmp_0);
-    return tmp_10;
+    tmp_0 = tmp_4();
+    *(tmp_5) = tmp_6;
+    *(tmp_5) = tmp_7;
+    *(tmp_5) = tmp_8;
+    *(tmp_5) = tmp_9;
+    tmp_2 = tmp_10(tmp_0);
+    return tmp_11;
 }
 
 int _printf(const char * a1) {

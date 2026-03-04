@@ -359,18 +359,32 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             Instruction* inst = *it;
             VarSet defs;
             VarSet reqs;
+            bool has_call_value = false;
             for (const VarKey& k : keys_from_variables(inst->definitions())) {
                 defs.insert(k);
             }
             for (const VarKey& k : keys_from_variables(inst->requirements())) {
                 reqs.insert(k);
             }
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                if (dyn_cast<Call>(assign->value()) != nullptr) {
+                    has_call_value = true;
+                } else if (auto* op = dyn_cast<Operation>(assign->value())) {
+                    has_call_value = op->type() == OperationType::call;
+                }
+            }
 
             const std::vector<VarKey> sorted_defs = sorted_var_keys(defs);
+            const std::vector<VarKey> sorted_reqs = sorted_var_keys(reqs);
             const std::vector<VarKey> sorted_current = sorted_var_keys(current);
             for (const VarKey& d : sorted_defs) {
                 for (const VarKey& live : sorted_current) {
                     add_edge(interference, d, live);
+                }
+                if (has_call_value) {
+                    for (const VarKey& r : sorted_reqs) {
+                        add_edge(interference, d, r);
+                    }
                 }
             }
             for (const VarKey& d : sorted_defs) {

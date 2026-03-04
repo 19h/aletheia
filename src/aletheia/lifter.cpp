@@ -1903,13 +1903,20 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
                 }
             }
         }
+        if (auto* target_var = dyn_cast<Variable>(target)) {
+            const std::string target_name = to_lower_ascii(target_var->name());
+            if (target_name == "rax" || target_name == "eax"
+                || target_name == "ax" || target_name == "al") {
+                target = arena_.create<Variable>("rax_call_target", 8);
+            }
+        }
         std::vector<Expression*> args;
         for (size_t i = 1; i < operands.size(); ++i) {
             args.push_back(operands[i]);
         }
         auto* call = arena_.create<Call>(target, std::move(args), 8);
-        // Call result assigned to a synthetic return-value variable
-        auto* ret_var = arena_.create<Variable>("ret", 8);
+        // x86-64 integer/pointer return is carried in RAX.
+        auto* ret_var = arena_.create<Variable>("rax", 8);
         auto* assign = arena_.create<Assignment>(ret_var, call);
         assign->set_address(addr);
         return assign;

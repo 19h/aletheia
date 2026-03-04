@@ -227,6 +227,14 @@ void build_interference(ControlFlowGraph& cfg,
         auto insts = block->instructions();
         for (auto it = insts.rbegin(); it != insts.rend(); ++it) {
             Instruction* inst = *it;
+            bool has_call_value = false;
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                if (dyn_cast<Call>(assign->value()) != nullptr) {
+                    has_call_value = true;
+                } else if (auto* op = dyn_cast<Operation>(assign->value())) {
+                    has_call_value = op->type() == OperationType::call;
+                }
+            }
 
             VarSet defs;
             for (const VarKey& k : keys_from_variables(inst->definitions())) {
@@ -241,6 +249,11 @@ void build_interference(ControlFlowGraph& cfg,
             for (const VarKey& d : defs) {
                 for (const VarKey& live : current) {
                     add_edge(interference, d, live);
+                }
+                if (has_call_value) {
+                    for (const VarKey& r : reqs) {
+                        add_edge(interference, d, r);
+                    }
                 }
             }
             for (const VarKey& d : defs) {
