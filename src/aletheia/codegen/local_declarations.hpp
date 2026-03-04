@@ -245,6 +245,18 @@ private:
 class GlobalDeclarationGenerator {
 public:
     static std::vector<std::string> generate(DecompilerTask& task) {
+        auto is_valid_identifier = [](const std::string& name) {
+            if (name.empty()) return false;
+            const unsigned char first = static_cast<unsigned char>(name.front());
+            if (!(std::isalpha(first) || first == '_')) return false;
+            for (unsigned char c : name) {
+                if (!(std::isalnum(c) || c == '_')) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
         GlobalVariableCollector collector;
         if (task.ast() && task.ast()->root()) {
             collector.traverse(task.ast()->root());
@@ -259,6 +271,9 @@ public:
 
         std::vector<std::string> decls;
         for (const auto& [name, gv] : globals_by_name) {
+            if (!is_valid_identifier(name)) {
+                continue;
+            }
             std::string type_str = "int";
             if (gv->ir_type()) {
                 type_str = gv->ir_type()->to_string();

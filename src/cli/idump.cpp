@@ -774,17 +774,21 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
     pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationStage>());
     pipeline.add_stage(std::make_unique<aletheia::BitFieldComparisonUnrollingStage>());
     pipeline.add_stage(std::make_unique<aletheia::TypePropagationStage>());
-    pipeline.add_stage(std::make_unique<aletheia::DeadPathEliminationStage>());
-    pipeline.add_stage(std::make_unique<aletheia::DeadLoopEliminationStage>());
+    // NOTE: Temporarily disable aggressive dead path/loop pruning here because
+    // it can prune semantically relevant validation/base-case paths before
+    // sink-definition repair and structuring complete.
     pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationMemoryStage>());
     pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationFunctionCallStage>());
     pipeline.add_stage(std::make_unique<aletheia::DeadCodeEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::SinkDefinitionRepairStage>());
+    pipeline.add_stage(std::make_unique<aletheia::VoidReturnNormalizationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::ReturnDefinitionSanityStage>());
     pipeline.add_stage(std::make_unique<aletheia::RedundantCastsEliminationStage>());
     pipeline.add_stage(std::make_unique<aletheia::IdentityEliminationStage>());
     pipeline.add_stage(std::make_unique<aletheia::CommonSubexpressionEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::AddressResolutionStage>());
     pipeline.add_stage(std::make_unique<aletheia::ArrayAccessDetectionStage>());
     pipeline.add_stage(std::make_unique<aletheia::ExpressionSimplificationStage>());
-    pipeline.add_stage(std::make_unique<aletheia::AddressResolutionStage>());
     pipeline.add_stage(std::make_unique<aletheia::DeadComponentPrunerStage>());
     pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
     pipeline.add_stage(std::make_unique<aletheia::EdgePrunerStage>());

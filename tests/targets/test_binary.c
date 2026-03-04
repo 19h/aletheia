@@ -32,10 +32,9 @@ unsigned long _nested_cfg() {
     return tmp_1;
 }
 
-extern const int "%d %d %d %d\n";
-
 int _main(int a1, char ** a2, char ** a3) {
-    unsigned long tmp_0, tmp_1, tmp_2, tmp_3, tmp_4;
+    int tmp_4;
+    unsigned long tmp_0, tmp_1, tmp_2, tmp_3, tmp_5;
 
     a1 = _simple_math();
     a1 = _diamond_cfg();
@@ -45,14 +44,14 @@ int _main(int a1, char ** a2, char ** a3) {
     *(tmp_0) = tmp_2;
     *(tmp_0) = tmp_3;
     *(tmp_0) = a1;
-    a1 = _printf("%d %d %d %d\n");
-    return tmp_4;
+    tmp_4 = _printf("%d %d %d %d\n");
+    return 0x0;
 }
 
 int _printf(char * a1) {
     unsigned long tmp_0;
 
-    tmp_0 = *(0x100004000UL);
+    tmp_0 = *(_printf_ptr);
     /* indirect branch tmp_0 */
 }
 

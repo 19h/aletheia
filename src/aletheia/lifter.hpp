@@ -57,6 +57,15 @@ private:
     /// Populated from IDA register_variables() during populate_task_signature().
     std::unordered_map<std::string, std::string> regvar_alias_map_;
 
+    /// Best-effort count of the current function's logical parameters.
+    /// Used as a fallback for recursive arm64 BL argument injection when
+    /// prototypes are unavailable.
+    std::size_t current_function_param_count_hint_ = 0;
+
+    /// True when the current function's first logical argument is a 32-bit
+    /// integer-like value and recursive calls should prefer wN argument regs.
+    bool current_function_prefers_w_args_ = false;
+
     BasicBlock* process_block(const ida::graph::BasicBlock& ida_block, std::unordered_map<ida::Address, BasicBlock*>& block_map);
     Instruction* lift_instruction(const ida::instruction::Instruction& insn);
     

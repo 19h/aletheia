@@ -63,6 +63,33 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+/// Validates that variables used by Return instructions have at least one
+/// dominating reaching definition (or are parameters). Fails the pipeline when
+/// this invariant is violated.
+class ReturnDefinitionSanityStage : public PipelineStage {
+public:
+    const char* name() const override { return "ReturnDefinitionSanity"; }
+    void execute(DecompilerTask& task) override;
+};
+
+/// Repairs missing/non-dominating definitions for variables consumed by
+/// branch conditions and return values by inserting conservative SSA bridge
+/// assignments before the sink use sites.
+class SinkDefinitionRepairStage : public PipelineStage {
+public:
+    const char* name() const override { return "SinkDefinitionRepair"; }
+    void execute(DecompilerTask& task) override;
+};
+
+/// For functions explicitly typed as void, clear accidental return values in
+/// CFG Return nodes so downstream codegen does not infer a non-void signature
+/// from disconnected temporaries.
+class VoidReturnNormalizationStage : public PipelineStage {
+public:
+    const char* name() const override { return "VoidReturnNormalization"; }
+    void execute(DecompilerTask& task) override;
+};
+
 class RedundantCastsEliminationStage : public PipelineStage {
 public:
     const char* name() const override { return "RedundantCastsElimination"; }

@@ -21,6 +21,11 @@ static void extract_uses(Expression* expr, std::unordered_set<std::string>& uses
     }
 }
 
+static std::string var_key_string(Variable* v) {
+    if (!v) return {};
+    return v->name() + "_" + std::to_string(v->ssa_version());
+}
+
 
 // recursively check for calls
 static bool contains_call(Expression* expr) {
@@ -64,11 +69,19 @@ void DeadCodeEliminationStage::execute(DecompilerTask& task) {
         changed = false;
         
         std::unordered_set<std::string> global_uses;
+        std::unordered_map<std::string, Assignment*> def_of;
+
+        // Track direct sink requirements (branch conditions + return values)
+        // and preserve the whole def-use chain feeding those sinks.
+        std::unordered_set<std::string> sink_roots;
 
         // Pass 1: Collect all variable uses across the CFG
         for (BasicBlock* bb : task.cfg()->blocks()) {
             for (Instruction* inst : bb->instructions()) {
                 if (auto* assign = dyn_cast<Assignment>(inst)) {
+                    if (auto* dst = dyn_cast<Variable>(assign->destination())) {
+                        def_of[var_key_string(dst)] = assign;
+                    }
                     // Uses from the RHS
                     extract_uses(assign->value(), global_uses);
                     // If destination is a complex expression (e.g., deref), its
@@ -78,9 +91,19 @@ void DeadCodeEliminationStage::execute(DecompilerTask& task) {
                     }
                 } else if (auto* branch = dyn_cast<Branch>(inst)) {
                     extract_uses(branch->condition(), global_uses);
+                    std::unordered_set<Variable*> reqs;
+                    branch->collect_requirements(reqs);
+                    for (Variable* req : reqs) {
+                        sink_roots.insert(var_key_string(req));
+                    }
                 } else if (auto* ret = dyn_cast<Return>(inst)) {
                     for (auto* val : ret->values()) {
                         extract_uses(val, global_uses);
+                    }
+                    std::unordered_set<Variable*> reqs;
+                    ret->collect_requirements(reqs);
+                    for (Variable* req : reqs) {
+                        sink_roots.insert(var_key_string(req));
                     }
                 } else if (auto* phi = dyn_cast<Phi>(inst)) {
                     // Phi operands are uses
@@ -89,6 +112,31 @@ void DeadCodeEliminationStage::execute(DecompilerTask& task) {
                     }
                 }
                 // Break, Continue, Comment have no variable references
+            }
+        }
+
+        std::unordered_set<std::string> protected_defs;
+        std::vector<std::string> stack(sink_roots.begin(), sink_roots.end());
+        while (!stack.empty()) {
+            const std::string current = stack.back();
+            stack.pop_back();
+            if (current.empty() || protected_defs.contains(current)) {
+                continue;
+            }
+            protected_defs.insert(current);
+
+            auto it = def_of.find(current);
+            if (it == def_of.end() || !it->second) {
+                continue;
+            }
+
+            std::unordered_set<Variable*> rhs_reqs;
+            it->second->collect_requirements(rhs_reqs);
+            for (Variable* req : rhs_reqs) {
+                const std::string dep = var_key_string(req);
+                if (!dep.empty() && !protected_defs.contains(dep)) {
+                    stack.push_back(dep);
+                }
             }
         }
 
@@ -105,6 +153,11 @@ void DeadCodeEliminationStage::execute(DecompilerTask& task) {
                     
                     if (auto* target = dyn_cast<Variable>(assign->destination())) {
                         std::string def_name = target->name() + "_" + std::to_string(target->ssa_version());
+
+                        if (protected_defs.contains(def_name)) {
+                            new_insts.push_back(inst);
+                            continue;
+                        }
                         
                         // Don't eliminate definitions of special registers (return values, stack pointer)
                         if (!global_uses.contains(def_name) && 
