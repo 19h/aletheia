@@ -16,6 +16,7 @@
 #include "../aletheia/structuring/variable_name_generation.hpp"
 #include "../aletheia/structuring/loop_name_generator.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -457,27 +458,99 @@ void emit_inline_branch_snapshot(
     path.erase(block);
 }
 
+std::string lowercase_copy(const std::string& text) {
+    std::string out = text;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+struct ParameterDisplayInfo {
+    std::unordered_map<std::string, std::string> expr_name_map;
+    std::unordered_map<int, std::string> index_to_name;
+};
+
+ParameterDisplayInfo build_parameter_display_info(const aletheia::DecompilerTask& task) {
+    ParameterDisplayInfo info;
+
+    for (const auto& [reg, param] : task.parameter_registers()) {
+        auto it = info.index_to_name.find(param.index);
+        if (it == info.index_to_name.end() || param.name.size() > it->second.size()) {
+            info.index_to_name[param.index] = param.name;
+        }
+    }
+
+    for (const auto& [reg, param] : task.parameter_registers()) {
+        std::string chosen = param.name;
+        auto best_it = info.index_to_name.find(param.index);
+        if (best_it != info.index_to_name.end() && !best_it->second.empty()) {
+            chosen = best_it->second;
+        }
+        info.expr_name_map[lowercase_copy(reg)] = chosen;
+    }
+
+    for (const auto& [idx, name] : info.index_to_name) {
+        info.expr_name_map["arg_" + std::to_string(idx)] = name;
+    }
+
+    return info;
+}
+
+bool is_declared_void_function(const aletheia::DecompilerTask& task) {
+    if (!task.function_type()) {
+        return true;
+    }
+
+    if (auto* func_type = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
+        return func_type->return_type() && func_type->return_type()->to_string() == "void";
+    }
+
+    return task.function_type()->to_string() == "void";
+}
+
+std::string infer_return_type_from_expression(aletheia::Expression* expr) {
+    if (expr && expr->ir_type()) {
+        return expr->ir_type()->to_string();
+    }
+
+    const std::size_t size = expr ? expr->size_bytes : 0;
+    switch (size) {
+        case 1: return "unsigned char";
+        case 2: return "unsigned short";
+        case 4: return "int";
+        case 8: return "long";
+        default: return "int";
+    }
+}
+
+aletheia::Expression* find_value_return_in_cfg(aletheia::ControlFlowGraph* cfg) {
+    if (!cfg) return nullptr;
+
+    for (aletheia::BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        for (aletheia::Instruction* inst : block->instructions()) {
+            auto* ret = aletheia::dyn_cast<aletheia::Return>(inst);
+            if (!ret || !ret->has_value() || ret->values().empty()) {
+                continue;
+            }
+            if (ret->values()[0]) {
+                return ret->values()[0];
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& task) {
     std::vector<std::string> lines;
     aletheia::CExpressionGenerator expr_gen;
 
     // Set up parameter display name mapping.
     // Include both raw register names AND post-rename "arg_N" names.
-    {
-        std::unordered_map<std::string, std::string> param_names;
-        std::unordered_map<int, std::string> best_per_index;
-        for (const auto& [reg, info] : task.parameter_registers()) {
-            param_names[reg] = info.name;
-            auto it = best_per_index.find(info.index);
-            if (it == best_per_index.end() || info.name.size() > it->second.size()) {
-                best_per_index[info.index] = info.name;
-            }
-        }
-        for (const auto& [idx, name] : best_per_index) {
-            param_names["arg_" + std::to_string(idx)] = name;
-        }
-        expr_gen.set_parameter_names(param_names);
-    }
+    const ParameterDisplayInfo param_display = build_parameter_display_info(task);
+    expr_gen.set_parameter_names(param_display.expr_name_map);
 
     auto global_decls = aletheia::GlobalDeclarationGenerator::generate(task);
     for (const auto& decl : global_decls) {
@@ -487,14 +560,22 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
         lines.push_back("");
     }
 
-    std::string sig = "void ";
+    std::string return_type = "void";
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
-            sig = func_type->return_type()->to_string() + " ";
+            return_type = func_type->return_type()->to_string();
         } else {
-            sig = task.function_type()->to_string() + " ";
+            return_type = task.function_type()->to_string();
         }
     }
+
+    if (is_declared_void_function(task)) {
+        if (aletheia::Expression* return_value = find_value_return_in_cfg(task.cfg())) {
+            return_type = infer_return_type_from_expression(return_value);
+        }
+    }
+
+    std::string sig = return_type + " ";
 
     std::string name = task.function_name().empty()
         ? "sub_" + std::to_string(task.function_address())
@@ -504,15 +585,10 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
             const auto& params = func_type->parameters();
-            // Build index -> name map from parameter_registers.
-            std::unordered_map<int, std::string> index_to_name;
-            for (const auto& [reg, info] : task.parameter_registers()) {
-                index_to_name[info.index] = info.name;
-            }
             for (std::size_t i = 0; i < params.size(); ++i) {
                 if (i > 0) sig += ", ";
-                auto it = index_to_name.find(static_cast<int>(i));
-                std::string pname = (it != index_to_name.end() && !it->second.empty())
+                auto it = param_display.index_to_name.find(static_cast<int>(i));
+                std::string pname = (it != param_display.index_to_name.end() && !it->second.empty())
                     ? it->second
                     : "a" + std::to_string(i + 1);
                 sig += params[i]->to_string() + " " + pname;

@@ -1,6 +1,7 @@
 #include "codegen.hpp"
 #include "local_declarations.hpp"
 #include <ida/lines.hpp>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -646,6 +647,159 @@ bool is_cfg_fallback_root(AstNode* root) {
     return true;
 }
 
+std::string lowercase_copy(const std::string& text) {
+    std::string out = text;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+struct ParameterDisplayInfo {
+    std::unordered_map<std::string, std::string> expr_name_map;
+    std::unordered_map<int, std::string> index_to_name;
+};
+
+ParameterDisplayInfo build_parameter_display_info(const DecompilerTask& task) {
+    ParameterDisplayInfo info;
+
+    for (const auto& [reg, param] : task.parameter_registers()) {
+        auto it = info.index_to_name.find(param.index);
+        if (it == info.index_to_name.end() || param.name.size() > it->second.size()) {
+            info.index_to_name[param.index] = param.name;
+        }
+    }
+
+    for (const auto& [reg, param] : task.parameter_registers()) {
+        std::string chosen = param.name;
+        auto best_it = info.index_to_name.find(param.index);
+        if (best_it != info.index_to_name.end() && !best_it->second.empty()) {
+            chosen = best_it->second;
+        }
+        info.expr_name_map[lowercase_copy(reg)] = chosen;
+    }
+
+    for (const auto& [idx, name] : info.index_to_name) {
+        info.expr_name_map["arg_" + std::to_string(idx)] = name;
+    }
+
+    return info;
+}
+
+bool is_declared_void_function(const DecompilerTask& task) {
+    if (!task.function_type()) {
+        return true;
+    }
+
+    if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
+        return func_type->return_type() && func_type->return_type()->to_string() == "void";
+    }
+
+    return task.function_type()->to_string() == "void";
+}
+
+std::string infer_return_type_from_expression(Expression* expr) {
+    if (expr && expr->ir_type()) {
+        return expr->ir_type()->to_string();
+    }
+
+    const std::size_t size = expr ? expr->size_bytes : 0;
+    switch (size) {
+        case 1: return "unsigned char";
+        case 2: return "unsigned short";
+        case 4: return "int";
+        case 8: return "long";
+        default: return "int";
+    }
+}
+
+Expression* find_value_return_in_cfg(ControlFlowGraph* cfg) {
+    if (!cfg) return nullptr;
+
+    for (BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        for (Instruction* inst : block->instructions()) {
+            auto* ret = dyn_cast<Return>(inst);
+            if (!ret || !ret->has_value() || ret->values().empty()) {
+                continue;
+            }
+            if (ret->values()[0]) {
+                return ret->values()[0];
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+Expression* find_value_return_in_ast(AstNode* root) {
+    if (!root) return nullptr;
+
+    SmallVector<AstNode*, 32> stack;
+    stack.push_back(root);
+
+    while (!stack.empty()) {
+        AstNode* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+
+        if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+            BasicBlock* block = code->block();
+            if (!block) continue;
+            for (Instruction* inst : block->instructions()) {
+                auto* ret = dyn_cast<Return>(inst);
+                if (!ret || !ret->has_value() || ret->values().empty()) {
+                    continue;
+                }
+                if (ret->values()[0]) {
+                    return ret->values()[0];
+                }
+            }
+            continue;
+        }
+
+        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+            for (AstNode* child : seq->nodes()) {
+                if (child) stack.push_back(child);
+            }
+            continue;
+        }
+
+        if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+            if (if_node->false_branch()) stack.push_back(if_node->false_branch());
+            if (if_node->true_branch()) stack.push_back(if_node->true_branch());
+            continue;
+        }
+
+        if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+            if (loop->body()) stack.push_back(loop->body());
+            continue;
+        }
+
+        if (auto* switch_node = ast_dyn_cast<SwitchNode>(node)) {
+            for (CaseNode* case_node : switch_node->cases()) {
+                if (case_node && case_node->body()) stack.push_back(case_node->body());
+            }
+            continue;
+        }
+
+        if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+            if (case_node->body()) stack.push_back(case_node->body());
+        }
+    }
+
+    return nullptr;
+}
+
+Expression* find_first_value_return(const DecompilerTask& task) {
+    if (task.ast() && task.ast()->root()) {
+        if (Expression* value = find_value_return_in_ast(task.ast()->root())) {
+            return value;
+        }
+    }
+    return find_value_return_in_cfg(task.cfg());
+}
+
 std::string format_unknown_operation(Operation* o, CExpressionGenerator& gen, std::string_view placeholder_name) {
     std::string rendered = std::string(placeholder_name) + "(";
     if (o != nullptr) {
@@ -1044,25 +1198,8 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     // Include both raw register names AND post-rename "arg_N" names so that
     // variables renamed by VariableNameGeneration still resolve to the
     // prototype parameter name (e.g., "arg_0" → "cmd").
-    {
-        std::unordered_map<std::string, std::string> param_names;
-        // First pass: collect the best display name per parameter index.
-        // Prefer longer (more specific) names over "aN" defaults.
-        std::unordered_map<int, std::string> best_per_index;
-        for (const auto& [reg, info] : task.parameter_registers()) {
-            param_names[reg] = info.name;
-            auto it = best_per_index.find(info.index);
-            if (it == best_per_index.end() || info.name.size() > it->second.size()) {
-                best_per_index[info.index] = info.name;
-            }
-        }
-        // Second pass: map "arg_N" to the best display name for each index.
-        for (const auto& [idx, name] : best_per_index) {
-            std::string arg_key = "arg_" + std::to_string(idx);
-            param_names[arg_key] = name;
-        }
-        expr_gen_.set_parameter_names(param_names);
-    }
+    const ParameterDisplayInfo param_display = build_parameter_display_info(task);
+    expr_gen_.set_parameter_names(param_display.expr_name_map);
 
     auto global_decls = GlobalDeclarationGenerator::generate(task);
     for (const auto& decl : global_decls) {
@@ -1072,15 +1209,23 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
         lines_.push_back("");
     }
 
-    // Generate function signature
-    std::string sig = "void "; // default
+    // Generate function signature (with void->non-void reconciliation when needed)
+    std::string return_type = "void";
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
-            sig = func_type->return_type()->to_string() + " ";
+            return_type = func_type->return_type()->to_string();
         } else {
-            sig = task.function_type()->to_string() + " ";
+            return_type = task.function_type()->to_string();
         }
     }
+
+    if (is_declared_void_function(task)) {
+        if (Expression* return_value = find_first_value_return(task)) {
+            return_type = infer_return_type_from_expression(return_value);
+        }
+    }
+
+    std::string sig = return_type + " ";
 
     std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : task.function_name();
     sig += name + "(";
@@ -1088,15 +1233,10 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
             const auto& params = func_type->parameters();
-            // Build index -> name map from parameter_registers.
-            std::unordered_map<int, std::string> index_to_name;
-            for (const auto& [reg, info] : task.parameter_registers()) {
-                index_to_name[info.index] = info.name;
-            }
             for (size_t i = 0; i < params.size(); ++i) {
                 if (i > 0) sig += ", ";
-                auto it = index_to_name.find(static_cast<int>(i));
-                std::string pname = (it != index_to_name.end() && !it->second.empty())
+                auto it = param_display.index_to_name.find(static_cast<int>(i));
+                std::string pname = (it != param_display.index_to_name.end() && !it->second.empty())
                     ? it->second
                     : "a" + std::to_string(i + 1);
                 sig += params[i]->to_string() + " " + pname;

@@ -1802,6 +1802,104 @@ void test_codegen_if_branch_swapping() {
     std::cout << "[+] test_codegen_if_branch_swapping passed.\n";
 }
 
+void test_codegen_return_type_reconciliation() {
+    DecompilerTask task(0x7b10);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(915);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    task.set_function_name("f");
+    task.set_function_type(std::make_shared<const FunctionTypeDef>(
+        CustomType::void_type(),
+        std::vector<TypePtr>{}));
+
+    auto* x = task.arena().create<Variable>("x", 4);
+    x->set_ir_type(Integer::int32_t());
+    bb->add_instruction(task.arena().create<Assignment>(x, task.arena().create<Constant>(7, 4)));
+    bb->add_instruction(task.arena().create<Return>(std::vector<Expression*>{x}));
+
+    auto ast = std::make_unique<AbstractSyntaxForest>();
+    ast->set_root(task.arena().create<CodeNode>(bb));
+    task.set_ast(std::move(ast));
+
+    CodeVisitor visitor;
+    auto lines = visitor.generate_code(task);
+
+    ASSERT_TRUE(!lines.empty());
+    ASSERT_TRUE(lines[0].find("void f(") == std::string::npos);
+    ASSERT_TRUE(lines[0].find("int f(") != std::string::npos);
+
+    std::cout << "[+] test_codegen_return_type_reconciliation passed.\n";
+}
+
+void test_codegen_parameter_signature_body_name_coherence() {
+    DecompilerTask task(0x7b11);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(916);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    task.set_function_name("grub_cmd_do_search");
+    task.set_function_type(std::make_shared<const FunctionTypeDef>(
+        Integer::int32_t(),
+        std::vector<TypePtr>{
+            std::make_shared<const CustomType>("grub_command_t", 64),
+            Integer::int32_t(),
+            std::make_shared<const Pointer>(std::make_shared<const Pointer>(Integer::char_type()))
+        }));
+
+    task.set_parameter_register("rdi", {"cmd", 0, std::make_shared<const CustomType>("grub_command_t", 64)});
+    task.set_parameter_register("rsi", {"a2", 1, Integer::int32_t()});
+    task.set_parameter_register("esi", {"argc", 1, Integer::int32_t()});
+    task.set_parameter_register("rdx", {"a3", 2, std::make_shared<const Pointer>(std::make_shared<const Pointer>(Integer::char_type()))});
+    task.set_parameter_register("edx", {"args", 2, std::make_shared<const Pointer>(std::make_shared<const Pointer>(Integer::char_type()))});
+
+    auto* cmd_reg = task.arena().create<Variable>("rdi", 8);
+    auto* argc_var = task.arena().create<Variable>("arg_1", 4);
+    auto* args_reg = task.arena().create<Variable>("edx", 8);
+    auto* out = task.arena().create<Variable>("out", 4);
+
+    bb->add_instruction(task.arena().create<Assignment>(out, argc_var));
+    bb->add_instruction(task.arena().create<Assignment>(task.arena().create<Variable>("keep_cmd", 8), cmd_reg));
+    bb->add_instruction(task.arena().create<Assignment>(task.arena().create<Variable>("keep_args", 8), args_reg));
+    bb->add_instruction(task.arena().create<Return>(std::vector<Expression*>{out}));
+
+    auto ast = std::make_unique<AbstractSyntaxForest>();
+    ast->set_root(task.arena().create<CodeNode>(bb));
+    task.set_ast(std::move(ast));
+
+    CodeVisitor visitor;
+    auto lines = visitor.generate_code(task);
+    ASSERT_TRUE(!lines.empty());
+
+    const std::string& signature = lines[0];
+    ASSERT_TRUE(signature.find("grub_command_t cmd") != std::string::npos);
+    ASSERT_TRUE(signature.find("int argc") != std::string::npos);
+    ASSERT_TRUE(signature.find("char ** args") != std::string::npos);
+    ASSERT_TRUE(signature.find("a2") == std::string::npos);
+    ASSERT_TRUE(signature.find("a3") == std::string::npos);
+
+    bool body_has_cmd = false;
+    bool body_has_argc = false;
+    bool body_has_args = false;
+    for (const auto& line : lines) {
+        if (line.find("cmd") != std::string::npos) body_has_cmd = true;
+        if (line.find("argc") != std::string::npos) body_has_argc = true;
+        if (line.find("args") != std::string::npos) body_has_args = true;
+    }
+
+    ASSERT_TRUE(body_has_cmd);
+    ASSERT_TRUE(body_has_argc);
+    ASSERT_TRUE(body_has_args);
+
+    std::cout << "[+] test_codegen_parameter_signature_body_name_coherence passed.\n";
+}
+
 void test_array_access_detection_stage() {
     DecompilerTask task(0x7b00);
 
@@ -3349,6 +3447,172 @@ void test_identity_elimination_stage() {
     ASSERT_TRUE(found_out);
 
     std::cout << "[+] test_identity_elimination_stage passed.\n";
+}
+
+void test_expression_propagation_function_call_target_canonicalization() {
+    {
+        DecompilerTask task(0x7050);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(501);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* sym = task.arena().create<GlobalVariable>("resolved_symbol", 8);
+        auto* v0 = task.arena().create<Variable>("v0", 8);
+        auto* v1 = task.arena().create<Variable>("v1", 8);
+        auto* v2 = task.arena().create<Variable>("v2", 8);
+
+        bb->add_instruction(task.arena().create<Assignment>(v0, sym));
+        bb->add_instruction(task.arena().create<Assignment>(
+            v1,
+            task.arena().create<Operation>(OperationType::cast, std::vector<Expression*>{v0}, 8)));
+        bb->add_instruction(task.arena().create<Assignment>(v2, v1));
+
+        auto* out_call = task.arena().create<Variable>("out_call", 8);
+        auto* call_expr = task.arena().create<Call>(v2, std::vector<Expression*>{}, 8);
+        auto* call_assign = task.arena().create<Assignment>(out_call, call_expr);
+        bb->add_instruction(call_assign);
+
+        auto* out_legacy = task.arena().create<Variable>("out_legacy", 8);
+        auto* legacy_call = task.arena().create<Operation>(
+            OperationType::call,
+            std::vector<Expression*>{v2, task.arena().create<Constant>(7, 8)},
+            8);
+        auto* legacy_assign = task.arena().create<Assignment>(out_legacy, legacy_call);
+        bb->add_instruction(legacy_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* resolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(resolved_call != nullptr);
+        auto* resolved_call_target = dyn_cast<GlobalVariable>(resolved_call->target());
+        ASSERT_TRUE(resolved_call_target != nullptr);
+        ASSERT_EQ(resolved_call_target->name(), "resolved_symbol");
+
+        auto* resolved_legacy = dyn_cast<Operation>(legacy_assign->value());
+        ASSERT_TRUE(resolved_legacy != nullptr);
+        ASSERT_EQ(resolved_legacy->type(), OperationType::call);
+        auto* resolved_legacy_target = dyn_cast<GlobalVariable>(resolved_legacy->operands()[0]);
+        ASSERT_TRUE(resolved_legacy_target != nullptr);
+        ASSERT_EQ(resolved_legacy_target->name(), "resolved_symbol");
+    }
+
+    {
+        DecompilerTask task(0x7051);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(502);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* ptr = task.arena().create<Variable>("ptr", 8);
+        auto* u0 = task.arena().create<Variable>("u0", 8);
+        auto* u1 = task.arena().create<Variable>("u1", 8);
+
+        auto* load = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{ptr}, 8);
+        bb->add_instruction(task.arena().create<Assignment>(u0, load));
+        bb->add_instruction(task.arena().create<Assignment>(u1, u0));
+
+        auto* out_call = task.arena().create<Variable>("unsafe_call", 8);
+        auto* call_expr = task.arena().create<Call>(u1, std::vector<Expression*>{}, 8);
+        auto* call_assign = task.arena().create<Assignment>(out_call, call_expr);
+        bb->add_instruction(call_assign);
+
+        auto* out_legacy = task.arena().create<Variable>("unsafe_legacy", 8);
+        auto* legacy_call = task.arena().create<Operation>(OperationType::call, std::vector<Expression*>{u1}, 8);
+        auto* legacy_assign = task.arena().create<Assignment>(out_legacy, legacy_call);
+        bb->add_instruction(legacy_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* unresolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(unresolved_call != nullptr);
+        auto* unresolved_call_target = dyn_cast<Variable>(unresolved_call->target());
+        ASSERT_TRUE(unresolved_call_target != nullptr);
+        ASSERT_EQ(unresolved_call_target->name(), "u1");
+
+        auto* unresolved_legacy = dyn_cast<Operation>(legacy_assign->value());
+        ASSERT_TRUE(unresolved_legacy != nullptr);
+        ASSERT_EQ(unresolved_legacy->type(), OperationType::call);
+        auto* unresolved_legacy_target = dyn_cast<Variable>(unresolved_legacy->operands()[0]);
+        ASSERT_TRUE(unresolved_legacy_target != nullptr);
+        ASSERT_EQ(unresolved_legacy_target->name(), "u1");
+    }
+
+    {
+        DecompilerTask task(0x7052);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(503);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* sym = task.arena().create<GlobalVariable>("phi_resolved", 8);
+        auto* left = task.arena().create<Variable>("left", 8);
+        auto* right = task.arena().create<Variable>("right", 8);
+        auto* merged = task.arena().create<Variable>("merged", 8);
+
+        bb->add_instruction(task.arena().create<Assignment>(left, sym));
+        bb->add_instruction(task.arena().create<Assignment>(right, sym));
+
+        auto* phi_ops = task.arena().create<ListOperation>(std::vector<Expression*>{left, right});
+        bb->add_instruction(task.arena().create<Phi>(merged, phi_ops));
+
+        auto* out_call = task.arena().create<Variable>("phi_call", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(merged, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* resolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(resolved_call != nullptr);
+        auto* resolved_target = dyn_cast<GlobalVariable>(resolved_call->target());
+        ASSERT_TRUE(resolved_target != nullptr);
+        ASSERT_EQ(resolved_target->name(), "phi_resolved");
+    }
+
+    {
+        DecompilerTask task(0x7053);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(504);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* sym = task.arena().create<GlobalVariable>("mem_resolved", 8);
+        auto* slot = task.arena().create<GlobalVariable>("global_slot", 8, sym, true);
+        auto* loaded = task.arena().create<Variable>("loaded", 8);
+
+        auto* load_expr = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{slot}, 8);
+        bb->add_instruction(task.arena().create<Assignment>(loaded, load_expr));
+
+        auto* out_call = task.arena().create<Variable>("mem_call", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(loaded, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* resolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(resolved_call != nullptr);
+        auto* resolved_target = dyn_cast<GlobalVariable>(resolved_call->target());
+        ASSERT_TRUE(resolved_target != nullptr);
+        ASSERT_EQ(resolved_target->name(), "mem_resolved");
+    }
+
+    std::cout << "[+] test_expression_propagation_function_call_target_canonicalization passed.\n";
 }
 
 void test_common_subexpression_existing_replacer_stage() {
@@ -5167,6 +5431,8 @@ int main() {
     test_codegen_unknown_operation_placeholder();
     test_codegen_fallback_branch_marker();
     test_codegen_if_branch_swapping();
+    test_codegen_return_type_reconciliation();
+    test_codegen_parameter_signature_body_name_coherence();
     test_array_access_detection_stage();
     test_global_variable_declarations();
     test_variable_name_generation_default();
@@ -5207,6 +5473,7 @@ int main() {
     test_insert_missing_definitions_stage();
     test_phi_function_fixer_stage();
     test_identity_elimination_stage();
+    test_expression_propagation_function_call_target_canonicalization();
     test_common_subexpression_existing_replacer_stage();
     test_common_subexpression_definition_generator_stage();
     test_edge_pruner_stage();

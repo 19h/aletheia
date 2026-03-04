@@ -555,6 +555,280 @@ struct PhiIdentityInfo {
     std::vector<VarKey> operands;
 };
 
+using AssignmentDefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
+
+static constexpr std::size_t MAX_CALL_TARGET_ALIAS_DEPTH = 8;
+
+static Expression* strip_trivial_casts(Expression* expr) {
+    Expression* current = expr;
+    while (auto* op = dyn_cast<Operation>(current)) {
+        if (op->type() != OperationType::cast || op->operands().size() != 1 || op->operands()[0] == nullptr) {
+            break;
+        }
+        current = op->operands()[0];
+    }
+    return current;
+}
+
+static int call_target_specificity(Expression* expr) {
+    Expression* stripped = strip_trivial_casts(expr);
+    if (isa<GlobalVariable>(stripped)) return 2;
+    if (isa<Constant>(stripped)) return 1;
+    return 0;
+}
+
+static bool same_concrete_call_target(Expression* lhs, Expression* rhs) {
+    Expression* left = strip_trivial_casts(lhs);
+    Expression* right = strip_trivial_casts(rhs);
+    if (!left || !right) return false;
+
+    if (auto* lgv = dyn_cast<GlobalVariable>(left)) {
+        auto* rgv = dyn_cast<GlobalVariable>(right);
+        return rgv && lgv->name() == rgv->name();
+    }
+
+    auto* lc = dyn_cast<Constant>(left);
+    auto* rc = dyn_cast<Constant>(right);
+    return lc && rc && lc->value() == rc->value() && lc->size_bytes == rc->size_bytes;
+}
+
+static Expression* resolve_call_target_alias_chain_impl(
+    Expression* target,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo,
+    std::unordered_set<VarKey, VarKeyHash>& active,
+    std::size_t depth);
+
+static Expression* resolve_phi_call_target(
+    Phi* phi,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo,
+    std::unordered_set<VarKey, VarKeyHash>& active,
+    std::size_t depth) {
+
+    if (!phi || !phi->operand_list() || depth == 0) {
+        return nullptr;
+    }
+
+    Expression* candidate = nullptr;
+    for (Expression* operand : phi->operand_list()->operands()) {
+        Expression* resolved = resolve_call_target_alias_chain_impl(
+            operand,
+            def_map,
+            memo,
+            active,
+            depth - 1);
+        if (!resolved) {
+            return nullptr;
+        }
+
+        if (!candidate) {
+            candidate = resolved;
+            continue;
+        }
+
+        if (!same_concrete_call_target(candidate, resolved)) {
+            return nullptr;
+        }
+    }
+
+    return candidate;
+}
+
+static Expression* resolve_memory_backed_call_target(
+    Operation* op,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo,
+    std::unordered_set<VarKey, VarKeyHash>& active,
+    std::size_t depth) {
+
+    if (!op || op->type() != OperationType::deref || op->operands().size() != 1 || depth == 0) {
+        return nullptr;
+    }
+
+    Expression* base = strip_trivial_casts(op->operands()[0]);
+    if (!base) {
+        return nullptr;
+    }
+
+    Expression* resolved_base = resolve_call_target_alias_chain_impl(
+        base,
+        def_map,
+        memo,
+        active,
+        depth - 1);
+
+    auto* gv = dyn_cast<GlobalVariable>(resolved_base ? resolved_base : base);
+    if (!gv || !gv->is_constant() || !gv->initial_value()) {
+        return nullptr;
+    }
+
+    return resolve_call_target_alias_chain_impl(
+        gv->initial_value(),
+        def_map,
+        memo,
+        active,
+        depth - 1);
+}
+
+static Expression* resolve_call_target_alias_chain_impl(
+    Expression* target,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo,
+    std::unordered_set<VarKey, VarKeyHash>& active,
+    std::size_t depth) {
+
+    if (depth == 0) {
+        return nullptr;
+    }
+
+    Expression* stripped_target = strip_trivial_casts(target);
+    if (!stripped_target) {
+        return nullptr;
+    }
+
+    if (isa<GlobalVariable>(stripped_target) || isa<Constant>(stripped_target)) {
+        return stripped_target;
+    }
+
+    if (auto* op = dyn_cast<Operation>(stripped_target)) {
+        return resolve_memory_backed_call_target(op, def_map, memo, active, depth);
+    }
+
+    auto* start = dyn_cast<Variable>(stripped_target);
+    if (!start) return nullptr;
+
+    VarKey key = var_key(start);
+    auto memo_it = memo.find(key);
+    if (memo_it != memo.end()) {
+        return memo_it->second;
+    }
+
+    if (!active.insert(key).second) {
+        return nullptr;
+    }
+
+    Expression* resolved = nullptr;
+    auto it_def = def_map.find(key);
+    if (it_def != def_map.end() && it_def->second) {
+        Assignment* def = it_def->second;
+        if (auto* phi = dyn_cast<Phi>(def)) {
+            resolved = resolve_phi_call_target(phi, def_map, memo, active, depth - 1);
+        } else {
+            resolved = resolve_call_target_alias_chain_impl(
+                def->value(),
+                def_map,
+                memo,
+                active,
+                depth - 1);
+        }
+    }
+
+    active.erase(key);
+    memo[key] = resolved;
+    return resolved;
+}
+
+static Expression* resolve_call_target_alias_chain(
+    Expression* target,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo) {
+    std::unordered_set<VarKey, VarKeyHash> active;
+    return resolve_call_target_alias_chain_impl(
+        target,
+        def_map,
+        memo,
+        active,
+        MAX_CALL_TARGET_ALIAS_DEPTH);
+}
+
+static bool canonicalize_call_targets_in_expression(
+    Expression* root,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo) {
+
+    if (!root) return false;
+    bool changed = false;
+    SmallVector<Expression*, 32> stack;
+    std::unordered_set<Expression*> visited;
+    stack.push_back(root);
+    visited.insert(root);
+
+    while (!stack.empty()) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+
+        if (auto* call = dyn_cast<Call>(node)) {
+            if (!call->mutable_operands().empty()) {
+                Expression*& target_ref = call->mutable_operands()[0];
+                Expression* resolved = resolve_call_target_alias_chain(target_ref, def_map, memo);
+                if (resolved && call_target_specificity(resolved) > call_target_specificity(target_ref)) {
+                    target_ref = resolved;
+                    changed = true;
+                }
+            }
+            for (Expression* child : call->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+            continue;
+        }
+
+        if (auto* op = dyn_cast<Operation>(node)) {
+            if (op->type() == OperationType::call && !op->mutable_operands().empty()) {
+                Expression*& target_ref = op->mutable_operands()[0];
+                Expression* resolved = resolve_call_target_alias_chain(target_ref, def_map, memo);
+                if (resolved && call_target_specificity(resolved) > call_target_specificity(target_ref)) {
+                    target_ref = resolved;
+                    changed = true;
+                }
+            }
+            for (Expression* child : op->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+            continue;
+        }
+
+        if (auto* list = dyn_cast<ListOperation>(node)) {
+            for (Expression* child : list->operands()) {
+                if (child && visited.insert(child).second) stack.push_back(child);
+            }
+        }
+    }
+
+    return changed;
+}
+
+static bool canonicalize_call_targets_in_instruction(
+    Instruction* inst,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo) {
+
+    if (!inst) return false;
+
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
+        bool changed = canonicalize_call_targets_in_expression(assign->value(), def_map, memo);
+        if (assign->destination() && !isa<Variable>(assign->destination())) {
+            changed |= canonicalize_call_targets_in_expression(assign->destination(), def_map, memo);
+        }
+        return changed;
+    }
+    if (auto* branch = dyn_cast<Branch>(inst)) {
+        return canonicalize_call_targets_in_expression(branch->condition(), def_map, memo);
+    }
+    if (auto* ret = dyn_cast<Return>(inst)) {
+        bool changed = false;
+        for (Expression* value : ret->values()) {
+            changed |= canonicalize_call_targets_in_expression(value, def_map, memo);
+        }
+        return changed;
+    }
+    if (auto* ibranch = dyn_cast<IndirectBranch>(inst)) {
+        return canonicalize_call_targets_in_expression(ibranch->expression(), def_map, memo);
+    }
+    return false;
+}
+
 static bool type_compatible_for_identity(Variable* a, Variable* b) {
     if (!a || !b) return false;
 
@@ -666,8 +940,7 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
         std::vector<Instruction*> dangerous_uses;
 
         // Step 2: Build DefMap globally (Variable -> Assignment*)
-        using DefMap = std::unordered_map<VarKey, Assignment*, VarKeyHash>;
-        DefMap def_map;
+        AssignmentDefMap def_map;
 
         for (BasicBlock* block : task.cfg()->blocks()) {
             for (std::size_t i = 0; i < block->instructions().size(); ++i) {
@@ -1163,6 +1436,15 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                 collect_requirements_iterative(inst, reqs);
                 for (Variable* req : reqs) {
                     use_map[var_key(req)].insert(inst);
+                }
+            }
+        }
+
+        std::unordered_map<VarKey, Expression*, VarKeyHash> canonical_target_memo;
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            for (Instruction* inst : block->instructions()) {
+                if (canonicalize_call_targets_in_instruction(inst, def_map, canonical_target_memo)) {
+                    changed = true;
                 }
             }
         }
