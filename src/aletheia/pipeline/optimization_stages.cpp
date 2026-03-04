@@ -102,6 +102,37 @@ static inline bool is_target_var(Expression* expr,
     return false;
 }
 
+/// Check if an expression tree references a specific variable (by name + SSA version).
+/// Used to detect self-referencing definitions (e.g., x = (cond ? a : x))
+/// which would cause infinite expansion during propagation.
+static bool expression_references_variable(Expression* expr,
+                                            const std::string& target_name,
+                                            std::size_t target_ssa) {
+    if (!expr) return false;
+
+    SmallVector<Expression*, 32> stack;
+    stack.push_back(expr);
+
+    while (!stack.empty()) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+
+        if (is_target_var(node, target_name, target_ssa)) return true;
+
+        if (auto* op = dyn_cast<Operation>(node)) {
+            for (auto* child : op->operands()) {
+                stack.push_back(child);
+            }
+        } else if (auto* list = dyn_cast<ListOperation>(node)) {
+            for (auto* child : list->operands()) {
+                stack.push_back(child);
+            }
+        }
+    }
+    return false;
+}
+
 /// Compute the "weight" (number of unique nodes) in an expression DAG.
 /// Capped at `limit` to avoid traversing huge DAGs.
 /// Uses a visited set to handle shared subtrees correctly.
@@ -1276,6 +1307,19 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                     if (allowed && isa<Phi>(inst) && isa<Operation>(def->value())) allowed = false;
 
                     if (!allowed) continue;
+
+                    // Guard: Don't propagate definitions where the RHS
+                    // references the LHS variable. Self-referential
+                    // assignments like CMOV ternaries (x = (cond ? a : x))
+                    // would cause exponential expression growth during
+                    // substitution because the replaced variable reappears
+                    // in the replacement, triggering infinite re-expansion.
+                    if (auto* dest_var = dyn_cast<Variable>(def->destination())) {
+                        if (expression_references_variable(
+                                def->value(), dest_var->name(), dest_var->ssa_version())) {
+                            continue;
+                        }
+                    }
 
                     if (!is_memory) {
                         if (contains_aliased_variable(def->destination()) ||

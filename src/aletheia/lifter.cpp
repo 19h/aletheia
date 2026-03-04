@@ -173,6 +173,130 @@ bool contains_register_token(std::string_view text, std::string_view token) {
     return false;
 }
 
+/// Extract the base register name from an IDA Intel-syntax memory operand text.
+/// Examples: "[rdi]" -> "rdi", "[rax-41h]" -> "rax", "[rsp+rdi*8+10h]" -> "rsp"
+/// Returns nullopt if no valid register-like token is found inside brackets.
+std::optional<std::string> extract_base_register_from_operand_text(std::string_view text) {
+    auto open = text.find('[');
+    if (open == std::string_view::npos) return std::nullopt;
+    auto close = text.find(']', open);
+    if (close == std::string_view::npos) return std::nullopt;
+
+    // Content between [ and ]
+    auto inner = text.substr(open + 1, close - open - 1);
+
+    // Skip leading whitespace
+    std::size_t i = 0;
+    while (i < inner.size() && (inner[i] == ' ' || inner[i] == '\t')) ++i;
+
+    // Extract the first identifier token (the base register)
+    std::size_t start = i;
+    while (i < inner.size() && is_identifier_char(inner[i])) ++i;
+
+    if (i == start) return std::nullopt;
+
+    std::string reg(inner.substr(start, i - start));
+    // Validate it looks like a register name (starts with letter, not a pure number)
+    if (reg.empty() || std::isdigit(static_cast<unsigned char>(reg[0]))) return std::nullopt;
+
+    return reg;
+}
+
+/// Parse a displacement value from IDA Intel-syntax memory operand text,
+/// handling both standard 0x prefix and IDA's h suffix for hexadecimal.
+/// Examples: "[rax-41h]" -> -0x41, "[rdx+20h]" -> 0x20, "[rax-0x41]" -> -0x41
+/// This is specifically for memory operand inner text, looking for +/- displacement.
+std::optional<std::int64_t> parse_memory_displacement(std::string_view text) {
+    auto open = text.find('[');
+    auto close = text.find(']');
+    if (open == std::string_view::npos || close == std::string_view::npos) return std::nullopt;
+
+    auto inner = text.substr(open + 1, close - open - 1);
+
+    // Find the last + or - that precedes a number (skip leading register tokens)
+    // Walk past the first identifier (base register)
+    std::size_t i = 0;
+    while (i < inner.size() && (inner[i] == ' ' || inner[i] == '\t')) ++i;
+    while (i < inner.size() && is_identifier_char(inner[i])) ++i;
+
+    // Now look for +/- displacement after the base register
+    // There may be index register expressions like +rdi*8 before the displacement,
+    // so we scan for the last +/- followed by a hex/decimal number.
+    std::optional<std::int64_t> result;
+
+    while (i < inner.size()) {
+        if (inner[i] == '+' || inner[i] == '-') {
+            bool negative = inner[i] == '-';
+            std::size_t j = i + 1;
+            // Skip whitespace
+            while (j < inner.size() && (inner[j] == ' ' || inner[j] == '\t')) ++j;
+
+            // Check for 0x prefix
+            int base = 10;
+            if (j + 1 < inner.size() && inner[j] == '0' && (inner[j + 1] == 'x' || inner[j + 1] == 'X')) {
+                base = 16;
+                j += 2;
+            }
+
+            // Parse digits
+            std::size_t dstart = j;
+            while (j < inner.size()) {
+                unsigned char ch = static_cast<unsigned char>(inner[j]);
+                bool ok = (base == 16) ? std::isxdigit(ch) : std::isdigit(ch);
+                if (!ok) break;
+                ++j;
+            }
+
+            if (j > dstart) {
+                // Check for IDA 'h' suffix (hex)
+                if (j < inner.size() && (inner[j] == 'h' || inner[j] == 'H') && base == 10) {
+                    base = 16; // Reinterpret as hex
+                }
+
+                // Also check if the digits contain a-f, implying hex even without prefix
+                bool has_hex_digits = false;
+                for (std::size_t k = dstart; k < j; ++k) {
+                    unsigned char ch = static_cast<unsigned char>(inner[k]);
+                    if ((ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+                        has_hex_digits = true;
+                        break;
+                    }
+                }
+                if (has_hex_digits) base = 16;
+
+                // Check if this is actually a register name (e.g., +rdi*8)
+                // by checking if the next non-space character is a letter or *
+                std::size_t after = j;
+                if (after < inner.size() && (inner[after] == 'h' || inner[after] == 'H')) ++after;
+                while (after < inner.size() && (inner[after] == ' ' || inner[after] == '\t')) ++after;
+
+                bool is_register = false;
+                if (after < inner.size() && inner[after] == '*') is_register = true;
+                // Also check if the parsed "number" starts with a letter (it's a register)
+                if (dstart < j && std::isalpha(static_cast<unsigned char>(inner[dstart])) && base == 10) {
+                    is_register = true;
+                }
+
+                if (!is_register) {
+                    std::int64_t value = 0;
+                    for (std::size_t k = dstart; k < j; ++k) {
+                        char c = inner[k];
+                        int digit = 0;
+                        if (c >= '0' && c <= '9') digit = c - '0';
+                        else if (c >= 'a' && c <= 'f') digit = 10 + (c - 'a');
+                        else if (c >= 'A' && c <= 'F') digit = 10 + (c - 'A');
+                        value = value * base + digit;
+                    }
+                    result = negative ? -value : value;
+                }
+            }
+        }
+        ++i;
+    }
+
+    return result;
+}
+
 constexpr std::array<std::string_view, 16> kArmConditionSuffixes = {
     "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl",
     "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le"
@@ -1602,6 +1726,48 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
                         slot->set_aliased(true);
                         tag_variable(slot, insn_addr);
                         expr = slot;
+                    }
+                }
+
+                // Strategy 3: Register-indirect memory access (non-stack).
+                // Parse operand text to extract base register + optional displacement.
+                // Handles: [rdi] -> deref(rdi), [rax-41h] -> deref(rax - 0x41)
+                if (!resolved && !expr) {
+                    // Strip IDA color tags for clean parsing. The tagged text
+                    // contains control codes (COLOR_ON/OFF) that interfere with
+                    // identifier extraction.
+                    std::string clean_text = to_lower_ascii(ida::lines::tag_remove(text));
+                    auto base_reg = extract_base_register_from_operand_text(clean_text);
+                    if (base_reg) {
+                        auto mem_disp = parse_memory_displacement(clean_text);
+                        // Use pointer size (8 bytes for 64-bit) for the address expression
+                        const std::size_t addr_size = 8;
+                        Expression* addr_expr = arena_.create<Variable>(*base_reg, addr_size);
+                        if (mem_disp && *mem_disp != 0) {
+                            if (*mem_disp > 0) {
+                                addr_expr = arena_.create<Operation>(
+                                    OperationType::add,
+                                    std::vector<Expression*>{
+                                        addr_expr,
+                                        arena_.create<Constant>(
+                                            static_cast<std::uint64_t>(*mem_disp), addr_size)
+                                    },
+                                    addr_size);
+                            } else {
+                                addr_expr = arena_.create<Operation>(
+                                    OperationType::sub,
+                                    std::vector<Expression*>{
+                                        addr_expr,
+                                        arena_.create<Constant>(
+                                            static_cast<std::uint64_t>(-*mem_disp), addr_size)
+                                    },
+                                    addr_size);
+                            }
+                        }
+                        expr = arena_.create<Operation>(
+                            OperationType::deref,
+                            std::vector<Expression*>{addr_expr},
+                            width);
                     }
                 }
             }
