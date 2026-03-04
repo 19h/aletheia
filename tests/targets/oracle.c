@@ -1,4 +1,4 @@
-void _analyze_series() {
+unsigned long _analyze_series() {
     int exit_flag_0, tmp_1, tmp_10, tmp_17, tmp_3, tmp_5, tmp_7, tmp_8, tmp_9;
     unsigned int counter, tmp_11, tmp_12, tmp_13, tmp_14, tmp_15, tmp_16, tmp_18, tmp_2, tmp_6;
     unsigned long tmp_0, tmp_19;
@@ -98,7 +98,7 @@ void _analyze_series() {
     }
 }
 
-void _fold_bytes() {
+unsigned long _fold_bytes() {
     int tmp_2;
     unsigned long counter, tmp_0, tmp_3;
 
@@ -118,7 +118,7 @@ void _fold_bytes() {
     return tmp_3;
 }
 
-void _control_flow_showcase() {
+unsigned long _control_flow_showcase() {
     int exit_flag_0, tmp_0, tmp_10, tmp_12, tmp_13, tmp_14, tmp_17, tmp_4, tmp_5, tmp_6, tmp_7;
     unsigned int tmp_1, tmp_11, tmp_15, tmp_16, tmp_2, tmp_3, tmp_8, tmp_9;
     unsigned long tmp_18;

@@ -3612,6 +3612,267 @@ void test_expression_propagation_function_call_target_canonicalization() {
         ASSERT_EQ(resolved_target->name(), "mem_resolved");
     }
 
+    {
+        DecompilerTask task(0x7054);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(505);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* sym0 = task.arena().create<GlobalVariable>("dispatch_0", 8);
+        auto* sym1 = task.arena().create<GlobalVariable>("dispatch_1", 8);
+        auto* table_vals = task.arena().create<ListOperation>(std::vector<Expression*>{sym0, sym1});
+        auto* table = task.arena().create<GlobalVariable>("dispatch_table", 8, table_vals, true);
+
+        auto* base_ptr = task.arena().create<Variable>("base_ptr", 8);
+        auto* loaded = task.arena().create<Variable>("loaded", 8);
+        auto* offset_expr = task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{table, task.arena().create<Constant>(8, 8)},
+            8);
+        bb->add_instruction(task.arena().create<Assignment>(base_ptr, offset_expr));
+
+        auto* load_expr = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{base_ptr}, 8);
+        bb->add_instruction(task.arena().create<Assignment>(loaded, load_expr));
+
+        auto* out_call = task.arena().create<Variable>("table_call", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(loaded, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* resolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(resolved_call != nullptr);
+        auto* resolved_target = dyn_cast<GlobalVariable>(resolved_call->target());
+        ASSERT_TRUE(resolved_target != nullptr);
+        ASSERT_EQ(resolved_target->name(), "dispatch_1");
+    }
+
+    {
+        DecompilerTask task(0x7056);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(507);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* sym = task.arena().create<GlobalVariable>("got_target", 8);
+        auto* slot = task.arena().create<GlobalVariable>("got_slot", 8, sym, false);
+        auto* loaded = task.arena().create<Variable>("got_loaded", 8);
+
+        auto* load_expr = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{slot}, 8);
+        bb->add_instruction(task.arena().create<Assignment>(loaded, load_expr));
+
+        auto* out_call = task.arena().create<Variable>("got_call", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(loaded, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* resolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(resolved_call != nullptr);
+        auto* resolved_target = dyn_cast<GlobalVariable>(resolved_call->target());
+        ASSERT_TRUE(resolved_target != nullptr);
+        ASSERT_EQ(resolved_target->name(), "got_target");
+    }
+
+    {
+        DecompilerTask task(0x7055);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(506);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* sym0 = task.arena().create<GlobalVariable>("unsafe_dispatch_0", 8);
+        auto* sym1 = task.arena().create<GlobalVariable>("unsafe_dispatch_1", 8);
+        auto* table_vals = task.arena().create<ListOperation>(std::vector<Expression*>{sym0, sym1});
+        auto* table = task.arena().create<GlobalVariable>("unsafe_dispatch_table", 8, table_vals, true);
+
+        auto* base_ptr = task.arena().create<Variable>("unsafe_base_ptr", 8);
+        auto* loaded = task.arena().create<Variable>("unsafe_loaded", 8);
+        auto* offset_expr = task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{table, task.arena().create<Constant>(4, 8)},
+            8);
+        bb->add_instruction(task.arena().create<Assignment>(base_ptr, offset_expr));
+
+        auto* load_expr = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{base_ptr}, 8);
+        bb->add_instruction(task.arena().create<Assignment>(loaded, load_expr));
+
+        auto* out_call = task.arena().create<Variable>("unsafe_table_call", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(loaded, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* unresolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(unresolved_call != nullptr);
+        auto* unresolved_global = dyn_cast<GlobalVariable>(unresolved_call->target());
+        ASSERT_TRUE(unresolved_global == nullptr);
+    }
+
+    {
+        DecompilerTask task(0x7057);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(508);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* slot = task.arena().create<GlobalVariable>("unsafe_slot", 8, task.arena().create<Constant>(0, 8), false);
+        auto* loaded = task.arena().create<Variable>("unsafe_got_loaded", 8);
+
+        auto* load_expr = task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{slot}, 8);
+        bb->add_instruction(task.arena().create<Assignment>(loaded, load_expr));
+
+        auto* out_call = task.arena().create<Variable>("unsafe_got_call", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(loaded, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* unresolved_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(unresolved_call != nullptr);
+        auto* unresolved_global = dyn_cast<GlobalVariable>(unresolved_call->target());
+        ASSERT_TRUE(unresolved_global == nullptr);
+    }
+
+    {
+        DecompilerTask task(0x7058);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(509);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* sym_a = task.arena().create<GlobalVariable>("ssa_target_a", 8);
+        auto* sym_b = task.arena().create<GlobalVariable>("ssa_target_b", 8);
+        auto* fp_v0 = task.arena().create<Variable>("fp", 8);
+        auto* fp_v1 = task.arena().create<Variable>("fp", 8);
+        auto* fp_v2 = task.arena().create<Variable>("fp", 8);
+        fp_v0->set_ssa_version(0);
+        fp_v1->set_ssa_version(1);
+        fp_v2->set_ssa_version(2);
+
+        bb->add_instruction(task.arena().create<Assignment>(fp_v0, sym_a));
+        bb->add_instruction(task.arena().create<Assignment>(fp_v1, sym_b));
+
+        auto* out_exact = task.arena().create<Variable>("out_exact", 8);
+        auto* exact_call_assign = task.arena().create<Assignment>(
+            out_exact,
+            task.arena().create<Call>(fp_v1, std::vector<Expression*>{}, 8));
+        bb->add_instruction(exact_call_assign);
+
+        auto* out_missing = task.arena().create<Variable>("out_missing", 8);
+        auto* missing_call_assign = task.arena().create<Assignment>(
+            out_missing,
+            task.arena().create<Call>(fp_v2, std::vector<Expression*>{}, 8));
+        bb->add_instruction(missing_call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* exact_call = dyn_cast<Call>(exact_call_assign->value());
+        ASSERT_TRUE(exact_call != nullptr);
+        auto* exact_target = dyn_cast<GlobalVariable>(exact_call->target());
+        ASSERT_TRUE(exact_target != nullptr);
+        ASSERT_EQ(exact_target->name(), "ssa_target_b");
+
+        auto* missing_call = dyn_cast<Call>(missing_call_assign->value());
+        ASSERT_TRUE(missing_call != nullptr);
+        auto* missing_target = dyn_cast<Variable>(missing_call->target());
+        ASSERT_TRUE(missing_target != nullptr);
+        ASSERT_EQ(missing_target->name(), "fp");
+        ASSERT_EQ(missing_target->ssa_version(), 2);
+    }
+
+    {
+        DecompilerTask task(0x7059);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(510);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* fn_ptr = task.arena().create<Variable>("fn_ptr", 8);
+        auto* loaded = task.arena().create<Variable>("loaded_fn", 8);
+        bb->add_instruction(task.arena().create<Assignment>(
+            loaded,
+            task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{fn_ptr}, 8)));
+
+        auto* out_call = task.arena().create<Variable>("out_folded", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(loaded, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* folded_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(folded_call != nullptr);
+        auto* folded_target = dyn_cast<Operation>(folded_call->target());
+        ASSERT_TRUE(folded_target != nullptr);
+        ASSERT_EQ(folded_target->type(), OperationType::deref);
+    }
+
+    {
+        DecompilerTask task(0x705A);
+
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(511);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+
+        auto* fn_ptr = task.arena().create<Variable>("fn_ptr_unsafe", 8);
+        auto* loaded = task.arena().create<Variable>("loaded_fn_unsafe", 8);
+        auto* scratch = task.arena().create<Variable>("scratch", 8);
+        bb->add_instruction(task.arena().create<Assignment>(
+            loaded,
+            task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{fn_ptr}, 8)));
+
+        auto* mem_store_ptr = task.arena().create<Variable>("mem_store_ptr", 8);
+        bb->add_instruction(task.arena().create<Assignment>(
+            task.arena().create<Operation>(OperationType::deref, std::vector<Expression*>{mem_store_ptr}, 8),
+            scratch));
+
+        auto* out_call = task.arena().create<Variable>("out_unfolded", 8);
+        auto* call_assign = task.arena().create<Assignment>(
+            out_call,
+            task.arena().create<Call>(loaded, std::vector<Expression*>{}, 8));
+        bb->add_instruction(call_assign);
+
+        ExpressionPropagationFunctionCallStage stage;
+        stage.execute(task);
+
+        auto* unfolded_call = dyn_cast<Call>(call_assign->value());
+        ASSERT_TRUE(unfolded_call != nullptr);
+        auto* unfolded_target = dyn_cast<Variable>(unfolded_call->target());
+        ASSERT_TRUE(unfolded_target != nullptr);
+        ASSERT_EQ(unfolded_target->name(), "loaded_fn_unsafe");
+    }
+
     std::cout << "[+] test_expression_propagation_function_call_target_canonicalization passed.\n";
 }
 

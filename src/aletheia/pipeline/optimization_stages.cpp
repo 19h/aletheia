@@ -635,6 +635,211 @@ static Expression* resolve_phi_call_target(
     return candidate;
 }
 
+static Expression* resolve_call_target_address_arithmetic(
+    Operation* op,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo,
+    std::unordered_set<VarKey, VarKeyHash>& active,
+    std::size_t depth) {
+
+    if (!op || op->operands().size() != 2 || depth == 0) {
+        return nullptr;
+    }
+
+    if (op->type() != OperationType::add && op->type() != OperationType::sub) {
+        return nullptr;
+    }
+
+    Expression* lhs = strip_trivial_casts(op->operands()[0]);
+    Expression* rhs = strip_trivial_casts(op->operands()[1]);
+    if (!lhs || !rhs) {
+        return nullptr;
+    }
+
+    Expression* resolved_lhs = resolve_call_target_alias_chain_impl(
+        lhs,
+        def_map,
+        memo,
+        active,
+        depth - 1);
+    Expression* resolved_rhs = resolve_call_target_alias_chain_impl(
+        rhs,
+        def_map,
+        memo,
+        active,
+        depth - 1);
+
+    auto extract_global_base = [&](Expression* candidate) -> GlobalVariable* {
+        if (auto* gv = dyn_cast<GlobalVariable>(candidate)) {
+            return gv;
+        }
+        auto* base_op = dyn_cast<Operation>(candidate);
+        if (!base_op || base_op->type() != OperationType::address_of || base_op->operands().size() != 1) {
+            return nullptr;
+        }
+
+        Expression* addr_base = strip_trivial_casts(base_op->operands()[0]);
+        if (!addr_base) {
+            return nullptr;
+        }
+
+        Expression* resolved_addr_base = resolve_call_target_alias_chain_impl(
+            addr_base,
+            def_map,
+            memo,
+            active,
+            depth - 1);
+        return dyn_cast<GlobalVariable>(resolved_addr_base ? resolved_addr_base : addr_base);
+    };
+
+    auto* lhs_const = dyn_cast<Constant>(resolved_lhs ? resolved_lhs : lhs);
+    auto* rhs_const = dyn_cast<Constant>(resolved_rhs ? resolved_rhs : rhs);
+    auto* lhs_global = extract_global_base(resolved_lhs ? resolved_lhs : lhs);
+    auto* rhs_global = extract_global_base(resolved_rhs ? resolved_rhs : rhs);
+
+    if (op->type() == OperationType::add) {
+        if (lhs_global && rhs_const && rhs_const->value() == 0) {
+            return lhs_global;
+        }
+        if (rhs_global && lhs_const && lhs_const->value() == 0) {
+            return rhs_global;
+        }
+    }
+
+    if (op->type() == OperationType::sub && lhs_global && rhs_const && rhs_const->value() == 0) {
+        return lhs_global;
+    }
+
+    return nullptr;
+}
+
+static Expression* resolve_address_of_call_target(
+    Operation* op,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo,
+    std::unordered_set<VarKey, VarKeyHash>& active,
+    std::size_t depth) {
+
+    if (!op || op->type() != OperationType::address_of || op->operands().size() != 1 || depth == 0) {
+        return nullptr;
+    }
+
+    Expression* base = strip_trivial_casts(op->operands()[0]);
+    if (!base) {
+        return nullptr;
+    }
+
+    if (auto* base_op = dyn_cast<Operation>(base)) {
+        if (base_op->type() == OperationType::deref && base_op->operands().size() == 1) {
+            base = strip_trivial_casts(base_op->operands()[0]);
+            if (!base) {
+                return nullptr;
+            }
+        }
+    }
+
+    Expression* resolved = resolve_call_target_alias_chain_impl(
+        base,
+        def_map,
+        memo,
+        active,
+        depth - 1);
+    Expression* concrete = resolved ? resolved : base;
+    if (isa<GlobalVariable>(concrete) || isa<Constant>(concrete)) {
+        return concrete;
+    }
+
+    return nullptr;
+}
+
+struct GlobalOffsetTarget {
+    GlobalVariable* global = nullptr;
+    std::uint64_t byte_offset = 0;
+};
+
+static std::optional<GlobalOffsetTarget> extract_global_offset_target(
+    Expression* expr,
+    const AssignmentDefMap& def_map,
+    std::unordered_map<VarKey, Expression*, VarKeyHash>& memo,
+    std::unordered_set<VarKey, VarKeyHash>& active,
+    std::size_t depth) {
+
+    if (!expr || depth == 0) {
+        return std::nullopt;
+    }
+
+    Expression* stripped = strip_trivial_casts(expr);
+    if (!stripped) {
+        return std::nullopt;
+    }
+
+    Expression* resolved = resolve_call_target_alias_chain_impl(stripped, def_map, memo, active, depth - 1);
+    Expression* concrete = resolved ? resolved : stripped;
+
+    auto extract_global_base = [&](Expression* candidate) -> GlobalVariable* {
+        if (auto* gv = dyn_cast<GlobalVariable>(candidate)) {
+            return gv;
+        }
+        auto* base_op = dyn_cast<Operation>(candidate);
+        if (!base_op || base_op->type() != OperationType::address_of || base_op->operands().size() != 1) {
+            return nullptr;
+        }
+
+        Expression* addr_base = strip_trivial_casts(base_op->operands()[0]);
+        if (!addr_base) {
+            return nullptr;
+        }
+
+        Expression* resolved_addr_base = resolve_call_target_alias_chain_impl(
+            addr_base,
+            def_map,
+            memo,
+            active,
+            depth - 1);
+        return dyn_cast<GlobalVariable>(resolved_addr_base ? resolved_addr_base : addr_base);
+    };
+
+    if (auto* gv = extract_global_base(concrete)) {
+        return GlobalOffsetTarget{gv, 0};
+    }
+
+    auto* op = dyn_cast<Operation>(concrete);
+    if (!op || op->operands().size() != 2 ||
+        (op->type() != OperationType::add && op->type() != OperationType::sub)) {
+        return std::nullopt;
+    }
+
+    Expression* lhs = strip_trivial_casts(op->operands()[0]);
+    Expression* rhs = strip_trivial_casts(op->operands()[1]);
+    if (!lhs || !rhs) {
+        return std::nullopt;
+    }
+
+    Expression* lhs_resolved = resolve_call_target_alias_chain_impl(lhs, def_map, memo, active, depth - 1);
+    Expression* rhs_resolved = resolve_call_target_alias_chain_impl(rhs, def_map, memo, active, depth - 1);
+
+    auto* lhs_global = extract_global_base(lhs_resolved ? lhs_resolved : lhs);
+    auto* rhs_global = extract_global_base(rhs_resolved ? rhs_resolved : rhs);
+    auto* lhs_const = dyn_cast<Constant>(lhs_resolved ? lhs_resolved : lhs);
+    auto* rhs_const = dyn_cast<Constant>(rhs_resolved ? rhs_resolved : rhs);
+
+    if (op->type() == OperationType::add) {
+        if (lhs_global && rhs_const) {
+            return GlobalOffsetTarget{lhs_global, rhs_const->value()};
+        }
+        if (rhs_global && lhs_const) {
+            return GlobalOffsetTarget{rhs_global, lhs_const->value()};
+        }
+        return std::nullopt;
+    }
+
+    if (!lhs_global || !rhs_const || rhs_const->value() != 0) {
+        return std::nullopt;
+    }
+
+    return GlobalOffsetTarget{lhs_global, 0};
+}
+
 static Expression* resolve_memory_backed_call_target(
     Operation* op,
     const AssignmentDefMap& def_map,
@@ -659,12 +864,53 @@ static Expression* resolve_memory_backed_call_target(
         depth - 1);
 
     auto* gv = dyn_cast<GlobalVariable>(resolved_base ? resolved_base : base);
-    if (!gv || !gv->is_constant() || !gv->initial_value()) {
+    if (gv && gv->initial_value()) {
+        Expression* resolved_init = resolve_call_target_alias_chain_impl(
+            gv->initial_value(),
+            def_map,
+            memo,
+            active,
+            depth - 1);
+        Expression* concrete_init = strip_trivial_casts(resolved_init ? resolved_init : gv->initial_value());
+
+        if (isa<GlobalVariable>(concrete_init)) {
+            return concrete_init;
+        }
+
+        if (gv->is_constant()) {
+            if (auto* c = dyn_cast<Constant>(concrete_init)) {
+                if (c->value() != 0) {
+                    return c;
+                }
+            }
+        }
+    }
+
+    Expression* table_base = resolved_base ? resolved_base : base;
+    if (auto* table_var = dyn_cast<Variable>(table_base)) {
+        auto it_def = def_map.find(var_key(table_var));
+        if (it_def != def_map.end() && it_def->second && !isa<Phi>(it_def->second)) {
+            table_base = it_def->second->value();
+        }
+    }
+
+    auto global_offset = extract_global_offset_target(table_base, def_map, memo, active, depth - 1);
+    if (!global_offset.has_value() || !global_offset->global) {
+        return nullptr;
+    }
+
+    auto* table_values = dyn_cast<ListOperation>(global_offset->global->initial_value());
+    if (!table_values || op->size_bytes == 0 || global_offset->byte_offset % op->size_bytes != 0) {
+        return nullptr;
+    }
+
+    const std::size_t element_index = static_cast<std::size_t>(global_offset->byte_offset / op->size_bytes);
+    if (element_index >= table_values->operands().size()) {
         return nullptr;
     }
 
     return resolve_call_target_alias_chain_impl(
-        gv->initial_value(),
+        table_values->operands()[element_index],
         def_map,
         memo,
         active,
@@ -692,6 +938,12 @@ static Expression* resolve_call_target_alias_chain_impl(
     }
 
     if (auto* op = dyn_cast<Operation>(stripped_target)) {
+        if (Expression* addrof = resolve_address_of_call_target(op, def_map, memo, active, depth)) {
+            return addrof;
+        }
+        if (Expression* arith = resolve_call_target_address_arithmetic(op, def_map, memo, active, depth)) {
+            return arith;
+        }
         return resolve_memory_backed_call_target(op, def_map, memo, active, depth);
     }
 
@@ -1446,6 +1698,70 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                 if (canonicalize_call_targets_in_instruction(inst, def_map, canonical_target_memo)) {
                     changed = true;
                 }
+            }
+        }
+
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            auto& instrs = block->mutable_instructions();
+            for (std::size_t idx = 0; idx < instrs.size(); ++idx) {
+                Instruction* inst = instrs[idx];
+                if (!inst) continue;
+
+                Expression** target_ref = nullptr;
+                if (auto* assign = dyn_cast<Assignment>(inst)) {
+                    if (auto* call = dyn_cast<Call>(assign->value())) {
+                        target_ref = &call->mutable_operands()[0];
+                    } else if (auto* op = dyn_cast<Operation>(assign->value())) {
+                        if (op->type() == OperationType::call && !op->mutable_operands().empty()) {
+                            target_ref = &op->mutable_operands()[0];
+                        }
+                    }
+                }
+
+                if (!target_ref || !*target_ref) {
+                    continue;
+                }
+
+                auto* call_target_var = dyn_cast<Variable>(strip_trivial_casts(*target_ref));
+                if (!call_target_var) {
+                    continue;
+                }
+
+                const VarKey target_key = var_key(call_target_var);
+                Assignment* local_def = nullptr;
+                bool crossed_dangerous_memory = false;
+
+                for (std::size_t back = idx; back > 0; --back) {
+                    Instruction* prev = instrs[back - 1];
+                    if (!prev) {
+                        continue;
+                    }
+
+                    if (is_dangerous_memory_instruction(prev)) {
+                        crossed_dangerous_memory = true;
+                    }
+
+                    auto* prev_assign = dyn_cast<Assignment>(prev);
+                    auto* prev_dest = prev_assign ? dyn_cast<Variable>(prev_assign->destination()) : nullptr;
+                    if (!prev_dest || var_key(prev_dest) != target_key) {
+                        continue;
+                    }
+
+                    local_def = prev_assign;
+                    break;
+                }
+
+                if (!local_def || crossed_dangerous_memory) {
+                    continue;
+                }
+
+                auto* load_op = dyn_cast<Operation>(local_def->value());
+                if (!load_op || load_op->type() != OperationType::deref || load_op->operands().size() != 1) {
+                    continue;
+                }
+
+                *target_ref = load_op->copy(task.arena());
+                changed = true;
             }
         }
 
