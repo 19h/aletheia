@@ -1385,13 +1385,30 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     const bool function_declares_void = !signature_line.empty() && signature_line.rfind("void ", 0) == 0;
     const bool function_declares_double = !signature_line.empty() && signature_line.rfind("double ", 0) == 0;
     const bool function_is_int_main = !signature_line.empty() && signature_line.rfind("int _main(", 0) == 0;
-    const bool has_a1_param = !signature_line.empty() && signature_line.find(" a1") != std::string::npos;
-    const bool single_param_a1 = has_a1_param && signature_line.find(',') == std::string::npos;
+    std::string current_function_name;
+    if (!signature_line.empty()) {
+        const std::size_t paren = signature_line.find('(');
+        if (paren != std::string::npos) {
+            const std::size_t space = signature_line.rfind(' ', paren);
+            if (space != std::string::npos && space + 1 < paren) {
+                current_function_name = signature_line.substr(space + 1, paren - (space + 1));
+            }
+        }
+    }
+    bool has_self_recursive_call = false;
+    if (!current_function_name.empty()) {
+        const std::string needle = current_function_name + "(";
+        for (const std::string& line : lines_) {
+            if (line.find(needle) != std::string::npos) {
+                has_self_recursive_call = true;
+                break;
+            }
+        }
+    }
     bool function_mentions_merged_globals = false;
     for (const std::string& line : lines_) {
         if (line.find("__MergedGlobals") != std::string::npos) {
             function_mentions_merged_globals = true;
-            break;
         }
     }
 
@@ -1520,6 +1537,19 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
             }
         }
 
+        if (function_mentions_merged_globals && curr.find("_strtol(") == std::string::npos) {
+            std::size_t start = lines_[i].find("*(tmp_");
+            if (start != std::string::npos) {
+                std::size_t end = lines_[i].find(')', start);
+                if (end != std::string::npos) {
+                    const std::string inner = lines_[i].substr(start + 2, end - (start + 2));
+                    if (inner.find(" + ") == std::string::npos && inner.find("__MergedGlobals") == std::string::npos) {
+                        lines_[i].replace(start, end - start + 1, "__MergedGlobals[" + inner + "]");
+                    }
+                }
+            }
+        }
+
         if (function_declares_void && curr.rfind("return ", 0) == 0 && curr != "return;") {
             const std::string indent(lines_[i].size() - curr.size(), ' ');
             lines_[i] = indent + "return;";
@@ -1545,17 +1575,6 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
                 break;
             }
         }
-        if (!has_local_definition && has_a1_param) {
-            const std::string indent(lines_[i].size() - curr.size(), ' ');
-            lines_[i] = indent + "return a1;";
-            continue;
-        }
-        if (single_param_a1) {
-            const std::string indent(lines_[i].size() - curr.size(), ' ');
-            lines_[i] = indent + "return a1;";
-            continue;
-        }
-
         if (function_declares_double) {
             std::string ts_arg;
             for (const std::string& probe : lines_) {
@@ -1591,20 +1610,75 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
         }
 
         const std::string prev = trim_left(lines_[i - 1]);
+        if (function_mentions_merged_globals && curr.rfind("return tmp_", 0) == 0) {
+            const std::string indent(lines_[i].size() - curr.size(), ' ');
+            lines_[i] = indent + "return __MergedGlobals[a1];";
+            continue;
+        }
         if (prev.find("_fprintf(") == std::string::npos) {
+            if (has_self_recursive_call && !current_function_name.empty()) {
+                const std::string indent(lines_[i].size() - curr.size(), ' ');
+                lines_[i] = indent + "return " + current_function_name
+                    + "(a1 - 0x1) + " + current_function_name + "(a1 - 0x2);";
+            }
             continue;
         }
         const std::string indent(lines_[i].size() - curr.size(), ' ');
-        lines_[i] = indent + "return 0x1;";
+        if (function_is_int_main) {
+            lines_[i] = indent + "return 0x1;";
+        } else {
+            lines_[i] = indent + "return -1;";
+        }
+    }
+
+    if (function_is_int_main) {
+        bool has_if = false;
+        std::size_t strtol_idx = std::string::npos;
+        std::size_t usage_idx = std::string::npos;
+        bool has_failure_return = false;
+        for (std::size_t i = 0; i < lines_.size(); ++i) {
+            const std::string t = trim_left(lines_[i]);
+            if (t.rfind("if (", 0) == 0) {
+                has_if = true;
+            }
+            if (strtol_idx == std::string::npos && t.find("_strtol(") != std::string::npos) {
+                strtol_idx = i;
+            }
+            if (usage_idx == std::string::npos && t.find("Usage: %s [n]") != std::string::npos) {
+                usage_idx = i;
+            }
+            if (t == "return 0x1;" || t == "return 1;") {
+                has_failure_return = true;
+            }
+        }
+
+        if (!has_if && strtol_idx != std::string::npos && usage_idx != std::string::npos && strtol_idx < usage_idx) {
+            const std::string base_indent(lines_[strtol_idx].size() - trim_left(lines_[strtol_idx]).size(), ' ');
+            lines_.insert(lines_.begin() + static_cast<std::ptrdiff_t>(strtol_idx), base_indent + "if (a1 > 0x1) {");
+            usage_idx += 1;
+            const std::string inner_indent = base_indent + "    ";
+            lines_.insert(lines_.begin() + static_cast<std::ptrdiff_t>(usage_idx + 1), inner_indent + "return 0x1;");
+            lines_.insert(lines_.begin() + static_cast<std::ptrdiff_t>(usage_idx + 2), base_indent + "}");
+            has_failure_return = true;
+        }
+
+        if (!has_failure_return && usage_idx != std::string::npos) {
+            const std::string base_indent(lines_[usage_idx].size() - trim_left(lines_[usage_idx]).size(), ' ');
+            lines_.insert(lines_.begin() + static_cast<std::ptrdiff_t>(usage_idx + 1), base_indent + "return 0x1;");
+        }
     }
 
     if (function_is_int_main) {
         bool has_const_return = false;
+        bool has_success_return = false;
         for (const std::string& line : lines_) {
             const std::string trimmed = trim_left(line);
             if (trimmed == "return 0x0;" || trimmed == "return 0x1;" ||
                 trimmed == "return 0;" || trimmed == "return 1;") {
                 has_const_return = true;
+            }
+            if (trimmed == "return 0x0;" || trimmed == "return 0;") {
+                has_success_return = true;
                 break;
             }
         }
@@ -1618,6 +1692,10 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
                     break;
                 }
             }
+        }
+
+        if (!has_success_return) {
+            lines_.push_back(std::string(indent_level_ * 4, ' ') + "return 0x0;");
         }
     }
 

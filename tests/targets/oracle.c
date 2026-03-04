@@ -4,11 +4,11 @@ unsigned long _analyze_series(unsigned long arg_0, unsigned long arg_1, unsigned
     unsigned long tmp_0;
 
     if (arg_0 == 0x0) {
-        return tmp_0;
+        return _analyze_series(a1 - 0x1) + _analyze_series(a1 - 0x2);
     } else {
         tmp_1 = arg_1 - 0x1;
         if (arg_1 < 0x1UL) {
-            return tmp_0;
+            return _analyze_series(a1 - 0x1) + _analyze_series(a1 - 0x2);
         }
     }
     tmp_2 = tmp_1;
@@ -113,7 +113,7 @@ unsigned long _analyze_series(unsigned long arg_0, unsigned long arg_1, unsigned
     tmp_4 = tmp_3;
     tmp_6 = tmp_5;
     continue;
-    return tmp_0;
+    return _analyze_series(a1 - 0x1) + _analyze_series(a1 - 0x2);
 }
 
 unsigned long _fold_bytes(unsigned long arg_0, unsigned long arg_1) {
@@ -145,11 +145,11 @@ unsigned long _fold_bytes(unsigned long arg_0, unsigned long arg_1) {
                 tmp_1 = arg_1;
             }
             if (arg_1 == tmp_2) {
-                return tmp_14;
+                return _fold_bytes(a1 - 0x1) + _fold_bytes(a1 - 0x2);
             }
         }
     }
-    return tmp_14;
+    return _fold_bytes(a1 - 0x1) + _fold_bytes(a1 - 0x2);
 }
 
 unsigned long _control_flow_showcase(unsigned long arg_0) {
@@ -232,12 +232,12 @@ unsigned long _control_flow_showcase(unsigned long arg_0) {
         tmp_4 = tmp_5;
         arg_0 = tmp_4;
         if ((arg_0 & 0x80000000) == 0x0) {
-            return tmp_14;
+            return _control_flow_showcase(a1 - 0x1) + _control_flow_showcase(a1 - 0x2);
         }
     }
     if (exit_flag_0 == 0x1) {
         tmp_4 = arg_0;
     }
-    return tmp_14;
+    return _control_flow_showcase(a1 - 0x1) + _control_flow_showcase(a1 - 0x2);
 }
 

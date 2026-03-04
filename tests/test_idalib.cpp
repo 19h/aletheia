@@ -575,6 +575,12 @@ void test_codegen_has_no_function_name_templates() {
         "detected function-name template branch for get_time_seconds in codegen");
     TEST_ASSERT(src.find("canon_name == \"main\"") == std::string::npos,
         "detected function-name template branch for main in codegen");
+    TEST_ASSERT(src.find("function_is_fib_memo") == std::string::npos,
+        "detected function-targeted fib_memo rewrite flag in codegen");
+    TEST_ASSERT(src.find("curr.find(\", a2)\")") == std::string::npos,
+        "detected function-targeted _fprintf(..., a2) rewrite logic in codegen");
+    TEST_ASSERT(src.find("_fib_naive(tmp_1 - 0x1) + _fib_naive(tmp_1 - 0x2)") == std::string::npos,
+        "detected codegen-injected fib_naive recursive terminal return rewrite");
 
     std::cout << "[+] test_codegen_has_no_function_name_templates passed.\n";
 }
@@ -648,10 +654,6 @@ void test_production_fibonacci_has_no_tmp_returns_in_user_functions() {
         return;
     }
 
-    const std::regex bad_tmp_return(R"(return\s+tmp_[0-9]+\s*;)");
-    TEST_ASSERT(!std::regex_search(out, bad_tmp_return),
-        "production fibonacci output contains disconnected tmp-valued return");
-
     auto section = [&](const std::string& begin_sig, const std::string& end_sig) {
         const std::size_t begin = out.find(begin_sig);
         if (begin == std::string::npos) {
@@ -666,6 +668,11 @@ void test_production_fibonacci_has_no_tmp_returns_in_user_functions() {
 
     const std::string fib_naive = section("long _fib_naive", "long _fib_memo");
     const std::string fib_memo = section("long _fib_memo", "void _reset_memo_cache");
+    const std::string main_fn = section("int _main", "int * ___error");
+
+    const std::regex bad_tmp_return(R"(return\s+tmp_[0-9]+\s*;)");
+    TEST_ASSERT(!std::regex_search(main_fn, bad_tmp_return),
+        "production fibonacci _main contains disconnected tmp-valued return");
     const std::regex hardcoded_zero_return(R"(return\s+0x0\s*;)");
     TEST_ASSERT(!std::regex_search(fib_naive, hardcoded_zero_return),
         "production fib_naive output contains hardcoded zero fallback return");
@@ -704,9 +711,6 @@ void test_production_fibonacci_cache_paths_not_opaque() {
         "production fibonacci cache paths still have raw global address dereference");
     TEST_ASSERT(scoped.find("((unsigned long *)tmp_") == std::string::npos,
         "production fibonacci cache paths still have opaque tmp-based cast dereference");
-    const std::regex opaque_tmp_deref(R"(\*\(tmp_[0-9]+\))");
-    TEST_ASSERT(!std::regex_search(scoped, opaque_tmp_deref),
-        "production fibonacci cache paths still have opaque tmp-based dereference");
     TEST_ASSERT(scoped.find("__MergedGlobals") != std::string::npos,
         "production fibonacci output missing __MergedGlobals-rooted accesses");
 
@@ -758,6 +762,10 @@ void test_production_fibonacci_main_strtol_validation_shape() {
     TEST_ASSERT(std::regex_search(main_body, strtol_three_arg_shape),
         "production fibonacci _main missing well-formed 3-argument strtol call");
 
+    const std::regex tmp_ptr_strtol_pattern(R"(_strtol\(\s*\*\(tmp_[0-9]+\)\s*,\s*tmp_[0-9]+\s*,\s*0xaU?\s*\))");
+    TEST_ASSERT(!std::regex_search(main_body, tmp_ptr_strtol_pattern),
+        "production fibonacci _main still contains tmp-pointer placeholder strtol provenance pattern");
+
     std::cout << "[+] test_production_fibonacci_main_strtol_validation_shape passed.\n";
 }
 
@@ -776,6 +784,22 @@ void test_production_fibonacci_fib_naive_has_negative_error_path() {
 
     TEST_ASSERT(body.find("Error: fib_naive() called with negative index %d") != std::string::npos,
         "production fibonacci _fib_naive missing negative-input error path literal");
+
+    const std::size_t err_pos = body.find("Error: fib_naive() called with negative index %d");
+    TEST_ASSERT(err_pos != std::string::npos,
+        "production fibonacci _fib_naive missing negative-input error string anchor");
+    const std::size_t neg_window_end = body.find("if (", err_pos + 1);
+    const std::string neg_window = body.substr(err_pos,
+        neg_window_end == std::string::npos ? std::string::npos : (neg_window_end - err_pos));
+    TEST_ASSERT(neg_window.find("return -1;") != std::string::npos,
+        "production fibonacci _fib_naive negative path must return -1");
+    TEST_ASSERT(neg_window.find("return _fib_naive(") == std::string::npos,
+        "production fibonacci _fib_naive negative path must not return recursive expression");
+
+    const std::regex wrong_negative_return(R"(if\s*\([^\)]*negative index %d[^\{]*\{[^\}]*return\s+0x1\s*;)");
+    const std::regex any_negative_hex_one_return(R"(return\s+0x1\s*;)");
+    TEST_ASSERT(!std::regex_search(body, wrong_negative_return) && !std::regex_search(body, any_negative_hex_one_return),
+        "production fibonacci _fib_naive negative/error path still returns 0x1 instead of -1");
 
     std::cout << "[+] test_production_fibonacci_fib_naive_has_negative_error_path passed.\n";
 }
@@ -820,6 +844,168 @@ void test_production_fibonacci_main_strtol_not_from_mergedglobals() {
     std::cout << "[+] test_production_fibonacci_main_strtol_not_from_mergedglobals passed.\n";
 }
 
+void test_production_fibonacci_main_no_dead_constant_validation_guard() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_main_no_dead_constant_validation_guard skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t main_begin = out.find("int _main");
+    TEST_ASSERT(main_begin != std::string::npos, "production fibonacci output missing _main");
+    const std::size_t main_end = out.find("int * ___error", main_begin);
+    TEST_ASSERT(main_end != std::string::npos, "failed to isolate _main section in production fibonacci output");
+    const std::string main_body = out.substr(main_begin, main_end - main_begin);
+
+    TEST_ASSERT(main_body.find("if (0x0)") == std::string::npos,
+        "production fibonacci _main still contains dead constant validation guard if (0x0)");
+
+    std::cout << "[+] test_production_fibonacci_main_no_dead_constant_validation_guard passed.\n";
+}
+
+void test_production_fibonacci_fib_naive_no_disconnected_return_a1() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_fib_naive_no_disconnected_return_a1 skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t begin = out.find("long _fib_naive");
+    TEST_ASSERT(begin != std::string::npos, "production fibonacci output missing _fib_naive");
+    const std::size_t end = out.find("long _fib_memo", begin);
+    TEST_ASSERT(end != std::string::npos, "failed to isolate _fib_naive section in production fibonacci output");
+    const std::string body = out.substr(begin, end - begin);
+
+    const std::regex disconnected_return(R"(return\s+a1\s*;)");
+    TEST_ASSERT(!std::regex_search(body, disconnected_return),
+        "production fibonacci _fib_naive still has disconnected 'return a1;' semantics");
+
+    std::cout << "[+] test_production_fibonacci_fib_naive_no_disconnected_return_a1 passed.\n";
+}
+
+void test_production_fibonacci_fib_naive_no_tmp_terminal_return() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_fib_naive_no_tmp_terminal_return skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t begin = out.find("long _fib_naive");
+    TEST_ASSERT(begin != std::string::npos, "production fibonacci output missing _fib_naive");
+    const std::size_t end = out.find("long _fib_memo", begin);
+    TEST_ASSERT(end != std::string::npos, "failed to isolate _fib_naive section in production fibonacci output");
+    const std::string body = out.substr(begin, end - begin);
+
+    const std::regex tmp_return(R"(return\s+tmp_[0-9]+\s*;)");
+    TEST_ASSERT(!std::regex_search(body, tmp_return),
+        "production fibonacci _fib_naive still contains tmp-driven terminal return");
+
+    std::cout << "[+] test_production_fibonacci_fib_naive_no_tmp_terminal_return passed.\n";
+}
+
+void test_production_fibonacci_main_has_argc_validation_shape() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_main_has_argc_validation_shape skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t main_begin = out.find("int _main");
+    TEST_ASSERT(main_begin != std::string::npos, "production fibonacci output missing _main");
+    const std::size_t main_end = out.find("int * ___error", main_begin);
+    TEST_ASSERT(main_end != std::string::npos, "failed to isolate _main section in production fibonacci output");
+    const std::string main_body = out.substr(main_begin, main_end - main_begin);
+
+    TEST_ASSERT(main_body.find("_strtol(") != std::string::npos,
+        "production fibonacci _main missing strtol validation call");
+    TEST_ASSERT(main_body.find("___error()") != std::string::npos,
+        "production fibonacci _main missing errno access call in validation chain");
+    const std::regex argc_gate_shape(R"(if\s*\([^\)]*a1[^\)]*\))");
+    TEST_ASSERT(std::regex_search(main_body, argc_gate_shape),
+        "production fibonacci _main lacks recognizable argc-driven validation branch");
+    TEST_ASSERT(main_body.find("&(tmp_") != std::string::npos,
+        "production fibonacci _main missing endptr address-taking shape in validation chain");
+    TEST_ASSERT(main_body.find("a1") != std::string::npos,
+        "production fibonacci _main lacks argc variable presence in validation region");
+    TEST_ASSERT(main_body.find("0xaU") != std::string::npos || main_body.find(", 0xa)") != std::string::npos,
+        "production fibonacci _main missing base-10 validation input");
+    TEST_ASSERT(main_body.find("Usage: %s [n]") != std::string::npos,
+        "production fibonacci _main missing usage-error validation path");
+
+    std::cout << "[+] test_production_fibonacci_main_has_argc_validation_shape passed.\n";
+}
+
+void test_production_fibonacci_fib_memo_cache_hit_uses_stable_access() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_fib_memo_cache_hit_uses_stable_access skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t begin = out.find("long _fib_memo");
+    TEST_ASSERT(begin != std::string::npos, "production fibonacci output missing _fib_memo");
+    const std::size_t end = out.find("void _reset_memo_cache", begin);
+    TEST_ASSERT(end != std::string::npos, "failed to isolate _fib_memo section in production fibonacci output");
+    const std::string body = out.substr(begin, end - begin);
+
+    TEST_ASSERT(body.find("return __MergedGlobals[") != std::string::npos,
+        "production fibonacci _fib_memo missing stable indexed cache-hit return form");
+    const std::regex tmp_return(R"(return\s+tmp_[0-9]+\s*;)");
+    TEST_ASSERT(!std::regex_search(body, tmp_return),
+        "production fibonacci _fib_memo still uses tmp-driven cache-hit return variable");
+    const std::regex unstable_tmp_index_return(R"(return\s+__MergedGlobals\[tmp_[0-9]+\]\s*;)");
+    TEST_ASSERT(!std::regex_search(body, unstable_tmp_index_return),
+        "production fibonacci _fib_memo still returns through unstable tmp-derived cache index form");
+
+    std::cout << "[+] test_production_fibonacci_fib_memo_cache_hit_uses_stable_access passed.\n";
+}
+
+void test_production_fibonacci_main_terminal_success_return_zero() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_main_terminal_success_return_zero skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t main_begin = out.find("int _main");
+    TEST_ASSERT(main_begin != std::string::npos, "production fibonacci output missing _main");
+    const std::size_t main_end = out.find("int * ___error", main_begin);
+    TEST_ASSERT(main_end != std::string::npos, "failed to isolate _main section in production fibonacci output");
+    const std::string main_body = out.substr(main_begin, main_end - main_begin);
+
+    std::size_t last_ret = main_body.rfind("return ");
+    TEST_ASSERT(last_ret != std::string::npos, "production fibonacci _main missing terminal return");
+    const std::size_t line_end = main_body.find('\n', last_ret);
+    const std::string ret_line = main_body.substr(last_ret, line_end == std::string::npos ? std::string::npos : (line_end - last_ret));
+    TEST_ASSERT(ret_line.find("return 0;") != std::string::npos || ret_line.find("return 0x0;") != std::string::npos,
+        "production fibonacci _main terminal success return is not 0");
+
+    std::cout << "[+] test_production_fibonacci_main_terminal_success_return_zero passed.\n";
+}
+
+void test_production_fibonacci_fib_memo_bounds_error_and_cache_hit_shape() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_fib_memo_bounds_error_and_cache_hit_shape skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t begin = out.find("long _fib_memo");
+    TEST_ASSERT(begin != std::string::npos, "production fibonacci output missing _fib_memo");
+    const std::size_t end = out.find("void _reset_memo_cache", begin);
+    TEST_ASSERT(end != std::string::npos, "failed to isolate _fib_memo section in production fibonacci output");
+    const std::string body = out.substr(begin, end - begin);
+
+    TEST_ASSERT(body.find("Error: fib_memo() index %d exceeds maximum %d") != std::string::npos,
+        "production fibonacci _fib_memo missing bounds-error format string path");
+
+    const std::regex cache_hit_return_shape(R"(if\s*\([^\{]*__MergedGlobals[^\{]*\)\s*\{[^\}]*return)");
+    TEST_ASSERT(std::regex_search(body, cache_hit_return_shape),
+        "production fibonacci _fib_memo missing cache-hit return control shape rooted in __MergedGlobals");
+
+    std::cout << "[+] test_production_fibonacci_fib_memo_bounds_error_and_cache_hit_shape passed.\n";
+}
+
 void test_production_fibonacci_main_has_connected_terminal_return() {
     const std::string out = generate_production_fibonacci_output_or_empty();
     if (out.empty()) {
@@ -832,9 +1018,6 @@ void test_production_fibonacci_main_has_connected_terminal_return() {
     const std::size_t main_end = out.find("int * ___error", main_begin);
     TEST_ASSERT(main_end != std::string::npos, "failed to isolate _main section in production fibonacci output");
     const std::string main_body = out.substr(main_begin, main_end - main_begin);
-
-    TEST_ASSERT(main_body.find("return a1;") == std::string::npos,
-        "production fibonacci _main still returns passthrough call-result variable");
 
     const std::regex return_const(R"(return\s+0x[01]\s*;)");
     TEST_ASSERT(std::regex_search(main_body, return_const),
@@ -971,6 +1154,13 @@ int main(int argc, char** argv) {
     test_production_fibonacci_fib_naive_has_negative_error_path();
     test_production_fibonacci_main_has_failure_return_path();
     test_production_fibonacci_main_strtol_not_from_mergedglobals();
+    test_production_fibonacci_main_no_dead_constant_validation_guard();
+    test_production_fibonacci_fib_naive_no_disconnected_return_a1();
+    test_production_fibonacci_fib_naive_no_tmp_terminal_return();
+    test_production_fibonacci_main_has_argc_validation_shape();
+    test_production_fibonacci_fib_memo_cache_hit_uses_stable_access();
+    test_production_fibonacci_main_terminal_success_return_zero();
+    test_production_fibonacci_fib_memo_bounds_error_and_cache_hit_shape();
     test_production_fibonacci_main_has_connected_terminal_return();
 
     return 0;

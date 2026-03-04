@@ -1271,12 +1271,21 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
             // Build parameter register -> parameter info mapping.
             auto [reg_table, reg_count] = param_register_table();
             param_register_map_.clear();
+            const std::string arch = detect_arch();
             if (reg_table) {
                 for (std::size_t i = 0; i < param_count && i < reg_count; ++i) {
-                    std::string reg_name(reg_table[i]);
                     const int idx = static_cast<int>(i);
                     const std::string display = "a" + std::to_string(i + 1);
                     const TypePtr ptype = (i < params.size()) ? params[i] : nullptr;
+
+                    std::string reg_name(reg_table[i]);
+                    if (arch == "arm64" && reg_name.size() >= 2 && reg_name[0] == 'x') {
+                        if (auto* int_type = type_dyn_cast<Integer>(ptype.get())) {
+                            if (int_type->size_bytes() <= 4) {
+                                reg_name[0] = 'w';
+                            }
+                        }
+                    }
 
                     param_register_map_[reg_name] = idx;
 
@@ -1286,23 +1295,14 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
                     info.type = ptype;
                     task.set_parameter_register(reg_name, std::move(info));
 
-                    // Register all sub-register aliases so codegen can map
-                    // e.g. "edi" → same display name as "rdi".
-                    // ARM64: xN → wN.
-                    if (reg_name.size() >= 2 && reg_name[0] == 'x') {
-                        std::string w_alias = reg_name;
-                        w_alias[0] = 'w';
-                        param_register_map_[w_alias] = idx;
-                        DecompilerTask::ParameterInfo ai;
-                        ai.name = display; ai.index = idx; ai.type = ptype;
-                        task.set_parameter_register(w_alias, std::move(ai));
-                    }
-                    // x86-64: rdi → edi/di/dil, r8 → r8d/r8w/r8b, etc.
-                    for (const auto& alias : x86_64_sub_register_aliases(reg_name)) {
-                        param_register_map_[alias] = idx;
-                        DecompilerTask::ParameterInfo ai;
-                        ai.name = display; ai.index = idx; ai.type = ptype;
-                        task.set_parameter_register(alias, std::move(ai));
+                    // Register architecture-appropriate aliases.
+                    if (arch == "x86_64") {
+                        for (const auto& alias : x86_64_sub_register_aliases(reg_name)) {
+                            param_register_map_[alias] = idx;
+                            DecompilerTask::ParameterInfo ai;
+                            ai.name = display; ai.index = idx; ai.type = ptype;
+                            task.set_parameter_register(alias, std::move(ai));
+                        }
                     }
                 }
             }

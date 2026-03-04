@@ -774,9 +774,8 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
     pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationStage>());
     pipeline.add_stage(std::make_unique<aletheia::BitFieldComparisonUnrollingStage>());
     pipeline.add_stage(std::make_unique<aletheia::TypePropagationStage>());
-    // NOTE: Temporarily disable aggressive dead path/loop pruning here because
-    // it can prune semantically relevant validation/base-case paths before
-    // sink-definition repair and structuring complete.
+    pipeline.add_stage(std::make_unique<aletheia::DeadPathEliminationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::DeadLoopEliminationStage>());
     pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationMemoryStage>());
     pipeline.add_stage(std::make_unique<aletheia::ExpressionPropagationFunctionCallStage>());
     pipeline.add_stage(std::make_unique<aletheia::DeadCodeEliminationStage>());
