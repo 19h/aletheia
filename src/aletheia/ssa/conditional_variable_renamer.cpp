@@ -70,6 +70,9 @@ struct VarInfo {
     std::size_t size_bytes = 0;
     bool aliased = false;
     TypePtr type = nullptr;
+    VariableKind kind = VariableKind::Register;
+    int parameter_index = -1;
+    std::int64_t stack_offset = 0;
 };
 
 using VarSet = std::unordered_set<VarKey, VarKeyHash>;
@@ -137,11 +140,24 @@ void collect_var_info(ControlFlowGraph& cfg,
             info.size_bytes = var->size_bytes;
             info.aliased = var->is_aliased();
             info.type = var->ir_type();
+            info.kind = var->kind();
+            info.parameter_index = var->parameter_index();
+            info.stack_offset = var->stack_offset();
         } else {
             info.aliased = info.aliased || var->is_aliased();
             info.size_bytes = std::max(info.size_bytes, var->size_bytes);
             if (!info.type && var->ir_type()) {
                 info.type = var->ir_type();
+            }
+            // Upgrade kind: Parameter > StackLocal/StackArgument > Register
+            if (var->is_parameter() && !info.sample->is_parameter()) {
+                info.kind = var->kind();
+                info.parameter_index = var->parameter_index();
+            }
+            if ((var->kind() == VariableKind::StackLocal || var->kind() == VariableKind::StackArgument)
+                && info.kind == VariableKind::Register) {
+                info.kind = var->kind();
+                info.stack_offset = var->stack_offset();
             }
         }
         add_vertex_if_missing(interference, key);
@@ -486,6 +502,17 @@ void ConditionalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph
             if (!lhs.repr.type && rhs.repr.type) {
                 lhs.repr.type = rhs.repr.type;
             }
+            // Merge provenance: Parameter > StackLocal/StackArgument > Register
+            if (rhs.repr.kind == VariableKind::Parameter && rhs.repr.parameter_index >= 0
+                && lhs.repr.kind != VariableKind::Parameter) {
+                lhs.repr.kind = rhs.repr.kind;
+                lhs.repr.parameter_index = rhs.repr.parameter_index;
+            }
+            if ((rhs.repr.kind == VariableKind::StackLocal || rhs.repr.kind == VariableKind::StackArgument)
+                && lhs.repr.kind == VariableKind::Register) {
+                lhs.repr.kind = rhs.repr.kind;
+                lhs.repr.stack_offset = rhs.repr.stack_offset;
+            }
 
             for (const VarKey& k : rhs.members) {
                 group_of[k] = lhs.id;
@@ -509,11 +536,42 @@ void ConditionalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph
             continue;
         }
 
-        const std::size_t size = g.repr.size_bytes > 0 ? g.repr.size_bytes : 4;
+        // Scan all members for the best provenance metadata.
+        VariableKind best_kind = g.repr.kind;
+        int best_param_index = g.repr.parameter_index;
+        std::int64_t best_stack_offset = g.repr.stack_offset;
+        std::size_t best_size = g.repr.size_bytes;
+        TypePtr best_type = g.repr.type;
+
+        for (const VarKey& key : g.members) {
+            auto it = var_info.find(key);
+            if (it == var_info.end()) {
+                continue;
+            }
+            const VarInfo& mi = it->second;
+            best_size = std::max(best_size, mi.size_bytes);
+            if (!best_type && mi.type) {
+                best_type = mi.type;
+            }
+            if (mi.kind == VariableKind::Parameter && mi.parameter_index >= 0) {
+                best_kind = VariableKind::Parameter;
+                best_param_index = mi.parameter_index;
+            }
+            if ((mi.kind == VariableKind::StackLocal || mi.kind == VariableKind::StackArgument)
+                && best_kind != VariableKind::Parameter) {
+                best_kind = mi.kind;
+                best_stack_offset = mi.stack_offset;
+            }
+        }
+
+        const std::size_t size = best_size > 0 ? best_size : 4;
         auto* replacement = arena.create<Variable>("var_" + std::to_string(counter++), size);
         replacement->set_ssa_version(0);
         replacement->set_aliased(g.repr.aliased);
-        replacement->set_ir_type(g.repr.type);
+        replacement->set_ir_type(best_type);
+        replacement->set_kind(best_kind);
+        replacement->set_parameter_index(best_param_index);
+        replacement->set_stack_offset(best_stack_offset);
 
         for (const VarKey& key : g.members) {
             replacement_for[key] = replacement;

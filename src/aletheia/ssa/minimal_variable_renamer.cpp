@@ -35,6 +35,9 @@ struct VarInfo {
     std::size_t size_bytes = 0;
     bool aliased = false;
     TypePtr type = nullptr;
+    VariableKind kind = VariableKind::Register;
+    int parameter_index = -1;
+    std::int64_t stack_offset = 0;
 };
 
 using VarSet = std::unordered_set<VarKey, VarKeyHash>;
@@ -267,9 +270,22 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             info.sample = var;
             info.size_bytes = var->size_bytes;
             info.aliased = var->is_aliased();
+            info.kind = var->kind();
+            info.parameter_index = var->parameter_index();
+            info.stack_offset = var->stack_offset();
         } else {
             info.aliased = info.aliased || var->is_aliased();
             info.size_bytes = std::max(info.size_bytes, var->size_bytes);
+            // Upgrade kind: Parameter > StackLocal/StackArgument > Register
+            if (var->is_parameter() && !info.sample->is_parameter()) {
+                info.kind = var->kind();
+                info.parameter_index = var->parameter_index();
+            }
+            if ((var->kind() == VariableKind::StackLocal || var->kind() == VariableKind::StackArgument)
+                && info.kind == VariableKind::Register) {
+                info.kind = var->kind();
+                info.stack_offset = var->stack_offset();
+            }
         }
 
         if (TypePtr candidate_type = var->ir_type()) {
@@ -503,12 +519,46 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
         if (info.aliased) {
             continue;
         }
-        const std::size_t size = info.size_bytes > 0 ? info.size_bytes : 4;
+
+        // Scan all members for the best provenance metadata.
+        // Priority: Parameter > StackLocal/StackArgument > Register.
+        VariableKind best_kind = VariableKind::Register;
+        int best_param_index = -1;
+        std::int64_t best_stack_offset = 0;
+        std::size_t best_size = 0;
+        TypePtr best_type = nullptr;
+
+        for (const VarKey& key : members) {
+            auto it = var_info.find(key);
+            if (it == var_info.end()) {
+                continue;
+            }
+            const VarInfo& mi = it->second;
+            best_size = std::max(best_size, mi.size_bytes);
+            if (!best_type && mi.type) {
+                best_type = mi.type;
+            }
+            if (mi.kind == VariableKind::Parameter && mi.parameter_index >= 0) {
+                best_kind = VariableKind::Parameter;
+                best_param_index = mi.parameter_index;
+                // Parameter is highest priority, but don't break — keep scanning for size/type
+            }
+            if ((mi.kind == VariableKind::StackLocal || mi.kind == VariableKind::StackArgument)
+                && best_kind != VariableKind::Parameter) {
+                best_kind = mi.kind;
+                best_stack_offset = mi.stack_offset;
+            }
+        }
+
+        const std::size_t size = best_size > 0 ? best_size : (info.size_bytes > 0 ? info.size_bytes : 4);
         std::string replacement_name = "var_" + std::to_string(fresh_name++);
         auto* replacement = arena.create<Variable>(replacement_name, size);
         replacement->set_ssa_version(0);
         replacement->set_aliased(info.aliased);
-        replacement->set_ir_type(info.type);
+        replacement->set_ir_type(best_type ? best_type : info.type);
+        replacement->set_kind(best_kind);
+        replacement->set_parameter_index(best_param_index);
+        replacement->set_stack_offset(best_stack_offset);
 
         for (const VarKey& key : members) {
             replacement_for[key] = replacement;

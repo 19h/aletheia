@@ -53,6 +53,10 @@ private:
     /// Maps lowercase register name -> parameter index.
     std::unordered_map<std::string, int> param_register_map_;
 
+    /// Reverse regvar alias map: maps lowercase IDA user name -> canonical register name.
+    /// Populated from IDA register_variables() during populate_task_signature().
+    std::unordered_map<std::string, std::string> regvar_alias_map_;
+
     BasicBlock* process_block(const ida::graph::BasicBlock& ida_block, std::unordered_map<ida::Address, BasicBlock*>& block_map);
     Instruction* lift_instruction(const ida::instruction::Instruction& insn);
     

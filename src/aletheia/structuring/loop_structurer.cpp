@@ -44,6 +44,88 @@ static bool is_broad_break_condition(AstNode* node) {
     return ifn->true_branch()->does_end_with_break();
 }
 
+/// Collect all variable name#version keys referenced in a condition expression.
+static void collect_break_cond_var_keys(Expression* expr, std::unordered_set<std::string>& keys) {
+    if (!expr) return;
+    std::unordered_set<Variable*> required;
+    expr->collect_requirements(required);
+    for (Variable* var : required) {
+        if (var) {
+            keys.insert(var->name() + "#" + std::to_string(var->ssa_version()));
+        }
+    }
+}
+
+/// Check if any assignment in an AST subtree writes to any of the given
+/// variable keys. This recursively descends into SeqNode, IfNode, etc.
+static bool subtree_writes_any_key(AstNode* node, const std::unordered_set<std::string>& keys) {
+    if (!node || keys.empty()) return false;
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) return false;
+        for (Instruction* inst : code->block()->instructions()) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+            if (dst && keys.contains(dst->name() + "#" + std::to_string(dst->ssa_version()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            if (subtree_writes_any_key(child, keys)) return true;
+        }
+        return false;
+    }
+
+    if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
+        return subtree_writes_any_key(ifn->true_branch(), keys)
+            || subtree_writes_any_key(ifn->false_branch(), keys);
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return subtree_writes_any_key(loop->body(), keys);
+    }
+
+    return false;
+}
+
+/// Check whether a break-condition's variables are loop-carried (defined
+/// inside the loop body). If so, hoisting the condition to while(!cond) is
+/// unsafe because the defining load is inside the loop body.
+static bool break_condition_has_loop_carried_defs(Expression* cond_expr, AstNode* loop_body) {
+    if (!cond_expr || !loop_body) return false;
+    std::unordered_set<std::string> keys;
+    collect_break_cond_var_keys(cond_expr, keys);
+    if (keys.empty()) return false;
+    return subtree_writes_any_key(loop_body, keys);
+}
+
+/// Check if the break-condition's variables have no visible definition in the
+/// entire function body. If they don't, hoisting the condition to while(!cond)
+/// creates an uninitialized-variable reference. This catches cases where
+/// phi-residual variables lost their defining assignment during optimization.
+static bool break_condition_has_no_visible_definition(
+    Expression* cond_expr, AstNode* loop_body, AstNode* full_body) {
+    if (!cond_expr) return false;
+    std::unordered_set<std::string> keys;
+    collect_break_cond_var_keys(cond_expr, keys);
+    if (keys.empty()) return false;
+    // If the condition variable is written inside the loop body, it has a
+    // definition (even if it's loop-carried). The problem is when it has NO
+    // definition at all — not in the loop body and not before it.
+    if (subtree_writes_any_key(loop_body, keys)) return false;
+    // Check if there's a definition outside the loop body (in the broader AST).
+    // If full_body == loop_body, there's nothing else to check.
+    if (full_body && full_body != loop_body) {
+        if (subtree_writes_any_key(full_body, keys)) return false;
+    }
+    // No visible definition anywhere — unsafe to hoist.
+    return true;
+}
+
 /// Check that all code nodes interrupting the ancestor loop are in the
 /// given end_nodes set.
 static bool has_only_loop_interruptions_in(
@@ -80,14 +162,37 @@ bool WhileLoopRule::can_be_applied(LoopNode* loop) const {
     if (!body) return false;
 
     // Case 1: body itself is a break-condition (strict or broad)
-    if (body->is_break_condition() || is_broad_break_condition(body)) return true;
+    if (body->is_break_condition() || is_broad_break_condition(body)) {
+        // Guard: if the condition's variables are defined inside the loop body,
+        // hoisting is unsafe (creates uninitialized variable at loop header).
+        // Also block hoisting if the condition variable has NO visible
+        // definition (phi-residual absorbed by optimization).
+        Expression* cond = extract_break_condition_expr(body);
+        if (!cond) {
+            auto* ifn = ast_dyn_cast<IfNode>(body);
+            if (ifn) cond = ifn->condition_expr();
+        }
+        if (break_condition_has_loop_carried_defs(cond, body)) return false;
+        return true;
+    }
 
     // Case 2: body is a SeqNode whose first child is a break-condition
     if (auto* seq = ast_dyn_cast<SeqNode>(body)) {
         if (!seq->nodes().empty()) {
             auto* first = seq->first();
-            if (first->is_break_condition() || is_broad_break_condition(first))
+            if (first->is_break_condition() || is_broad_break_condition(first)) {
+                // Guard: check if condition variables are loop-carried
+                Expression* cond = extract_break_condition_expr(first);
+                if (!cond) {
+                    auto* ifn = ast_dyn_cast<IfNode>(first);
+                    if (ifn) cond = ifn->condition_expr();
+                }
+                // Check the ENTIRE loop body (all seq children), not just
+                // the break-if, because the defining assignment may be in
+                // the remaining loop body after the break-if.
+                if (break_condition_has_loop_carried_defs(cond, body)) return false;
                 return true;
+            }
         }
     }
     return false;

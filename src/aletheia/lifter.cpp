@@ -1203,14 +1203,23 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
     }
 
     // Also check for register variables defined by the user in IDA.
+    regvar_alias_map_.clear();
     auto regvars = ida::function::register_variables(ea);
     if (regvars) {
         for (const auto& rv : *regvars) {
             if (!rv.user_name.empty()) {
                 std::string canonical = to_lower_ascii(rv.canonical_name);
-                // If this register is a parameter, update the display name.
+                std::string user_lower = to_lower_ascii(rv.user_name);
+
+                // Build reverse alias map: user_name -> canonical_name.
+                regvar_alias_map_[user_lower] = canonical;
+
+                // If this register is a parameter, update the display name
+                // AND add the user alias to the parameter register map.
                 auto it = param_register_map_.find(canonical);
                 if (it != param_register_map_.end()) {
+                    param_register_map_[user_lower] = it->second;
+
                     DecompilerTask::ParameterInfo info;
                     info.name = rv.user_name;
                     info.index = it->second;
@@ -1740,9 +1749,19 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
                     auto base_reg = extract_base_register_from_operand_text(clean_text);
                     if (base_reg) {
                         auto mem_disp = parse_memory_displacement(clean_text);
+                        // Resolve IDA regvar aliases back to canonical register names.
+                        // IDA may present "rdi" as "s1" in operand text for functions
+                        // with recognized parameter names.
+                        std::string resolved_reg = *base_reg;
+                        auto alias_it = regvar_alias_map_.find(resolved_reg);
+                        if (alias_it != regvar_alias_map_.end()) {
+                            resolved_reg = alias_it->second;
+                        }
                         // Use pointer size (8 bytes for 64-bit) for the address expression
                         const std::size_t addr_size = 8;
-                        Expression* addr_expr = arena_.create<Variable>(*base_reg, addr_size);
+                        auto* base_var = arena_.create<Variable>(resolved_reg, addr_size);
+                        tag_variable(base_var, insn_addr);
+                        Expression* addr_expr = base_var;
                         if (mem_disp && *mem_disp != 0) {
                             if (*mem_disp > 0) {
                                 addr_expr = arena_.create<Operation>(
