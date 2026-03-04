@@ -5749,42 +5749,6 @@ void AddressResolutionStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
 
     const auto aliases = collect_global_address_aliases(task.cfg());
-    bool has_direct_self_call = false;
-    auto canonical_name_for_match = [&](std::string name) {
-        std::transform(name.begin(), name.end(), name.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        while (!name.empty() && name.front() == '_') {
-            name.erase(name.begin());
-        }
-        return name;
-    };
-    const std::string fn_canon_name = canonical_name_for_match(task.function_name());
-
-    for (BasicBlock* b : task.cfg()->blocks()) {
-        for (Instruction* i : b->instructions()) {
-            auto* a = dyn_cast<Assignment>(i);
-            if (!a) {
-                continue;
-            }
-            auto* c = dyn_cast<Call>(a->value());
-            if (!c) {
-                continue;
-            }
-            auto* target_gv = dyn_cast<GlobalVariable>(strip_trivial_casts(c->target()));
-            auto* init = target_gv ? dyn_cast<Constant>(target_gv->initial_value()) : nullptr;
-            if (init && static_cast<ida::Address>(init->value()) == task.function_address()) {
-                has_direct_self_call = true;
-                break;
-            }
-            if (target_gv && canonical_name_for_match(target_gv->name()) == fn_canon_name) {
-                has_direct_self_call = true;
-                break;
-            }
-        }
-        if (has_direct_self_call) {
-            break;
-        }
-    }
     auto canonicalize_name = [](std::string name) {
         std::transform(name.begin(), name.end(), name.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -5955,29 +5919,6 @@ void AddressResolutionStage::execute(DecompilerTask& task) {
             } else if (auto* ret = dyn_cast<Return>(inst)) {
                 for (Expression*& val : ret->mutable_values()) {
                     val = resolve_addresses_in_expr(task.arena(), val, aliases);
-                }
-
-                if (has_direct_self_call && ret->mutable_values().size() == 1) {
-                    auto* ret_var = dyn_cast<Variable>(strip_trivial_casts(ret->mutable_values()[0]));
-                    if (ret_var && ret_var->name().rfind("tmp_", 0) == 0) {
-                        auto* fn = task.arena().create<GlobalVariable>(
-                            task.function_name(), 8,
-                            task.arena().create<Constant>(static_cast<std::uint64_t>(task.function_address()), 8),
-                            false);
-                        auto* n = task.arena().create<Variable>("arg_0", 4);
-                        n->set_kind(VariableKind::Parameter);
-                        n->set_parameter_index(0);
-                        auto* one = task.arena().create<Constant>(1, 4);
-                        auto* two = task.arena().create<Constant>(2, 4);
-                        auto* n1 = task.arena().create<Operation>(
-                            OperationType::sub, std::vector<Expression*>{n, one}, 4);
-                        auto* n2 = task.arena().create<Operation>(
-                            OperationType::sub, std::vector<Expression*>{n, two}, 4);
-                        auto* c1 = task.arena().create<Call>(fn, std::vector<Expression*>{n1}, 8);
-                        auto* c2 = task.arena().create<Call>(fn, std::vector<Expression*>{n2}, 8);
-                        ret->mutable_values()[0] = task.arena().create<Operation>(
-                            OperationType::add, std::vector<Expression*>{c1, c2}, 8);
-                    }
                 }
 
             }

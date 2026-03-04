@@ -983,6 +983,72 @@ void test_production_fibonacci_main_terminal_success_return_zero() {
     std::cout << "[+] test_production_fibonacci_main_terminal_success_return_zero passed.\n";
 }
 
+void test_production_fibonacci_main_no_contradictory_terminal_returns() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_main_no_contradictory_terminal_returns skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t main_begin = out.find("int _main");
+    TEST_ASSERT(main_begin != std::string::npos, "production fibonacci output missing _main");
+    const std::size_t main_end = out.find("int * ___error", main_begin);
+    TEST_ASSERT(main_end != std::string::npos, "failed to isolate _main section in production fibonacci output");
+    const std::string main_body = out.substr(main_begin, main_end - main_begin);
+
+    const bool has_merged_ret = main_body.find("return __MergedGlobals[") != std::string::npos;
+    const bool has_zero_ret = main_body.find("return 0x0;") != std::string::npos || main_body.find("return 0;") != std::string::npos;
+    TEST_ASSERT(!(has_merged_ret && has_zero_ret),
+        "production fibonacci _main contains contradictory returns (__MergedGlobals[...] and terminal return 0)");
+
+    std::cout << "[+] test_production_fibonacci_main_no_contradictory_terminal_returns passed.\n";
+}
+
+void test_production_fibonacci_main_validation_chain_markers() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_main_validation_chain_markers skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t main_begin = out.find("int _main");
+    TEST_ASSERT(main_begin != std::string::npos, "production fibonacci output missing _main");
+    const std::size_t main_end = out.find("int * ___error", main_begin);
+    TEST_ASSERT(main_end != std::string::npos, "failed to isolate _main section in production fibonacci output");
+    const std::string main_body = out.substr(main_begin, main_end - main_begin);
+
+    TEST_ASSERT(main_body.find("if (a1") != std::string::npos,
+        "production fibonacci _main missing recognizable argc-driven gate marker");
+    TEST_ASSERT(main_body.find("___error()") != std::string::npos,
+        "production fibonacci _main missing errno flow marker");
+    TEST_ASSERT(main_body.find("_strtol(") != std::string::npos,
+        "production fibonacci _main missing strtol marker");
+    TEST_ASSERT(main_body.find("&(tmp_") != std::string::npos,
+        "production fibonacci _main missing endptr address marker");
+
+    std::cout << "[+] test_production_fibonacci_main_validation_chain_markers passed.\n";
+}
+
+void test_production_fibonacci_fib_memo_cache_store_index_not_tmp_alias() {
+    const std::string out = generate_production_fibonacci_output_or_empty();
+    if (out.empty()) {
+        std::cout << "[i] test_production_fibonacci_fib_memo_cache_store_index_not_tmp_alias skipped (fibonacci fixture unavailable).\n";
+        return;
+    }
+
+    const std::size_t begin = out.find("long _fib_memo");
+    TEST_ASSERT(begin != std::string::npos, "production fibonacci output missing _fib_memo");
+    const std::size_t end = out.find("void _reset_memo_cache", begin);
+    TEST_ASSERT(end != std::string::npos, "failed to isolate _fib_memo section in production fibonacci output");
+    const std::string body = out.substr(begin, end - begin);
+
+    const std::regex tmp_store_alias(R"(__MergedGlobals\[tmp_[0-9]+\]\s*=)");
+    TEST_ASSERT(!std::regex_search(body, tmp_store_alias),
+        "production fibonacci _fib_memo cache stores still use tmp-derived index aliases");
+
+    std::cout << "[+] test_production_fibonacci_fib_memo_cache_store_index_not_tmp_alias passed.\n";
+}
+
 void test_production_fibonacci_fib_memo_bounds_error_and_cache_hit_shape() {
     const std::string out = generate_production_fibonacci_output_or_empty();
     if (out.empty()) {
@@ -1160,6 +1226,9 @@ int main(int argc, char** argv) {
     test_production_fibonacci_main_has_argc_validation_shape();
     test_production_fibonacci_fib_memo_cache_hit_uses_stable_access();
     test_production_fibonacci_main_terminal_success_return_zero();
+    test_production_fibonacci_main_no_contradictory_terminal_returns();
+    test_production_fibonacci_main_validation_chain_markers();
+    test_production_fibonacci_fib_memo_cache_store_index_not_tmp_alias();
     test_production_fibonacci_fib_memo_bounds_error_and_cache_hit_shape();
     test_production_fibonacci_main_has_connected_terminal_return();
 
