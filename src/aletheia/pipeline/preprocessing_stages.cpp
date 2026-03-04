@@ -1964,3 +1964,270 @@ void aletheia::EmptyBasicBlockRemoverStage::execute(DecompilerTask& task) {
         }
     }
 }
+
+// =============================================================================
+// FallthroughBlockMergeStage
+// =============================================================================
+// Merges consecutive fall-through basic blocks where the predecessor has exactly
+// one successor and the successor has exactly one predecessor. This is critical
+// for ARM64 code where IDA splits basic blocks at BL (call) instructions, which
+// causes ADRP+ADD constant-setup instructions and their consuming BL calls to
+// end up in different blocks. When SSA construction later processes these blocks,
+// the dominator-tree-based renaming can assign different SSA versions to the
+// ADRP definition and the BL use, breaking data flow.
+
+void aletheia::FallthroughBlockMergeStage::execute(DecompilerTask& task) {
+    ControlFlowGraph* cfg = task.cfg();
+    if (!cfg) return;
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+
+        for (BasicBlock* block : cfg->blocks()) {
+            // Block must have exactly one successor via unconditional/fallthrough edge
+            if (block->successors().size() != 1) continue;
+            Edge* succ_edge = block->successors().front();
+            BasicBlock* succ = succ_edge->target();
+
+            // Don't merge self-loops
+            if (succ == block) continue;
+
+            // Don't merge the entry block INTO something (entry must stay)
+            // But we CAN merge a successor INTO the entry block
+
+            // Successor must have exactly one predecessor (this block)
+            if (succ->predecessors().size() != 1) continue;
+
+            // The successor must not contain phi nodes (phis require multiple preds)
+            // This is a safety check — with exactly one predecessor, there should
+            // be no phis, but check anyway.
+            bool has_phi = false;
+            for (Instruction* inst : succ->instructions()) {
+                if (isa<Phi>(inst)) {
+                    has_phi = true;
+                    break;
+                }
+            }
+            if (has_phi) continue;
+
+            // Merge: append succ's instructions to block
+            for (Instruction* inst : succ->instructions()) {
+                block->add_instruction(inst);
+            }
+
+            // Redirect succ's outgoing edges to come from block
+            // Make copies of the successor lists since we'll be modifying them
+            std::vector<Edge*> succ_outgoing = succ->successors();
+            for (Edge* out_edge : succ_outgoing) {
+                BasicBlock* target = out_edge->target();
+                auto* new_edge = task.arena().create<Edge>(block, target, out_edge->type());
+                block->add_successor(new_edge);
+                target->add_predecessor(new_edge);
+
+                // Remove the old edge from target's predecessors
+                target->remove_predecessor(out_edge);
+            }
+
+            // Remove the edge from block to succ
+            block->remove_successor(succ_edge);
+            succ->remove_predecessor(succ_edge);
+
+            // If succ was the entry block (shouldn't happen but be safe)
+            if (cfg->entry_block() == succ) {
+                cfg->set_entry_block(block);
+            }
+
+            // Remove succ from the CFG
+            std::unordered_set<BasicBlock*> dead = {succ};
+            cfg->remove_nodes_from(dead);
+            changed = true;
+            break; // Restart iteration since blocks list changed
+        }
+    }
+}
+
+// =============================================================================
+// LocalConstantFoldingStage
+// =============================================================================
+// Pre-SSA local constant folding within basic blocks. Tracks the most recent
+// definition of each register variable and substitutes constant values forward
+// into subsequent uses. This folds ADRP+ADD pairs and inlines constants into
+// call arguments before SSA construction, avoiding version desynchronization.
+
+namespace {
+
+using aletheia::Constant;
+using aletheia::Expression;
+using aletheia::Variable;
+using aletheia::GlobalVariable;
+using aletheia::Operation;
+using aletheia::OperationType;
+using aletheia::Call;
+using aletheia::DecompilerArena;
+
+/// Try to evaluate a binary operation on two constants.
+/// Returns the folded result, or nullopt if the operation is not foldable.
+std::optional<std::uint64_t> lcf_try_fold_binary(OperationType op,
+                                                  std::uint64_t lhs,
+                                                  std::uint64_t rhs) {
+    switch (op) {
+    case OperationType::add:
+        return lhs + rhs;
+    case OperationType::sub:
+        return lhs - rhs;
+    case OperationType::bit_or:
+        return lhs | rhs;
+    case OperationType::bit_and:
+        return lhs & rhs;
+    case OperationType::bit_xor:
+        return lhs ^ rhs;
+    case OperationType::shl:
+        return (rhs < 64) ? (lhs << rhs) : 0UL;
+    case OperationType::shr:
+        return (rhs < 64) ? (lhs >> rhs) : 0UL;
+    default:
+        return std::nullopt;
+    }
+}
+
+/// Substitute constants into an expression tree, returning the (possibly new)
+/// expression. Performs constant folding for binary ops on two constants.
+/// `defs` maps variable name → most recent Constant* value in this block.
+/// Only substitutes plain `Variable` nodes (not GlobalVariable).
+Expression* lcf_substitute_and_fold(Expression* expr,
+                                    const std::unordered_map<std::string, Constant*>& defs,
+                                    DecompilerArena& arena,
+                                    bool& changed) {
+    if (!expr) return expr;
+
+    // Leaf: Variable → substitute if we have a constant definition
+    if (auto* var = dyn_cast<Variable>(expr)) {
+        // Don't substitute GlobalVariable (resolved symbols)
+        if (isa<GlobalVariable>(var)) return expr;
+        auto it = defs.find(var->name());
+        if (it != defs.end()) {
+            changed = true;
+            return it->second;
+        }
+        return expr;
+    }
+
+    // Leaf: Constant → no substitution needed
+    if (isa<Constant>(expr)) return expr;
+
+    // Binary/unary Operation → recurse into operands, then try folding
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        // Don't recurse into Call nodes — we handle call arguments separately
+        // to avoid substituting into the call target
+        if (isa<Call>(op)) return expr;
+        if (op->type() == OperationType::call) return expr;
+        // Don't touch deref operands — they are memory accesses, not arithmetic
+        if (op->type() == OperationType::deref) return expr;
+
+        bool any_changed = false;
+        for (std::size_t i = 0; i < op->operands().size(); ++i) {
+            Expression* child = op->operands()[i];
+            Expression* new_child = lcf_substitute_and_fold(child, defs, arena, any_changed);
+            if (new_child != child) {
+                op->mutable_operands()[i] = new_child;
+            }
+        }
+        if (any_changed) changed = true;
+
+        // Try constant folding: binary op with two Constant operands
+        if (op->operands().size() == 2) {
+            auto* lhs_c = dyn_cast<Constant>(op->operands()[0]);
+            auto* rhs_c = dyn_cast<Constant>(op->operands()[1]);
+            if (lhs_c && rhs_c) {
+                auto folded = lcf_try_fold_binary(op->type(), lhs_c->value(), rhs_c->value());
+                if (folded.has_value()) {
+                    changed = true;
+                    return arena.create<Constant>(*folded, op->size_bytes);
+                }
+            }
+        }
+
+        return op;
+    }
+
+    return expr;
+}
+
+} // namespace
+
+void aletheia::LocalConstantFoldingStage::execute(aletheia::DecompilerTask& task) {
+    if (!task.cfg()) return;
+
+
+
+
+    for (auto* block : task.cfg()->blocks()) {
+        // Map: variable name → most recent Constant value in this block.
+        // Only tracks variables whose most recent definition is a plain Constant.
+        // Cleared/updated as we walk instructions linearly.
+        std::unordered_map<std::string, Constant*> const_defs;
+
+        auto instructions = block->instructions();
+        for (auto* inst : instructions) {
+            auto* assign = dyn_cast<aletheia::Assignment>(inst);
+            if (!assign) continue;
+
+            auto* dest_var = dyn_cast<Variable>(assign->destination());
+            // Skip assignments to non-Variable destinations (e.g., deref)
+            // and GlobalVariable destinations
+            if (!dest_var || isa<GlobalVariable>(dest_var)) continue;
+
+            Expression* value = assign->value();
+
+            // Handle Call separately: substitute constants into arguments only
+            // (not into the call target, which is operands[0])
+            if (auto* call = dyn_cast<Call>(value)) {
+                for (std::size_t i = 0; i < call->arg_count(); ++i) {
+                    Expression* arg = call->arg(i);
+                    bool arg_changed = false;
+                    Expression* new_arg = lcf_substitute_and_fold(arg, const_defs, task.arena(), arg_changed);
+                    if (new_arg != arg) {
+                        // args are at operands[i+1]
+                        call->mutable_operands()[i + 1] = new_arg;
+                    }
+                }
+                // A call clobbers the destination register — remove it from defs
+                const_defs.erase(dest_var->name());
+                continue;
+            }
+
+            // For Operation-typed calls (OperationType::call), handle similarly
+            if (auto* op = dyn_cast<Operation>(value)) {
+                if (op->type() == OperationType::call) {
+                    // operands[0] is target, operands[1..N] are args
+                    for (std::size_t i = 1; i < op->operands().size(); ++i) {
+                        Expression* arg = op->operands()[i];
+                        bool arg_changed = false;
+                        Expression* new_arg = lcf_substitute_and_fold(arg, const_defs, task.arena(), arg_changed);
+                        if (new_arg != arg) {
+                            op->mutable_operands()[i] = new_arg;
+                        }
+                    }
+                    const_defs.erase(dest_var->name());
+                    continue;
+                }
+            }
+
+            // Substitute constants into the RHS expression
+            bool rhs_changed = false;
+            Expression* new_value = lcf_substitute_and_fold(value, const_defs, task.arena(), rhs_changed);
+            if (new_value != value) {
+                assign->set_value(new_value);
+            }
+
+            // Update const_defs: if the new RHS is a Constant, track it
+            if (auto* c = dyn_cast<Constant>(assign->value())) {
+                const_defs[dest_var->name()] = c;
+            } else {
+                // Non-constant definition kills the tracking
+                const_defs.erase(dest_var->name());
+            }
+        }
+    }
+}

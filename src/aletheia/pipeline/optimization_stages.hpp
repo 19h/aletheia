@@ -100,4 +100,13 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+/// Resolves remaining address-valued Constants to string literals or named
+/// symbols using IDA's database.  Runs AFTER constant folding so that
+/// ADRP+ADD pairs have already been collapsed to a single address.
+class AddressResolutionStage : public PipelineStage {
+public:
+    const char* name() const override { return "AddressResolution"; }
+    void execute(DecompilerTask& task) override;
+};
+
 } // namespace aletheia

@@ -1230,6 +1230,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : task.function_name();
     sig += name + "(";
 
+    bool params_emitted = false;
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
             const auto& params = func_type->parameters();
@@ -1241,6 +1242,41 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
                     : "a" + std::to_string(i + 1);
                 sig += params[i]->to_string() + " " + pname;
             }
+            params_emitted = true;
+        }
+    }
+    // Fallback: when there's no FunctionTypeDef but parameter_registers are
+    // populated (from the conservative ABI seed), emit parameters from the
+    // register map so user-defined functions don't appear with empty parens.
+    // Only emit parameters that are actually used in the function body.
+    if (!params_emitted && !task.parameter_registers().empty() && task.cfg()) {
+        // Collect which parameter indices are actually referenced in the IR.
+        std::unordered_set<int> used_indices;
+        for (auto* block : task.cfg()->blocks()) {
+            for (auto* inst : block->instructions()) {
+                std::unordered_set<Variable*> reqs;
+                inst->collect_requirements(reqs);
+                for (auto* var : reqs) {
+                    if (var->is_parameter() && var->parameter_index() >= 0) {
+                        used_indices.insert(var->parameter_index());
+                    }
+                }
+            }
+        }
+        // Build sorted parameter list from used indices.
+        if (!used_indices.empty()) {
+            int max_idx = *std::max_element(used_indices.begin(), used_indices.end());
+            // Emit all indices from 0 to max (to preserve positional meaning).
+            for (int i = 0; i <= max_idx; ++i) {
+                if (i > 0) sig += ", ";
+                auto it = param_display.index_to_name.find(i);
+                std::string pname = (it != param_display.index_to_name.end() && !it->second.empty())
+                    ? it->second
+                    : "a" + std::to_string(i + 1);
+                // Use a generic type for untyped parameters.
+                sig += "unsigned long " + pname;
+            }
+            params_emitted = true;
         }
     }
     sig += ") {";

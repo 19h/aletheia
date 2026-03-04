@@ -55,7 +55,7 @@ std::vector<VarKey> keys_from_variables(const std::vector<Variable*>& vars) {
     result.reserve(vars.size());
     VarSet seen;
     for (Variable* var : vars) {
-        if (var == nullptr) {
+        if (var == nullptr || isa<GlobalVariable>(var)) {
             continue;
         }
         VarKey key = key_of(var);
@@ -261,7 +261,7 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
     const std::vector<BasicBlock*> ordered_blocks = sorted_blocks_by_id(cfg.blocks());
 
     auto record_var = [&](Variable* var) {
-        if (var == nullptr) {
+        if (var == nullptr || isa<GlobalVariable>(var)) {
             return;
         }
         VarKey key = key_of(var);
@@ -574,6 +574,11 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             std::unordered_set<Variable*> seen;
             for (Variable* old_var : vars) {
                 if (old_var == nullptr) {
+                    continue;
+                }
+                // GlobalVariables represent resolved symbol names and must
+                // not be replaced with plain Variable objects.
+                if (isa<GlobalVariable>(old_var)) {
                     continue;
                 }
                 if (!seen.insert(old_var).second) {

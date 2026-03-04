@@ -1,4 +1,7 @@
 #include "optimization_stages.hpp"
+#include <ida/data.hpp>
+#include <ida/name.hpp>
+#include <ida/segment.hpp>
 
 namespace {
 aletheia::OperationType flip_comparison(aletheia::OperationType op) {
@@ -1888,6 +1891,22 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                     }
 
                     if (!safe) continue;
+
+                    // Guard: do NOT inline a call result into another call's
+                    // arguments. On ARM64, x0 is both the return register and
+                    // first argument register, so consecutive calls form
+                    // artificial def-use chains through x0. Inlining call
+                    // results into other calls creates semantically wrong
+                    // nested expressions like puts(printf(clock_gettime(...))).
+                    if (auto* use_assign = dyn_cast<Assignment>(inst)) {
+                        bool use_is_call = false;
+                        if (auto* uop = dyn_cast<Operation>(use_assign->value())) {
+                            if (uop->type() == OperationType::call) use_is_call = true;
+                        } else if (isa<Call>(use_assign->value())) {
+                            use_is_call = true;
+                        }
+                        if (use_is_call) continue;
+                    }
 
                     // Copy-on-write substitution
                     Expression* replacement = def->value();
@@ -4616,6 +4635,158 @@ void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
     };
 
     if (task.ast()) traverse(task.ast()->root());
+}
+
+// =============================================================================
+// AddressResolutionStage
+// =============================================================================
+
+namespace {
+
+/// Escape a raw byte string into a C string literal (with surrounding quotes).
+std::string addr_res_escape_c_string(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('"');
+    for (unsigned char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\0': out += "\\0"; break;
+            default:
+                if (c >= 0x20 && c <= 0x7e) {
+                    out.push_back(static_cast<char>(c));
+                } else {
+                    char buf[5];
+                    std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+                    out += buf;
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+/// Sanitize a name for use as a C identifier (simplified version).
+std::string addr_res_sanitize(const std::string& name) {
+    std::string out;
+    out.reserve(name.size());
+    for (unsigned char c : name) {
+        if (std::isalnum(c) || c == '_') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (!out.empty() && std::isdigit(static_cast<unsigned char>(out.front()))) {
+        out = "g_" + out;
+    }
+    return out;
+}
+
+/// Check if a constant value looks like a plausible address (above 0x10000).
+bool is_plausible_address(std::uint64_t value) {
+    return value > 0x10000 && value < 0x200000000ULL;
+}
+
+/// Try to resolve a Constant to a GlobalVariable (string or symbol).
+/// Returns nullptr if resolution fails.
+Expression* try_resolve_address_constant(
+    DecompilerArena& arena,
+    Constant* c)
+{
+    if (!c) return nullptr;
+    const auto value = c->value();
+    if (!is_plausible_address(value)) return nullptr;
+
+    const auto addr = static_cast<ida::Address>(value);
+    const auto width = c->size_bytes > 0 ? c->size_bytes : 8U;
+
+    // Try string first.
+    auto str_res = ida::data::read_string(addr);
+    if (str_res && !str_res->empty()) {
+        std::string escaped = addr_res_escape_c_string(*str_res);
+        auto* init = arena.create<Constant>(value, width);
+        return arena.create<GlobalVariable>(escaped, width, init, /*is_const=*/true);
+    }
+
+    // Try symbol name.
+    auto name_res = ida::name::get(addr);
+    if (name_res && !name_res->empty()) {
+        std::string sym = addr_res_sanitize(*name_res);
+        if (!sym.empty()) {
+            bool is_const = false;
+            if (auto seg = ida::segment::at(addr)) {
+                is_const = !seg->permissions().write;
+            }
+            auto* init = arena.create<Constant>(value, width);
+            return arena.create<GlobalVariable>(sym, width, init, is_const);
+        }
+    }
+
+    return nullptr;
+}
+
+/// Recursively walk an expression tree and replace address-valued Constants
+/// with GlobalVariables.
+Expression* resolve_addresses_in_expr(DecompilerArena& arena, Expression* expr) {
+    if (!expr) return expr;
+
+    if (auto* c = dyn_cast<Constant>(expr)) {
+        if (auto* resolved = try_resolve_address_constant(arena, c)) {
+            return resolved;
+        }
+        return expr;
+    }
+
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        bool changed = false;
+        for (Expression*& child : op->mutable_operands()) {
+            Expression* resolved = resolve_addresses_in_expr(arena, child);
+            if (resolved != child) {
+                child = resolved;
+                changed = true;
+            }
+        }
+        (void)changed;
+        return expr;
+    }
+
+    // ListOperation, GlobalVariable, Variable — no resolution needed.
+    return expr;
+}
+
+} // namespace (AddressResolutionStage helpers)
+
+void AddressResolutionStage::execute(DecompilerTask& task) {
+    if (!task.cfg()) return;
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                Expression* new_val = resolve_addresses_in_expr(
+                    task.arena(), assign->value());
+                if (new_val != assign->value()) {
+                    assign->set_value(new_val);
+                }
+                if (!isa<Variable>(assign->destination())) {
+                    Expression* new_dest = resolve_addresses_in_expr(
+                        task.arena(), assign->destination());
+                    if (new_dest != assign->destination()) {
+                        assign->set_destination(new_dest);
+                    }
+                }
+            } else if (auto* ret = dyn_cast<Return>(inst)) {
+                for (Expression*& val : ret->mutable_values()) {
+                    val = resolve_addresses_in_expr(task.arena(), val);
+                }
+            }
+        }
+    }
 }
 
 } // namespace aletheia

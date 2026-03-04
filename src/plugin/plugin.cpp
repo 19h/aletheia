@@ -88,6 +88,8 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<aletheia::SwitchVariableDetectionStage>());
         pipeline.add_stage(std::make_unique<aletheia::MemPhiConverterStage>());
         pipeline.add_stage(std::make_unique<aletheia::CoherenceStage>());
+        pipeline.add_stage(std::make_unique<aletheia::FallthroughBlockMergeStage>());
+        pipeline.add_stage(std::make_unique<aletheia::LocalConstantFoldingStage>());
         pipeline.add_stage(std::make_unique<aletheia::SsaConstructor>());
         pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
         pipeline.add_stage(std::make_unique<aletheia::DeadComponentPrunerStage>());
@@ -104,6 +106,7 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<aletheia::CommonSubexpressionEliminationStage>());
         pipeline.add_stage(std::make_unique<aletheia::ArrayAccessDetectionStage>());
         pipeline.add_stage(std::make_unique<aletheia::ExpressionSimplificationStage>());
+        pipeline.add_stage(std::make_unique<aletheia::AddressResolutionStage>());
         pipeline.add_stage(std::make_unique<aletheia::DeadComponentPrunerStage>());
         pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
         pipeline.add_stage(std::make_unique<aletheia::EdgePrunerStage>());

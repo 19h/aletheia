@@ -764,6 +764,8 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
         return pipeline;
     }
 
+    pipeline.add_stage(std::make_unique<aletheia::FallthroughBlockMergeStage>());
+    pipeline.add_stage(std::make_unique<aletheia::LocalConstantFoldingStage>());
     pipeline.add_stage(std::make_unique<aletheia::InsertMissingDefinitionsStage>());
     pipeline.add_stage(std::make_unique<aletheia::MemPhiConverterStage>());
     pipeline.add_stage(std::make_unique<aletheia::SsaConstructor>());
@@ -782,6 +784,7 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
     pipeline.add_stage(std::make_unique<aletheia::CommonSubexpressionEliminationStage>());
     pipeline.add_stage(std::make_unique<aletheia::ArrayAccessDetectionStage>());
     pipeline.add_stage(std::make_unique<aletheia::ExpressionSimplificationStage>());
+    pipeline.add_stage(std::make_unique<aletheia::AddressResolutionStage>());
     pipeline.add_stage(std::make_unique<aletheia::DeadComponentPrunerStage>());
     pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
     pipeline.add_stage(std::make_unique<aletheia::EdgePrunerStage>());

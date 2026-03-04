@@ -144,7 +144,8 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
     auto update_uses = [&](Expression* expr, auto& update_uses_ref) -> void {
         if (!expr) return;
         if (auto* v = dyn_cast<Variable>(expr)) {
-            if (counters.contains(v->name())) {
+            // GlobalVariables are resolved symbol names — never SSA-versioned.
+            if (!isa<GlobalVariable>(v) && counters.contains(v->name())) {
                 v->set_ssa_version(counters[v->name()].top());
             }
         } else if (auto* op = dyn_cast<Operation>(expr)) {

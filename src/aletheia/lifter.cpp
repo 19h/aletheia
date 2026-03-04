@@ -6,6 +6,7 @@
 #include <ida/segment.hpp>
 #include <ida/xref.hpp>
 #include <ida/name.hpp>
+#include <ida/data.hpp>
 #include <array>
 #include <algorithm>
 #include <cctype>
@@ -91,6 +92,34 @@ std::string strip_ida_address_prefix(const std::string& name) {
         if (!inner.empty()) return inner;
     }
     return name;
+}
+
+/// Escape a raw string into a C string literal (with surrounding quotes).
+std::string escape_c_string(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('"');
+    for (unsigned char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\0': out += "\\0"; break;
+            default:
+                if (c >= 0x20 && c <= 0x7e) {
+                    out.push_back(static_cast<char>(c));
+                } else {
+                    char buf[5];
+                    std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+                    out += buf;
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+    return out;
 }
 
 std::string global_name_from_operand(const ida::instruction::Operand& op, ida::Address insn_addr) {
@@ -1621,15 +1650,22 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
         std::string reg_name = op.register_name();
         std::string lower_reg = to_lower_ascii(reg_name);
         
+        // Use the lowercase register name for Variable creation so that
+        // all references to the same physical register share a single
+        // canonical name. IDA returns uppercase names for ARM64 registers
+        // (e.g., "X0", "W1") but the BL call handler injects arguments
+        // using lowercase ("x0", "x1"). Using different cases would cause
+        // SSA construction to treat them as separate variables, breaking
+        // data flow between ADRP/ADD constant setup and BL call arguments.
         // Check if this register is a parameter register.
         auto pit = param_register_map_.find(lower_reg);
         if (pit != param_register_map_.end()) {
-            auto* var = arena_.create<Variable>(reg_name, op.byte_width());
+            auto* var = arena_.create<Variable>(lower_reg, op.byte_width());
             var->set_kind(VariableKind::Parameter);
             var->set_parameter_index(pit->second);
             expr = var;
         } else {
-            expr = arena_.create<Variable>(reg_name, op.byte_width());
+            expr = arena_.create<Variable>(lower_reg, op.byte_width());
         }
     } else if (op.is_immediate()) {
         expr = arena_.create<Constant>(op.value(), op.byte_width());
@@ -1639,7 +1675,43 @@ Expression* Lifter::lift_operand(const ida::instruction::Operand& op, ida::Addre
             ? static_cast<std::uint64_t>(op.target_address())
             : op.value();
         const std::size_t width = op.byte_width() > 0 ? static_cast<std::size_t>(op.byte_width()) : 8U;
-        expr = arena_.create<Constant>(target, width);
+
+        // Skip string/symbol resolution for page-aligned addresses (ADRP
+        // targets). These are typically combined with a subsequent ADD to
+        // produce the real address; resolving the page base to a
+        // GlobalVariable blocks constant folding of the ADRP+ADD pair.
+        const bool page_aligned = (target & 0xFFF) == 0;
+        bool resolved = false;
+
+        if (!page_aligned) {
+            // Try to resolve the target address as a string literal.
+            auto str_res = ida::data::read_string(static_cast<ida::Address>(target));
+            if (str_res && !str_res->empty()) {
+                std::string escaped = escape_c_string(*str_res);
+                auto* init = arena_.create<Constant>(target, width);
+                expr = arena_.create<GlobalVariable>(escaped, width, init, /*is_const=*/true);
+                resolved = true;
+            }
+            if (!resolved) {
+                // Try to resolve as a named symbol.
+                auto name_res = ida::name::get(static_cast<ida::Address>(target));
+                if (name_res && !name_res->empty()) {
+                    std::string sym_name = sanitize_identifier(*name_res);
+                    if (!sym_name.empty()) {
+                        auto* init = arena_.create<Constant>(target, width);
+                        bool is_const = false;
+                        if (auto seg = ida::segment::at(static_cast<ida::Address>(target))) {
+                            is_const = !seg->permissions().write;
+                        }
+                        expr = arena_.create<GlobalVariable>(sym_name, width, init, is_const);
+                        resolved = true;
+                    }
+                }
+            }
+        }
+        if (!resolved) {
+            expr = arena_.create<Constant>(target, width);
+        }
     } else if (op.is_memory()) {
         const std::size_t width = op.byte_width() > 0 ? static_cast<std::size_t>(op.byte_width()) : 8U;
         if (op.type() == ida::instruction::OperandType::MemoryDirect) {
@@ -1894,7 +1966,11 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     if (is_mnemonic_in(lmnem, {"ret", "retn", "retf", "retaa", "retab", "eret"})) {
         if (operands.empty()) {
-            auto* ret_reg = arena_.create<Variable>("rax", 8);
+            // Use architecture-appropriate return register:
+            // ARM64 uses x0, x86-64 uses rax.
+            const std::string arch = detect_arch();
+            const char* ret_name = (arch == "arm64") ? "x0" : "rax";
+            auto* ret_reg = arena_.create<Variable>(ret_name, 8);
             operands.push_back(ret_reg);
         }
         auto* ret = arena_.create<Return>(std::move(operands));
@@ -2158,14 +2234,44 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         std::vector<Expression*> args;
 
         // Try to determine actual parameter count from callee prototype.
+        // Strategy 1: Use the raw operand address (works for stubs with prototypes).
+        // Strategy 2: Use the resolved GlobalVariable's address.
+        // Strategy 3: Follow xrefs to find the actual callee and get its prototype.
         // Fall back to 0 args rather than unconditionally injecting 8.
         std::size_t param_count = 0;
-        if (auto* c = dyn_cast<Constant>(operands.empty() ? nullptr : operands[0])) {
-            auto type_res = ida::type::retrieve(static_cast<ida::Address>(c->value()));
+        auto try_retrieve_param_count = [&](ida::Address target_addr) -> bool {
+            auto type_res = ida::type::retrieve(target_addr);
             if (type_res && type_res->is_function()) {
                 auto args_res = type_res->function_argument_types();
                 if (args_res) {
                     param_count = args_res->size();
+                    return true;
+                }
+            }
+            return false;
+        };
+        // Strategy 1: raw operand address
+        if (auto* c = dyn_cast<Constant>(operands.empty() ? nullptr : operands[0])) {
+            try_retrieve_param_count(static_cast<ida::Address>(c->value()));
+        }
+        // Strategy 2: resolved GlobalVariable address (may differ from raw operand
+        // for stubs where the prototype lives on the actual function, not the stub)
+        if (param_count == 0) {
+            if (auto* gv = dyn_cast<GlobalVariable>(target)) {
+                if (auto* init_c = dyn_cast<Constant>(gv->initial_value())) {
+                    try_retrieve_param_count(static_cast<ida::Address>(init_c->value()));
+                }
+            }
+        }
+        // Strategy 3: follow xrefs from this instruction to find the callee
+        if (param_count == 0) {
+            auto xrefs = ida::xref::code_refs_from(addr);
+            if (xrefs) {
+                for (const auto& ref : *xrefs) {
+                    if (ref.type == ida::xref::ReferenceType::CallNear ||
+                        ref.type == ida::xref::ReferenceType::CallFar) {
+                        if (try_retrieve_param_count(ref.to)) break;
+                    }
                 }
             }
         }
@@ -2703,6 +2809,10 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // =====================================================================
     if (arm_mnemonic_in(lmnem, {"adr", "adrp", "adrl"}, false, nullptr, nullptr, nullptr)
         && operands.size() >= 2) {
+        // Keep ADRP values as plain Constants so that constant folding can
+        // merge ADRP(page) + ADD(offset) into a single address constant.
+        // The AddressResolutionStage (post-simplification) will resolve the
+        // folded constant to a string literal or named symbol.
         auto* assign = arena_.create<Assignment>(operands[0], operands[1]);
         assign->set_address(addr);
         return assign;

@@ -471,6 +471,15 @@ public:
     TypePtr parse(const std::string& text) const {
         std::string trimmed = trim(text);
 
+        // Strip const qualifiers before further parsing.
+        if (trimmed.starts_with("const ")) {
+            trimmed = trimmed.substr(6);
+        }
+        if (trimmed.ends_with(" const")) {
+            trimmed = trimmed.substr(0, trimmed.size() - 6);
+        }
+        trimmed = trim(trimmed);
+
         // Pointer types: strip trailing '*' and recurse
         if (!trimmed.empty() && trimmed.back() == '*') {
             std::string base = trimmed.substr(0, trimmed.size() - 1);
@@ -507,12 +516,45 @@ private:
             {"unsigned long",      Integer::uint64_t()},
             {"long int",           Integer::int64_t()},
             {"unsigned long int",  Integer::uint64_t()},
-            {"long long",          Integer::int128_t()},
-            {"unsigned long long", Integer::uint128_t()},
+            // Fix: long long is 64-bit on LP64 (both macOS and Linux),
+            // NOT 128-bit.
+            {"long long",          Integer::int64_t()},
+            {"unsigned long long", Integer::uint64_t()},
+            {"long long int",      Integer::int64_t()},
+            {"unsigned long long int", Integer::uint64_t()},
             {"void",               CustomType::void_type()},
             {"bool",               CustomType::bool_type()},
             {"float",              Float::float32()},
             {"double",             Float::float64()},
+
+            // IDA-specific integer types
+            {"__int8",             Integer::int8_t()},
+            {"unsigned __int8",    Integer::uint8_t()},
+            {"__int16",            Integer::int16_t()},
+            {"unsigned __int16",   Integer::uint16_t()},
+            {"__int32",            Integer::int32_t()},
+            {"unsigned __int32",   Integer::uint32_t()},
+            {"__int64",            Integer::int64_t()},
+            {"unsigned __int64",   Integer::uint64_t()},
+
+            // IDA underscore-prefixed aggregate types
+            {"_byte",              Integer::uint8_t()},
+            {"_word",              Integer::uint16_t()},
+            {"_dword",             Integer::uint32_t()},
+            {"_qword",             Integer::uint64_t()},
+            {"_bool",              std::make_shared<const CustomType>("bool", 8)},
+
+            // Common fixed-width types
+            {"size_t",             Integer::uint64_t()},
+            {"ssize_t",            Integer::int64_t()},
+            {"int8_t",             Integer::int8_t()},
+            {"uint8_t",            Integer::uint8_t()},
+            {"int16_t",            Integer::int16_t()},
+            {"uint16_t",           Integer::uint16_t()},
+            {"int32_t",            Integer::int32_t()},
+            {"uint32_t",           Integer::uint32_t()},
+            {"int64_t",            Integer::int64_t()},
+            {"uint64_t",           Integer::uint64_t()},
         };
     }
 

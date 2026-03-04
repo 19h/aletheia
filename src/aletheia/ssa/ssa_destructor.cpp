@@ -123,6 +123,12 @@ void apply_simple_renamer(DecompilerArena& arena, ControlFlowGraph& cfg) {
                 if (old_var == nullptr) {
                     continue;
                 }
+                // GlobalVariables represent resolved symbol names (function
+                // call targets, named globals) and must not be replaced
+                // with plain Variable objects during out-of-SSA renaming.
+                if (isa<GlobalVariable>(old_var)) {
+                    continue;
+                }
                 if (!seen.insert(old_var).second) {
                     continue;
                 }

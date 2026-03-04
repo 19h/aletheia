@@ -70,4 +70,27 @@ public:
     void execute(DecompilerTask& task) override;
 };
 
+class FallthroughBlockMergeStage : public PipelineStage {
+public:
+    const char* name() const override { return "FallthroughBlockMerge"; }
+    void execute(DecompilerTask& task) override;
+};
+
+/// Pre-SSA local constant folding within basic blocks.
+///
+/// Tracks the most recent definition of each variable within a block and
+/// substitutes Constant values forward into uses. This folds ADRP+ADD
+/// pairs (e.g., X1 = Const(page); X1 = X1 + Const(offset)) into a single
+/// constant assignment (X1 = Const(page + offset)), and inlines constants
+/// into Call arguments so that downstream AddressResolution can resolve
+/// them to string literals and symbol names.
+///
+/// Must run BEFORE SSA construction. Operates only on straight-line code
+/// within each basic block — no cross-block analysis required.
+class LocalConstantFoldingStage : public PipelineStage {
+public:
+    const char* name() const override { return "LocalConstantFolding"; }
+    void execute(DecompilerTask& task) override;
+};
+
 } // namespace aletheia
