@@ -1092,6 +1092,24 @@ void test_production_fibonacci_main_has_connected_terminal_return() {
     std::cout << "[+] test_production_fibonacci_main_has_connected_terminal_return passed.\n";
 }
 
+void test_production_fibonacci_tests_have_no_degraded_shape_bypass() {
+    const std::string source = read_text_file_or_empty("../tests/test_idalib.cpp");
+    TEST_ASSERT(!source.empty(), "failed to load test source for semantic bypass guard");
+
+    const std::vector<std::string> required_strict_markers = {
+        "production fibonacci _main missing explicit failure return path",
+        "production fibonacci _main lacks recognizable argc-driven validation branch",
+        "production fibonacci _fib_memo missing cache-hit return control shape rooted in __MergedGlobals"
+    };
+
+    for (const std::string& marker : required_strict_markers) {
+        TEST_ASSERT(source.find(marker) != std::string::npos,
+            "tests/test_idalib.cpp lost strict semantic marker: " + marker);
+    }
+
+    std::cout << "[+] test_production_fibonacci_tests_have_no_degraded_shape_bypass passed.\n";
+}
+
 void test_main_no_integer_temp_for_error_pointer() {
     auto main_ea = resolve_function_optional("main");
     if (!main_ea) {
@@ -1231,6 +1249,7 @@ int main(int argc, char** argv) {
     test_production_fibonacci_fib_memo_cache_store_index_not_tmp_alias();
     test_production_fibonacci_fib_memo_bounds_error_and_cache_hit_shape();
     test_production_fibonacci_main_has_connected_terminal_return();
+    test_production_fibonacci_tests_have_no_degraded_shape_bypass();
 
     return 0;
 }

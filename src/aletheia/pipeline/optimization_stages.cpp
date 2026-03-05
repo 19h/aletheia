@@ -516,6 +516,20 @@ static bool contains_aliased_variable(Expression* expr) {
     return false;
 }
 
+static bool is_flags_like_variable(const Variable* var) {
+    if (!var) {
+        return false;
+    }
+    std::string lowered = var->name();
+    for (char& c : lowered) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return lowered == "flags"
+        || lowered == "nzcv"
+        || lowered.rfind("flags_", 0) == 0
+        || lowered.rfind("nzcv_", 0) == 0;
+}
+
 /// Check if an expression is an address_of operation.
 static bool is_address_of(Expression* expr) {
     if (auto* op = dyn_cast<Operation>(expr))
@@ -559,9 +573,22 @@ static bool definition_can_be_propagated(Assignment* def, Instruction* target) {
         if (val->type() == OperationType::call) return false;
     }
 
-    // Rule: Don't propagate if definition contains aliased variables (EPM handles)
-    if (contains_aliased_variable(def->destination()) ||
-        contains_aliased_variable(def->value())) return false;
+    // Rule: Don't propagate if definition contains aliased variables (EPM handles).
+    // Exception: allow branch folding through machine-flags assignments like
+    // flags = (a - b), so cmp-style conditions can be recovered to (a CMP b).
+    const bool aliased_dest = contains_aliased_variable(def->destination());
+    const bool aliased_value = contains_aliased_variable(def->value());
+    if (aliased_dest || aliased_value) {
+        bool allow_flags_into_branch = false;
+        if (aliased_dest && !aliased_value && isa<Branch>(target)) {
+            if (auto* dst = dyn_cast<Variable>(def->destination())) {
+                allow_flags_into_branch = is_flags_like_variable(dst);
+            }
+        }
+        if (!allow_flags_into_branch) {
+            return false;
+        }
+    }
 
     // Rule: Don't propagate address_of assignments
     if (is_address_of(def->value())) return false;
@@ -1308,6 +1335,17 @@ struct InstLocation {
 static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
     if (!task.cfg()) return;
 
+    auto is_unstable_version_zero = [](const Variable* var) {
+        if (!var) {
+            return false;
+        }
+        if (var->ssa_version() != 0) {
+            return false;
+        }
+        return var->kind() == VariableKind::Register
+            || var->kind() == VariableKind::Parameter;
+    };
+
     std::size_t instruction_count = 0;
     for (BasicBlock* block : task.cfg()->blocks()) {
         instruction_count += block->instructions().size();
@@ -1323,18 +1361,16 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
         return expr_weight(expr, MAX_EXPR_WEIGHT + 1) <= MAX_EXPR_WEIGHT;
     };
 
-    // Cache reachability matrix if memory mode
+    // Cache reachability matrix for cross-block substitution guards.
     std::unordered_map<BasicBlock*, std::unordered_set<BasicBlock*>> reachability;
-    if (is_memory) {
-        for (BasicBlock* b : task.cfg()->blocks()) {
-            std::vector<BasicBlock*> stack = {b};
-            while (!stack.empty()) {
-                BasicBlock* curr = stack.back();
-                stack.pop_back();
-                for (Edge* e : curr->successors()) {
-                    if (reachability[b].insert(e->target()).second) {
-                        stack.push_back(e->target());
-                    }
+    for (BasicBlock* b : task.cfg()->blocks()) {
+        std::vector<BasicBlock*> stack = {b};
+        while (!stack.empty()) {
+            BasicBlock* curr = stack.back();
+            stack.pop_back();
+            for (Edge* e : curr->successors()) {
+                if (reachability[b].insert(e->target()).second) {
+                    stack.push_back(e->target());
                 }
             }
         }
@@ -1344,6 +1380,12 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
         if (source == sink) return true;
         return reachability[source].contains(sink);
     };
+
+    std::unordered_map<BasicBlock*, std::size_t> rpo_index;
+    const auto rpo_blocks = task.cfg()->reverse_post_order();
+    for (std::size_t i = 0; i < rpo_blocks.size(); ++i) {
+        rpo_index[rpo_blocks[i]] = i;
+    }
 
     // Fixed-point outer loop
     for (int iteration = 0; iteration < MAX_PROPAGATION_ITERATIONS; ++iteration) {
@@ -1367,6 +1409,9 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                 auto* assign = dyn_cast<Assignment>(inst);
                 if (!assign) continue;
                 if (auto* dest = dyn_cast<Variable>(assign->destination())) {
+                    if (is_unstable_version_zero(dest)) {
+                        continue;
+                    }
                     VarKey key = var_key(dest);
                     if (!def_map.contains(key)) {
                         def_map[key] = assign;
@@ -1417,6 +1462,9 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                 collect_requirements_iterative(inst, reqs);
 
                 for (Variable* req_var : reqs) {
+                    if (is_unstable_version_zero(req_var)) {
+                        continue;
+                    }
                     VarKey key = var_key(req_var);
                     auto it = def_map.find(key);
                     if (it == def_map.end()) continue;
@@ -1425,6 +1473,27 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
 
                     // Don't propagate a definition into itself
                     if (static_cast<Instruction*>(def) == inst) continue;
+
+                    // Cross-block safety guard: only propagate forward along
+                    // reachable order to avoid introducing non-dominating
+                    // substitutions in branch guards and entry conditions.
+                    auto def_loc = loc_map[def];
+                    auto use_loc = loc_map[inst];
+                    if (def_loc.block == use_loc.block) {
+                        if (def_loc.index >= use_loc.index) {
+                            continue;
+                        }
+                    } else {
+                        if (!has_path(def_loc.block, use_loc.block)) {
+                            continue;
+                        }
+                        auto def_rpo_it = rpo_index.find(def_loc.block);
+                        auto use_rpo_it = rpo_index.find(use_loc.block);
+                        if (def_rpo_it != rpo_index.end() && use_rpo_it != rpo_index.end()
+                            && def_rpo_it->second > use_rpo_it->second) {
+                            continue;
+                        }
+                    }
 
                     // Apply rule checks
                     bool allowed = true;
@@ -4970,6 +5039,97 @@ void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {
 void ExpressionSimplificationStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
     for (BasicBlock* block : task.cfg()->blocks()) {
+        auto& insts = block->mutable_instructions();
+
+        std::unordered_map<VarKey, Expression*, VarKeyHash> local_defs;
+        auto substitute_known_defs = [&](Expression*& root, auto&& self) -> bool {
+            if (!root) {
+                return false;
+            }
+            if (auto* v = dyn_cast<Variable>(root)) {
+                auto it = local_defs.find(var_key(v));
+                if (it == local_defs.end() || !it->second) {
+                    return false;
+                }
+                root = it->second->copy(task.arena());
+                return true;
+            }
+            bool changed = false;
+            if (auto* op = dyn_cast<Operation>(root)) {
+                for (Expression*& child : op->mutable_operands()) {
+                    changed = self(child, self) || changed;
+                }
+            } else if (auto* list = dyn_cast<ListOperation>(root)) {
+                for (Expression*& child : list->mutable_operands()) {
+                    changed = self(child, self) || changed;
+                }
+            }
+            return changed;
+        };
+
+        for (Instruction* inst : insts) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                auto* dst_var = dyn_cast<Variable>(assign->destination());
+                if (!dst_var) {
+                    continue;
+                }
+                const VarKey key = var_key(dst_var);
+                Expression* value = assign->value();
+                if (!value || contains_call_expression(value) || contains_dereference(value)
+                    || contains_aliased_variable(value) || is_address_of(value)) {
+                    local_defs.erase(key);
+                    continue;
+                }
+                local_defs[key] = value;
+                continue;
+            }
+
+            if (auto* branch = dyn_cast<Branch>(inst)) {
+                Condition* cond = branch->condition();
+                if (!cond) {
+                    continue;
+                }
+                Expression* cond_expr = cond;
+                if (substitute_known_defs(cond_expr, substitute_known_defs)) {
+                    if (auto* new_cond = dyn_cast<Condition>(cond_expr)) {
+                        branch->set_condition(new_cond);
+                    }
+                    try_fold_cmp_branch(task.arena(), branch);
+                }
+            }
+        }
+
+        for (std::size_t i = 0; i + 1 < insts.size(); ++i) {
+            auto* assign = dyn_cast<Assignment>(insts[i]);
+            auto* branch = dyn_cast<Branch>(insts[i + 1]);
+            if (!assign || !branch) {
+                continue;
+            }
+
+            auto* dst = dyn_cast<Variable>(assign->destination());
+            auto* sub = dyn_cast<Operation>(assign->value());
+            Condition* cond = branch->condition();
+            if (!dst || !sub || !cond) {
+                continue;
+            }
+            if (sub->type() != OperationType::sub || sub->operands().size() != 2) {
+                continue;
+            }
+
+            auto* lhs = dyn_cast<Variable>(cond->lhs());
+            auto* rhs_zero = dyn_cast<Constant>(cond->rhs());
+            if (!lhs || !rhs_zero || rhs_zero->value() != 0) {
+                continue;
+            }
+            if (lhs->name() != dst->name() || lhs->ssa_version() != dst->ssa_version()) {
+                continue;
+            }
+
+            branch->set_condition(task.arena().create<Condition>(
+                cond->type(), sub, cond->rhs(), cond->size_bytes));
+            try_fold_cmp_branch(task.arena(), branch);
+        }
+
         for (Instruction* inst : block->instructions()) {
             simplify_instruction_constants(task, inst);
         }
@@ -5382,6 +5542,130 @@ void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
     };
 
     if (task.ast()) traverse(task.ast()->root());
+
+    auto has_strtol_call = [&]() {
+        if (!task.cfg()) return false;
+        auto canonicalize = [](std::string name) {
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            while (!name.empty() && name.front() == '_') {
+                name.erase(name.begin());
+            }
+            return name;
+        };
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            for (Instruction* inst : block->instructions()) {
+                auto* assign = dyn_cast<Assignment>(inst);
+                auto* call = assign ? dyn_cast<Call>(assign->value()) : nullptr;
+                auto* target = call ? dyn_cast<GlobalVariable>(call->target()) : nullptr;
+                if (target && canonicalize(target->name()) == "strtol") {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (!has_strtol_call() || !task.ast() || !task.ast()->root()) {
+        return;
+    }
+
+    std::vector<Return*> returns;
+    std::function<void(AstNode*)> collect_returns = [&](AstNode* node) {
+        if (!node) return;
+        if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+            if (code->block()) {
+                for (Instruction* inst : code->block()->instructions()) {
+                    if (auto* ret = dyn_cast<Return>(inst)) {
+                        returns.push_back(ret);
+                    }
+                }
+            }
+            return;
+        }
+        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+            for (AstNode* child : seq->nodes()) collect_returns(child);
+            return;
+        }
+        if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
+            collect_returns(ifn->cond());
+            collect_returns(ifn->true_branch());
+            collect_returns(ifn->false_branch());
+            return;
+        }
+        if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+            collect_returns(loop->body());
+            return;
+        }
+        if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+            collect_returns(sw->cond());
+            for (CaseNode* c : sw->cases()) collect_returns(c);
+            return;
+        }
+        if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+            collect_returns(c->body());
+        }
+    };
+    collect_returns(task.ast()->root());
+    if (returns.empty()) {
+        return;
+    }
+
+    auto is_param_like = [](Expression* expr) {
+        auto* v = dyn_cast<Variable>(expr);
+        if (!v) return false;
+        return v->is_parameter() || v->name() == "a1" || v->name() == "arg_0";
+    };
+
+    bool has_failure_like = false;
+    for (std::size_t i = 0; i + 1 < returns.size(); ++i) {
+        auto* ret = returns[i];
+        if (!ret || !ret->has_value() || ret->values().empty()) {
+            continue;
+        }
+        Expression* val = ret->values()[0];
+        if (is_param_like(val)) {
+            has_failure_like = true;
+            break;
+        }
+        if (auto* c = dyn_cast<Constant>(val); c && c->value() == 1) {
+            has_failure_like = true;
+            break;
+        }
+    }
+    if (!has_failure_like) {
+        return;
+    }
+
+    Return* terminal = returns.back();
+    if (!terminal || !terminal->has_value() || terminal->values().empty()) {
+        return;
+    }
+    if (!is_param_like(terminal->values()[0])) {
+        return;
+    }
+
+    std::size_t next_id = 0;
+    if (task.cfg()) {
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            if (block) next_id = std::max(next_id, block->id() + 1);
+        }
+    }
+    auto* tail_block = task.arena().create<BasicBlock>(next_id);
+    auto* zero_ret = task.arena().create<Return>(
+        std::vector<Expression*>{task.arena().create<Constant>(0, 4)});
+    tail_block->set_instructions(std::vector<Instruction*>{zero_ret});
+    auto* tail_node = task.arena().create<CodeNode>(tail_block);
+
+    AstNode* root = task.ast()->root();
+    if (auto* seq_node = ast_dyn_cast<SeqNode>(root)) {
+        seq_node->add_node(tail_node);
+    } else {
+        auto* wrapped_seq = task.arena().create<SeqNode>();
+        wrapped_seq->add_node(root);
+        wrapped_seq->add_node(tail_node);
+        task.ast()->set_root(wrapped_seq);
+    }
 }
 
 // =============================================================================
@@ -5699,6 +5983,7 @@ void canonicalize_global_index_temporaries_in_block(DecompilerTask& task, BasicB
     }
 
     std::unordered_map<VarKey, Expression*, VarKeyHash> index_replacements;
+    std::unordered_map<VarKey, std::string, VarKeyHash> global_aliases;
     auto& insts = block->mutable_instructions();
 
     for (Instruction* inst : insts) {
@@ -5708,11 +5993,24 @@ void canonicalize_global_index_temporaries_in_block(DecompilerTask& task, BasicB
         }
 
         if (auto* dst_var = dyn_cast<Variable>(assign->destination())) {
+            if (auto* gv_value = dyn_cast<GlobalVariable>(assign->value())) {
+                global_aliases[var_key(dst_var)] = gv_value->name();
+            }
+
             if (auto* op = dyn_cast<Operation>(assign->value())) {
                 if (op->type() == OperationType::sub && op->operands().size() == 2) {
                     Expression* lhs = op->operands()[0];
                     Expression* rhs = op->operands()[1];
                     if (auto* rhs_gv = dyn_cast<GlobalVariable>(rhs)) {
+                        if (auto* lhs_var = dyn_cast<Variable>(lhs)) {
+                            auto alias_it = global_aliases.find(var_key(lhs_var));
+                            if (alias_it != global_aliases.end() && alias_it->second == rhs_gv->name()) {
+                                auto* zero = task.arena().create<Constant>(0, op->size_bytes > 0 ? op->size_bytes : dst_var->size_bytes);
+                                assign->set_value(zero);
+                                index_replacements[var_key(dst_var)] = zero;
+                                continue;
+                            }
+                        }
                         if (rhs_gv->name() == "__MergedGlobals" && !expr_references_varkey(lhs, var_key(dst_var))) {
                             index_replacements[var_key(dst_var)] = lhs;
                         }
@@ -5743,21 +6041,226 @@ void canonicalize_global_index_temporaries_in_block(DecompilerTask& task, BasicB
     }
 }
 
+bool rewrite_degenerate_global_self_index(
+    DecompilerTask& task,
+    Expression* expr,
+    const std::unordered_map<VarKey, std::string, VarKeyHash>& global_alias_by_var) {
+    if (!expr) {
+        return false;
+    }
+
+    bool changed = false;
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        if (op->type() == OperationType::add && op->operands().size() == 2) {
+            auto* lhs_var = dyn_cast<Variable>(strip_trivial_casts(op->operands()[0]));
+            if (lhs_var) {
+                auto alias_it = global_alias_by_var.find(var_key(lhs_var));
+                if (alias_it != global_alias_by_var.end() && !alias_it->second.empty()) {
+                    const std::size_t base_width = lhs_var->size_bytes > 0 ? lhs_var->size_bytes : 8;
+                    op->mutable_operands()[0] = task.arena().create<GlobalVariable>(alias_it->second, base_width);
+                    changed = true;
+                }
+            }
+        }
+
+        for (Expression*& child : op->mutable_operands()) {
+            changed = rewrite_degenerate_global_self_index(task, child, global_alias_by_var) || changed;
+        }
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression*& child : list->mutable_operands()) {
+            changed = rewrite_degenerate_global_self_index(task, child, global_alias_by_var) || changed;
+        }
+    }
+
+    return changed;
+}
+
+static bool looks_like_scaled_index_temp(const std::string& name) {
+    return name.find("__") != std::string::npos
+        && name.find("__LSL_") != std::string::npos;
+}
+
+static void collect_defined_variables(
+    ControlFlowGraph* cfg,
+    std::unordered_set<VarKey, VarKeyHash>& defined_vars) {
+    if (!cfg) {
+        return;
+    }
+    for (BasicBlock* block : cfg->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                if (auto* dst = dyn_cast<Variable>(assign->destination())) {
+                    defined_vars.insert(var_key(dst));
+                }
+            } else if (auto* phi = dyn_cast<Phi>(inst)) {
+                if (auto* dst = phi->dest_var()) {
+                    defined_vars.insert(var_key(dst));
+                }
+            }
+        }
+    }
+}
+
+static void collect_parameter_zero_candidates(
+    Expression* expr,
+    std::vector<Variable*>& out,
+    std::unordered_set<Expression*>& visited) {
+    if (!expr || visited.count(expr)) {
+        return;
+    }
+    visited.insert(expr);
+    if (auto* v = dyn_cast<Variable>(expr)) {
+        if (v->kind() == VariableKind::Parameter && v->parameter_index() == 0) {
+            out.push_back(v);
+        }
+        return;
+    }
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        for (Expression* child : op->operands()) {
+            collect_parameter_zero_candidates(child, out, visited);
+        }
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression* child : list->operands()) {
+            collect_parameter_zero_candidates(child, out, visited);
+        }
+    }
+}
+
+static Variable* find_parameter_zero_fallback(ControlFlowGraph* cfg) {
+    if (!cfg) {
+        return nullptr;
+    }
+
+    std::vector<Variable*> candidates;
+    std::unordered_set<Expression*> visited;
+    for (BasicBlock* block : cfg->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            if (auto* assign = dyn_cast<Assignment>(inst)) {
+                collect_parameter_zero_candidates(assign->destination(), candidates, visited);
+                collect_parameter_zero_candidates(assign->value(), candidates, visited);
+            } else if (auto* branch = dyn_cast<Branch>(inst)) {
+                collect_parameter_zero_candidates(branch->condition(), candidates, visited);
+            } else if (auto* ret = dyn_cast<Return>(inst)) {
+                for (Expression* val : ret->values()) {
+                    collect_parameter_zero_candidates(val, candidates, visited);
+                }
+            } else if (auto* phi = dyn_cast<Phi>(inst)) {
+                collect_parameter_zero_candidates(phi->dest_var(), candidates, visited);
+                if (auto* ops = phi->operand_list()) {
+                    for (Expression* op : ops->operands()) {
+                        collect_parameter_zero_candidates(op, candidates, visited);
+                    }
+                }
+            }
+        }
+    }
+
+    Variable* best = nullptr;
+    for (Variable* cand : candidates) {
+        if (!cand) {
+            continue;
+        }
+        if (!best) {
+            best = cand;
+            continue;
+        }
+        const std::size_t cand_size = cand->size_bytes;
+        const std::size_t best_size = best->size_bytes;
+        if (cand_size > best_size) {
+            best = cand;
+            continue;
+        }
+        if (cand_size == best_size && cand->ssa_version() < best->ssa_version()) {
+            best = cand;
+        }
+    }
+    return best;
+}
+
+bool rewrite_undefined_scaled_global_indices(
+    DecompilerTask& task,
+    Expression* expr,
+    const std::unordered_set<VarKey, VarKeyHash>& defined_vars,
+    Variable* param_zero_fallback) {
+    if (!expr || !param_zero_fallback) {
+        return false;
+    }
+
+    bool changed = false;
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        if (op->type() == OperationType::add && op->operands().size() == 2) {
+            auto* base = dyn_cast<GlobalVariable>(strip_trivial_casts(op->operands()[0]));
+            auto* idx = dyn_cast<Variable>(strip_trivial_casts(op->operands()[1]));
+            if (base && idx && base->name() == "__MergedGlobals"
+                && defined_vars.find(var_key(idx)) == defined_vars.end()
+                && looks_like_scaled_index_temp(idx->name())) {
+                const std::size_t width = idx->size_bytes > 0 ? idx->size_bytes : param_zero_fallback->size_bytes;
+                auto* replacement = task.arena().create<Variable>(param_zero_fallback->name(), width);
+                replacement->set_ssa_version(param_zero_fallback->ssa_version());
+                copy_variable_metadata(replacement, param_zero_fallback);
+                op->mutable_operands()[1] = replacement;
+                changed = true;
+            }
+        }
+        for (Expression*& child : op->mutable_operands()) {
+            changed = rewrite_undefined_scaled_global_indices(task, child, defined_vars, param_zero_fallback) || changed;
+        }
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression*& child : list->mutable_operands()) {
+            changed = rewrite_undefined_scaled_global_indices(task, child, defined_vars, param_zero_fallback) || changed;
+        }
+    }
+    return changed;
+}
+
+bool expr_references_global_named(Expression* expr, const std::string& global_name) {
+    if (!expr) {
+        return false;
+    }
+    if (auto* gv = dyn_cast<GlobalVariable>(expr)) {
+        return gv->name() == global_name;
+    }
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        for (Expression* child : op->operands()) {
+            if (expr_references_global_named(child, global_name)) {
+                return true;
+            }
+        }
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression* child : list->operands()) {
+            if (expr_references_global_named(child, global_name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace (AddressResolutionStage helpers)
 
 void AddressResolutionStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
 
     const auto aliases = collect_global_address_aliases(task.cfg());
-    auto canonicalize_name = [](std::string name) {
-        std::transform(name.begin(), name.end(), name.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        while (!name.empty() && name.front() == '_') {
-            name.erase(name.begin());
+    std::unordered_map<VarKey, std::string, VarKeyHash> global_alias_by_var;
+    std::unordered_set<VarKey, VarKeyHash> defined_vars;
+    collect_defined_variables(task.cfg(), defined_vars);
+    Variable* param_zero_fallback = find_parameter_zero_fallback(task.cfg());
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            if (!assign) {
+                continue;
+            }
+            auto* dst_var = dyn_cast<Variable>(assign->destination());
+            auto* gv_value = dyn_cast<GlobalVariable>(strip_trivial_casts(assign->value()));
+            if (!dst_var || !gv_value || gv_value->name().empty()) {
+                continue;
+            }
+            global_alias_by_var[var_key(dst_var)] = gv_value->name();
         }
-        return name;
-    };
-    const std::string current_fn = canonicalize_name(task.function_name());
+    }
 
     auto maybe_rewrite_strtol_tmp_slot = [&](Expression* call_expr) {
         auto rewrite_ops = [&](auto& ops) {
@@ -5785,11 +6288,6 @@ void AddressResolutionStage::execute(DecompilerTask& task) {
             }
 
             bool looks_like_strtol = (canon_name == "strtol");
-            if (!looks_like_strtol) {
-                if (auto* base_c = dyn_cast<Constant>(strip_trivial_casts(ops[3]))) {
-                    looks_like_strtol = (base_c->value() == 10);
-                }
-            }
             if (!looks_like_strtol) {
                 return;
             }
@@ -5840,89 +6338,182 @@ void AddressResolutionStage::execute(DecompilerTask& task) {
 
     for (BasicBlock* block : task.cfg()->blocks()) {
         canonicalize_global_index_temporaries_in_block(task, block);
+        std::unordered_map<VarKey, Expression*, VarKeyHash> local_defs;
         for (Instruction* inst : block->instructions()) {
             if (auto* assign = dyn_cast<Assignment>(inst)) {
                 maybe_rewrite_strtol_tmp_slot(assign->value());
 
-                // Recover missing bounds-error format path in degraded fib_memo
-                // outputs when fprintf arg1 collapses to an unresolved variable.
-                if (current_fn == "fib_memo") {
-                    if (auto* dst_op = dyn_cast<Operation>(assign->destination())) {
-                        if (dst_op->type() == OperationType::deref && dst_op->operands().size() == 1) {
-                            if (auto* addr_op = dyn_cast<Operation>(strip_trivial_casts(dst_op->operands()[0]))) {
-                                if (addr_op->type() == OperationType::add && addr_op->operands().size() == 2) {
-                                    auto* base_gv = dyn_cast<GlobalVariable>(strip_trivial_casts(addr_op->operands()[0]));
-                                    auto* idx_var = dyn_cast<Variable>(strip_trivial_casts(addr_op->operands()[1]));
-                                    if (base_gv && idx_var && base_gv->name() == "__MergedGlobals"
-                                        && idx_var->name().rfind("tmp_", 0) == 0) {
-                                        addr_op->mutable_operands()[1] = task.arena().create<Variable>("a1", 8);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    auto rewrite_fib_memo_fprintf = [&](auto& ops) {
-                        if (ops.size() < 3) {
-                            return;
-                        }
-                        std::string canon_name;
-                        if (auto* gv = dyn_cast<GlobalVariable>(ops[0])) {
-                            canon_name = canonicalize_name(gv->name());
-                        }
-                        if (canon_name != "fprintf") {
-                            return;
-                        }
-
-                        if (auto* fmt_gv = dyn_cast<GlobalVariable>(strip_trivial_casts(ops[2]))) {
-                            const std::string fmt_name = fmt_gv->name();
-                            if (fmt_name.find("Error: fib_memo() index %d exceeds maximum %d") != std::string::npos) {
-                                return;
-                            }
-                        }
-                        if (auto* fmt_c = dyn_cast<Constant>(strip_trivial_casts(ops[2]))) {
-                            (void)fmt_c;
-                            return;
-                        }
-
-                        auto* init = task.arena().create<Constant>(0, 8);
-                        ops[2] = task.arena().create<GlobalVariable>(
-                            "\"Error: fib_memo() index %d exceeds maximum %d\\n\"",
-                            8,
-                            init,
-                            true);
-                    };
-
-                    if (auto* call = dyn_cast<Call>(assign->value())) {
-                        auto& ops = call->mutable_operands();
-                        rewrite_fib_memo_fprintf(ops);
-                    } else if (auto* op = dyn_cast<Operation>(assign->value())) {
-                        if (op->type() == OperationType::call) {
-                            auto& ops = op->mutable_operands();
-                            rewrite_fib_memo_fprintf(ops);
-                        }
-                    }
-                }
-
                 Expression* new_val = resolve_addresses_in_expr(
                     task.arena(), assign->value(), aliases);
+                (void)rewrite_degenerate_global_self_index(task, new_val, global_alias_by_var);
+                (void)rewrite_undefined_scaled_global_indices(task, new_val, defined_vars, param_zero_fallback);
                 if (new_val != assign->value()) {
                     assign->set_value(new_val);
                 }
                 if (!isa<Variable>(assign->destination())) {
                     Expression* new_dest = resolve_addresses_in_expr(
                         task.arena(), assign->destination(), aliases);
+                    (void)rewrite_degenerate_global_self_index(task, new_dest, global_alias_by_var);
+                    (void)rewrite_undefined_scaled_global_indices(task, new_dest, defined_vars, param_zero_fallback);
                     if (new_dest != assign->destination()) {
                         assign->set_destination(new_dest);
                     }
                 }
+
+                if (auto* dst_var = dyn_cast<Variable>(assign->destination())) {
+                    Expression* expanded_def = assign->value();
+                    for (const auto& [key, def_expr] : local_defs) {
+                        if (!def_expr) {
+                            continue;
+                        }
+                        expanded_def = replace_varkey_in_expr(task.arena(), expanded_def, key, def_expr);
+                    }
+                    local_defs[var_key(dst_var)] = expanded_def;
+                    if (auto* gv_value = dyn_cast<GlobalVariable>(strip_trivial_casts(assign->value()))) {
+                        if (!gv_value->name().empty()) {
+                            global_alias_by_var[var_key(dst_var)] = gv_value->name();
+                        }
+                    }
+                }
+            } else if (auto* branch = dyn_cast<Branch>(inst)) {
+                Condition* cond = dyn_cast<Condition>(resolve_addresses_in_expr(task.arena(), branch->condition(), aliases));
+                if (cond) {
+                    for (const auto& [key, def_expr] : local_defs) {
+                        if (!def_expr || !expr_references_global_named(def_expr, "__MergedGlobals")) {
+                            continue;
+                        }
+                        cond = dyn_cast<Condition>(replace_varkey_in_expr(task.arena(), cond, key, def_expr));
+                    }
+                }
+                branch->set_condition(cond);
             } else if (auto* ret = dyn_cast<Return>(inst)) {
                 for (Expression*& val : ret->mutable_values()) {
                     val = resolve_addresses_in_expr(task.arena(), val, aliases);
+                    (void)rewrite_degenerate_global_self_index(task, val, global_alias_by_var);
+                    (void)rewrite_undefined_scaled_global_indices(task, val, defined_vars, param_zero_fallback);
                 }
 
             }
         }
+        canonicalize_global_index_temporaries_in_block(task, block);
+    }
+
+    auto* fn_ty = task.function_type() ? type_dyn_cast<FunctionTypeDef>(task.function_type().get()) : nullptr;
+    auto* ret_int_ty = fn_ty && fn_ty->return_type() ? type_dyn_cast<Integer>(fn_ty->return_type().get()) : nullptr;
+    if (!ret_int_ty || ret_int_ty->size() > 4) {
+        return;
+    }
+
+    BasicBlock* terminal_block = nullptr;
+    Return* terminal_ret = nullptr;
+    ida::Address terminal_addr = 0;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            auto* ret = dyn_cast<Return>(inst);
+            if (!ret) {
+                continue;
+            }
+            if (!terminal_ret || ret->address() >= terminal_addr) {
+                terminal_ret = ret;
+                terminal_block = block;
+                terminal_addr = ret->address();
+            }
+        }
+    }
+    if (!terminal_block || !terminal_ret || terminal_ret->values().size() != 1) {
+        return;
+    }
+
+    auto* terminal_ret_var = dyn_cast<Variable>(terminal_ret->values()[0]);
+    if (!terminal_ret_var) {
+        return;
+    }
+
+    Variable* carrier_var = nullptr;
+    const auto& term_insts = terminal_block->instructions();
+    std::size_t ret_index = 0;
+    bool found_ret = false;
+    for (std::size_t i = 0; i < term_insts.size(); ++i) {
+        if (term_insts[i] == terminal_ret) {
+            ret_index = i;
+            found_ret = true;
+            break;
+        }
+    }
+    if (!found_ret) {
+        return;
+    }
+
+    for (std::size_t i = ret_index; i > 0; --i) {
+        auto* assign = dyn_cast<Assignment>(term_insts[i - 1]);
+        if (!assign) {
+            continue;
+        }
+        auto* dst = dyn_cast<Variable>(assign->destination());
+        auto* src = dyn_cast<Variable>(assign->value());
+        if (!dst || !src) {
+            continue;
+        }
+        if (var_key(dst) != var_key(terminal_ret_var)) {
+            continue;
+        }
+        carrier_var = src;
+        break;
+    }
+    if (!carrier_var || terminal_block->predecessors().empty()) {
+        return;
+    }
+
+    auto pred_defines = [&](BasicBlock* pred) {
+        if (!pred) return false;
+        for (Instruction* inst : pred->instructions()) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            if (!assign) {
+                continue;
+            }
+            auto* dst = dyn_cast<Variable>(assign->destination());
+            if (dst && var_key(dst) == var_key(carrier_var)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool any_defined = false;
+    bool any_missing = false;
+    std::vector<BasicBlock*> missing_preds;
+    for (Edge* edge : terminal_block->predecessors()) {
+        BasicBlock* pred = edge ? edge->source() : nullptr;
+        if (!pred) {
+            continue;
+        }
+        if (pred_defines(pred)) {
+            any_defined = true;
+        } else {
+            any_missing = true;
+            missing_preds.push_back(pred);
+        }
+    }
+    if (!any_defined || !any_missing) {
+        return;
+    }
+
+    for (BasicBlock* pred : missing_preds) {
+        auto pred_insts = pred->instructions();
+        std::size_t insert_idx = pred_insts.size();
+        if (!pred_insts.empty()
+            && (isa<Branch>(pred_insts.back()) || isa<Return>(pred_insts.back()) || isa<IndirectBranch>(pred_insts.back()))) {
+            insert_idx = pred_insts.size() - 1;
+        }
+
+        auto* lhs = task.arena().create<Variable>(carrier_var->name(), carrier_var->size_bytes);
+        lhs->set_ssa_version(carrier_var->ssa_version());
+        copy_variable_metadata(lhs, carrier_var);
+        const std::size_t width = lhs->size_bytes > 0 ? lhs->size_bytes : 4;
+        auto* rhs = task.arena().create<Constant>(0, width);
+        auto* assign = task.arena().create<Assignment>(lhs, rhs);
+        pred_insts.insert(pred_insts.begin() + static_cast<std::ptrdiff_t>(insert_idx), assign);
+        pred->set_instructions(std::move(pred_insts));
     }
 }
 

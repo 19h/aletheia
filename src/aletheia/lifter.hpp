@@ -66,6 +66,10 @@ private:
     /// integer-like value and recursive calls should prefer wN argument regs.
     bool current_function_prefers_w_args_ = false;
 
+    /// True when the current function returns a 32-bit integer-like value and
+    /// ARM64 return sinks should use w0 instead of x0.
+    bool current_function_prefers_w_return_ = false;
+
     BasicBlock* process_block(const ida::graph::BasicBlock& ida_block, std::unordered_map<ida::Address, BasicBlock*>& block_map);
     Instruction* lift_instruction(const ida::instruction::Instruction& insn);
     

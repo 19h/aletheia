@@ -629,6 +629,14 @@ AstNode* refine_sequence_once(
                     logos::Z3Converter conv(ctx);
                     logos::LogicCondition extracted_cond = conv.convert_to_condition(branch->condition());
 
+                    if (cbr_debug_enabled()) {
+                        std::cerr << "BRANCH at " << i << " nodes size: " << nodes.size() << std::endl;
+                        for (size_t k = i; k < nodes.size(); ++k) {
+                            TransitionBlock* tb = transition_block_for_ast_node(reaching_conditions, nodes[k]);
+                            std::cerr << "  node " << k << " rc: " << (tb ? reaching_conditions.at(tb).expression() : ctx.bool_val(false)) << std::endl;
+                        }
+                    }
+
                     rebuilt_nodes.push_back(node);
                     ++i;
 
@@ -643,14 +651,19 @@ AstNode* refine_sequence_once(
 
                         if (matching_tb) {
                             const auto& rc = reaching_conditions.at(matching_tb);
-                            if (rc.does_imply(extracted_cond) || extracted_cond.does_imply(rc)) {
+                            if (rc.does_imply(extracted_cond)) {
                                 true_branch->add_node(next_node);
-                            } else if (rc.is_complementary_to(extracted_cond)) {
+                            } else if (rc.does_imply(extracted_cond.negate())) {
                                 false_branch->add_node(next_node);
                             } else {
                                 if (cbr_debug_enabled()) {
                                     std::cerr << "[CBR Debug] Node " << i
                                               << " broke out! Condition did not imply/complement." << std::endl;
+                                    if (auto* tb = matching_tb) {
+                                        if (auto* ast = tb->ast_node()) {
+                                            std::cerr << "Node type: " << static_cast<int>(ast->ast_kind()) << std::endl;
+                                        }
+                                    }
                                     std::cerr << "rc: " << rc.expression()
                                               << " | extracted: " << extracted_cond.expression() << std::endl;
                                 }

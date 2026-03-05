@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace aletheia {
 
@@ -29,6 +30,7 @@ struct RenameState {
     std::unordered_map<VarKey, std::string, VarKeyHash> canonical_name;
     std::unordered_map<Variable*, std::string> pointer_name;
     std::unordered_map<std::string, std::size_t> prefix_next_id;
+    std::unordered_set<VarKey, VarKeyHash> return_sink_keys;
     std::size_t next_id = 0;
     enum class Scheme {
         Default,
@@ -243,6 +245,14 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
             return "local_" + std::to_string(state.prefix_next_id["local"]++);
         }
 
+        const VarKey key = canonical_key_for(var);
+        if (state.return_sink_keys.contains(key)
+            && !var->is_parameter()
+            && var->kind() != VariableKind::StackArgument
+            && var->kind() != VariableKind::StackLocal) {
+            return "ret_" + std::to_string(state.prefix_next_id["ret"]++);
+        }
+
         if (var->kind() == VariableKind::Temporary) {
             if (var->ir_type() && var->ir_type()->is_boolean()) {
                 return "flag_" + std::to_string(state.prefix_next_id["flag"]++);
@@ -281,6 +291,27 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
     const std::string prefix = type_prefix_for(var ? var->ir_type() : nullptr);
     const std::size_t id = state.prefix_next_id[prefix]++;
     return prefix + "Var" + std::to_string(id);
+}
+
+void collect_var_keys(Expression* expr, std::unordered_set<VarKey, VarKeyHash>& out) {
+    if (!expr) {
+        return;
+    }
+    if (auto* var = dyn_cast<Variable>(expr)) {
+        out.insert(canonical_key_for(var));
+        return;
+    }
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        for (Expression* child : op->operands()) {
+            collect_var_keys(child, out);
+        }
+        return;
+    }
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression* child : list->operands()) {
+            collect_var_keys(child, out);
+        }
+    }
 }
 
 void rename_variable(Variable* var, RenameState& state) {
@@ -425,6 +456,59 @@ void rename_ast_node(AstNode* node, RenameState& state) {
     }
 }
 
+void collect_return_sink_keys_from_ast(AstNode* node, std::unordered_set<VarKey, VarKeyHash>& out) {
+    if (!node) {
+        return;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) {
+            return;
+        }
+        for (Instruction* inst : code->block()->instructions()) {
+            auto* ret = dyn_cast<Return>(inst);
+            if (!ret) {
+                continue;
+            }
+            for (Expression* value : ret->values()) {
+                collect_var_keys(value, out);
+            }
+        }
+        return;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            collect_return_sink_keys_from_ast(child, out);
+        }
+        return;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        collect_return_sink_keys_from_ast(if_node->cond(), out);
+        collect_return_sink_keys_from_ast(if_node->true_branch(), out);
+        collect_return_sink_keys_from_ast(if_node->false_branch(), out);
+        return;
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        collect_return_sink_keys_from_ast(loop->body(), out);
+        return;
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        collect_return_sink_keys_from_ast(sw->cond(), out);
+        for (CaseNode* c : sw->cases()) {
+            collect_return_sink_keys_from_ast(c, out);
+        }
+        return;
+    }
+
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        collect_return_sink_keys_from_ast(c->body(), out);
+    }
+}
+
 } // namespace
 
 void VariableNameGeneration::apply_default(AbstractSyntaxForest* forest) {
@@ -434,6 +518,7 @@ void VariableNameGeneration::apply_default(AbstractSyntaxForest* forest) {
 
     RenameState state;
     state.scheme = RenameState::Scheme::Default;
+    collect_return_sink_keys_from_ast(forest->root(), state.return_sink_keys);
     rename_ast_node(forest->root(), state);
 }
 
@@ -444,6 +529,7 @@ void VariableNameGeneration::apply_system_hungarian(AbstractSyntaxForest* forest
 
     RenameState state;
     state.scheme = RenameState::Scheme::SystemHungarian;
+    collect_return_sink_keys_from_ast(forest->root(), state.return_sink_keys);
     rename_ast_node(forest->root(), state);
 }
 
@@ -454,6 +540,19 @@ void VariableNameGeneration::apply_to_cfg(ControlFlowGraph* cfg) {
 
     RenameState state;
     state.scheme = RenameState::Scheme::Default;
+
+    for (BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        for (Instruction* inst : block->instructions()) {
+            auto* ret = dyn_cast<Return>(inst);
+            if (!ret) {
+                continue;
+            }
+            for (Expression* value : ret->values()) {
+                collect_var_keys(value, state.return_sink_keys);
+            }
+        }
+    }
 
     for (BasicBlock* block : cfg->blocks()) {
         if (!block) continue;

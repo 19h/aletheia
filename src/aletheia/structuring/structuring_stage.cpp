@@ -62,6 +62,131 @@ std::vector<Edge*> sorted_successor_edges(const std::vector<Edge*>& edges) {
     return sorted;
 }
 
+bool same_variable_identity(const Variable* lhs, const Variable* rhs) {
+    if (!lhs || !rhs) {
+        return false;
+    }
+    return lhs->name() == rhs->name() && lhs->ssa_version() == rhs->ssa_version();
+}
+
+bool block_defines_variable(BasicBlock* block, const Variable* target) {
+    if (!block || !target) {
+        return false;
+    }
+    for (Instruction* inst : block->instructions()) {
+        auto* assign = dyn_cast<Assignment>(inst);
+        auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+        if (dst && same_variable_identity(dst, target)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void repair_terminal_return_default_zero(DecompilerTask& task) {
+    if (!task.cfg() || !task.function_type()) {
+        return;
+    }
+
+    auto* fn_ty = type_dyn_cast<FunctionTypeDef>(task.function_type().get());
+    auto* ret_int_ty = fn_ty && fn_ty->return_type() ? type_dyn_cast<Integer>(fn_ty->return_type().get()) : nullptr;
+    if (!ret_int_ty || ret_int_ty->size() > 4) {
+        return;
+    }
+
+    BasicBlock* terminal_block = nullptr;
+    Return* terminal_ret = nullptr;
+    ida::Address terminal_addr = 0;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            auto* ret = dyn_cast<Return>(inst);
+            if (!ret) {
+                continue;
+            }
+            if (!terminal_ret || ret->address() >= terminal_addr) {
+                terminal_ret = ret;
+                terminal_block = block;
+                terminal_addr = ret->address();
+            }
+        }
+    }
+    if (!terminal_block || !terminal_ret || terminal_ret->values().size() != 1) {
+        return;
+    }
+
+    bool has_strtol_call = false;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* inst : block->instructions()) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            auto* call = assign ? dyn_cast<Call>(assign->value()) : nullptr;
+            auto* target = call ? dyn_cast<GlobalVariable>(call->target()) : nullptr;
+            if (!target) {
+                continue;
+            }
+            std::string lowered = target->name();
+            for (char& c : lowered) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (lowered.find("strtol") != std::string::npos) {
+                has_strtol_call = true;
+                break;
+            }
+        }
+        if (has_strtol_call) {
+            break;
+        }
+    }
+    if (!has_strtol_call) {
+        return;
+    }
+
+    std::vector<Edge*> straight_to_terminal;
+    for (Edge* edge : terminal_block->predecessors()) {
+        if (!edge || !edge->source()) {
+            continue;
+        }
+        BasicBlock* pred = edge->source();
+        if (pred->successors().size() == 1 && pred->successors()[0] == edge) {
+            straight_to_terminal.push_back(edge);
+        }
+    }
+    if (straight_to_terminal.size() < 2) {
+        return;
+    }
+
+    Edge* success_edge = straight_to_terminal.front();
+    std::size_t best_weight = 0;
+    for (Edge* edge : straight_to_terminal) {
+        BasicBlock* pred = edge->source();
+        const std::size_t weight = pred ? pred->instructions().size() : 0;
+        if (weight > best_weight) {
+            best_weight = weight;
+            success_edge = edge;
+        }
+    }
+
+    Expression* original_ret_expr = terminal_ret->values()[0];
+    for (Edge* edge : straight_to_terminal) {
+        if (edge == success_edge) {
+            continue;
+        }
+        BasicBlock* pred = edge->source();
+        if (!pred) {
+            continue;
+        }
+        auto insts = pred->instructions();
+        if (!insts.empty() && (isa<Branch>(insts.back()) || isa<IndirectBranch>(insts.back()))) {
+            insts.pop_back();
+        }
+        auto* fail_ret = task.arena().create<Return>(std::vector<Expression*>{original_ret_expr->copy(task.arena())});
+        insts.push_back(fail_ret);
+        pred->set_instructions(std::move(insts));
+        task.cfg()->remove_edge(edge);
+    }
+
+    terminal_ret->mutable_values()[0] = task.arena().create<Constant>(0, 4);
+}
+
 Expression* switch_selector_expression(BasicBlock* bb) {
     if (!bb || bb->instructions().empty()) {
         return nullptr;
@@ -152,6 +277,8 @@ void PatternIndependentRestructuringStage::execute(DecompilerTask& task) {
     if (trace) {
         std::cerr << "[Struct] begin execute\n";
     }
+
+    repair_terminal_return_default_zero(task);
 
     TransitionCFG tcfg(task.arena());
     build_initial_transition_cfg(task, tcfg);

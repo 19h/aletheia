@@ -31,7 +31,7 @@ idump: .configure-release
 
 # Build and run tests
 test: .configure-release
-	cmake --build --preset release-optimized --target aletheia_tests test_idiom_resolver
+	cmake --build --preset release-optimized --target aletheia_tests test_idiom_resolver aletheia_debug_tests
 	ctest --preset release-optimized
 
 test-debug: .configure-debug

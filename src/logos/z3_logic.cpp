@@ -45,6 +45,28 @@ bool is_boolean_operation(aletheia::OperationType type) {
 
 } // namespace
 
+static std::string expr_fingerprint(aletheia::Expression* expr) {
+    if (!expr) return "<null>";
+    if (auto* c = aletheia::dyn_cast<aletheia::Constant>(expr)) {
+        return "C:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
+    }
+    if (auto* v = aletheia::dyn_cast<aletheia::Variable>(expr)) {
+        return "V:" + v->name() + ":" + std::to_string(v->ssa_version());
+    }
+    if (auto* op = aletheia::dyn_cast<aletheia::Operation>(expr)) {
+        std::string out = "O:" + std::to_string(static_cast<int>(op->type())) + "(";
+        bool first = true;
+        for (auto* child : op->operands()) {
+            if (!first) out += ",";
+            first = false;
+            out += expr_fingerprint(child);
+        }
+        out += ")";
+        return out;
+    }
+    return "E:unknown";
+}
+
 z3::expr Z3Converter::fresh_bool(const char* prefix) {
     const std::string name = std::string(prefix) + "_" + std::to_string(fresh_symbol_id_++);
     return ctx_.bool_const(name.c_str());
@@ -149,8 +171,11 @@ z3::expr Z3Converter::convert_operation(aletheia::Operation* o) {
         case OperationType::pointer:
         case OperationType::call:
         case OperationType::list_op:
-        case OperationType::unknown:
-            return fresh_bv(result_width, "opaque_op");
+        case OperationType::unknown: {
+            std::string fp = expr_fingerprint(o);
+            std::string name = std::string("opaque_op_") + std::to_string(std::hash<std::string>{}(fp));
+            return ctx_.bv_const(name.c_str(), result_width);
+        }
 
         case OperationType::cast:
         case OperationType::low:

@@ -61,6 +61,17 @@ static void substitute_uses(Expression* expr, const std::unordered_map<VarKey, E
 void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
 
+    auto is_unstable_version_zero = [](const Variable* var) {
+        if (!var) {
+            return false;
+        }
+        if (var->ssa_version() != 0) {
+            return false;
+        }
+        return var->kind() == VariableKind::Register
+            || var->kind() == VariableKind::Parameter;
+    };
+
     // True Global Expression Graph Folding
     // Identity mapping Phase — uses VarKey (name + SSA version) for correct identity
     std::unordered_map<VarKey, Expression*, VarKeyHash> substitutions;
@@ -75,6 +86,9 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
 
             if (auto* assign = dyn_cast<Assignment>(inst)) {
                 if (auto* target = dyn_cast<Variable>(assign->destination())) {
+                    if (is_unstable_version_zero(target)) {
+                        continue;
+                    }
                     Expression* value = assign->value();
                     
                     // If assigning to a Constant or another Variable without side effects
@@ -94,6 +108,9 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
         changed = false;
         for (auto& [target_key, value] : substitutions) {
             if (auto* v_val = dyn_cast<Variable>(value)) {
+                if (is_unstable_version_zero(v_val)) {
+                    continue;
+                }
                 auto chain_key = var_key(v_val);
                 auto chain_it = substitutions.find(chain_key);
                 if (chain_it != substitutions.end()) {
@@ -152,6 +169,10 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
                 // Substitute in the value (RHS) only
                 Expression* value = assign->value();
                 if (auto* v = dyn_cast<Variable>(value)) {
+                    if (is_unstable_version_zero(v)) {
+                        new_insts.push_back(inst);
+                        continue;
+                    }
                     auto it = substitutions.find(var_key(v));
                     if (it != substitutions.end()) {
                         assign->set_value(it->second);
@@ -163,8 +184,15 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
                 // Substitute in branch condition
                 substitute_uses(branch->condition(), substitutions);
             } else if (auto* ret = dyn_cast<Return>(inst)) {
-                // Return values: substitute handled via expression walk
-                for (auto* val : ret->values()) {
+                // Return values: rewrite direct variable roots and nested uses.
+                for (Expression*& val : ret->mutable_values()) {
+                    if (auto* v = dyn_cast<Variable>(val)) {
+                        auto it = substitutions.find(var_key(v));
+                        if (it != substitutions.end()) {
+                            val = it->second;
+                            continue;
+                        }
+                    }
                     substitute_uses(val, substitutions);
                 }
             }

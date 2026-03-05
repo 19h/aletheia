@@ -223,6 +223,14 @@ add_library(aletheia STATIC
     src/aletheia/structuring/car/car.cpp
     src/aletheia/pipeline/expressions/graph_expression_folding.cpp
     src/aletheia/pipeline/dataflow_analysis/dead_code_elimination.cpp
+    src/aletheia/debug/ir_serializer.cpp
+    src/aletheia/debug/expr_tree.cpp
+    src/aletheia/debug/stage_metrics.cpp
+    src/aletheia/debug/ir_diff.cpp
+    src/aletheia/debug/ir_invariants.cpp
+    src/aletheia/debug/variable_provenance.cpp
+    src/aletheia/debug/ir_query.cpp
+    src/aletheia/debug/debug_observer.cpp
 )
 target_link_libraries(aletheia PUBLIC idax::idax logos idiomata)
 target_include_directories(aletheia PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
@@ -269,6 +277,14 @@ add_library(aletheia_core STATIC
     src/aletheia/structuring/car/car.cpp
     src/aletheia/pipeline/expressions/graph_expression_folding.cpp
     src/aletheia/pipeline/dataflow_analysis/dead_code_elimination.cpp
+    src/aletheia/debug/ir_serializer.cpp
+    src/aletheia/debug/expr_tree.cpp
+    src/aletheia/debug/stage_metrics.cpp
+    src/aletheia/debug/ir_diff.cpp
+    src/aletheia/debug/ir_invariants.cpp
+    src/aletheia/debug/variable_provenance.cpp
+    src/aletheia/debug/ir_query.cpp
+    src/aletheia/debug/debug_observer.cpp
 )
 target_link_libraries(aletheia_core PUBLIC logos)
 target_include_directories(aletheia_core PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
@@ -287,6 +303,14 @@ if(APPLE)
     set_target_properties(aletheia_tests PROPERTIES LINK_FLAGS "-Wl,-undefined,dynamic_lookup")
 endif()
 add_test(NAME aletheia_unit_tests COMMAND aletheia_tests)
+
+# Debug infrastructure unit tests (uses aletheia_core, no IDA runtime)
+add_executable(aletheia_debug_tests tests/test_debug.cpp)
+target_link_libraries(aletheia_debug_tests aletheia_core logos)
+if(APPLE)
+    set_target_properties(aletheia_debug_tests PROPERTIES LINK_FLAGS "-Wl,-undefined,dynamic_lookup")
+endif()
+add_test(NAME aletheia_debug_tests COMMAND aletheia_debug_tests)
 
 # Idiom resolver unit test
 add_executable(test_idiom_resolver tests/test_idiom_resolver.cpp)

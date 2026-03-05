@@ -16,14 +16,22 @@
 #include "../aletheia/structuring/variable_name_generation.hpp"
 #include "../aletheia/structuring/loop_name_generator.hpp"
 
+#include "../aletheia/debug/debug_observer.hpp"
+#include "../aletheia/debug/ir_serializer.hpp"
+
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -35,6 +43,16 @@ struct CliOptions {
     std::string output_path;
     bool explicit_headless = false;
     bool trace_pass_pseudocode = false;
+    // Debug flags
+    bool stage_metrics = false;
+    bool stage_metrics_json = false;
+    bool diff_stages = false;
+    std::string diff_stage_name;
+    bool check_invariants = false;
+    std::string check_invariants_after;
+    std::string trace_variable;
+    bool dump_ir = false;
+    bool debug_all = false;
 };
 
 bool env_flag_enabled(const char* name) {
@@ -243,8 +261,116 @@ std::size_t count_cfg_non_control_instructions(const aletheia::ControlFlowGraph*
     return count;
 }
 
+struct JsonMetricsPerFunction {
+    std::string function_name;
+    std::uint64_t function_address = 0;
+    std::vector<aletheia::debug::StageMetrics> stages;
+};
+
+struct DecompileDebugOutput {
+    std::vector<aletheia::debug::StageMetrics> stage_metrics;
+    std::string summary;
+    std::string provenance_trace;
+};
+
+struct RunScopedDebugState {
+    std::unordered_set<std::string> emitted_unknown_selector_once;
+};
+
+std::string dedupe_selector_diagnostic_per_run(
+    std::string summary,
+    const aletheia::debug::DebugOptions& debug_opts,
+    RunScopedDebugState* run_state) {
+    if (!run_state || debug_opts.check_invariants_after.empty()) {
+        return summary;
+    }
+    if (!summary.starts_with("debug: --check-invariants-after selector")) {
+        return summary;
+    }
+
+    if (run_state->emitted_unknown_selector_once.contains(debug_opts.check_invariants_after)) {
+        while (summary.starts_with("debug:")) {
+            auto nl = summary.find('\n');
+            if (nl == std::string::npos) {
+                summary.clear();
+                break;
+            }
+            summary.erase(0, nl + 1);
+        }
+        return summary;
+    }
+
+    run_state->emitted_unknown_selector_once.insert(debug_opts.check_invariants_after);
+    return summary;
+}
+
+class NullBuffer final : public std::streambuf {
+public:
+    int overflow(int c) override { return c; }
+};
+
+class ScopedStdoutSilencer final {
+public:
+    explicit ScopedStdoutSilencer(bool enabled) {
+        if (!enabled) {
+            return;
+        }
+        backup_fd_ = ::dup(STDOUT_FILENO);
+        if (backup_fd_ < 0) {
+            return;
+        }
+        null_fd_ = ::open("/dev/null", O_WRONLY);
+        if (null_fd_ < 0) {
+            ::close(backup_fd_);
+            backup_fd_ = -1;
+            return;
+        }
+        if (::dup2(null_fd_, STDOUT_FILENO) < 0) {
+            ::close(null_fd_);
+            ::close(backup_fd_);
+            null_fd_ = -1;
+            backup_fd_ = -1;
+            return;
+        }
+        active_ = true;
+    }
+
+    ~ScopedStdoutSilencer() { restore(); }
+
+    ScopedStdoutSilencer(const ScopedStdoutSilencer&) = delete;
+    ScopedStdoutSilencer& operator=(const ScopedStdoutSilencer&) = delete;
+
+    void restore() {
+        if (!active_) {
+            return;
+        }
+        ::fflush(stdout);
+        ::dup2(backup_fd_, STDOUT_FILENO);
+        ::close(backup_fd_);
+        ::close(null_fd_);
+        backup_fd_ = -1;
+        null_fd_ = -1;
+        active_ = false;
+    }
+
+private:
+    int backup_fd_ = -1;
+    int null_fd_ = -1;
+    bool active_ = false;
+};
+
 void print_usage() {
-    std::cerr << "Usage: idump <binary> [-o <output.c>] [--headless] [--trace-pass-pseudocode]\n";
+    std::cerr << "Usage: idump <binary> [-o <output.c>] [--headless] [--trace-pass-pseudocode]\n"
+              << "  Debug options:\n"
+              << "    --stage-metrics           Print per-stage timing and IR size table\n"
+              << "    --stage-metrics=json      Print per-stage timing/size as JSON\n"
+              << "    --diff-stages             Print per-stage IR diffs\n"
+              << "    --diff-stage=NAME         Diff for a specific stage only\n"
+              << "    --check-invariants        Run IR invariant checks after each stage\n"
+              << "    --check-invariants-after=SELECTOR  Run checks only after stage (Name or Name#N)\n"
+              << "    --trace-variable=NAME     Trace variable mutations through pipeline\n"
+              << "    --dump-ir                 Dump full IR after each stage\n"
+              << "    --debug-all               Enable all debug features\n";
 }
 
 bool parse_args(int argc, char** argv, CliOptions& options) {
@@ -267,6 +393,22 @@ bool parse_args(int argc, char** argv, CliOptions& options) {
             options.output_path = argv[++i];
             continue;
         }
+        if (arg == "--stage-metrics") { options.stage_metrics = true; continue; }
+        if (arg == "--stage-metrics=json") {
+            options.stage_metrics = true;
+            options.stage_metrics_json = true;
+            continue;
+        }
+        if (arg == "--diff-stages") { options.diff_stages = true; continue; }
+        if (arg.starts_with("--diff-stage=")) { options.diff_stage_name = arg.substr(13); options.diff_stages = true; continue; }
+        if (arg == "--check-invariants") { options.check_invariants = true; continue; }
+        if (arg.starts_with("--check-invariants-after=")) {
+            options.check_invariants_after = arg.substr(25);
+            continue;
+        }
+        if (arg.starts_with("--trace-variable=")) { options.trace_variable = arg.substr(17); continue; }
+        if (arg == "--dump-ir") { options.dump_ir = true; continue; }
+        if (arg == "--debug-all") { options.debug_all = true; continue; }
         if (!arg.empty() && arg[0] == '-') {
             return false;
         }
@@ -803,7 +945,8 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
 std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     ida::Address ea,
     idiomata::IdiomMatcher& matcher,
-    PassPseudocodeTracer* pass_tracer) {
+    PassPseudocodeTracer* pass_tracer,
+    aletheia::debug::DebugObserver* debug_observer) {
     aletheia::DecompilerTask fallback_task(ea);
     configure_out_of_ssa_mode(fallback_task);
 
@@ -811,6 +954,9 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     std::vector<idiomata::IdiomTag> idiom_tags;
 
     fallback_lifter.populate_task_signature(fallback_task);
+    if (debug_observer) {
+        (*debug_observer)("Lifter", true, fallback_task);
+    }
     auto cfg_res = fallback_lifter.lift_function(ea, &idiom_tags);
     if (!cfg_res) {
         return std::nullopt;
@@ -818,13 +964,21 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
 
     fallback_task.set_cfg(std::move(*cfg_res));
     fallback_task.set_idiom_tags(std::move(idiom_tags));
+    if (debug_observer) {
+        (*debug_observer)("Lifter", false, fallback_task);
+    }
 
     auto fallback_pipeline = build_pipeline(false);
-    if (pass_tracer && pass_tracer->enabled()) {
+    if ((pass_tracer && pass_tracer->enabled()) || debug_observer) {
         fallback_pipeline.run(
             fallback_task,
-            [pass_tracer](const char* stage_name, bool before_stage, aletheia::DecompilerTask& observed_task) {
-                pass_tracer->emit_stage_snapshot("fallback-pass", stage_name, before_stage, observed_task);
+            [pass_tracer, debug_observer](const char* stage_name, bool before_stage, aletheia::DecompilerTask& observed_task) {
+                if (pass_tracer && pass_tracer->enabled()) {
+                    pass_tracer->emit_stage_snapshot("fallback-pass", stage_name, before_stage, observed_task);
+                }
+                if (debug_observer) {
+                    (*debug_observer)(stage_name, before_stage, observed_task);
+                }
             });
     } else {
         fallback_pipeline.run(fallback_task);
@@ -840,8 +994,21 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     fallback_ast->set_root(seq);
     fallback_task.set_ast(std::move(fallback_ast));
 
+    if (debug_observer) {
+        (*debug_observer)("InstructionLengthHandler", true, fallback_task);
+    }
     aletheia::InstructionLengthHandler::apply(fallback_task.ast(), fallback_task.arena());
+    if (debug_observer) {
+        (*debug_observer)("InstructionLengthHandler", false, fallback_task);
+    }
+
+    if (debug_observer) {
+        (*debug_observer)("VariableNameGeneration", true, fallback_task);
+    }
     apply_variable_naming(fallback_task);
+    if (debug_observer) {
+        (*debug_observer)("VariableNameGeneration", false, fallback_task);
+    }
 
     return generate_cfg_fallback_code(fallback_task);
 }
@@ -851,7 +1018,10 @@ std::vector<std::string> decompile_function(
     idiomata::IdiomMatcher& matcher,
     bool& ok,
     std::string& error_message,
-    bool trace_pass_pseudocode) {
+    bool trace_pass_pseudocode,
+    const CliOptions& cli_options = {},
+    RunScopedDebugState* run_debug_state = nullptr,
+    DecompileDebugOutput* debug_output = nullptr) {
     ok = false;
     error_message.clear();
 
@@ -859,10 +1029,75 @@ std::vector<std::string> decompile_function(
     PassPseudocodeTracer pass_tracer(ea, trace_pass_pseudocode);
     configure_out_of_ssa_mode(task);
 
+    if (debug_output) {
+        debug_output->stage_metrics.clear();
+        debug_output->summary.clear();
+        debug_output->provenance_trace.clear();
+    }
+
+    // Setup debug observer
+    aletheia::debug::DebugOptions debug_opts;
+    debug_opts.stage_metrics = cli_options.stage_metrics;
+    debug_opts.stage_metrics_json = cli_options.stage_metrics_json;
+    debug_opts.diff_stages = cli_options.diff_stages;
+    debug_opts.diff_stage_name = cli_options.diff_stage_name;
+    debug_opts.check_invariants = cli_options.check_invariants;
+    debug_opts.check_invariants_after = cli_options.check_invariants_after;
+    debug_opts.trace_variable = cli_options.trace_variable;
+    debug_opts.dump_ir = cli_options.dump_ir;
+    debug_opts.debug_all = cli_options.debug_all;
+    const bool has_debug = debug_opts.stage_metrics || debug_opts.diff_stages ||
+                           debug_opts.check_invariants || !debug_opts.check_invariants_after.empty() ||
+                           !debug_opts.trace_variable.empty() ||
+                           debug_opts.dump_ir || debug_opts.debug_all;
+
+    NullBuffer null_buffer;
+    std::ostream null_stream(&null_buffer);
+    std::ostream& debug_stream = debug_opts.stage_metrics_json ? null_stream : std::cerr;
+    std::optional<aletheia::debug::DebugObserver> debug_observer;
+    if (has_debug) {
+        debug_observer.emplace(debug_opts, debug_stream);
+    }
+    const bool emit_human_debug = has_debug && !debug_opts.stage_metrics_json;
+
+    auto emit_debug_outputs = [&]() {
+        if (!has_debug || !debug_observer.has_value()) {
+            return;
+        }
+        std::string debug_summary = dedupe_selector_diagnostic_per_run(
+            debug_observer->format_summary(),
+            debug_opts,
+            run_debug_state);
+        std::string provenance_trace;
+        if (!debug_opts.trace_variable.empty()) {
+            provenance_trace = debug_observer->provenance().format_trace(debug_opts.trace_variable);
+        }
+
+        if (debug_output) {
+            debug_output->stage_metrics = debug_observer->metrics().metrics();
+            debug_output->summary = debug_summary;
+            debug_output->provenance_trace = provenance_trace;
+        }
+
+        if (emit_human_debug) {
+            if (!debug_summary.empty()) {
+                std::cerr << debug_summary;
+            }
+            if (!provenance_trace.empty()) {
+                std::cerr << provenance_trace;
+            }
+        }
+    };
+
     aletheia::Lifter lifter(task.arena(), matcher);
     std::vector<idiomata::IdiomTag> idiom_tags;
 
     lifter.populate_task_signature(task);
+
+    // Capture pre-lifter state as synthetic stage boundary (baseline for metrics/provenance)
+    if (has_debug) {
+        (*debug_observer)("Lifter", true, task);
+    }
 
     auto cfg_res = lifter.lift_function(ea, &idiom_tags);
     if (!cfg_res) {
@@ -875,20 +1110,30 @@ std::vector<std::string> decompile_function(
     task.set_cfg(std::move(*cfg_res));
     task.set_idiom_tags(std::move(idiom_tags));
 
+    // Capture lifter output as synthetic stage boundary
+    if (has_debug) {
+        (*debug_observer)("Lifter", false, task);
+    }
+
     const bool enable_structuring = should_enable_structuring();
     const bool force_structured_output = env_flag_enabled("ALETHEIA_IDUMP_FORCE_STRUCTURED_OUTPUT");
     auto pipeline = build_pipeline(enable_structuring);
-    if (pass_tracer.enabled()) {
+    if (has_debug || pass_tracer.enabled()) {
         pipeline.run(
             task,
-            [&pass_tracer](const char* stage_name, bool before_stage, aletheia::DecompilerTask& observed_task) {
-                pass_tracer.emit_stage_snapshot("pipeline-pass", stage_name, before_stage, observed_task);
+            [&pass_tracer, &debug_observer, has_debug](const char* stage_name, bool before_stage, aletheia::DecompilerTask& observed_task) {
+                if (pass_tracer.enabled()) {
+                    pass_tracer.emit_stage_snapshot("pipeline-pass", stage_name, before_stage, observed_task);
+                }
+                if (has_debug) {
+                    (*debug_observer)(stage_name, before_stage, observed_task);
+                }
             });
     } else {
         pipeline.run(task);
     }
 
-    if (task.failed()) {
+    if (task.failed() && !debug_opts.stage_metrics_json) {
         std::cerr << "idump: pipeline stopped at stage '" << task.failure_stage() << "'";
         if (!task.failure_message().empty()) {
             std::cerr << ": " << task.failure_message();
@@ -915,35 +1160,74 @@ std::vector<std::string> decompile_function(
 
     if (using_cfg_fallback) {
         if (enable_structuring && !force_structured_output) {
-            if (auto rebuilt = regenerate_conservative_fallback(ea, matcher, &pass_tracer); rebuilt.has_value()) {
+            if (auto rebuilt = regenerate_conservative_fallback(
+                    ea, matcher, &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
+                rebuilt.has_value()) {
+                emit_debug_outputs();
                 ok = true;
                 return *rebuilt;
             }
         }
 
+        if (has_debug) {
+            (*debug_observer)("InstructionLengthHandler", true, task);
+        }
         aletheia::InstructionLengthHandler::apply(task.ast(), task.arena());
+        if (has_debug) {
+            (*debug_observer)("InstructionLengthHandler", false, task);
+        }
+
+        if (has_debug) {
+            (*debug_observer)("VariableNameGeneration", true, task);
+        }
         apply_variable_naming(task);
+        if (has_debug) {
+            (*debug_observer)("VariableNameGeneration", false, task);
+        }
         aletheia::VariableNameGeneration::apply_to_cfg(task.cfg());
+
+        emit_debug_outputs();
+
         ok = true;
         return generate_cfg_fallback_code(task);
     }
 
+    if (has_debug) {
+        (*debug_observer)("InstructionLengthHandler", true, task);
+    }
     aletheia::InstructionLengthHandler::apply(task.ast(), task.arena());
+    if (has_debug) {
+        (*debug_observer)("InstructionLengthHandler", false, task);
+    }
+
+    if (has_debug) {
+        (*debug_observer)("VariableNameGeneration", true, task);
+    }
     apply_variable_naming(task);
+    if (has_debug) {
+        (*debug_observer)("VariableNameGeneration", false, task);
+    }
+
+    emit_debug_outputs();
 
     aletheia::CodeVisitor visitor;
     auto structured_lines = visitor.generate_code(task);
 
     if (enable_structuring && !force_structured_output
         && generated_output_too_lossy(lifted_non_control_count, structured_lines)) {
-        if (ea == 0) {
+        if (ea == 0 && !debug_opts.stage_metrics_json) {
             std::cerr << "STRUCTURED LINES FOR FUNC 0:" << std::endl;
             for (const auto& l : structured_lines) {
                 std::cerr << "  " << l << std::endl;
             }
         }
-        std::cerr << "FALLING BACK FOR FUNCTION " << std::hex << ea << std::dec << std::endl;
-        if (auto rebuilt = regenerate_conservative_fallback(ea, matcher, &pass_tracer); rebuilt.has_value()) {
+        if (!debug_opts.stage_metrics_json) {
+            std::cerr << "FALLING BACK FOR FUNCTION " << std::hex << ea << std::dec << std::endl;
+        }
+        if (auto rebuilt = regenerate_conservative_fallback(
+                ea, matcher, &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
+            rebuilt.has_value()) {
+            emit_debug_outputs();
             ok = true;
             return *rebuilt;
         }
@@ -962,9 +1246,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const bool trace_pass_pseudocode = should_trace_pass_pseudocode(options);
+    const bool json_metrics_mode = options.stage_metrics_json;
+    ScopedStdoutSilencer stdout_silencer(json_metrics_mode);
 
-    if (!detect_headless(options)) {
+    const bool trace_pass_pseudocode = !json_metrics_mode && should_trace_pass_pseudocode(options);
+
+    if (!json_metrics_mode && !detect_headless(options)) {
         std::cerr << "idump: headless mode not explicit; proceeding (set --headless or ALETHEIA_HEADLESS=1).\n";
     }
 
@@ -972,13 +1259,17 @@ int main(int argc, char** argv) {
     runtime_options.quiet = true;
     auto init_res = ida::database::init(runtime_options);
     if (!init_res) {
-        std::cerr << "idump: failed to initialize idalib runtime.\n";
+        if (!json_metrics_mode) {
+            std::cerr << "idump: failed to initialize idalib runtime.\n";
+        }
         return 1;
     }
 
     auto open_res = ida::database::open(options.input_binary, ida::database::OpenMode::Analyze);
     if (!open_res) {
-        std::cerr << "idump: failed to open input binary: " << options.input_binary << "\n";
+        if (!json_metrics_mode) {
+            std::cerr << "idump: failed to open input binary: " << options.input_binary << "\n";
+        }
         return 1;
     }
 
@@ -997,17 +1288,36 @@ int main(int argc, char** argv) {
 
     std::size_t total_functions = 0;
     std::size_t decompiled_functions = 0;
+    RunScopedDebugState run_debug_state;
+    std::vector<JsonMetricsPerFunction> json_metrics_functions;
 
     for (const auto& fn : ida::function::all()) {
         ++total_functions;
         bool ok = false;
         std::string error_message;
-        auto lines = decompile_function(fn.start(), matcher, ok, error_message, trace_pass_pseudocode);
+        DecompileDebugOutput debug_output;
+        auto lines = decompile_function(
+            fn.start(),
+            matcher,
+            ok,
+            error_message,
+            trace_pass_pseudocode,
+            options,
+            &run_debug_state,
+            &debug_output);
 
         if (!ok) {
             out << "/* decompilation failed at " << std::hex << fn.start() << std::dec << ": "
                 << error_message << " */\n\n";
             continue;
+        }
+
+        if (json_metrics_mode) {
+            JsonMetricsPerFunction metrics_row;
+            metrics_row.function_address = static_cast<std::uint64_t>(fn.start());
+            metrics_row.function_name = "sub_" + std::to_string(static_cast<std::uint64_t>(fn.start()));
+            metrics_row.stages = std::move(debug_output.stage_metrics);
+            json_metrics_functions.push_back(std::move(metrics_row));
         }
 
         ++decompiled_functions;
@@ -1019,6 +1329,31 @@ int main(int argc, char** argv) {
 
     out.flush();
     ida::database::close(false);
+
+    if (json_metrics_mode) {
+        std::sort(
+            json_metrics_functions.begin(),
+            json_metrics_functions.end(),
+            [](const JsonMetricsPerFunction& lhs, const JsonMetricsPerFunction& rhs) {
+                return lhs.function_address < rhs.function_address;
+            });
+        std::vector<aletheia::debug::FunctionStageMetrics> functions;
+        functions.reserve(json_metrics_functions.size());
+        for (const auto& fn : json_metrics_functions) {
+            aletheia::debug::FunctionStageMetrics row;
+            row.function_name = fn.function_name;
+            row.function_address = fn.function_address;
+            row.stages = fn.stages;
+            functions.push_back(std::move(row));
+        }
+        stdout_silencer.restore();
+        std::cout << aletheia::debug::format_stage_metrics_report_json(
+            options.input_binary,
+            total_functions,
+            decompiled_functions,
+            functions);
+        return 0;
+    }
 
     std::cerr << "idump: wrote " << decompiled_functions << "/" << total_functions
               << " functions to " << output_path << "\n";

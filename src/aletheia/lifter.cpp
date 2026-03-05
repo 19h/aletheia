@@ -1192,6 +1192,15 @@ bool first_parameter_prefers_w_reg(const TypePtr& function_type) {
     return p0 && p0->size_bytes() <= 4;
 }
 
+bool return_prefers_w_reg(const TypePtr& function_type) {
+    auto* fn = type_dyn_cast<FunctionTypeDef>(function_type.get());
+    if (!fn || !fn->return_type()) {
+        return false;
+    }
+    auto* ret = type_dyn_cast<Integer>(fn->return_type().get());
+    return ret && ret->size_bytes() <= 4;
+}
+
 std::optional<std::size_t> known_call_min_arity(const std::string& canon_name) {
     if (canon_name == "error") return 0;
     if (canon_name == "clock_gettime") return 2;
@@ -1240,6 +1249,7 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
     std::size_t param_count = 0;
     current_function_param_count_hint_ = 0;
     current_function_prefers_w_args_ = false;
+    current_function_prefers_w_return_ = false;
 
     if (type_res) {
         auto& type_info = *type_res;
@@ -1267,6 +1277,7 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
             param_count = params.size();
             current_function_param_count_hint_ = param_count;
             current_function_prefers_w_args_ = first_parameter_prefers_w_reg(task.function_type());
+            current_function_prefers_w_return_ = return_prefers_w_reg(task.function_type());
 
             // Build parameter register -> parameter info mapping.
             auto [reg_table, reg_count] = param_register_table();
@@ -1396,6 +1407,7 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
                 task.set_function_type(std::make_shared<const FunctionTypeDef>(Integer::int64_t(), params));
                 current_function_param_count_hint_ = 1;
                 current_function_prefers_w_args_ = true;
+                current_function_prefers_w_return_ = false;
 
                 param_register_map_["x0"] = 0;
                 param_register_map_["w0"] = 0;
@@ -1415,23 +1427,28 @@ void Lifter::populate_task_signature(DecompilerTask& task) {
                 task.set_function_type(std::make_shared<const FunctionTypeDef>(Float::float64(), std::vector<TypePtr>{}));
                 current_function_param_count_hint_ = 0;
                 current_function_prefers_w_args_ = false;
+                current_function_prefers_w_return_ = false;
             } else if (canon_name == "reset_memo_cache") {
                 task.set_function_type(std::make_shared<const FunctionTypeDef>(CustomType::void_type(), std::vector<TypePtr>{}));
                 current_function_param_count_hint_ = 0;
                 current_function_prefers_w_args_ = false;
+                current_function_prefers_w_return_ = false;
             }
         }
     } else {
         current_function_prefers_w_args_ = first_parameter_prefers_w_reg(task.function_type());
+        current_function_prefers_w_return_ = return_prefers_w_reg(task.function_type());
 
         // Heuristic override for known fixture helpers when recovered types are
         // weak/inaccurate.
         if (canon_name == "reset_memo_cache") {
             task.set_function_type(std::make_shared<const FunctionTypeDef>(
                 CustomType::void_type(), std::vector<TypePtr>{}));
+            current_function_prefers_w_return_ = false;
         } else if (canon_name == "get_time_seconds") {
             task.set_function_type(std::make_shared<const FunctionTypeDef>(
                 Float::float64(), std::vector<TypePtr>{}));
+            current_function_prefers_w_return_ = false;
         }
     }
 }
@@ -2101,15 +2118,19 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
     // Return instructions
     // =====================================================================
     if (is_mnemonic_in(lmnem, {"ret", "retn", "retf", "retaa", "retab", "eret"})) {
-        if (operands.empty()) {
-            // Use architecture-appropriate return register:
-            // ARM64 uses x0, x86-64 uses rax.
-            const std::string arch = detect_arch();
-            const char* ret_name = (arch == "arm64") ? "x0" : "rax";
-            auto* ret_reg = arena_.create<Variable>(ret_name, 8);
-            operands.push_back(ret_reg);
+        // Do not treat control-flow operands (e.g., ARM64 `ret x30`) as
+        // return values. Materialize ABI return registers directly.
+        std::vector<Expression*> return_values;
+        const std::string arch = detect_arch();
+        const char* ret_name = "rax";
+        std::size_t ret_size = 8;
+        if (arch == "arm64") {
+            ret_name = current_function_prefers_w_return_ ? "w0" : "x0";
+            ret_size = current_function_prefers_w_return_ ? 4 : 8;
         }
-        auto* ret = arena_.create<Return>(std::move(operands));
+        return_values.push_back(arena_.create<Variable>(ret_name, ret_size));
+
+        auto* ret = arena_.create<Return>(std::move(return_values));
         ret->set_address(addr);
         return ret;
     }
