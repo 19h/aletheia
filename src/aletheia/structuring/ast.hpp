@@ -211,7 +211,7 @@ public:
     void set_true_branch(AstNode* b) { true_branch_ = b; }
     void set_false_branch(AstNode* b) { false_branch_ = b; }
 
-    /// Swap true and false branches (and negate the condition if possible).
+    /// Swap true and false branches.
     void switch_branches() { std::swap(true_branch_, false_branch_); }
 
     /// Get the condition Expression (unwraps ExprAstNode if present).

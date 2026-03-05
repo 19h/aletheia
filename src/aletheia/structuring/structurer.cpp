@@ -289,8 +289,8 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                 }
             }
 
-            if (entry_edges.empty()) {
-                // Nothing enters the loop from outside this region; skip abnormal-entry rewriting.
+            if (entry_edges.size() <= 1) {
+                // Single-entry loops do not need abnormal-entry rewriting.
                 goto skip_abnormal_entry;
             }
 
@@ -461,17 +461,7 @@ skip_abnormal_entry:
             && std::all_of(loop_successors.begin(), loop_successors.end(), [](TransitionBlock* succ) {
                 return transition_block_has_terminal_return(succ);
             });
-        const bool has_shared_terminal_exit = all_terminal_return_exits
-            && std::any_of(loop_successors.begin(), loop_successors.end(), [&](TransitionBlock* succ) {
-                if (!succ) {
-                    return false;
-                }
-                return std::any_of(succ->predecessors().begin(), succ->predecessors().end(), [&](TransitionEdge* in_e) {
-                    return in_e && in_e->source() && !region_set.contains(in_e->source());
-                });
-            });
         const bool can_skip_abnormal_exit_rewrite = all_terminal_return_exits
-            && !has_shared_terminal_exit
             && !rewrote_abnormal_entry;
         if (loop_successors.size() > 1 && !can_skip_abnormal_exit_rewrite) {
             size_t num_exits = loop_successors.size();
@@ -521,12 +511,8 @@ skip_abnormal_entry:
                 ext_conds.push_back({condition_nodes.back().first, condition_nodes.back().second.negate()});
             }
 
-            // Reverse sorted successors according to python
-            std::vector<TransitionBlock*> reversed_succs = sorted_successors;
-            std::reverse(reversed_succs.begin(), reversed_succs.end());
-
-            for (size_t i = 0; i < reversed_succs.size(); ++i) {
-                auto* tb = reversed_succs[i];
+            for (size_t i = 0; i < sorted_successors.size(); ++i) {
+                auto* tb = sorted_successors[i];
                 auto* cn = code_nodes[i];
                 if (i < ext_conds.size()) {
                     cfg.add_edge(ext_conds[i].first, tb, ext_conds[i].second, EdgeProperty::NonLoop);
@@ -562,6 +548,7 @@ skip_abnormal_entry:
             block_map[node] = clone;
             loop_cfg->add_block(clone);
         }
+        std::unordered_map<TransitionBlock*, TransitionBlock*> terminal_exit_clones;
         if (!block_map.contains(head) || block_map[head] == nullptr) {
             continue;
         }
@@ -589,8 +576,15 @@ skip_abnormal_entry:
                     loop_cfg->add_edge(clone_src, cont_trans, e->tag(), EdgeProperty::NonLoop);
                 } else if (!region_set.contains(succ)) {
                     if (can_skip_abnormal_exit_rewrite && transition_block_has_terminal_return(succ)) {
-                        auto* ret_trans = arena_.create<TransitionBlock>(succ->ast_node());
-                        loop_cfg->add_block(ret_trans);
+                        TransitionBlock* ret_trans = nullptr;
+                        auto clone_it = terminal_exit_clones.find(succ);
+                        if (clone_it != terminal_exit_clones.end()) {
+                            ret_trans = clone_it->second;
+                        } else {
+                            ret_trans = arena_.create<TransitionBlock>(succ->ast_node());
+                            terminal_exit_clones.emplace(succ, ret_trans);
+                            loop_cfg->add_block(ret_trans);
+                        }
                         loop_cfg->add_edge(clone_src, ret_trans, e->tag(), EdgeProperty::NonLoop);
                     } else {
                         // Exit edge -> Break node
@@ -619,6 +613,20 @@ skip_abnormal_entry:
         auto* endless_loop = arena_.create<WhileLoopNode>(loop_body_ast);
         AstNode* refined = LoopStructurer::refine_loop(arena_, endless_loop);
         head->set_ast_node(refined);
+
+        if (can_skip_abnormal_exit_rewrite) {
+            for (auto* succ : loop_successors) {
+                if (!succ) {
+                    continue;
+                }
+                for (auto* node : loop_region->blocks()) {
+                    if (node) {
+                        cfg.remove_edge_between(node, succ);
+                    }
+                }
+            }
+            loop_successors.clear();
+        }
 
         for (auto* succ : loop_successors) {
             if (!succ) {

@@ -814,7 +814,7 @@ AstNode* AstProcessor::clean_node(DecompilerArena& arena, AstNode* root) {
             for (std::size_t i = 1; i < flattened.size(); ++i) {
                 auto* prev_if = ast_dyn_cast<IfNode>(flattened[i - 1]);
                 AstNode* trailing = flattened[i];
-                if (!prev_if || prev_if->false_branch() != nullptr || !trailing || !trailing->is_break_node()) {
+                if (!prev_if || prev_if->false_branch() != nullptr || !trailing) {
                     continue;
                 }
 
@@ -825,6 +825,12 @@ AstNode* AstProcessor::clean_node(DecompilerArena& arena, AstNode* root) {
 
                 auto* cond_ast = ast_dyn_cast<ExprAstNode>(prev_if->cond());
                 if (!cond_ast || !cond_ast->expr()) {
+                    continue;
+                }
+
+                const bool trailing_is_break = trailing->is_break_node();
+                const bool trailing_is_return = trailing->does_end_with_return();
+                if (!trailing_is_break && !trailing_is_return) {
                     continue;
                 }
 

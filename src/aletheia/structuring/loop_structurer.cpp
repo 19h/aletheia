@@ -420,11 +420,9 @@ AstNode* ConditionToSequenceRule::restructure(DecompilerArena& arena, LoopNode* 
 
     // Get the condition for the new while loop
     Expression* cond_expr = ifn->condition_expr();
-    // If we swapped branches, the condition is already correct (we want to
-    // loop while the original true branch's condition holds). If we didn't
-    // swap, the condition needs to be negated (we loop while NOT the
-    // false condition).
-    if (!break_in_true && cond_expr) {
+    // If we swapped branches via IfNode::switch_branches(), we must negate
+    // manually because that helper swaps branches only.
+    if (break_in_true && cond_expr) {
         cond_expr = negate_condition_expr(arena, cond_expr);
     }
 
