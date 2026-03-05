@@ -109,6 +109,93 @@ bool constant_is_plus_minus_one(Expression* expr, int& sign) {
     return false;
 }
 
+int precedence_for_operation(OperationType type);
+int precedence_for_expression(Expression* expr);
+
+bool is_zero_constant(Expression* expr) {
+    auto* c = dyn_cast<Constant>(expr);
+    return c != nullptr && c->value() == 0;
+}
+
+std::optional<std::size_t> integer_bit_width(Expression* expr) {
+    if (!expr) {
+        return std::nullopt;
+    }
+    if (expr->size_bytes > 0) {
+        return expr->size_bytes * 8;
+    }
+    if (auto* integer = type_dyn_cast<Integer>(expr->ir_type().get())) {
+        return integer->size();
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> try_render_sign_bit_condition(Condition* c, CExpressionGenerator& gen) {
+    if (!c) {
+        return std::nullopt;
+    }
+
+    const bool check_sign_bit_set = c->type() == OperationType::neq;
+    const bool check_sign_bit_clear = c->type() == OperationType::eq;
+    if (!check_sign_bit_set && !check_sign_bit_clear) {
+        return std::nullopt;
+    }
+
+    auto* and_op = dyn_cast<Operation>(c->lhs());
+    Expression* other_side = c->rhs();
+    if (!(and_op && and_op->type() == OperationType::bit_and && is_zero_constant(other_side))) {
+        and_op = dyn_cast<Operation>(c->rhs());
+        other_side = c->lhs();
+        if (!(and_op && and_op->type() == OperationType::bit_and && is_zero_constant(other_side))) {
+            return std::nullopt;
+        }
+    }
+
+    const auto& operands = and_op->operands();
+    if (operands.size() != 2) {
+        return std::nullopt;
+    }
+
+    Expression* value_expr = nullptr;
+    auto* mask_const = dyn_cast<Constant>(operands[0]);
+    if (mask_const != nullptr) {
+        value_expr = operands[1];
+    } else {
+        mask_const = dyn_cast<Constant>(operands[1]);
+        if (mask_const == nullptr) {
+            return std::nullopt;
+        }
+        value_expr = operands[0];
+    }
+
+    const auto width_bits_opt = integer_bit_width(value_expr);
+    std::optional<std::size_t> resolved_width_bits = width_bits_opt;
+    if (!resolved_width_bits.has_value() && mask_const->size_bytes > 0) {
+        resolved_width_bits = mask_const->size_bytes * 8;
+    }
+    if (!resolved_width_bits.has_value()) {
+        return std::nullopt;
+    }
+    const std::size_t width_bits = *resolved_width_bits;
+    if (width_bits == 0 || width_bits > 64) {
+        return std::nullopt;
+    }
+
+    const std::uint64_t expected_mask = std::uint64_t{1} << (width_bits - 1);
+    if (mask_const->value() != expected_mask) {
+        return std::nullopt;
+    }
+
+    const OperationType cmp_type = check_sign_bit_set ? OperationType::lt : OperationType::ge;
+    const int cmp_prec = precedence_for_operation(cmp_type);
+    std::string rendered_value = gen.generate(value_expr);
+    if (precedence_for_expression(value_expr) < cmp_prec) {
+        rendered_value = "(" + rendered_value + ")";
+    }
+
+    return rendered_value + (check_sign_bit_set ? " < 0" : " >= 0");
+}
+
 std::size_t configured_hex_threshold() {
     const char* value = std::getenv("ALETHEIA_INT_HEX_THRESHOLD");
     if (!value || *value == '\0') {
@@ -248,8 +335,6 @@ bool should_swap_if_branches(IfNode* inode) {
     return false;
 }
 
-int precedence_for_operation(OperationType type);
-int precedence_for_expression(Expression* expr);
 bool needs_parentheses_for_equal_precedence_rhs(OperationType parent_type);
 
 std::string negate_condition_string(std::string cond) {
@@ -1213,6 +1298,11 @@ void CExpressionGenerator::visit(Call* c) {
 }
 
 void CExpressionGenerator::visit(Condition* c) {
+    if (auto simplified = try_render_sign_bit_condition(c, *this); simplified.has_value()) {
+        result_ = *simplified;
+        return;
+    }
+
     std::string op_str = " == ";
     switch (c->type()) {
         case OperationType::eq:    op_str = " == "; break;
