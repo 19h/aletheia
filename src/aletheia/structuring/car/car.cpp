@@ -1026,6 +1026,55 @@ bool extract_variable_constant_comparison(
     return false;
 }
 
+Expression* extract_terminal_return_expr(AstNode* node) {
+    if (!node) {
+        return nullptr;
+    }
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        if (seq->empty()) {
+            return nullptr;
+        }
+        return extract_terminal_return_expr(seq->last());
+    }
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        BasicBlock* block = code->block();
+        if (!block || block->instructions().empty()) {
+            return nullptr;
+        }
+        auto* ret = dyn_cast<Return>(block->instructions().back());
+        if (!ret || ret->values().size() != 1) {
+            return nullptr;
+        }
+        return ret->values()[0];
+    }
+    return nullptr;
+}
+
+Expression* negate_condition_expr(DecompilerArena& arena, Expression* expr) {
+    if (!expr) {
+        return nullptr;
+    }
+    if (auto* cond = dyn_cast<Condition>(expr)) {
+        return arena.create<Condition>(Condition::negate_comparison(cond->type()), cond->lhs(), cond->rhs(), cond->size_bytes);
+    }
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        if (op->type() == OperationType::logical_not && op->operands().size() == 1) {
+            return op->operands()[0];
+        }
+    }
+    return arena.create<Operation>(OperationType::logical_not, std::vector<Expression*>{expr}, 1);
+}
+
+bool are_negated_conditions(DecompilerArena& arena, Expression* lhs, Expression* rhs) {
+    if (!lhs || !rhs) {
+        return false;
+    }
+    Expression* negated_lhs = negate_condition_expr(arena, lhs);
+    Expression* negated_rhs = negate_condition_expr(arena, rhs);
+    return expr_fingerprint(negated_lhs) == expr_fingerprint(rhs)
+        || expr_fingerprint(lhs) == expr_fingerprint(negated_rhs);
+}
+
 std::int64_t sign_extend_bits(std::uint64_t value, std::size_t bit_width) {
     if (bit_width == 0 || bit_width >= 64) {
         return static_cast<std::int64_t>(value);
@@ -1352,6 +1401,42 @@ void rewrite_do_while_to_for_in_sequence(DecompilerArena& arena, SeqNode* seq) {
     }
 }
 
+void rewrite_early_return_guarded_do_while_to_while(DecompilerArena& arena, SeqNode* seq) {
+    if (!seq) {
+        return;
+    }
+
+    auto& nodes = seq->mutable_nodes();
+    if (nodes.size() < 3) {
+        return;
+    }
+
+    for (std::size_t i = 0; i + 2 < nodes.size(); ++i) {
+        auto* guard_if = ast_dyn_cast<IfNode>(nodes[i]);
+        auto* do_node = ast_dyn_cast<DoWhileLoopNode>(nodes[i + 1]);
+        if (!guard_if || guard_if->false_branch() != nullptr || !do_node || !do_node->condition()) {
+            continue;
+        }
+
+        Expression* guard_cond = guard_if->condition_expr();
+        if (!guard_cond || !are_negated_conditions(arena, guard_cond, do_node->condition())) {
+            continue;
+        }
+
+        Expression* guard_return = extract_terminal_return_expr(guard_if->true_branch());
+        Expression* trailing_return = extract_terminal_return_expr(nodes[i + 2]);
+        if (!guard_return || !trailing_return) {
+            continue;
+        }
+        if (expr_fingerprint(guard_return) != expr_fingerprint(trailing_return)) {
+            continue;
+        }
+
+        nodes[i] = arena.create<WhileLoopNode>(do_node->body(), do_node->condition());
+        nodes.erase(nodes.begin() + static_cast<long>(i + 1));
+    }
+}
+
 void rewrite_tail_driven_endless_loops(DecompilerArena& arena, SeqNode* seq) {
     if (!seq) {
         return;
@@ -1425,6 +1510,7 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
         for (AstNode*& child : seq->mutable_nodes()) {
             child = rewrite_guarded_do_while(arena, child);
         }
+        rewrite_early_return_guarded_do_while_to_while(arena, seq);
         rewrite_tail_driven_endless_loops(arena, seq);
         rewrite_do_while_to_for_in_sequence(arena, seq);
         rewrite_while_to_for_in_sequence(arena, seq);
@@ -1447,6 +1533,20 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
             if (dowhile != nullptr && guard_cond != nullptr && dowhile->condition() != nullptr) {
                 if (expr_fingerprint(guard_cond) == expr_fingerprint(dowhile->condition())) {
                     return arena.create<WhileLoopNode>(dowhile->body(), dowhile->condition());
+                }
+            }
+
+            auto* true_seq = ast_dyn_cast<SeqNode>(if_node->true_branch());
+            if (true_seq && true_seq->size() >= 1 && guard_cond != nullptr) {
+                auto* seq_dowhile = ast_dyn_cast<DoWhileLoopNode>(true_seq->first());
+                if (seq_dowhile != nullptr && seq_dowhile->condition() != nullptr
+                    && expr_fingerprint(guard_cond) == expr_fingerprint(seq_dowhile->condition())) {
+                    auto* replacement = arena.create<SeqNode>();
+                    replacement->add_node(arena.create<WhileLoopNode>(seq_dowhile->body(), seq_dowhile->condition()));
+                    for (std::size_t i = 1; i < true_seq->nodes().size(); ++i) {
+                        replacement->add_node(true_seq->nodes()[i]);
+                    }
+                    return replacement->size() == 1 ? replacement->first() : replacement;
                 }
             }
         }

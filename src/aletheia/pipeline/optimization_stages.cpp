@@ -1,7 +1,5 @@
 #include "optimization_stages.hpp"
 #include <ida/data.hpp>
-#include <ida/instruction.hpp>
-#include <ida/lines.hpp>
 #include <ida/name.hpp>
 #include <ida/segment.hpp>
 #include <ida/type.hpp>
@@ -34,7 +32,6 @@ aletheia::OperationType flip_comparison(aletheia::OperationType op) {
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 namespace aletheia {
@@ -2186,67 +2183,42 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
             return name;
         };
 
-        auto parse_memory_immediate_offset = [&](const std::string& operand_text) -> std::optional<std::uint64_t> {
-            std::string text = canonicalize_name(ida::lines::tag_remove(operand_text));
-            const auto hash = text.find('#');
-            if (hash == std::string::npos) {
-                return std::nullopt;
-            }
-            std::size_t i = hash + 1;
-            if (i < text.size() && text[i] == '+') {
-                ++i;
-            }
-            bool negative = false;
-            if (i < text.size() && text[i] == '-') {
-                negative = true;
-                ++i;
-            }
-            int base = 10;
-            if (i + 1 < text.size() && text[i] == '0' && text[i + 1] == 'x') {
-                base = 16;
-                i += 2;
-            }
-            const std::size_t start = i;
-            while (i < text.size() && ((base == 16) ? std::isxdigit(static_cast<unsigned char>(text[i]))
-                                                     : std::isdigit(static_cast<unsigned char>(text[i])))) {
-                ++i;
-            }
-            if (i == start || negative) {
+        auto pageoff_symbol_from_operand_text = [&](const std::string& operand_text) -> std::optional<std::string> {
+            std::string text = ida::lines::tag_remove(operand_text);
+            std::string lowered = canonicalize_name(text);
+            const auto pos = lowered.find("@pageoff");
+            if (pos == std::string::npos) {
                 return std::nullopt;
             }
 
-            std::uint64_t value = 0;
-            for (std::size_t j = start; j < i; ++j) {
-                const char c = text[j];
-                int digit = 0;
-                if (c >= '0' && c <= '9') digit = c - '0';
-                else if (c >= 'a' && c <= 'f') digit = 10 + (c - 'a');
-                else if (c >= 'A' && c <= 'F') digit = 10 + (c - 'A');
-                value = value * base + static_cast<std::uint64_t>(digit);
+            std::size_t end = pos;
+            while (end > 0 && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+                --end;
             }
-            return value;
-        };
+            std::size_t start = end;
+            while (start > 0) {
+                const unsigned char ch = static_cast<unsigned char>(text[start - 1]);
+                if (!(std::isalnum(ch) || ch == '_')) {
+                    break;
+                }
+                --start;
+            }
+            if (start == end) {
+                return std::nullopt;
+            }
 
-        auto extract_memory_base_register = [&](const std::string& operand_text) -> std::optional<std::string> {
-            std::string text = canonicalize_name(ida::lines::tag_remove(operand_text));
-            const auto open = text.find('[');
-            const auto close = text.find(']');
-            if (open == std::string::npos || close == std::string::npos || close <= open + 1) {
+            std::string token = text.substr(start, end - start);
+            std::size_t trim = 0;
+            while (trim < token.size() && std::isxdigit(static_cast<unsigned char>(token[trim]))) {
+                ++trim;
+            }
+            if (trim >= 8 && trim < token.size() && token[trim] == '_') {
+                token.erase(0, trim);
+            }
+            if (token.empty()) {
                 return std::nullopt;
             }
-            std::string inner = text.substr(open + 1, close - open - 1);
-            std::size_t i = 0;
-            while (i < inner.size() && std::isspace(static_cast<unsigned char>(inner[i]))) {
-                ++i;
-            }
-            const std::size_t start = i;
-            while (i < inner.size() && (std::isalnum(static_cast<unsigned char>(inner[i])) || inner[i] == '_')) {
-                ++i;
-            }
-            if (i == start) {
-                return std::nullopt;
-            }
-            return inner.substr(start, i - start);
+            return token;
         };
 
         for (BasicBlock* block : task.cfg()->blocks()) {
@@ -2254,7 +2226,19 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
             for (std::size_t i = 0; i < instrs.size(); ++i) {
                 auto* assign = dyn_cast<Assignment>(instrs[i]);
                 auto* call = assign ? dyn_cast<Call>(assign->value()) : nullptr;
-                if (!assign || !call || call->mutable_operands().size() < 2 || assign->address() == 0) {
+                if (!assign || !call || call->mutable_operands().size() < 3 || assign->address() == 0) {
+                    continue;
+                }
+
+                std::string callee;
+                if (auto* gv = dyn_cast<GlobalVariable>(call->target())) {
+                    callee = canonicalize_name(gv->name());
+                } else if (auto* c = dyn_cast<Constant>(call->target())) {
+                    if (auto maybe = ida::name::get(static_cast<ida::Address>(c->value()))) {
+                        callee = canonicalize_name(*maybe);
+                    }
+                }
+                if (callee != "fprintf") {
                     continue;
                 }
 
@@ -2270,8 +2254,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                     continue;
                 }
 
-                std::optional<std::string> load_base_reg;
-                std::optional<std::uint64_t> load_offset;
+                std::optional<std::string> pageoff_symbol;
                 constexpr std::size_t kMaxBackInstructions = 6;
                 for (std::size_t step = 1; step <= kMaxBackInstructions; ++step) {
                     if (assign->address() < step * 4) {
@@ -2292,52 +2275,42 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                         continue;
                     }
                     const auto& ops = prev_insn.operands();
-                    if (ops.size() < 2 || !ops[0].is_register()) {
+                    if (ops.size() < 2) {
                         continue;
                     }
                     auto mem_text = ida::instruction::operand_text(prev_addr, ops[1].index());
                     if (!mem_text) {
                         continue;
                     }
-                    const std::string dst_reg = canonicalize_name(ops[0].register_name());
-                    auto mem_base = extract_memory_base_register(*mem_text);
-                    if (!mem_base.has_value()) {
-                        continue;
-                    }
-
-                    if (!load_base_reg.has_value()) {
-                        if ((dst_reg == "x0" || dst_reg == "w0") && mem_base.has_value()) {
-                            load_base_reg = *mem_base;
-                        }
-                        continue;
-                    }
-
-                    if (dst_reg == *load_base_reg && *mem_base == *load_base_reg) {
-                        load_offset = parse_memory_immediate_offset(*mem_text);
-                        if (!load_offset.has_value()) {
-                            const ida::Address target = ops[1].target_address();
-                            if (target != ida::BadAddress
-                                && static_cast<std::uint64_t>(target) >= base_const->value()) {
-                                load_offset = static_cast<std::uint64_t>(target) - base_const->value();
-                            }
-                        }
-                        if (!load_offset.has_value()) {
-                            const std::uint64_t raw = ops[1].value();
-                            if (raw > 0 && raw <= 0x1000) {
-                                load_offset = raw;
-                            }
-                        }
+                    pageoff_symbol = pageoff_symbol_from_operand_text(*mem_text);
+                    if (pageoff_symbol.has_value()) {
                         break;
                     }
                 }
 
-                if (!load_offset.has_value() || *load_offset == 0) {
+                if (!pageoff_symbol.has_value()) {
                     continue;
                 }
 
-                inner_deref->mutable_operands()[0] = task.arena().create<Constant>(
-                    base_const->value() + *load_offset,
-                    base_const->size_bytes > 0 ? base_const->size_bytes : 8);
+                auto* rewritten_gv = task.arena().create<GlobalVariable>(
+                    *pageoff_symbol,
+                    base_const->size_bytes,
+                    base_const->copy(task.arena()),
+                    false);
+                rewritten_gv->set_ir_type(base_const->ir_type());
+
+                auto* rewritten_inner = task.arena().create<Operation>(
+                    OperationType::deref,
+                    std::vector<Expression*>{rewritten_gv},
+                    inner_deref->size_bytes);
+                rewritten_inner->set_ir_type(inner_deref->ir_type());
+
+                auto* rewritten_outer = task.arena().create<Operation>(
+                    OperationType::deref,
+                    std::vector<Expression*>{rewritten_inner},
+                    outer_deref->size_bytes);
+                rewritten_outer->set_ir_type(outer_deref->ir_type());
+                first_arg = rewritten_outer;
                 changed = true;
             }
         }
