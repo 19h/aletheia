@@ -51,7 +51,7 @@ bool is_aarch64_x0_family(std::string_view name) {
     return name == "x0" || name == "w0";
 }
 
-bool is_aarch64_x0_parameter_role(const VarKey& key, const VarInfo&) {
+bool is_aarch64_x0_parameter_role(const VarKey& key) {
     return key.version == 0;
 }
 
@@ -101,7 +101,7 @@ void add_clique(Adjacency& graph, const VarSet& vars) {
 
 std::string compatibility_group_of(const VarKey& key, const VarInfo& info) {
     if (is_aarch64_x0_family(key.name)) {
-        if (is_aarch64_x0_parameter_role(key, info)) {
+        if (is_aarch64_x0_parameter_role(key)) {
             // Treat x0/w0 entry parameter aliases as one compatibility class
             // so out-of-SSA can preserve a single argument owner.
             return "aarch64_x0:param";
@@ -282,6 +282,8 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             return;
         }
         VarKey key = key_of(var);
+        const bool x0_nonparam_role = is_aarch64_x0_family(key.name)
+            && !is_aarch64_x0_parameter_role(key);
         auto& info = var_info[key];
         if (info.sample == nullptr) {
             info.sample = var;
@@ -290,11 +292,15 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             info.kind = var->kind();
             info.parameter_index = var->parameter_index();
             info.stack_offset = var->stack_offset();
+            if (x0_nonparam_role) {
+                info.kind = VariableKind::Register;
+                info.parameter_index = -1;
+            }
         } else {
             info.aliased = info.aliased || var->is_aliased();
             info.size_bytes = std::max(info.size_bytes, var->size_bytes);
             // Upgrade kind: Parameter > StackLocal/StackArgument > Register
-            if (var->is_parameter() && !info.sample->is_parameter()) {
+            if (var->is_parameter() && !info.sample->is_parameter() && !x0_nonparam_role) {
                 info.kind = var->kind();
                 info.parameter_index = var->parameter_index();
             }
@@ -559,7 +565,11 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
                 best_kind = VariableKind::Parameter;
                 best_param_index = 0;
             }
-            if (mi.kind == VariableKind::Parameter && mi.parameter_index >= 0) {
+            const bool x0_nonparam_role = is_aarch64_x0_family(key.name)
+                && !is_aarch64_x0_parameter_role(key);
+            if (mi.kind == VariableKind::Parameter
+                && mi.parameter_index >= 0
+                && !x0_nonparam_role) {
                 best_kind = VariableKind::Parameter;
                 best_param_index = mi.parameter_index;
                 // Parameter is highest priority, but don't break — keep scanning for size/type

@@ -89,7 +89,7 @@ bool is_aarch64_x0_family(std::string_view name) {
     return name == "x0" || name == "w0";
 }
 
-bool is_aarch64_x0_parameter_role(const VarKey& key, const VarInfo&) {
+bool is_aarch64_x0_parameter_role(const VarKey& key) {
     return key.version == 0;
 }
 
@@ -143,6 +143,8 @@ void collect_var_info(ControlFlowGraph& cfg,
             return;
         }
         VarKey key = key_of(var);
+        const bool x0_nonparam_role = is_aarch64_x0_family(key.name)
+            && !is_aarch64_x0_parameter_role(key);
         auto& info = var_info[key];
         if (info.sample == nullptr) {
             info.sample = var;
@@ -152,6 +154,10 @@ void collect_var_info(ControlFlowGraph& cfg,
             info.kind = var->kind();
             info.parameter_index = var->parameter_index();
             info.stack_offset = var->stack_offset();
+            if (x0_nonparam_role) {
+                info.kind = VariableKind::Register;
+                info.parameter_index = -1;
+            }
         } else {
             info.aliased = info.aliased || var->is_aliased();
             info.size_bytes = std::max(info.size_bytes, var->size_bytes);
@@ -159,7 +165,7 @@ void collect_var_info(ControlFlowGraph& cfg,
                 info.type = var->ir_type();
             }
             // Upgrade kind: Parameter > StackLocal/StackArgument > Register
-            if (var->is_parameter() && !info.sample->is_parameter()) {
+            if (var->is_parameter() && !info.sample->is_parameter() && !x0_nonparam_role) {
                 info.kind = var->kind();
                 info.parameter_index = var->parameter_index();
             }
@@ -452,13 +458,8 @@ void ConditionalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph
                 if (!is_aarch64_x0_family(a.name) || !is_aarch64_x0_family(b.name)) {
                     continue;
                 }
-                auto a_it = var_info.find(a);
-                auto b_it = var_info.find(b);
-                if (a_it == var_info.end() || b_it == var_info.end()) {
-                    continue;
-                }
-                const bool a_param_role = is_aarch64_x0_parameter_role(a, a_it->second);
-                const bool b_param_role = is_aarch64_x0_parameter_role(b, b_it->second);
+                const bool a_param_role = is_aarch64_x0_parameter_role(a);
+                const bool b_param_role = is_aarch64_x0_parameter_role(b);
                 if (a_param_role != b_param_role) {
                     return false;
                 }
@@ -531,7 +532,16 @@ void ConditionalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph
                 lhs.repr.type = rhs.repr.type;
             }
             // Merge provenance: Parameter > StackLocal/StackArgument > Register
-            if (rhs.repr.kind == VariableKind::Parameter && rhs.repr.parameter_index >= 0
+            const bool rhs_has_x0_nonparam_member = std::any_of(
+                rhs.members.begin(), rhs.members.end(), [&](const VarKey& key) {
+                    auto it = var_info.find(key);
+                    return it != var_info.end()
+                        && is_aarch64_x0_family(key.name)
+                        && !is_aarch64_x0_parameter_role(key);
+                });
+            if (rhs.repr.kind == VariableKind::Parameter
+                && rhs.repr.parameter_index >= 0
+                && !rhs_has_x0_nonparam_member
                 && lhs.repr.kind != VariableKind::Parameter) {
                 lhs.repr.kind = rhs.repr.kind;
                 lhs.repr.parameter_index = rhs.repr.parameter_index;
@@ -581,7 +591,11 @@ void ConditionalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph
             if (!best_type && mi.type) {
                 best_type = mi.type;
             }
-            if (mi.kind == VariableKind::Parameter && mi.parameter_index >= 0) {
+            const bool x0_nonparam_role = is_aarch64_x0_family(key.name)
+                && !is_aarch64_x0_parameter_role(key);
+            if (mi.kind == VariableKind::Parameter
+                && mi.parameter_index >= 0
+                && !x0_nonparam_role) {
                 best_kind = VariableKind::Parameter;
                 best_param_index = mi.parameter_index;
             }

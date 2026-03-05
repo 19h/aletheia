@@ -44,13 +44,6 @@ struct RenameState {
 
 void rename_expression(Expression* expr, RenameState& state);
 
-bool var_key_less(const VarKey& lhs, const VarKey& rhs) {
-    if (lhs.name != rhs.name) {
-        return lhs.name < rhs.name;
-    }
-    return lhs.version < rhs.version;
-}
-
 std::string type_prefix_for(const TypePtr& type) {
     if (!type) {
         return "v";
@@ -341,7 +334,7 @@ void seed_parameter_owners_from_expression(Expression* expr, RenameState& state)
             if (index >= 0) {
                 const VarKey key{var->name(), var->ssa_version()};
                 auto it = state.parameter_owner.find(index);
-                if (it == state.parameter_owner.end() || var_key_less(key, it->second)) {
+                if (it == state.parameter_owner.end()) {
                     state.parameter_owner[index] = key;
                 }
             }
@@ -385,7 +378,7 @@ void seed_parameter_owners_from_ast(AstNode* node, RenameState& state) {
                     if (index < 0) continue;
                     const VarKey key{req->name(), req->ssa_version()};
                     auto it = state.parameter_owner.find(index);
-                    if (it == state.parameter_owner.end() || var_key_less(key, it->second)) {
+                    if (it == state.parameter_owner.end()) {
                         state.parameter_owner[index] = key;
                     }
                 }
@@ -397,7 +390,7 @@ void seed_parameter_owners_from_ast(AstNode* node, RenameState& state) {
                     if (index < 0) continue;
                     const VarKey key{req->name(), req->ssa_version()};
                     auto it = state.parameter_owner.find(index);
-                    if (it == state.parameter_owner.end() || var_key_less(key, it->second)) {
+                    if (it == state.parameter_owner.end()) {
                         state.parameter_owner[index] = key;
                     }
                 }
@@ -425,6 +418,24 @@ void seed_parameter_owners_from_ast(AstNode* node, RenameState& state) {
             return;
         }
         for (Instruction* inst : code->block()->instructions()) {
+            if (!inst) {
+                continue;
+            }
+
+            for (Variable* req : inst->requirements()) {
+                if (!req || !req->is_parameter()) {
+                    continue;
+                }
+                const int index = effective_parameter_index(req);
+                if (index < 0) {
+                    continue;
+                }
+                const VarKey key{req->name(), req->ssa_version()};
+                if (!state.parameter_owner.contains(index)) {
+                    state.parameter_owner[index] = key;
+                }
+            }
+
             if (auto* branch = dyn_cast<Branch>(inst)) {
                 seed_parameter_owners_from_expression(branch->condition(), state);
             }
