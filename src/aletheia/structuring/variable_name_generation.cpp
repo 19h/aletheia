@@ -818,6 +818,328 @@ bool substitute_variable_once(Expression*& expr, Variable* target, Expression* r
     return false;
 }
 
+bool is_safe_forward_substitution_expression(Expression* expr) {
+    if (!expr) {
+        return false;
+    }
+    if (isa<Constant>(expr) || isa<Variable>(expr)) {
+        return true;
+    }
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        switch (op->type()) {
+            case OperationType::call:
+            case OperationType::deref:
+            case OperationType::member_access:
+            case OperationType::field:
+            case OperationType::unknown:
+                return false;
+            default:
+                break;
+        }
+        for (Expression* child : op->operands()) {
+            if (!is_safe_forward_substitution_expression(child)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression* child : list->operands()) {
+            if (!is_safe_forward_substitution_expression(child)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+std::size_t count_variable_uses_in_instruction(Instruction* inst, Variable* target) {
+    if (!inst || !target) {
+        return 0;
+    }
+
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
+        return count_variable_uses(assign->destination(), target)
+            + count_variable_uses(assign->value(), target);
+    }
+    if (auto* branch = dyn_cast<Branch>(inst)) {
+        return count_variable_uses(branch->condition(), target);
+    }
+    if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
+        return count_variable_uses(ib->expression(), target);
+    }
+    if (auto* ret = dyn_cast<Return>(inst)) {
+        std::size_t total = 0;
+        for (Expression* value : ret->values()) {
+            total += count_variable_uses(value, target);
+        }
+        return total;
+    }
+    return 0;
+}
+
+bool substitute_variable_once_in_instruction(Instruction* inst, Variable* target, Expression* replacement) {
+    if (!inst || !target || !replacement) {
+        return false;
+    }
+
+    if (auto* assign = dyn_cast<Assignment>(inst)) {
+        Expression* value = assign->value();
+        if (substitute_variable_once(value, target, replacement)) {
+            assign->set_value(value);
+            return true;
+        }
+        Expression* dst = assign->destination();
+        if (substitute_variable_once(dst, target, replacement)) {
+            assign->set_destination(dst);
+            return true;
+        }
+        return false;
+    }
+    if (auto* branch = dyn_cast<Branch>(inst)) {
+        Expression* cond = branch->condition();
+        if (substitute_variable_once(cond, target, replacement)) {
+            if (auto* cond_expr = dyn_cast<Condition>(cond)) {
+                branch->set_condition(cond_expr);
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* ret = dyn_cast<Return>(inst)) {
+        for (Expression*& value : ret->mutable_values()) {
+            if (substitute_variable_once(value, target, replacement)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::size_t count_variable_uses_in_ast_node(AstNode* node, Variable* target);
+
+std::size_t count_variable_defs_in_ast_node(AstNode* node, Variable* target) {
+    if (!node || !target) {
+        return 0;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) {
+            return 0;
+        }
+        std::size_t count = 0;
+        for (Instruction* inst : code->block()->instructions()) {
+            if (!inst) {
+                continue;
+            }
+            for (Variable* def : inst->definitions()) {
+                auto* def_var = dyn_cast<Variable>(def);
+                if (same_variable_identity(def_var, target)) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        std::size_t total = 0;
+        for (AstNode* child : seq->nodes()) {
+            total += count_variable_defs_in_ast_node(child, target);
+        }
+        return total;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        return count_variable_defs_in_ast_node(if_node->true_branch(), target)
+            + count_variable_defs_in_ast_node(if_node->false_branch(), target);
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return count_variable_defs_in_ast_node(loop->body(), target);
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        std::size_t total = 0;
+        for (CaseNode* c : sw->cases()) {
+            total += count_variable_defs_in_ast_node(c, target);
+        }
+        return total;
+    }
+
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        return count_variable_defs_in_ast_node(c->body(), target);
+    }
+
+    return 0;
+}
+
+std::size_t count_variable_uses_in_ast_node(AstNode* node, Variable* target) {
+    if (!node || !target) {
+        return 0;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) {
+            return 0;
+        }
+        std::size_t count = 0;
+        for (Instruction* inst : code->block()->instructions()) {
+            count += count_variable_uses_in_instruction(inst, target);
+        }
+        return count;
+    }
+
+    if (auto* expr_node = ast_dyn_cast<ExprAstNode>(node)) {
+        return count_variable_uses(expr_node->expr(), target);
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        std::size_t total = 0;
+        for (AstNode* child : seq->nodes()) {
+            total += count_variable_uses_in_ast_node(child, target);
+        }
+        return total;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        std::size_t total = 0;
+        total += count_variable_uses_in_ast_node(if_node->cond(), target);
+        total += count_variable_uses_in_ast_node(if_node->true_branch(), target);
+        total += count_variable_uses_in_ast_node(if_node->false_branch(), target);
+        return total;
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return count_variable_uses(loop->condition(), target)
+            + count_variable_uses_in_ast_node(loop->body(), target);
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        std::size_t total = count_variable_uses_in_ast_node(sw->cond(), target);
+        for (CaseNode* c : sw->cases()) {
+            total += count_variable_uses_in_ast_node(c, target);
+        }
+        return total;
+    }
+
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        return count_variable_uses_in_ast_node(c->body(), target);
+    }
+
+    return 0;
+}
+
+bool substitute_variable_once_in_ast_node(AstNode* node, Variable* target, Expression* replacement) {
+    if (!node || !target || !replacement) {
+        return false;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) {
+            return false;
+        }
+        for (Instruction* inst : code->block()->instructions()) {
+            if (substitute_variable_once_in_instruction(inst, target, replacement)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            if (substitute_variable_once_in_ast_node(child, target, replacement)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        if (substitute_variable_once_in_ast_node(if_node->true_branch(), target, replacement)) {
+            return true;
+        }
+        return substitute_variable_once_in_ast_node(if_node->false_branch(), target, replacement);
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        return substitute_variable_once_in_ast_node(loop->body(), target, replacement);
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        for (CaseNode* c : sw->cases()) {
+            if (substitute_variable_once_in_ast_node(c, target, replacement)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        return substitute_variable_once_in_ast_node(c->body(), target, replacement);
+    }
+
+    return false;
+}
+
+void fold_single_use_pure_assignments_across_seq(SeqNode* seq, DecompilerArena* arena) {
+    if (!seq || !arena) {
+        return;
+    }
+
+    auto& nodes = seq->mutable_nodes();
+    for (std::size_t i = 0; i < nodes.size(); ) {
+        auto* code = ast_dyn_cast<CodeNode>(nodes[i]);
+        BasicBlock* block = code ? code->block() : nullptr;
+        if (!code || !block || block->instructions().size() != 1) {
+            i++;
+            continue;
+        }
+
+        auto* assign = dyn_cast<Assignment>(block->instructions()[0]);
+        auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+        if (!assign || !dst
+            || contains_call_expression(assign->value())
+            || count_variable_uses(assign->value(), dst) != 0
+            || !is_safe_forward_substitution_expression(assign->value())) {
+            i++;
+            continue;
+        }
+
+        std::size_t use_index = nodes.size();
+        bool blocked = false;
+        bool multiple_uses = false;
+        for (std::size_t j = i + 1; j < nodes.size(); ++j) {
+            if (count_variable_defs_in_ast_node(nodes[j], dst) > 0) {
+                blocked = true;
+                break;
+            }
+
+            const std::size_t uses_here = count_variable_uses_in_ast_node(nodes[j], dst);
+            if (uses_here > 0) {
+                if (uses_here > 1 || use_index != nodes.size()) {
+                    multiple_uses = true;
+                    break;
+                }
+                use_index = j;
+            }
+        }
+
+        if (!blocked && !multiple_uses && use_index < nodes.size()) {
+            Expression* replacement = assign->value()->copy(*arena);
+            if (replacement
+                && substitute_variable_once_in_ast_node(nodes[use_index], dst, replacement)) {
+                nodes.erase(nodes.begin() + i);
+                continue;
+            }
+        }
+
+        i++;
+    }
+}
+
 void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* arena) {
     if (!block) return;
     std::vector<Instruction*> filtered;
@@ -826,6 +1148,79 @@ void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* aren
 
     for (std::size_t i = 0; i < insts.size(); ++i) {
         Instruction* inst = insts[i];
+
+        // Fold adjacent call-result forwarding:
+        //   v = call(...)
+        //   x = <... v ...>
+        // into:
+        //   x = <... call(...) ...>
+        if (auto* assign = dyn_cast<Assignment>(inst);
+            assign && arena && i + 1 < insts.size() && contains_call_expression(assign->value())) {
+            auto* dst = dyn_cast<Variable>(assign->destination());
+            auto* next_assign = dyn_cast<Assignment>(insts[i + 1]);
+            auto* next_dst = next_assign ? dyn_cast<Variable>(next_assign->destination()) : nullptr;
+            if (dst && next_assign && (!next_dst || !same_variable_identity(next_dst, dst))) {
+                if (count_variable_uses(next_assign->value(), dst) == 1
+                    && count_variable_uses(next_assign->destination(), dst) == 0) {
+                    Expression* replacement = assign->value()->copy(*arena);
+                    if (replacement && substitute_variable_once_in_instruction(next_assign, dst, replacement)) {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Fold single-use pure temporary forwarding in the same block:
+        //   v = <pure expr>
+        //   ...
+        //   use(v)
+        // where v has exactly one reachable use before redefinition.
+        if (auto* assign = dyn_cast<Assignment>(inst);
+            assign && arena && !contains_call_expression(assign->value())) {
+            auto* dst = dyn_cast<Variable>(assign->destination());
+            if (dst
+                && count_variable_uses(assign->value(), dst) == 0
+                && is_safe_forward_substitution_expression(assign->value())) {
+                std::size_t use_index = insts.size();
+                bool blocked = false;
+                bool multiple_uses = false;
+
+                for (std::size_t j = i + 1; j < insts.size(); ++j) {
+                    Instruction* mid = insts[j];
+                    if (!mid) {
+                        continue;
+                    }
+
+                    for (Variable* def : mid->definitions()) {
+                        auto* def_var = dyn_cast<Variable>(def);
+                        if (same_variable_identity(dst, def_var)) {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if (blocked) {
+                        break;
+                    }
+
+                    const std::size_t uses_here = count_variable_uses_in_instruction(mid, dst);
+                    if (uses_here > 0) {
+                        if (uses_here > 1 || use_index != insts.size()) {
+                            multiple_uses = true;
+                            break;
+                        }
+                        use_index = j;
+                    }
+                }
+
+                if (!blocked && !multiple_uses && use_index < insts.size()) {
+                    Expression* replacement = assign->value()->copy(*arena);
+                    if (replacement
+                        && substitute_variable_once_in_instruction(insts[use_index], dst, replacement)) {
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Fold terminal pattern:
         //   v = <expr>
@@ -940,6 +1335,7 @@ void remove_self_assignments_from_ast(AstNode* node, DecompilerArena* arena) {
         return;
     }
     if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        fold_single_use_pure_assignments_across_seq(seq, arena);
         for (AstNode* child : seq->nodes()) {
             remove_self_assignments_from_ast(child, arena);
         }
