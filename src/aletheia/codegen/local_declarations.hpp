@@ -1,6 +1,7 @@
 #pragma once
 
 #include "codegen.hpp"
+#include <unordered_map>
 #include <unordered_set>
 #include <map>
 #include <set>
@@ -143,8 +144,32 @@ public:
             collector.traverse(task.ast()->root());
         }
 
-        // Build the set of parameter names to exclude from local declarations.
-        auto param_names = task.parameter_names();
+        std::unordered_set<std::string> declared_param_names;
+        if (task.function_type()) {
+            if (auto* fn_ty = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
+                const int declared_param_count = static_cast<int>(fn_ty->parameters().size());
+                std::unordered_map<int, std::string> best_name_for_index;
+                for (const auto& [reg, param] : task.parameter_registers()) {
+                    if (param.index < 0 || param.index >= declared_param_count) {
+                        continue;
+                    }
+                    auto it = best_name_for_index.find(param.index);
+                    if (it == best_name_for_index.end() || param.name.size() > it->second.size()) {
+                        best_name_for_index[param.index] = param.name;
+                    }
+                }
+                for (int i = 0; i < declared_param_count; ++i) {
+                    auto it = best_name_for_index.find(i);
+                    if (it != best_name_for_index.end() && !it->second.empty()) {
+                        declared_param_names.insert(it->second);
+                    } else {
+                        declared_param_names.insert("a" + std::to_string(i + 1));
+                    }
+                }
+            }
+        } else {
+            declared_param_names = task.parameter_names();
+        }
 
         // Group by type string -> sorted set of variable names.
         std::map<std::string, std::set<std::string>> type_to_vars;
@@ -155,19 +180,13 @@ public:
                 continue;
             }
             
-            // Skip parameter variables (they appear in the function signature).
-            if (var->is_parameter()) {
-                continue;
-            }
-
             std::string var_name = expr_gen.generate(var);
 
-            // Also skip by name match against parameter names (catches cases
-            // where the Variable node wasn't tagged but shares a parameter name).
-            if (param_names.contains(var_name)) {
+            // Skip names that are already declared in the function signature.
+            if (declared_param_names.contains(var_name)) {
                 continue;
             }
-            
+
             std::string type_str = "int"; // Default fallback.
             if (var->ir_type()) {
                 type_str = var->ir_type()->to_string();

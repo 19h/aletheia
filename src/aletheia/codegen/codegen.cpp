@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <string>
 
 namespace aletheia {
@@ -702,7 +703,28 @@ struct ParameterDisplayInfo {
 ParameterDisplayInfo build_parameter_display_info(const DecompilerTask& task) {
     ParameterDisplayInfo info;
 
+    std::optional<int> max_declared_param_index;
+    if (task.function_type()) {
+        if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
+            if (!func_type->parameters().empty()) {
+                max_declared_param_index = static_cast<int>(func_type->parameters().size()) - 1;
+            } else {
+                max_declared_param_index = -1;
+            }
+        }
+    }
+
+    auto include_param_index = [&](int index) {
+        if (!max_declared_param_index.has_value()) {
+            return true;
+        }
+        return index >= 0 && index <= *max_declared_param_index;
+    };
+
     for (const auto& [reg, param] : task.parameter_registers()) {
+        if (!include_param_index(param.index)) {
+            continue;
+        }
         auto it = info.index_to_name.find(param.index);
         if (it == info.index_to_name.end() || param.name.size() > it->second.size()) {
             info.index_to_name[param.index] = param.name;
@@ -710,6 +732,9 @@ ParameterDisplayInfo build_parameter_display_info(const DecompilerTask& task) {
     }
 
     for (const auto& [reg, param] : task.parameter_registers()) {
+        if (!include_param_index(param.index)) {
+            continue;
+        }
         std::string chosen = param.name;
         auto best_it = info.index_to_name.find(param.index);
         if (best_it != info.index_to_name.end() && !best_it->second.empty()) {

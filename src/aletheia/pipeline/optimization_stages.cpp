@@ -4378,6 +4378,116 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
     };
 
     std::unordered_map<VarKey, std::vector<LocalDefSite>, VarKeyHash> def_sites;
+    std::unordered_map<std::string, std::vector<LocalDefSite>> def_sites_by_name;
+
+    auto lower_ascii = [](std::string_view name) {
+        std::string lowered(name);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return lowered;
+    };
+
+    auto has_trailing_numeric_suffix = [](std::string_view name, std::size_t* split_pos) {
+        const std::size_t pos = name.rfind('_');
+        if (pos == std::string_view::npos || pos + 1 >= name.size()) {
+            return false;
+        }
+        for (std::size_t i = pos + 1; i < name.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+                return false;
+            }
+        }
+        if (split_pos) {
+            *split_pos = pos;
+        }
+        return true;
+    };
+
+    auto canonical_dependency_name = [&](std::string_view raw_name) {
+        std::string lowered = lower_ascii(raw_name);
+        std::string canonical = lowered;
+
+        auto looks_abi_arg_name = [](std::string_view s) {
+            if (s.size() < 2 || s[0] != 'a') {
+                return false;
+            }
+            std::size_t i = 1;
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+                ++i;
+            }
+            if (i == 1) {
+                return false;
+            }
+            if (i == s.size()) {
+                return true;
+            }
+            if (s[i] != '_') {
+                return false;
+            }
+            for (++i; i < s.size(); ++i) {
+                if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        auto looks_register_with_embedded_ssa = [](std::string_view s) {
+            if (s.size() < 2) {
+                return false;
+            }
+
+            const char prefix = s.front();
+            if (prefix != 'x' && prefix != 'w' && prefix != 'd'
+                && prefix != 's' && prefix != 'q' && prefix != 'v' && prefix != 'r') {
+                return false;
+            }
+
+            std::size_t i = 1;
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+                ++i;
+            }
+            if (i == 1) {
+                return false;
+            }
+
+            if (i == s.size()) {
+                return true;
+            }
+
+            if (s[i] != '_') {
+                return false;
+            }
+
+            for (++i; i < s.size(); ++i) {
+                if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (canonical.rfind("arg_", 0) == 0 || looks_abi_arg_name(canonical)
+            || parse_arm64_xw_index(canonical).has_value()
+            || looks_register_with_embedded_ssa(canonical)) {
+            std::size_t split_pos = std::string::npos;
+            if (has_trailing_numeric_suffix(canonical, &split_pos)) {
+                canonical.resize(split_pos);
+            }
+        }
+
+        return canonical;
+    };
+
+    auto index_def_site_by_name = [&](const std::string& raw_name, const LocalDefSite& site) {
+        const std::string lowered = lower_ascii(raw_name);
+        def_sites_by_name[lowered].push_back(site);
+
+        const std::string canonical = canonical_dependency_name(lowered);
+        if (!canonical.empty() && canonical != lowered) {
+            def_sites_by_name[canonical].push_back(site);
+        }
+    };
 
     // Pass 1: collect variable definitions.
     for (BasicBlock* block : cfg->blocks()) {
@@ -4386,7 +4496,9 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
             Instruction* inst = insts[i];
             for (Variable* def : inst->definitions()) {
                 if (!def) continue;
-                def_sites[var_key(def)].push_back(LocalDefSite{block, i, inst});
+                const LocalDefSite site{block, i, inst};
+                def_sites[var_key(def)].push_back(site);
+                index_def_site_by_name(def->name(), site);
             }
         }
     }
@@ -4418,9 +4530,8 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
                      : std::numeric_limits<std::uint64_t>::max();
     };
 
-    auto find_reaching_definition = [&](const VarKey& key, BasicBlock* use_block, std::size_t use_index) -> Instruction* {
-        auto it = def_sites.find(key);
-        if (it == def_sites.end()) {
+    auto best_reaching_definition = [&](const std::vector<LocalDefSite>& sites, BasicBlock* use_block, std::size_t use_index) -> Instruction* {
+        if (sites.empty()) {
             return nullptr;
         }
 
@@ -4435,7 +4546,7 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
         std::size_t best_dom_distance = std::numeric_limits<std::size_t>::max();
         std::uint64_t best_dom_block_key = std::numeric_limits<std::uint64_t>::max();
 
-        for (const LocalDefSite& site : it->second) {
+        for (const LocalDefSite& site : sites) {
             if (!site.inst || !site.block) {
                 continue;
             }
@@ -4445,7 +4556,7 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
                     best_same_index = site.index;
                     have_same_block = true;
                 }
-                if (site.index >= use_index && site.index < best_same_after_index) {
+                if (site.index > use_index && site.index < best_same_after_index) {
                     best_same_block_after = site.inst;
                     best_same_after_index = site.index;
                 }
@@ -4479,6 +4590,54 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
         return best_dom;
     };
 
+    auto find_reaching_definition_by_name = [&](std::string_view raw_name, BasicBlock* use_block, std::size_t use_index) -> Instruction* {
+        const std::string lowered = lower_ascii(raw_name);
+        if (auto it = def_sites_by_name.find(lowered); it != def_sites_by_name.end()) {
+            if (Instruction* dep = best_reaching_definition(it->second, use_block, use_index)) {
+                return dep;
+            }
+        }
+
+        const std::string canonical = canonical_dependency_name(lowered);
+        if (!canonical.empty() && canonical != lowered) {
+            if (auto it = def_sites_by_name.find(canonical); it != def_sites_by_name.end()) {
+                if (Instruction* dep = best_reaching_definition(it->second, use_block, use_index)) {
+                    return dep;
+                }
+            }
+        }
+
+        return nullptr;
+    };
+
+    auto find_reaching_definition = [&](const VarKey& key, BasicBlock* use_block, std::size_t use_index) -> Instruction* {
+        if (auto it = def_sites.find(key); it != def_sites.end()) {
+            if (Instruction* dep = best_reaching_definition(it->second, use_block, use_index)) {
+                return dep;
+            }
+        }
+
+        if (auto alias_key = register_width_alias_key(key)) {
+            if (auto alias_it = def_sites.find(*alias_key); alias_it != def_sites.end()) {
+                if (Instruction* dep = best_reaching_definition(alias_it->second, use_block, use_index)) {
+                    return dep;
+                }
+            }
+        }
+
+        if (Instruction* dep = find_reaching_definition_by_name(key.name, use_block, use_index)) {
+            return dep;
+        }
+
+        if (auto alias_key = register_width_alias_key(key)) {
+            if (Instruction* dep = find_reaching_definition_by_name(alias_key->name, use_block, use_index)) {
+                return dep;
+            }
+        }
+
+        return nullptr;
+    };
+
     // Pass 2: connect use -> def dependencies and identify sink instructions.
     for (BasicBlock* block : cfg->blocks()) {
         const auto& insts = block->instructions();
@@ -4501,13 +4660,7 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
                         }
                         const std::size_t pred_use_index = candidate_pred->instructions().size();
 
-                        Instruction* dep = find_reaching_definition(src_key, candidate_pred, pred_use_index);
-                        if (!dep) {
-                            if (auto alias_key = register_width_alias_key(src_key)) {
-                                dep = find_reaching_definition(*alias_key, candidate_pred, pred_use_index);
-                            }
-                        }
-                        return dep;
+                        return find_reaching_definition(src_key, candidate_pred, pred_use_index);
                     };
 
                     if (Instruction* dep = resolve_in_pred(pred_block)) {
@@ -4557,11 +4710,6 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
                     const VarKey req_key = var_key(req);
 
                     Instruction* dep = find_reaching_definition(req_key, block, i);
-                    if (!dep) {
-                        if (auto alias_key = register_width_alias_key(req_key)) {
-                            dep = find_reaching_definition(*alias_key, block, i);
-                        }
-                    }
 
                     if (dep && dep != inst) {
                         deps.push_back(dep);
@@ -5910,9 +6058,13 @@ void DeadComponentPrunerStage::execute(DecompilerTask& task) {
                     };
 
                     Expression* target_expr = nullptr;
+                    Expression* clock_id_arg = nullptr;
                     Expression* timespec_ptr = nullptr;
                     if (auto* call = dyn_cast<Call>(call_expr)) {
                         target_expr = call->target();
+                        if (call->operands().size() >= 2) {
+                            clock_id_arg = call->operands()[1];
+                        }
                         if (call->operands().size() >= 3) {
                             timespec_ptr = call->operands()[2];
                         }
@@ -5921,6 +6073,9 @@ void DeadComponentPrunerStage::execute(DecompilerTask& task) {
                             return nullptr;
                         }
                         target_expr = op->operands()[0];
+                        if (op->operands().size() >= 2) {
+                            clock_id_arg = op->operands()[1];
+                        }
                         if (op->operands().size() >= 3) {
                             timespec_ptr = op->operands()[2];
                         }
@@ -5963,6 +6118,97 @@ void DeadComponentPrunerStage::execute(DecompilerTask& task) {
 
                         return ptr_expr;
                     };
+
+                    auto rewrite_clock_id_arg = [&](Expression* id_expr) -> Expression* {
+                        auto* id_var = dyn_cast<Variable>(strip_trivial_casts(id_expr));
+                        if (!id_var) {
+                            return id_expr;
+                        }
+
+                        auto lower_ascii = [](std::string text) {
+                            std::transform(text.begin(), text.end(), text.begin(),
+                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            return text;
+                        };
+
+                        auto canonical_name = [&](const std::string& raw_name) {
+                            std::string lowered = lower_ascii(raw_name);
+                            std::size_t pos = lowered.rfind('_');
+                            if (pos == std::string::npos || pos + 1 >= lowered.size()) {
+                                return lowered;
+                            }
+
+                            bool numeric_suffix = true;
+                            for (std::size_t i = pos + 1; i < lowered.size(); ++i) {
+                                if (!std::isdigit(static_cast<unsigned char>(lowered[i]))) {
+                                    numeric_suffix = false;
+                                    break;
+                                }
+                            }
+                            if (!numeric_suffix) {
+                                return lowered;
+                            }
+
+                            const std::string base = lowered.substr(0, pos);
+                            if (base.rfind("arg_", 0) == 0 || parse_arm64_xw_index(base).has_value()) {
+                                return base;
+                            }
+                            return lowered;
+                        };
+
+                        auto normalize_arm64_xw_family = [&](const std::string& name) {
+                            std::string lowered = lower_ascii(name);
+                            if (auto idx = parse_arm64_xw_index(lowered)) {
+                                return std::string("x") + std::to_string(*idx);
+                            }
+                            return lowered;
+                        };
+
+                        const VarKey id_key = var_key(id_var);
+                        const std::string id_lower = lower_ascii(id_var->name());
+                        const std::string id_canonical = canonical_name(id_var->name());
+                        const std::string id_xw_family = normalize_arm64_xw_family(id_canonical);
+
+                        for (std::size_t k = call_def_index; k > 0; --k) {
+                            auto* prior_assign = dyn_cast<Assignment>(insts[k - 1]);
+                            auto* prior_dst = prior_assign ? dyn_cast<Variable>(prior_assign->destination()) : nullptr;
+                            if (!prior_assign || !prior_dst) {
+                                continue;
+                            }
+
+                            const bool same_key = var_key(prior_dst) == id_key;
+                            const std::string dst_lower = lower_ascii(prior_dst->name());
+                            const std::string dst_canonical = canonical_name(prior_dst->name());
+                            const std::string dst_xw_family = normalize_arm64_xw_family(dst_canonical);
+                            const bool same_name = dst_lower == id_lower
+                                || (!id_canonical.empty() && !dst_canonical.empty() && dst_canonical == id_canonical)
+                                || (!id_xw_family.empty() && !dst_xw_family.empty() && dst_xw_family == id_xw_family);
+                            if (!same_key && !same_name) {
+                                continue;
+                            }
+
+                            if (auto* c = dyn_cast<Constant>(strip_trivial_casts(prior_assign->value()))) {
+                                return c;
+                            }
+                            break;
+                        }
+
+                        return id_expr;
+                    };
+
+                    Expression* rewritten_clock_id = rewrite_clock_id_arg(clock_id_arg);
+                    if (rewritten_clock_id != clock_id_arg) {
+                        if (auto* call = dyn_cast<Call>(call_expr)) {
+                            if (call->mutable_operands().size() >= 2) {
+                                call->mutable_operands()[1] = rewritten_clock_id->copy(task.arena());
+                            }
+                        } else if (auto* op = dyn_cast<Operation>(call_expr)) {
+                            if (op->type() == OperationType::call && op->mutable_operands().size() >= 2) {
+                                op->mutable_operands()[1] = rewritten_clock_id->copy(task.arena());
+                            }
+                        }
+                        clock_id_arg = rewritten_clock_id;
+                    }
 
                     Expression* rewritten_ptr = rewrite_stack_adjust_temp(timespec_ptr);
                     if (rewritten_ptr != timespec_ptr) {
