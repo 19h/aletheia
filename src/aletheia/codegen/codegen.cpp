@@ -1073,7 +1073,7 @@ void CExpressionGenerator::visit(Variable* v) {
 
 void CExpressionGenerator::visit(GlobalVariable* v) {
     // Global names are rendered without SSA suffixes for stable declarations.
-    result_ = strip_macho_linker_prefix(v->name());
+    result_ = v->name();
 }
 
 void CExpressionGenerator::visit(Operation* o) {
@@ -1462,7 +1462,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
         lines_.push_back("");
     }
 
-    std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : strip_macho_linker_prefix(task.function_name());
+    std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : task.function_name();
 
     // Generate function signature (with void->non-void reconciliation when needed)
     std::string return_type = "void";

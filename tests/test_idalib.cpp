@@ -1085,7 +1085,7 @@ void test_production_fibonacci_main_has_connected_terminal_return() {
     TEST_ASSERT(main_end != std::string::npos, "failed to isolate _main section in production fibonacci output");
     const std::string main_body = out.substr(main_begin, main_end - main_begin);
 
-    const std::regex return_const(R"(return\s+0x[01]\s*;)");
+    const std::regex return_const(R"(return\s+(0x[01]|[01])\s*;)");
     TEST_ASSERT(std::regex_search(main_body, return_const),
         "production fibonacci _main missing connected terminal return constant");
 

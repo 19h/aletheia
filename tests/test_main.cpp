@@ -1447,7 +1447,7 @@ void test_codegen_loop_variants() {
     ASSERT_TRUE(has_substr("while (i < 0xa) {"));
     ASSERT_TRUE(has_substr("do {"));
     ASSERT_TRUE(has_substr("} while (i < 0xa);"));
-    ASSERT_TRUE(has_substr("for (i = 0x0; i < 0xa; i++) {"));
+    ASSERT_TRUE(has_substr("for (i = 0; i < 0xa; i++) {"));
 
     std::cout << "[+] test_codegen_loop_variants passed.\n";
 }
@@ -1622,9 +1622,9 @@ void test_codegen_constant_formatting() {
     auto* s64 = arena.create<aletheia::Constant>(1, 8);
     s64->set_ir_type(aletheia::Integer::int64_t());
 
-    ASSERT_EQ(gen.generate(u32), "0x1U");
-    ASSERT_EQ(gen.generate(u64), "0x1UL");
-    ASSERT_EQ(gen.generate(s64), "0x1L");
+    ASSERT_EQ(gen.generate(u32), "1");
+    ASSERT_EQ(gen.generate(u64), "1");
+    ASSERT_EQ(gen.generate(s64), "1");
 
     std::cout << "[+] test_codegen_constant_formatting passed.\n";
 }

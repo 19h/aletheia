@@ -2426,6 +2426,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                     }
 
                     std::vector<Expression*> recovered;
+                    bool recovered_needs_reverse = true;
                     for (std::size_t back = i; back > 0; --back) {
                         Instruction* prev = instrs[back - 1];
                         if (is_call_or_branch_barrier(prev)) {
@@ -2573,7 +2574,9 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                         return;
                     }
 
-                    std::reverse(recovered.begin(), recovered.end());
+                    if (recovered_needs_reverse) {
+                        std::reverse(recovered.begin(), recovered.end());
+                    }
                     for (Expression* extra : recovered) {
                         propagate_extra_arg(extra);
                         args.push_back(extra);
