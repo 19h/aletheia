@@ -91,7 +91,7 @@ if(NOT _z3_found_system)
 
     FetchContent_MakeAvailable(z3)
 
-    # Force Z3 to use the same aggressive optimizations as the rest of the project
+    # Keep source-built Z3 on the same Release baseline as project libraries.
     if(TARGET libz3)
         target_compile_options(libz3 PRIVATE $<$<CONFIG:Release>:-O3>)
     endif()
@@ -141,6 +141,77 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     endif()
 endif()
 
+# ── Aggressive micro-optimizations ───────────────────────────────────────
+# Keep this as an INTERFACE target so we can apply it selectively and avoid
+# impacting compile hotspots like idiomata's large embedded pattern table.
+add_library(aletheia_aggressive_opts INTERFACE)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    message(STATUS "Enabling Aggressive Micro-Optimizations")
+
+    # Hide symbols by default to improve devirtualization/inlining in C++.
+    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(aletheia_aggressive_opts INTERFACE
+            "-march=native"
+            "-mtune=native"
+            "-ffunction-sections"
+            "-fdata-sections"
+            "-fomit-frame-pointer"
+        )
+        if(NOT APPLE)
+            target_compile_options(aletheia_aggressive_opts INTERFACE "-fno-semantic-interposition")
+        endif()
+    elseif(MSVC)
+        target_compile_options(aletheia_aggressive_opts INTERFACE
+            "/Ob3"
+            "/Gw"
+            "/arch:AVX2"
+        )
+    endif()
+
+    if(NOT APPLE AND NOT WIN32)
+        target_link_options(aletheia_aggressive_opts INTERFACE
+            "-Wl,--gc-sections"
+            "-Wl,--icf=all"
+        )
+    elseif(APPLE)
+        target_link_options(aletheia_aggressive_opts INTERFACE "-Wl,-dead_strip")
+    elseif(WIN32)
+        target_link_options(aletheia_aggressive_opts INTERFACE "/OPT:REF" "/OPT:ICF")
+    endif()
+endif()
+
+# Apply aggressive flags to source-built Z3 directly to avoid introducing
+# non-exported parent targets into Z3's own exported target set.
+if(TARGET libz3 AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    set_target_properties(libz3 PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES
+    )
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(libz3 PRIVATE
+            "-march=native"
+            "-mtune=native"
+            "-ffunction-sections"
+            "-fdata-sections"
+            "-fomit-frame-pointer"
+        )
+        if(NOT APPLE)
+            target_compile_options(libz3 PRIVATE "-fno-semantic-interposition")
+        endif()
+    elseif(MSVC)
+        target_compile_options(libz3 PRIVATE
+            "/Ob3"
+            "/Gw"
+            "/arch:AVX2"
+        )
+    endif()
+endif()
+
 # ── Platform-specific IDA library names ──────────────────────────────────
 if(WIN32)
     set(ALETHEIA_IDALIB_NAME "idalib.lib")
@@ -176,7 +247,7 @@ add_library(logos STATIC
     src/logos/operation_simplifier.cpp
     src/logos/normal_form.cpp
 )
-target_link_libraries(logos PUBLIC aletheia_z3)
+target_link_libraries(logos PUBLIC aletheia_z3 aletheia_aggressive_opts)
 target_include_directories(logos PUBLIC src/logos ${IDAX_INC_DIRS} ${ALETHEIA_Z3_INCLUDE_DIRS})
 target_compile_options(logos PRIVATE $<$<CONFIG:Release>:-O3>)
 
@@ -232,7 +303,7 @@ add_library(aletheia STATIC
     src/aletheia/debug/ir_query.cpp
     src/aletheia/debug/debug_observer.cpp
 )
-target_link_libraries(aletheia PUBLIC idax::idax logos idiomata)
+target_link_libraries(aletheia PUBLIC idax::idax logos idiomata aletheia_aggressive_opts)
 target_include_directories(aletheia PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
 target_compile_options(aletheia PRIVATE $<$<CONFIG:Release>:-O3>)
 
@@ -286,7 +357,7 @@ add_library(aletheia_core STATIC
     src/aletheia/debug/ir_query.cpp
     src/aletheia/debug/debug_observer.cpp
 )
-target_link_libraries(aletheia_core PUBLIC logos)
+target_link_libraries(aletheia_core PUBLIC logos aletheia_aggressive_opts)
 target_include_directories(aletheia_core PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
 target_compile_options(aletheia_core PRIVATE $<$<CONFIG:Release>:-O3>)
 # Provide idax include directories (for headers only) without linking the idax

@@ -2536,6 +2536,23 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
                 if (is_stack_pointer_like(src) && !is_stack_pointer_like(dest)) {
                     continue;
                 }
+
+                // Do not collapse distinct ARM64 X/W register families into
+                // one identity component (e.g. x19 = x0). Those copies carry
+                // value movement semantics (argument -> callee-saved/local)
+                // and merging them can erase required initializations.
+                std::string dest_lower = dest->name();
+                std::string src_lower = src->name();
+                std::transform(dest_lower.begin(), dest_lower.end(), dest_lower.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                std::transform(src_lower.begin(), src_lower.end(), src_lower.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                const auto dest_arm64_idx = parse_arm64_xw_index(dest_lower);
+                const auto src_arm64_idx = parse_arm64_xw_index(src_lower);
+                if (dest_arm64_idx && src_arm64_idx && *dest_arm64_idx != *src_arm64_idx) {
+                    continue;
+                }
+
                 if (type_compatible_for_identity(dest, src)) {
                     direct_identity_edges.push_back({var_key(dest), var_key(src)});
                 }

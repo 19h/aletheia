@@ -465,9 +465,9 @@ void apply_variable_naming(aletheia::DecompilerTask& task) {
     aletheia::LoopNameGenerator::apply_while_loop_counters(task.ast());
     // Remove self-assignments that become visible after rename collapses
     // different SSA versions of the same register to the same name.
-    aletheia::VariableNameGeneration::remove_self_assignments(task.cfg());
+    aletheia::VariableNameGeneration::remove_self_assignments(task.cfg(), &task.arena());
     // Also remove from AST-wrapped blocks (may differ from flat CFG block list).
-    aletheia::VariableNameGeneration::remove_self_assignments_ast(task.ast());
+    aletheia::VariableNameGeneration::remove_self_assignments_ast(task.ast(), &task.arena());
 }
 
 std::string block_label(const aletheia::BasicBlock* block) {

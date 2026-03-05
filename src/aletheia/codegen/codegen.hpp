@@ -3,6 +3,7 @@
 #include "../structures/dataflow.hpp"
 #include "../pipeline/pipeline.hpp"
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -37,6 +38,7 @@ public:
 
 private:
     std::string result_;
+    std::unordered_set<const DataflowObject*> active_nodes_;
     /// Maps lowercase register name -> display name for parameter rendering.
     std::unordered_map<std::string, std::string> param_display_names_;
 };

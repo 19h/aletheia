@@ -15,20 +15,48 @@ public:
         variables_.insert(v);
     }
     void visit(Operation* o) override {
+        if (!o) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(o).second) {
+            return;
+        }
         for (auto* op : o->operands()) if (op) op->accept(*this);
+        active_expr_nodes_.erase(o);
     }
     void visit(Call* c) override {
+        if (!c) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(c).second) {
+            return;
+        }
         if (c->target()) c->target()->accept(*this);
         for (size_t i = 0; i < c->arg_count(); ++i) {
             if (c->arg(i)) c->arg(i)->accept(*this);
         }
+        active_expr_nodes_.erase(c);
     }
     void visit(ListOperation* lo) override {
+        if (!lo) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(lo).second) {
+            return;
+        }
         for (auto* op : lo->operands()) if (op) op->accept(*this);
+        active_expr_nodes_.erase(lo);
     }
     void visit(Condition* c) override {
+        if (!c) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(c).second) {
+            return;
+        }
         if (c->lhs()) c->lhs()->accept(*this);
         if (c->rhs()) c->rhs()->accept(*this);
+        active_expr_nodes_.erase(c);
     }
 
     void visit_assignment(Assignment* i) override {
@@ -42,7 +70,15 @@ public:
         if (i->expression()) i->expression()->accept(*this);
     }
     void visit_return(Return* i) override {
-        for (auto* v : i->values()) if (v) v->accept(*this);
+        if (!i) return;
+        // Keep return traversal conservative: malformed ASTs may contain
+        // non-expression payloads in return value slots, which can recurse
+        // indefinitely via visitor dispatch. Collect direct globals only.
+        for (auto* v : i->values()) {
+            if (auto* gv = dyn_cast<GlobalVariable>(v)) {
+                variables_.insert(gv);
+            }
+        }
     }
     void visit_phi(Phi* i) override {
         if (i->dest_var()) i->dest_var()->accept(*this);
@@ -95,6 +131,8 @@ public:
 
 private:
     std::unordered_set<Variable*> variables_;
+    std::unordered_set<Return*> active_returns_;
+    std::unordered_set<const Expression*> active_expr_nodes_;
 };
 
 class LocalDeclarationGenerator {
@@ -161,21 +199,49 @@ public:
     void visit(Variable* v) override {}
     void visit(GlobalVariable* gv) override { variables_.insert(gv); }
     void visit(Operation* o) override {
+        if (!o) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(o).second) {
+            return;
+        }
         for (auto* op : o->operands()) if (op) op->accept(*this);
+        active_expr_nodes_.erase(o);
     }
     void visit(Call* c) override {
+        if (!c) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(c).second) {
+            return;
+        }
         // Skip the call target — it's a function name, not a data global.
         // Only visit the call arguments.
         for (size_t i = 0; i < c->arg_count(); ++i) {
             if (c->arg(i)) c->arg(i)->accept(*this);
         }
+        active_expr_nodes_.erase(c);
     }
     void visit(ListOperation* lo) override {
+        if (!lo) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(lo).second) {
+            return;
+        }
         for (auto* op : lo->operands()) if (op) op->accept(*this);
+        active_expr_nodes_.erase(lo);
     }
     void visit(Condition* c) override {
+        if (!c) {
+            return;
+        }
+        if (!active_expr_nodes_.insert(c).second) {
+            return;
+        }
         if (c->lhs()) c->lhs()->accept(*this);
         if (c->rhs()) c->rhs()->accept(*this);
+        active_expr_nodes_.erase(c);
     }
 
     void visit_assignment(Assignment* i) override {
@@ -189,7 +255,15 @@ public:
         if (i->expression()) i->expression()->accept(*this);
     }
     void visit_return(Return* i) override {
-        for (auto* v : i->values()) if (v) v->accept(*this);
+        if (!i) return;
+        // Keep return traversal conservative: malformed ASTs may contain
+        // non-expression payloads in return value slots, which can recurse
+        // indefinitely via visitor dispatch. Collect direct globals only.
+        for (auto* v : i->values()) {
+            if (auto* gv = dyn_cast<GlobalVariable>(v)) {
+                variables_.insert(gv);
+            }
+        }
     }
     void visit_phi(Phi* i) override {
         if (i->dest_var()) i->dest_var()->accept(*this);
@@ -240,6 +314,7 @@ public:
     const std::set<Variable*>& variables() const { return variables_; }
 private:
     std::set<Variable*> variables_;
+    std::unordered_set<const Expression*> active_expr_nodes_;
 };
 
 class GlobalDeclarationGenerator {

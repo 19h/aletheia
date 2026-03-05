@@ -133,8 +133,8 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         }
         aletheia::LoopNameGenerator::apply_for_loop_counters(task.ast());
         aletheia::LoopNameGenerator::apply_while_loop_counters(task.ast());
-        aletheia::VariableNameGeneration::remove_self_assignments(task.cfg());
-        aletheia::VariableNameGeneration::remove_self_assignments_ast(task.ast());
+        aletheia::VariableNameGeneration::remove_self_assignments(task.cfg(), &task.arena());
+        aletheia::VariableNameGeneration::remove_self_assignments_ast(task.ast(), &task.arena());
 
         std::vector<std::string> lines;
         lines.push_back(ida::lines::colstr("// Aletheia Decompiled Output", ida::lines::Color::RegularComment));

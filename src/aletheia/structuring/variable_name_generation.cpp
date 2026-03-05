@@ -610,6 +610,9 @@ bool substitute_variable_once(Expression*& expr, Variable* target, Expression* r
     if (!expr || !target || !replacement) {
         return false;
     }
+    if (expr == replacement) {
+        return false;
+    }
     if (auto* v = dyn_cast<Variable>(expr)) {
         if (same_variable_identity(v, target)) {
             expr = replacement;
@@ -637,7 +640,7 @@ bool substitute_variable_once(Expression*& expr, Variable* target, Expression* r
     return false;
 }
 
-void remove_self_assignments_from_block(BasicBlock* block) {
+void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* arena) {
     if (!block) return;
     std::vector<Instruction*> filtered;
     const auto& insts = block->instructions();
@@ -658,16 +661,20 @@ void remove_self_assignments_from_block(BasicBlock* block) {
             auto* ret = dyn_cast<Return>(insts[i + 1]);
             auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
             if (assign && ret && dst && ret->values().size() == 1) {
+                const bool dst_in_value = count_variable_uses(assign->value(), dst) != 0;
                 auto* ret_var = dyn_cast<Variable>(ret->values()[0]);
-                if (same_variable_identity(dst, ret_var)) {
-                    ret->mutable_values()[0] = assign->value();
+                if (same_variable_identity(dst, ret_var) && arena) {
+                    ret->mutable_values()[0] = assign->value()->copy(*arena);
                     continue;
                 }
 
                 Expression*& ret_value = ret->mutable_values()[0];
-                if (!contains_call_expression(assign->value())
+                Expression* replacement = arena ? assign->value()->copy(*arena) : nullptr;
+                if (!dst_in_value
+                    && !contains_call_expression(assign->value())
                     && count_variable_uses(ret_value, dst) == 1
-                    && substitute_variable_once(ret_value, dst, assign->value())) {
+                    && replacement
+                    && substitute_variable_once(ret_value, dst, replacement)) {
                     continue;
                 }
             }
@@ -679,7 +686,9 @@ void remove_self_assignments_from_block(BasicBlock* block) {
         //   return <...v...>
         if (auto* assign = dyn_cast<Assignment>(inst)) {
             auto* dst = dyn_cast<Variable>(assign->destination());
-            if (dst && !contains_call_expression(assign->value())) {
+            if (dst
+                && !contains_call_expression(assign->value())
+                && count_variable_uses(assign->value(), dst) == 0) {
                 std::size_t ret_index = insts.size();
                 bool blocked = false;
                 bool used_before_return = false;
@@ -719,8 +728,10 @@ void remove_self_assignments_from_block(BasicBlock* block) {
                 if (!blocked && ret_index < insts.size()) {
                     auto* ret = dyn_cast<Return>(insts[ret_index]);
                     Expression*& ret_value = ret->mutable_values()[0];
+                    Expression* replacement = arena ? assign->value()->copy(*arena) : nullptr;
                     if (count_variable_uses(ret_value, dst) == 1
-                        && substitute_variable_once(ret_value, dst, assign->value())) {
+                        && replacement
+                        && substitute_variable_once(ret_value, dst, replacement)) {
                         if (!used_before_return) {
                             continue;
                         }
@@ -743,53 +754,53 @@ void remove_self_assignments_from_block(BasicBlock* block) {
     }
 }
 
-void remove_self_assignments_from_ast(AstNode* node) {
+void remove_self_assignments_from_ast(AstNode* node, DecompilerArena* arena) {
     if (!node) return;
 
     if (auto* code = ast_dyn_cast<CodeNode>(node)) {
-        remove_self_assignments_from_block(code->block());
+        remove_self_assignments_from_block(code->block(), arena);
         return;
     }
     if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
         for (AstNode* child : seq->nodes()) {
-            remove_self_assignments_from_ast(child);
+            remove_self_assignments_from_ast(child, arena);
         }
         return;
     }
     if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        remove_self_assignments_from_ast(if_node->cond());
-        remove_self_assignments_from_ast(if_node->true_branch());
-        remove_self_assignments_from_ast(if_node->false_branch());
+        remove_self_assignments_from_ast(if_node->cond(), arena);
+        remove_self_assignments_from_ast(if_node->true_branch(), arena);
+        remove_self_assignments_from_ast(if_node->false_branch(), arena);
         return;
     }
     if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        remove_self_assignments_from_ast(loop->body());
+        remove_self_assignments_from_ast(loop->body(), arena);
         return;
     }
     if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-        remove_self_assignments_from_ast(sw->cond());
+        remove_self_assignments_from_ast(sw->cond(), arena);
         for (CaseNode* c : sw->cases()) {
-            remove_self_assignments_from_ast(c);
+            remove_self_assignments_from_ast(c, arena);
         }
         return;
     }
     if (auto* c = ast_dyn_cast<CaseNode>(node)) {
-        remove_self_assignments_from_ast(c->body());
+        remove_self_assignments_from_ast(c->body(), arena);
     }
 }
 
 } // namespace (self-assignment helpers)
 
-void VariableNameGeneration::remove_self_assignments(ControlFlowGraph* cfg) {
+void VariableNameGeneration::remove_self_assignments(ControlFlowGraph* cfg, DecompilerArena* arena) {
     if (!cfg) return;
     for (BasicBlock* block : cfg->blocks()) {
-        remove_self_assignments_from_block(block);
+        remove_self_assignments_from_block(block, arena);
     }
 }
 
-void VariableNameGeneration::remove_self_assignments_ast(AbstractSyntaxForest* forest) {
+void VariableNameGeneration::remove_self_assignments_ast(AbstractSyntaxForest* forest, DecompilerArena* arena) {
     if (!forest || !forest->root()) return;
-    remove_self_assignments_from_ast(forest->root());
+    remove_self_assignments_from_ast(forest->root(), arena);
 }
 
 } // namespace aletheia

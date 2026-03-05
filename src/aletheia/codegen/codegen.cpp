@@ -857,11 +857,19 @@ std::string format_unknown_operation(Operation* o, CExpressionGenerator& gen, st
 } // namespace
 
 std::string CExpressionGenerator::generate(DataflowObject* obj) {
-    result_.clear();
-    if (obj) {
-        obj->accept(*this);
+    if (!obj) {
+        return "";
     }
-    return result_;
+
+    if (!active_nodes_.insert(obj).second) {
+        return "__aletheia_expr_cycle";
+    }
+
+    result_.clear();
+    obj->accept(*this);
+    const std::string rendered = result_;
+    active_nodes_.erase(obj);
+    return rendered;
 }
 
 void CExpressionGenerator::visit(Constant* c) {
