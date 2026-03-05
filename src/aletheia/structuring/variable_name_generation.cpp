@@ -564,17 +564,175 @@ void VariableNameGeneration::apply_to_cfg(ControlFlowGraph* cfg) {
 
 namespace {
 
+bool same_variable_identity(Variable* lhs, Variable* rhs) {
+    if (!lhs || !rhs) return false;
+    return lhs->name() == rhs->name() && lhs->ssa_version() == rhs->ssa_version();
+}
+
+bool contains_call_expression(Expression* expr) {
+    if (!expr) return false;
+    if (isa<Call>(expr)) return true;
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        if (op->type() == OperationType::call) return true;
+        for (Expression* child : op->operands()) {
+            if (contains_call_expression(child)) return true;
+        }
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression* child : list->operands()) {
+            if (contains_call_expression(child)) return true;
+        }
+    }
+    return false;
+}
+
+std::size_t count_variable_uses(Expression* expr, Variable* target) {
+    if (!expr || !target) {
+        return 0;
+    }
+    if (auto* v = dyn_cast<Variable>(expr)) {
+        return same_variable_identity(v, target) ? 1 : 0;
+    }
+
+    std::size_t count = 0;
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        for (Expression* child : op->operands()) {
+            count += count_variable_uses(child, target);
+        }
+    } else if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression* child : list->operands()) {
+            count += count_variable_uses(child, target);
+        }
+    }
+    return count;
+}
+
+bool substitute_variable_once(Expression*& expr, Variable* target, Expression* replacement) {
+    if (!expr || !target || !replacement) {
+        return false;
+    }
+    if (auto* v = dyn_cast<Variable>(expr)) {
+        if (same_variable_identity(v, target)) {
+            expr = replacement;
+            return true;
+        }
+        return false;
+    }
+
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        for (Expression*& child : op->mutable_operands()) {
+            if (substitute_variable_once(child, target, replacement)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression*& child : list->mutable_operands()) {
+            if (substitute_variable_once(child, target, replacement)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 void remove_self_assignments_from_block(BasicBlock* block) {
     if (!block) return;
     std::vector<Instruction*> filtered;
-    filtered.reserve(block->instructions().size());
-    for (Instruction* inst : block->instructions()) {
+    const auto& insts = block->instructions();
+    filtered.reserve(insts.size());
+
+    for (std::size_t i = 0; i < insts.size(); ++i) {
+        Instruction* inst = insts[i];
+
+        // Fold terminal pattern:
+        //   v = <expr>
+        //   return v
+        // into:
+        //   return <expr>
+        // This avoids disconnected return-via-parameter artifacts after
+        // SSA rename/coalescing while preserving expression semantics.
+        if (i + 1 < insts.size()) {
+            auto* assign = dyn_cast<Assignment>(inst);
+            auto* ret = dyn_cast<Return>(insts[i + 1]);
+            auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
+            if (assign && ret && dst && ret->values().size() == 1) {
+                auto* ret_var = dyn_cast<Variable>(ret->values()[0]);
+                if (same_variable_identity(dst, ret_var)) {
+                    ret->mutable_values()[0] = assign->value();
+                    continue;
+                }
+
+                Expression*& ret_value = ret->mutable_values()[0];
+                if (!contains_call_expression(assign->value())
+                    && count_variable_uses(ret_value, dst) == 1
+                    && substitute_variable_once(ret_value, dst, assign->value())) {
+                    continue;
+                }
+            }
+        }
+
+        // Fold non-adjacent assignment -> return uses when safe:
+        //   v = <expr>
+        //   ... (no v use/redef)
+        //   return <...v...>
+        if (auto* assign = dyn_cast<Assignment>(inst)) {
+            auto* dst = dyn_cast<Variable>(assign->destination());
+            if (dst && !contains_call_expression(assign->value())) {
+                std::size_t ret_index = insts.size();
+                bool blocked = false;
+                bool used_before_return = false;
+
+                for (std::size_t j = i + 1; j < insts.size(); ++j) {
+                    Instruction* mid = insts[j];
+                    if (!mid) {
+                        continue;
+                    }
+
+                    for (Variable* def : mid->definitions()) {
+                        auto* def_var = dyn_cast<Variable>(def);
+                        if (same_variable_identity(dst, def_var)) {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if (blocked) {
+                        break;
+                    }
+
+                    if (auto* ret = dyn_cast<Return>(mid)) {
+                        if (ret->values().size() == 1) {
+                            ret_index = j;
+                        }
+                        break;
+                    }
+
+                    for (Variable* req : mid->requirements()) {
+                        auto* req_var = dyn_cast<Variable>(req);
+                        if (same_variable_identity(dst, req_var)) {
+                            used_before_return = true;
+                        }
+                    }
+                }
+
+                if (!blocked && ret_index < insts.size()) {
+                    auto* ret = dyn_cast<Return>(insts[ret_index]);
+                    Expression*& ret_value = ret->mutable_values()[0];
+                    if (count_variable_uses(ret_value, dst) == 1
+                        && substitute_variable_once(ret_value, dst, assign->value())) {
+                        if (!used_before_return) {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         if (auto* assign = dyn_cast<Assignment>(inst)) {
             auto* dst = dyn_cast<Variable>(assign->destination());
             auto* src = dyn_cast<Variable>(assign->value());
-            if (dst && src
-                && dst->name() == src->name()
-                && dst->ssa_version() == src->ssa_version()) {
+            if (same_variable_identity(dst, src)) {
                 continue;  // skip self-assignment
             }
         }

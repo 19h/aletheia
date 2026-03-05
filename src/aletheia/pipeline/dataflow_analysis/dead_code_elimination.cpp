@@ -1,4 +1,5 @@
 #include "dead_code_elimination.hpp"
+#include <cctype>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -6,10 +7,62 @@
 
 namespace aletheia {
 
+static std::string to_lower_copy(const std::string& in) {
+    std::string out = in;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+static std::string arm64_xw_alias_name(const std::string& name) {
+    const std::string lowered = to_lower_copy(name);
+    if (lowered.size() < 2) {
+        return {};
+    }
+    const char prefix = lowered[0];
+    if (prefix != 'x' && prefix != 'w') {
+        return {};
+    }
+    for (std::size_t i = 1; i < lowered.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(lowered[i]))) {
+            return {};
+        }
+    }
+
+    unsigned index = 0;
+    for (std::size_t i = 1; i < lowered.size(); ++i) {
+        index = index * 10u + static_cast<unsigned>(lowered[i] - '0');
+    }
+    // x0-w7 are ABI argument/return registers and participate in many
+    // artificial cross-call chains; avoid alias expansion for them.
+    if (index < 8u) {
+        return {};
+    }
+
+    std::string alias = lowered;
+    alias[0] = (prefix == 'x') ? 'w' : 'x';
+    return alias;
+}
+
+static void add_use_with_width_alias(Variable* v, std::unordered_set<std::string>& uses) {
+    if (!v) {
+        return;
+    }
+
+    const std::string version = std::to_string(v->ssa_version());
+    uses.insert(v->name() + "_" + version);
+
+    const std::string alias_name = arm64_xw_alias_name(v->name());
+    if (!alias_name.empty()) {
+        uses.insert(alias_name + "_" + version);
+    }
+}
+
 static void extract_uses(Expression* expr, std::unordered_set<std::string>& uses) {
     if (!expr) return;
     if (auto* v = dyn_cast<Variable>(expr)) {
-        uses.insert(v->name() + "_" + std::to_string(v->ssa_version()));
+        add_use_with_width_alias(v, uses);
     } else if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression* child : op->operands()) {
             extract_uses(child, uses);
@@ -159,9 +212,11 @@ void DeadCodeEliminationStage::execute(DecompilerTask& task) {
                             continue;
                         }
                         
+                        const std::string lowered_name = to_lower_copy(target->name());
+
                         // Don't eliminate definitions of special registers (return values, stack pointer)
                         if (!global_uses.contains(def_name) && 
-                            target->name() != "SP" && target->name() != "W0" && target->name() != "X0") {
+                            lowered_name != "sp" && lowered_name != "w0" && lowered_name != "x0") {
                             
                             // DO NOT ELIMINATE FUNCTION CALLS
                             if (!contains_call(assign->value()) && !assignment_has_side_effect_destination(assign)) {

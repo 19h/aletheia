@@ -264,6 +264,46 @@ static bool is_machine_register_like_name(const std::string& lowered_name) {
     return known_register_names.contains(lowered_name);
 }
 
+static std::optional<unsigned> parse_arm64_xw_index(std::string_view lowered_name) {
+    if (lowered_name.size() < 2) {
+        return std::nullopt;
+    }
+    const char prefix = lowered_name.front();
+    if (prefix != 'x' && prefix != 'w') {
+        return std::nullopt;
+    }
+    unsigned index = 0;
+    for (std::size_t i = 1; i < lowered_name.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(lowered_name[i]);
+        if (!std::isdigit(c)) {
+            return std::nullopt;
+        }
+        index = index * 10u + static_cast<unsigned>(lowered_name[i] - '0');
+    }
+    return index;
+}
+
+static bool is_arm64_nonarg_width_alias_pair(const std::string& lhs_name, const std::string& rhs_name) {
+    std::string lhs = lhs_name;
+    std::string rhs = rhs_name;
+    std::transform(lhs.begin(), lhs.end(), lhs.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(rhs.begin(), rhs.end(), rhs.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    const auto lhs_idx = parse_arm64_xw_index(lhs);
+    const auto rhs_idx = parse_arm64_xw_index(rhs);
+    if (!lhs_idx || !rhs_idx || *lhs_idx != *rhs_idx) {
+        return false;
+    }
+    if (*lhs_idx < 8u) {
+        return false;
+    }
+
+    return (lhs.front() == 'x' && rhs.front() == 'w')
+        || (lhs.front() == 'w' && rhs.front() == 'x');
+}
+
 /// Compute the "weight" (number of unique nodes) in an expression DAG.
 /// Capped at `limit` to avoid traversing huge DAGs.
 /// Uses a visited set to handle shared subtrees correctly.
@@ -1275,6 +1315,10 @@ static bool type_compatible_for_identity(Variable* a, Variable* b) {
 
     if (a->is_aliased() != b->is_aliased()) return false;
     if (a->is_aliased() && b->is_aliased() && a->name() != b->name()) return false;
+
+    if (is_arm64_nonarg_width_alias_pair(a->name(), b->name())) {
+        return true;
+    }
 
     auto ta = a->ir_type();
     auto tb = b->ir_type();
@@ -2525,6 +2569,45 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
         auto ib = id_of.find(b);
         if (ia != id_of.end() && ib != id_of.end()) {
             dsu.unite(ia->second, ib->second);
+        }
+    }
+
+    std::unordered_map<VarKey, int, VarKeyHash> id_of_lower;
+    id_of_lower.reserve(keys.size());
+    for (const VarKey& key : keys) {
+        VarKey lowered_key{key.name, key.ssa_version};
+        std::transform(lowered_key.name.begin(), lowered_key.name.end(), lowered_key.name.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!id_of_lower.contains(lowered_key)) {
+            id_of_lower.emplace(std::move(lowered_key), id_of[key]);
+        }
+    }
+
+    // ARM64 width aliases (xN/wN, N>=8): preserve identity across width-only
+    // naming splits so out-of-SSA does not strand one side as undefined.
+    for (const VarKey& key : keys) {
+        std::string lowered = key.name;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        auto maybe_index = parse_arm64_xw_index(lowered);
+        if (!maybe_index || *maybe_index < 8u) {
+            continue;
+        }
+        const char prefix = lowered.front();
+        if (prefix != 'x' && prefix != 'w') {
+            continue;
+        }
+
+        std::string counterpart = lowered;
+        counterpart.front() = (prefix == 'x') ? 'w' : 'x';
+
+        VarKey lhs_lower{lowered, key.ssa_version};
+        VarKey rhs_lower{counterpart, key.ssa_version};
+        auto it_lhs = id_of_lower.find(lhs_lower);
+        auto it_rhs = id_of_lower.find(rhs_lower);
+        if (it_lhs != id_of_lower.end() && it_rhs != id_of_lower.end()) {
+            dsu.unite(it_lhs->second, it_rhs->second);
         }
     }
 
@@ -4285,6 +4368,9 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
         std::size_t best_same_index = 0;
         bool have_same_block = false;
 
+        Instruction* best_same_block_after = nullptr;
+        std::size_t best_same_after_index = std::numeric_limits<std::size_t>::max();
+
         Instruction* best_dom = nullptr;
         std::size_t best_dom_distance = std::numeric_limits<std::size_t>::max();
         std::uint64_t best_dom_block_key = std::numeric_limits<std::uint64_t>::max();
@@ -4298,6 +4384,10 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
                     best_same_block = site.inst;
                     best_same_index = site.index;
                     have_same_block = true;
+                }
+                if (site.index >= use_index && site.index < best_same_after_index) {
+                    best_same_block_after = site.inst;
+                    best_same_after_index = site.index;
                 }
                 continue;
             }
@@ -4318,6 +4408,13 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
 
         if (best_same_block) {
             return best_same_block;
+        }
+        // Conservative fallback for malformed SSA/order artifacts: if the only
+        // available definition in the same block appears after this use,
+        // keep that dependency so liveness pruning does not drop it and create
+        // undefined-variable failures downstream.
+        if (best_same_block_after) {
+            return best_same_block_after;
         }
         return best_dom;
     };
@@ -6713,6 +6810,8 @@ void canonicalize_global_index_temporaries_in_block(DecompilerTask& task, BasicB
             continue;
         }
 
+        auto* assign_dst_var = dyn_cast<Variable>(assign->destination());
+
         if (auto* dst_var = dyn_cast<Variable>(assign->destination())) {
             if (auto* gv_value = dyn_cast<GlobalVariable>(assign->value())) {
                 global_aliases[var_key(dst_var)] = gv_value->name();
@@ -6745,6 +6844,14 @@ void canonicalize_global_index_temporaries_in_block(DecompilerTask& task, BasicB
             if (assignment_value_is_call(assign)) {
                 continue;
             }
+
+            if (auto* replacement_var = dyn_cast<Variable>(strip_trivial_casts(replacement_expr))) {
+                const VarKey replacement_key = var_key(replacement_var);
+                if (assign_dst_var && var_key(assign_dst_var) == replacement_key) {
+                    continue;
+                }
+            }
+
             Expression* new_value = replace_varkey_in_expr(task.arena(), assign->value(), key, replacement_expr);
             if (new_value != assign->value()) {
                 assign->set_value(new_value);
@@ -6756,6 +6863,7 @@ void canonicalize_global_index_temporaries_in_block(DecompilerTask& task, BasicB
                 }
             }
         }
+
     }
 }
 
