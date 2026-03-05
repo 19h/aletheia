@@ -160,6 +160,14 @@ std::unordered_set<TransitionBlock*> compute_dominated_subset(
     return subset;
 }
 
+bool transition_block_has_terminal_return(TransitionBlock* block) {
+    if (!block) {
+        return false;
+    }
+    AstNode* ast = block->ast_node();
+    return ast && ast->does_end_with_return();
+}
+
 bool is_restructurable_region(
     TransitionCFG& cfg,
     TransitionBlock* header,
@@ -237,10 +245,33 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
         // 2. Restructure Abnormal Entry (TODO)
         // If there's a retreating edge into head
         bool has_retreating = false;
+        bool rewrote_abnormal_entry = false;
         for (auto* e : head->predecessors()) {
             if (e->property() == EdgeProperty::Retreating) has_retreating = true;
         }
         if (has_retreating) {
+            std::vector<TransitionBlock*> initial_loop_successors;
+            std::unordered_set<TransitionBlock*> initial_succ_set;
+            for (auto* node : sorted_transition_blocks(loop_region->blocks())) {
+                if (!node) {
+                    continue;
+                }
+                for (auto* succ : node->successors_blocks()) {
+                    if (!succ || region_set.contains(succ) || initial_succ_set.contains(succ)) {
+                        continue;
+                    }
+                    initial_succ_set.insert(succ);
+                    initial_loop_successors.push_back(succ);
+                }
+            }
+            const bool all_initial_terminal_return_exits = !initial_loop_successors.empty()
+                && std::all_of(initial_loop_successors.begin(), initial_loop_successors.end(), [](TransitionBlock* succ) {
+                    return transition_block_has_terminal_return(succ);
+                });
+            if (all_initial_terminal_return_exits) {
+                goto skip_abnormal_entry;
+            }
+
             std::unordered_map<TransitionBlock*, std::vector<TransitionEdge*>> entry_edges;
             std::vector<TransitionBlock*> sorted_region_nodes(region_set.begin(), region_set.end());
             sort_transition_blocks_deterministically(sorted_region_nodes);
@@ -400,6 +431,7 @@ void CyclicRegionFinder::process(TransitionCFG& cfg) {
                 region_set.insert(p.first);
                 loop_region->add_block(p.first);
             }
+            rewrote_abnormal_entry = true;
         }
 
 skip_abnormal_entry:
@@ -425,7 +457,23 @@ skip_abnormal_entry:
         sort_transition_blocks_deterministically(loop_successors);
 
         // 4. Restructure Abnormal Exit (TODO)
-        if (loop_successors.size() > 1) {
+        const bool all_terminal_return_exits = !loop_successors.empty()
+            && std::all_of(loop_successors.begin(), loop_successors.end(), [](TransitionBlock* succ) {
+                return transition_block_has_terminal_return(succ);
+            });
+        const bool has_shared_terminal_exit = all_terminal_return_exits
+            && std::any_of(loop_successors.begin(), loop_successors.end(), [&](TransitionBlock* succ) {
+                if (!succ) {
+                    return false;
+                }
+                return std::any_of(succ->predecessors().begin(), succ->predecessors().end(), [&](TransitionEdge* in_e) {
+                    return in_e && in_e->source() && !region_set.contains(in_e->source());
+                });
+            });
+        const bool can_skip_abnormal_exit_rewrite = all_terminal_return_exits
+            && !has_shared_terminal_exit
+            && !rewrote_abnormal_entry;
+        if (loop_successors.size() > 1 && !can_skip_abnormal_exit_rewrite) {
             size_t num_exits = loop_successors.size();
             const std::uint64_t head_key = transition_block_order_key(head);
             std::string var_name = "exit_" + std::to_string(head_key);
@@ -540,12 +588,18 @@ skip_abnormal_entry:
                     loop_cfg->add_block(cont_trans);
                     loop_cfg->add_edge(clone_src, cont_trans, e->tag(), EdgeProperty::NonLoop);
                 } else if (!region_set.contains(succ)) {
-                    // Exit edge -> Break node
-                    auto* brk_block = arena_.create<BasicBlock>(9998);
-                    brk_block->add_instruction(arena_.create<BreakInstr>());
-                    auto* brk_trans = arena_.create<TransitionBlock>(arena_.create<CodeNode>(brk_block));
-                    loop_cfg->add_block(brk_trans);
-                    loop_cfg->add_edge(clone_src, brk_trans, e->tag(), EdgeProperty::NonLoop);
+                    if (can_skip_abnormal_exit_rewrite && transition_block_has_terminal_return(succ)) {
+                        auto* ret_trans = arena_.create<TransitionBlock>(succ->ast_node());
+                        loop_cfg->add_block(ret_trans);
+                        loop_cfg->add_edge(clone_src, ret_trans, e->tag(), EdgeProperty::NonLoop);
+                    } else {
+                        // Exit edge -> Break node
+                        auto* brk_block = arena_.create<BasicBlock>(9998);
+                        brk_block->add_instruction(arena_.create<BreakInstr>());
+                        auto* brk_trans = arena_.create<TransitionBlock>(arena_.create<CodeNode>(brk_block));
+                        loop_cfg->add_block(brk_trans);
+                        loop_cfg->add_edge(clone_src, brk_trans, e->tag(), EdgeProperty::NonLoop);
+                    }
                 } else if (block_map.contains(succ)) {
                     auto* clone_dst = block_map[succ];
                     if (clone_dst) {

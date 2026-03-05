@@ -111,8 +111,8 @@ static inline bool is_target_var(Expression* expr,
 /// Used to detect self-referencing definitions (e.g., x = (cond ? a : x))
 /// which would cause infinite expansion during propagation.
 static bool expression_references_variable(Expression* expr,
-                                            const std::string& target_name,
-                                            std::size_t target_ssa) {
+                                             const std::string& target_name,
+                                             std::size_t target_ssa) {
     if (!expr) return false;
 
     SmallVector<Expression*, 32> stack;
@@ -124,6 +124,37 @@ static bool expression_references_variable(Expression* expr,
         if (!node) continue;
 
         if (is_target_var(node, target_name, target_ssa)) return true;
+
+        if (auto* op = dyn_cast<Operation>(node)) {
+            for (auto* child : op->operands()) {
+                stack.push_back(child);
+            }
+        } else if (auto* list = dyn_cast<ListOperation>(node)) {
+            for (auto* child : list->operands()) {
+                stack.push_back(child);
+            }
+        }
+    }
+    return false;
+}
+
+static bool expression_references_variable_name(Expression* expr,
+                                                const std::string& target_name) {
+    if (!expr) return false;
+
+    SmallVector<Expression*, 32> stack;
+    stack.push_back(expr);
+
+    while (!stack.empty()) {
+        Expression* node = stack.back();
+        stack.pop_back();
+        if (!node) continue;
+
+        if (auto* v = dyn_cast<Variable>(node)) {
+            if (v->name() == target_name) {
+                return true;
+            }
+        }
 
         if (auto* op = dyn_cast<Operation>(node)) {
             for (auto* child : op->operands()) {
@@ -1561,6 +1592,18 @@ static void expression_propagation_impl(DecompilerTask& task, bool is_memory) {
                     if (auto* dest_var = dyn_cast<Variable>(def->destination())) {
                         if (expression_references_variable(
                                 def->value(), dest_var->name(), dest_var->ssa_version())) {
+                            continue;
+                        }
+
+                        // Keep loop-carried update branches readable/stable.
+                        // If a branch guard consumes a variable that is defined
+                        // from the same register family (different SSA version),
+                        // substituting the update into the guard rewrites
+                        // post-update tests into pre-update arithmetic forms
+                        // (e.g. v1!=0 -> v0!=2), which later collapse poorly
+                        // after out-of-SSA.
+                        if (isa<Branch>(inst)
+                            && expression_references_variable_name(def->value(), dest_var->name())) {
                             continue;
                         }
                     }
@@ -5650,6 +5693,15 @@ void ExpressionSimplificationStage::execute(DecompilerTask& task) {
                     local_defs.erase(key);
                     continue;
                 }
+
+                // Do not treat loop-carried self-updates as inlineable local
+                // definitions (e.g. v = v - 2). Substituting them into nearby
+                // branch guards rewrites post-update checks into pre-update
+                // compares and destabilizes control-shape recovery.
+                if (expression_references_variable_name(tracked_value, dst_var->name())) {
+                    local_defs.erase(key);
+                    continue;
+                }
                 local_defs[key] = tracked_value;
                 continue;
             }
@@ -5693,6 +5745,19 @@ void ExpressionSimplificationStage::execute(DecompilerTask& task) {
             }
             if (lhs->name() != dst->name() || lhs->ssa_version() != dst->ssa_version()) {
                 continue;
+            }
+
+            // Avoid rewriting loop-carried self-updates like
+            //   v = v - k; if (v != 0)
+            // into pre-update compare forms. Once SSA versions are collapsed,
+            // this transform degrades to unstable shapes such as
+            //   if (v != k)
+            // and later loses the intended post-update zero test.
+            if (auto* sub_lhs = dyn_cast<Variable>(sub->operands()[0])) {
+                if (sub_lhs->name() == dst->name()
+                    && sub_lhs->ssa_version() == dst->ssa_version()) {
+                    continue;
+                }
             }
 
             branch->set_condition(task.arena().create<Condition>(

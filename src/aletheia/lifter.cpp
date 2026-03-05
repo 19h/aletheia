@@ -417,6 +417,20 @@ bool arm_mnemonic_in(
     return false;
 }
 
+bool arm_data_processing_sets_flags(std::string_view mnemonic) {
+    bool sets_flags = false;
+    if (arm_mnemonic_in(mnemonic,
+                        {"add", "adc", "sub", "sbc", "and", "orr", "eor",
+                         "lsl", "lsr", "asr", "ror", "neg", "mvn"},
+                        true,
+                        nullptr,
+                        nullptr,
+                        &sets_flags)) {
+        return sets_flags;
+    }
+    return false;
+}
+
 std::optional<std::int64_t> parse_signed_displacement(std::string_view text) {
     for (std::size_t i = 0; i < text.size(); ++i) {
         if (text[i] != '+' && text[i] != '-') {
@@ -1657,6 +1671,7 @@ ida::Result<std::unique_ptr<ControlFlowGraph>> Lifter::lift_function(
     id = 0;
     for (const auto& ida_block : *flowchart_res) {
         BasicBlock* block = block_map[id];
+        last_arm_flags_expr_ = nullptr;
 
         if (idiom_tags_out != nullptr) {
             auto block_tags = idiom_matcher_.match_block(ida_block);
@@ -2194,9 +2209,16 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
                 rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
             }
         } else {
-            // ARM B.cond / Bcc: branch uses flags predicate.
-            lhs = arena_.create<Variable>("flags", 1);
-            rhs = arena_.create<Constant>(0, 1);
+            // ARM B.cond / Bcc: prefer the most recent flags-producing
+            // expression in this block when available (e.g., SUBS/ADDS/ANDS).
+            // This avoids introducing disconnected synthetic flag carriers.
+            if (last_arm_flags_expr_) {
+                lhs = last_arm_flags_expr_->copy(arena_);
+                rhs = arena_.create<Constant>(0, lhs->size_bytes > 0 ? lhs->size_bytes : 1);
+            } else {
+                lhs = arena_.create<Variable>("flags", 1);
+                rhs = arena_.create<Constant>(0, 1);
+            }
         }
 
         auto* cond = arena_.create<Condition>(*cmp, lhs, rhs);
@@ -2241,6 +2263,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         auto* op = arena_.create<Operation>(OperationType::sub,
             std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
         op->set_type(op_type);
+        last_arm_flags_expr_ = op;
         auto* flags = arena_.create<Variable>("flags", operands[0]->size_bytes);
         auto* assign = arena_.create<Assignment>(flags, op);
         assign->set_address(addr);
@@ -2253,6 +2276,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         auto* op = arena_.create<Operation>(OperationType::bit_and,
             std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
         op->set_type(op_type);
+        last_arm_flags_expr_ = op;
         auto* flags = arena_.create<Variable>("flags", operands[0]->size_bytes);
         auto* assign = arena_.create<Assignment>(flags, op);
         assign->set_address(addr);
@@ -2262,6 +2286,7 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         && operands.size() >= 2) {
         auto* op = arena_.create<Operation>(OperationType::sub_float,
             std::vector<Expression*>{operands[0], operands[1]}, operands[0]->size_bytes);
+        last_arm_flags_expr_ = op;
         auto* flags = arena_.create<Variable>("flags", operands[0]->size_bytes > 0 ? operands[0]->size_bytes : 1);
         auto* assign = arena_.create<Assignment>(flags, op);
         assign->set_address(addr);
@@ -2711,7 +2736,12 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
 
         if (auto arith = integer_binary_operation_for(lmnem); arith.has_value()) {
             auto* result = make_binary_assign(*arith, operands, addr);
-            if (result) return result;
+            if (result) {
+                if (arm_data_processing_sets_flags(lmnem)) {
+                    last_arm_flags_expr_ = result->value();
+                }
+                return result;
+            }
         }
         if (auto farith = float_binary_operation_for(lmnem); farith.has_value()) {
             auto* result = make_binary_assign(*farith, operands, addr);

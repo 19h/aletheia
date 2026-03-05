@@ -70,6 +70,11 @@ private:
     /// ARM64 return sinks should use w0 instead of x0.
     bool current_function_prefers_w_return_ = false;
 
+    /// Most recent ARM flags-producing expression in the current basic block.
+    /// Used to recover B.cond semantics for flag-setting arithmetic forms
+    /// (e.g., SUBS/ADDS/ANDS) without introducing disconnected flag carriers.
+    Expression* last_arm_flags_expr_ = nullptr;
+
     BasicBlock* process_block(const ida::graph::BasicBlock& ida_block, std::unordered_map<ida::Address, BasicBlock*>& block_map);
     Instruction* lift_instruction(const ida::instruction::Instruction& insn);
     
