@@ -1,11 +1,13 @@
 #include "variable_name_generation.hpp"
 
 #include <cctype>
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace aletheia {
 
@@ -30,7 +32,9 @@ struct RenameState {
     std::unordered_map<VarKey, std::string, VarKeyHash> canonical_name;
     std::unordered_map<Variable*, std::string> pointer_name;
     std::unordered_map<std::string, std::size_t> prefix_next_id;
+    std::unordered_map<int, VarKey> parameter_owner;
     std::unordered_set<VarKey, VarKeyHash> return_sink_keys;
+    std::unordered_set<std::string> return_sink_names;
     std::size_t next_id = 0;
     enum class Scheme {
         Default,
@@ -39,6 +43,13 @@ struct RenameState {
 };
 
 void rename_expression(Expression* expr, RenameState& state);
+
+bool var_key_less(const VarKey& lhs, const VarKey& rhs) {
+    if (lhs.name != rhs.name) {
+        return lhs.name < rhs.name;
+    }
+    return lhs.version < rhs.version;
+}
 
 std::string type_prefix_for(const TypePtr& type) {
     if (!type) {
@@ -89,6 +100,24 @@ std::optional<int> infer_parameter_index_from_register_name(std::string_view nam
     if (name == "r9" || name == "r9d" || name == "r9w" || name == "r9b") return 5;
 
     return std::nullopt;
+}
+
+int effective_parameter_index(const Variable* var) {
+    if (!var) {
+        return -1;
+    }
+    int index = var->parameter_index();
+    if (index < 0) {
+        std::string lowered = var->name();
+        for (char& c : lowered) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        auto inferred = infer_parameter_index_from_register_name(lowered);
+        if (inferred.has_value()) {
+            index = *inferred;
+        }
+    }
+    return index;
 }
 
 std::string lower_ascii(std::string text) {
@@ -191,24 +220,21 @@ VarKey canonical_key_for(const Variable* var) {
         return {"<null>", 0};
     }
 
-    if (var->is_parameter()) {
-        int index = var->parameter_index();
-        if (index < 0) {
-            auto inferred = infer_parameter_index_from_register_name(lower_ascii(var->name()));
-            if (inferred.has_value()) {
-                index = *inferred;
-            }
-        }
-        if (index >= 0) {
-            return {"param_" + std::to_string(index), 0};
-        }
-    }
-
     if (var->kind() == VariableKind::StackLocal || var->kind() == VariableKind::StackArgument) {
         return {"stack_" + std::to_string(var->stack_offset()), 0};
     }
 
     return {var->name(), var->ssa_version()};
+}
+
+bool is_return_sink_variable(const Variable* var, const RenameState& state) {
+    if (!var) {
+        return false;
+    }
+    const VarKey key = canonical_key_for(var);
+    return state.return_sink_keys.contains(key)
+        || state.return_sink_keys.contains(VarKey{key.name, 0})
+        || state.return_sink_names.contains(key.name);
 }
 
 std::string allocate_name_for_variable(const Variable* var, RenameState& state) {
@@ -218,15 +244,24 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
         }
 
         if (var->is_parameter()) {
-            int index = var->parameter_index();
-            if (index < 0) {
-                auto inferred = infer_parameter_index_from_register_name(lower_ascii(var->name()));
-                if (inferred.has_value()) {
-                    index = *inferred;
-                }
-            }
+            int index = effective_parameter_index(var);
             if (index >= 0) {
-                return "arg_" + std::to_string(index);
+                const VarKey owner_key{var->name(), var->ssa_version()};
+                auto owner_it = state.parameter_owner.find(index);
+                if (owner_it == state.parameter_owner.end()) {
+                    state.parameter_owner.emplace(index, owner_key);
+                    return "arg_" + std::to_string(index);
+                }
+                if (owner_it->second == owner_key) {
+                    return "arg_" + std::to_string(index);
+                }
+                if (is_return_sink_variable(var, state)) {
+                    return "ret_" + std::to_string(state.prefix_next_id["ret"]++);
+                }
+                return "tmp_" + std::to_string(state.prefix_next_id["tmp"]++);
+            }
+            if (is_return_sink_variable(var, state)) {
+                return "ret_" + std::to_string(state.prefix_next_id["ret"]++);
             }
             return "arg_" + std::to_string(state.prefix_next_id["arg"]++);
         }
@@ -245,8 +280,8 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
             return "local_" + std::to_string(state.prefix_next_id["local"]++);
         }
 
-        const VarKey key = canonical_key_for(var);
-        if (state.return_sink_keys.contains(key)
+        const bool is_return_sink = is_return_sink_variable(var, state);
+        if (is_return_sink
             && !var->is_parameter()
             && var->kind() != VariableKind::StackArgument
             && var->kind() != VariableKind::StackLocal) {
@@ -293,12 +328,130 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
     return prefix + "Var" + std::to_string(id);
 }
 
+void seed_parameter_owners_from_expression(Expression* expr, RenameState& state) {
+    if (!expr) {
+        return;
+    }
+
+    if (auto* var = dyn_cast<Variable>(expr)) {
+        if (var->is_parameter()) {
+            const int index = effective_parameter_index(var);
+            if (index >= 0) {
+                const VarKey key{var->name(), var->ssa_version()};
+                auto it = state.parameter_owner.find(index);
+                if (it == state.parameter_owner.end() || var_key_less(key, it->second)) {
+                    state.parameter_owner[index] = key;
+                }
+            }
+        }
+        return;
+    }
+
+    if (auto* op = dyn_cast<Operation>(expr)) {
+        for (Expression* child : op->operands()) {
+            seed_parameter_owners_from_expression(child, state);
+        }
+        return;
+    }
+
+    if (auto* list = dyn_cast<ListOperation>(expr)) {
+        for (Expression* child : list->operands()) {
+            seed_parameter_owners_from_expression(child, state);
+        }
+    }
+}
+
+void seed_parameter_owners_from_ast(AstNode* node, RenameState& state) {
+    if (!node) {
+        return;
+    }
+
+    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+        seed_parameter_owners_from_ast(if_node->cond(), state);
+        seed_parameter_owners_from_ast(if_node->true_branch(), state);
+        seed_parameter_owners_from_ast(if_node->false_branch(), state);
+        return;
+    }
+
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        seed_parameter_owners_from_expression(loop->condition(), state);
+        if (auto* for_loop = ast_dyn_cast<ForLoopNode>(loop)) {
+            if (auto* decl = for_loop->declaration()) {
+                for (Variable* req : decl->requirements()) {
+                    if (!req || !req->is_parameter()) continue;
+                    const int index = effective_parameter_index(req);
+                    if (index < 0) continue;
+                    const VarKey key{req->name(), req->ssa_version()};
+                    auto it = state.parameter_owner.find(index);
+                    if (it == state.parameter_owner.end() || var_key_less(key, it->second)) {
+                        state.parameter_owner[index] = key;
+                    }
+                }
+            }
+            if (auto* mod = for_loop->modification()) {
+                for (Variable* req : mod->requirements()) {
+                    if (!req || !req->is_parameter()) continue;
+                    const int index = effective_parameter_index(req);
+                    if (index < 0) continue;
+                    const VarKey key{req->name(), req->ssa_version()};
+                    auto it = state.parameter_owner.find(index);
+                    if (it == state.parameter_owner.end() || var_key_less(key, it->second)) {
+                        state.parameter_owner[index] = key;
+                    }
+                }
+            }
+        }
+        seed_parameter_owners_from_ast(loop->body(), state);
+        return;
+    }
+
+    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+        seed_parameter_owners_from_ast(sw->cond(), state);
+        for (CaseNode* c : sw->cases()) {
+            seed_parameter_owners_from_ast(c, state);
+        }
+        return;
+    }
+
+    if (auto* expr_node = ast_dyn_cast<ExprAstNode>(node)) {
+        seed_parameter_owners_from_expression(expr_node->expr(), state);
+        return;
+    }
+
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (!code->block()) {
+            return;
+        }
+        for (Instruction* inst : code->block()->instructions()) {
+            if (auto* branch = dyn_cast<Branch>(inst)) {
+                seed_parameter_owners_from_expression(branch->condition(), state);
+            }
+        }
+        return;
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : seq->nodes()) {
+            seed_parameter_owners_from_ast(child, state);
+        }
+        return;
+    }
+
+    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
+        seed_parameter_owners_from_ast(c->body(), state);
+    }
+}
+
 void collect_var_keys(Expression* expr, std::unordered_set<VarKey, VarKeyHash>& out) {
     if (!expr) {
         return;
     }
     if (auto* var = dyn_cast<Variable>(expr)) {
-        out.insert(canonical_key_for(var));
+        const VarKey key = canonical_key_for(var);
+        out.insert(key);
+        if (key.version != 0) {
+            out.insert(VarKey{key.name, 0});
+        }
         return;
     }
     if (auto* op = dyn_cast<Operation>(expr)) {
@@ -509,6 +662,7 @@ void collect_return_sink_keys_from_ast(AstNode* node, std::unordered_set<VarKey,
     }
 }
 
+
 } // namespace
 
 void VariableNameGeneration::apply_default(AbstractSyntaxForest* forest) {
@@ -519,6 +673,10 @@ void VariableNameGeneration::apply_default(AbstractSyntaxForest* forest) {
     RenameState state;
     state.scheme = RenameState::Scheme::Default;
     collect_return_sink_keys_from_ast(forest->root(), state.return_sink_keys);
+    for (const VarKey& key : state.return_sink_keys) {
+        state.return_sink_names.insert(key.name);
+    }
+    seed_parameter_owners_from_ast(forest->root(), state);
     rename_ast_node(forest->root(), state);
 }
 
@@ -530,6 +688,10 @@ void VariableNameGeneration::apply_system_hungarian(AbstractSyntaxForest* forest
     RenameState state;
     state.scheme = RenameState::Scheme::SystemHungarian;
     collect_return_sink_keys_from_ast(forest->root(), state.return_sink_keys);
+    for (const VarKey& key : state.return_sink_keys) {
+        state.return_sink_names.insert(key.name);
+    }
+    seed_parameter_owners_from_ast(forest->root(), state);
     rename_ast_node(forest->root(), state);
 }
 
@@ -552,6 +714,9 @@ void VariableNameGeneration::apply_to_cfg(ControlFlowGraph* cfg) {
                 collect_var_keys(value, state.return_sink_keys);
             }
         }
+    }
+    for (const VarKey& key : state.return_sink_keys) {
+        state.return_sink_names.insert(key.name);
     }
 
     for (BasicBlock* block : cfg->blocks()) {

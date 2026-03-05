@@ -7152,6 +7152,7 @@ void canonicalize_global_index_temporaries_in_block(DecompilerTask& task, BasicB
                             if (auto* rhs_gv = dyn_cast<GlobalVariable>(rhs)) {
                                 if (rhs_gv->name() == "__MergedGlobals" && !expr_references_varkey(lhs, var_key(dst_var))) {
                                     index_replacements[var_key(dst_var)] = lhs;
+                                    assign->set_value(lhs->copy(task.arena()));
                                 }
                             }
                         }
