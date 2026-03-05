@@ -1823,7 +1823,7 @@ void PhiFunctionFixerStage::execute(DecompilerTask& task) {
                 }
             }
 
-            if (!origin.empty()) {
+            if (!origin.empty() && origin.size() == block->predecessors().size()) {
                 phi->mutable_origin_block().clear();
                 phi->update_phi_function(origin);
             }

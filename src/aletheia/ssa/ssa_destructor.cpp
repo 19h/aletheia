@@ -322,39 +322,58 @@ void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph
 
             // Use origin_block if available, otherwise fall back to positional matching.
             if (!phi->origin_block().empty()) {
+                bool needs_temp = false;
+                for (const auto& [pred_block, source_expr] : sorted_phi_origins(phi->origin_block())) {
+                    if (!pred_block || !source_expr) {
+                        continue;
+                    }
+                    if (liveness.live_out(pred_block).contains(target->name())) {
+                        needs_temp = true;
+                        break;
+                    }
+                }
+
+                Expression* phi_target = target;
+                if (needs_temp) {
+                    auto* tmp = arena.create<Variable>(target->name() + "_tmp", target->size_bytes);
+                    phi_target = tmp;
+                    auto* bb_copy = arena.create<Assignment>(target, tmp);
+                    new_insts.push_back(bb_copy);
+                }
+
                 for (const auto& [pred_block, source_expr] : sorted_phi_origins(phi->origin_block())) {
                     if (!pred_block || !source_expr) continue;
 
-                    bool interference = liveness.live_out(pred_block).contains(target->name());
-
-                    Expression* final_target = target;
-                    if (interference) {
-                        auto* tmp = arena.create<Variable>(target->name() + "_tmp", target->size_bytes);
-                        final_target = tmp;
-                        auto* bb_copy = arena.create<Assignment>(target, tmp);
-                        new_insts.push_back(bb_copy);
-                    }
-
-                    place_phi_copy(pred_block, final_target, source_expr);
+                    place_phi_copy(pred_block, phi_target, source_expr);
                 }
             } else {
+                bool needs_temp = false;
+                for (size_t i = 0; i < op_list->operands().size() && i < bb->predecessors().size(); ++i) {
+                    BasicBlock* pred = bb->predecessors()[i] ? bb->predecessors()[i]->source() : nullptr;
+                    if (!pred || !op_list->operands()[i]) {
+                        continue;
+                    }
+                    if (liveness.live_out(pred).contains(target->name())) {
+                        needs_temp = true;
+                        break;
+                    }
+                }
+
+                Expression* phi_target = target;
+                if (needs_temp) {
+                    auto* tmp = arena.create<Variable>(target->name() + "_tmp", target->size_bytes);
+                    phi_target = tmp;
+                    auto* bb_copy = arena.create<Assignment>(target, tmp);
+                    new_insts.push_back(bb_copy);
+                }
+
                 // Fallback: positional matching (predecessor index -> operand index)
                 for (size_t i = 0; i < op_list->operands().size() && i < bb->predecessors().size(); ++i) {
                     Expression* source = op_list->operands()[i];
-                    BasicBlock* pred = bb->predecessors()[i]->source();
+                    BasicBlock* pred = bb->predecessors()[i] ? bb->predecessors()[i]->source() : nullptr;
                     if (!pred || !source) continue;
 
-                    bool interference = liveness.live_out(pred).contains(target->name());
-
-                    Expression* final_target = target;
-                    if (interference) {
-                        auto* tmp = arena.create<Variable>(target->name() + "_tmp", target->size_bytes);
-                        final_target = tmp;
-                        auto* bb_copy = arena.create<Assignment>(target, tmp);
-                        new_insts.push_back(bb_copy);
-                    }
-
-                    place_phi_copy(pred, final_target, source);
+                    place_phi_copy(pred, phi_target, source);
                 }
             }
         }

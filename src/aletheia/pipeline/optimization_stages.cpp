@@ -2043,6 +2043,21 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                             return;
                         }
 
+                        auto is_stack_pointer_like = [](Expression* expr) {
+                            auto* v = dyn_cast<Variable>(strip_trivial_casts(expr));
+                            if (!v) {
+                                return false;
+                            }
+                            std::string lowered = v->name();
+                            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            return lowered == "sp" || lowered.rfind("sp_", 0) == 0;
+                        };
+
+                        if (is_stack_pointer_like(local_def->value()) && !is_stack_pointer_like(arg_var)) {
+                            return;
+                        }
+
                         Expression* replacement = local_def->value()->copy(task.arena());
                         if (!replacement) {
                             return;
@@ -4169,6 +4184,32 @@ struct ExpressionGraph {
     std::unordered_set<Instruction*> sinks;
 };
 
+std::optional<VarKey> register_width_alias_key(const VarKey& key) {
+    if (key.name.size() < 2) {
+        return std::nullopt;
+    }
+
+    const char family = static_cast<char>(std::tolower(static_cast<unsigned char>(key.name[0])));
+    if (family != 'x' && family != 'w') {
+        return std::nullopt;
+    }
+
+    std::size_t index_end = 1;
+    while (index_end < key.name.size()
+           && std::isdigit(static_cast<unsigned char>(key.name[index_end])) != 0) {
+        ++index_end;
+    }
+    if (index_end == 1) {
+        return std::nullopt;
+    }
+
+    const std::string index = key.name.substr(1, index_end - 1);
+    const std::string suffix = key.name.substr(index_end);
+
+    const char alias_family = family == 'x' ? 'w' : 'x';
+    return VarKey{std::string(1, alias_family) + index + suffix, key.ssa_version};
+}
+
 bool assignment_has_call_value(const Assignment* assign) {
     if (!assign) return false;
     if (isa<Call>(assign->value())) return true;
@@ -4187,21 +4228,105 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
     ExpressionGraph graph;
     if (!cfg) return graph;
 
-    std::unordered_map<VarKey, Instruction*, VarKeyHash> definition_of;
+    struct LocalDefSite {
+        BasicBlock* block = nullptr;
+        std::size_t index = 0;
+        Instruction* inst = nullptr;
+    };
+
+    std::unordered_map<VarKey, std::vector<LocalDefSite>, VarKeyHash> def_sites;
 
     // Pass 1: collect variable definitions.
     for (BasicBlock* block : cfg->blocks()) {
-        for (Instruction* inst : block->instructions()) {
+        const auto& insts = block->instructions();
+        for (std::size_t i = 0; i < insts.size(); ++i) {
+            Instruction* inst = insts[i];
             for (Variable* def : inst->definitions()) {
                 if (!def) continue;
-                definition_of[var_key(def)] = inst;
+                def_sites[var_key(def)].push_back(LocalDefSite{block, i, inst});
             }
         }
     }
 
+    DominatorTree dom(*cfg);
+
+    auto dominance_distance = [&](BasicBlock* dominator, BasicBlock* use_block) {
+        if (!dominator || !use_block) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        if (dominator == use_block) {
+            return std::size_t{0};
+        }
+        if (!dom.dominates(dominator, use_block)) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+
+        std::size_t distance = 0;
+        BasicBlock* cursor = use_block;
+        while (cursor && cursor != dominator) {
+            cursor = dom.idom(cursor);
+            ++distance;
+        }
+        return cursor == dominator ? distance : std::numeric_limits<std::size_t>::max();
+    };
+
+    auto block_key = [](BasicBlock* block) {
+        return block ? static_cast<std::uint64_t>(block->id())
+                     : std::numeric_limits<std::uint64_t>::max();
+    };
+
+    auto find_reaching_definition = [&](const VarKey& key, BasicBlock* use_block, std::size_t use_index) -> Instruction* {
+        auto it = def_sites.find(key);
+        if (it == def_sites.end()) {
+            return nullptr;
+        }
+
+        Instruction* best_same_block = nullptr;
+        std::size_t best_same_index = 0;
+        bool have_same_block = false;
+
+        Instruction* best_dom = nullptr;
+        std::size_t best_dom_distance = std::numeric_limits<std::size_t>::max();
+        std::uint64_t best_dom_block_key = std::numeric_limits<std::uint64_t>::max();
+
+        for (const LocalDefSite& site : it->second) {
+            if (!site.inst || !site.block) {
+                continue;
+            }
+            if (site.block == use_block) {
+                if (site.index < use_index && (!have_same_block || site.index > best_same_index)) {
+                    best_same_block = site.inst;
+                    best_same_index = site.index;
+                    have_same_block = true;
+                }
+                continue;
+            }
+
+            if (!dom.dominates(site.block, use_block)) {
+                continue;
+            }
+
+            const std::size_t distance = dominance_distance(site.block, use_block);
+            const std::uint64_t candidate_key = block_key(site.block);
+            if (!best_dom || distance < best_dom_distance
+                || (distance == best_dom_distance && candidate_key < best_dom_block_key)) {
+                best_dom = site.inst;
+                best_dom_distance = distance;
+                best_dom_block_key = candidate_key;
+            }
+        }
+
+        if (best_same_block) {
+            return best_same_block;
+        }
+        return best_dom;
+    };
+
     // Pass 2: connect use -> def dependencies and identify sink instructions.
     for (BasicBlock* block : cfg->blocks()) {
-        for (Instruction* inst : block->instructions()) {
+        const auto& insts = block->instructions();
+        for (std::size_t i = 0; i < insts.size(); ++i) {
+            Instruction* inst = insts[i];
             if (auto* assign = dyn_cast<Assignment>(inst)) {
                 if (assignment_has_call_value(assign) || assignment_has_side_effect_destination(assign)) {
                     graph.sinks.insert(inst);
@@ -4211,11 +4336,79 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
             }
 
             std::vector<Instruction*> deps;
-            for (Variable* req : inst->requirements()) {
-                if (!req) continue;
-                auto it = definition_of.find(var_key(req));
-                if (it != definition_of.end() && it->second != inst) {
-                    deps.push_back(it->second);
+            if (auto* phi = dyn_cast<Phi>(inst)) {
+                auto resolve_phi_dependency = [&](const VarKey& src_key, BasicBlock* pred_block) -> Instruction* {
+                    auto resolve_in_pred = [&](BasicBlock* candidate_pred) -> Instruction* {
+                        if (!candidate_pred) {
+                            return nullptr;
+                        }
+                        const std::size_t pred_use_index = candidate_pred->instructions().size();
+
+                        Instruction* dep = find_reaching_definition(src_key, candidate_pred, pred_use_index);
+                        if (!dep) {
+                            if (auto alias_key = register_width_alias_key(src_key)) {
+                                dep = find_reaching_definition(*alias_key, candidate_pred, pred_use_index);
+                            }
+                        }
+                        return dep;
+                    };
+
+                    if (Instruction* dep = resolve_in_pred(pred_block)) {
+                        return dep;
+                    }
+
+                    for (Edge* edge : block->predecessors()) {
+                        BasicBlock* candidate_pred = edge ? edge->source() : nullptr;
+                        if (candidate_pred == pred_block) {
+                            continue;
+                        }
+                        if (Instruction* dep = resolve_in_pred(candidate_pred)) {
+                            return dep;
+                        }
+                    }
+                    return nullptr;
+                };
+
+                auto add_phi_dependency = [&](BasicBlock* pred_block, Expression* src_expr) {
+                    auto* src_var = dyn_cast<Variable>(src_expr);
+                    if (!src_var) {
+                        return;
+                    }
+
+                    const VarKey src_key = var_key(src_var);
+                    if (Instruction* dep = resolve_phi_dependency(src_key, pred_block); dep && dep != inst) {
+                        deps.push_back(dep);
+                    }
+                };
+
+                if (!phi->origin_block().empty()) {
+                    for (const auto& [pred, src_expr] : phi->origin_block()) {
+                        add_phi_dependency(pred, src_expr);
+                    }
+                } else if (auto* ops = phi->operand_list()) {
+                    const auto& operands = ops->operands();
+                    const auto& preds = block->predecessors();
+                    const std::size_t n = std::min(operands.size(), preds.size());
+                    for (std::size_t op_i = 0; op_i < n; ++op_i) {
+                        BasicBlock* pred_block = preds[op_i] ? preds[op_i]->source() : nullptr;
+                        add_phi_dependency(pred_block, operands[op_i]);
+                    }
+                }
+            } else {
+                for (Variable* req : inst->requirements()) {
+                    if (!req) continue;
+                    const VarKey req_key = var_key(req);
+
+                    Instruction* dep = find_reaching_definition(req_key, block, i);
+                    if (!dep) {
+                        if (auto alias_key = register_width_alias_key(req_key)) {
+                            dep = find_reaching_definition(*alias_key, block, i);
+                        }
+                    }
+
+                    if (dep && dep != inst) {
+                        deps.push_back(dep);
+                    }
                 }
             }
             if (!deps.empty()) {
@@ -4950,9 +5143,6 @@ void SinkDefinitionRepairStage::execute(DecompilerTask& task) {
             auto insts = block->instructions();
             for (std::size_t i = 0; i < insts.size(); ++i) {
                 Instruction* inst = insts[i];
-                if (isa<Phi>(inst)) {
-                    continue;
-                }
 
                 std::unordered_set<Variable*> reqs;
                 collect_requirements_iterative(inst, reqs);
@@ -4989,6 +5179,13 @@ void SinkDefinitionRepairStage::execute(DecompilerTask& task) {
 
                     if (rhs == nullptr) {
                         continue;
+                    }
+
+                    if (isa<Phi>(inst)) {
+                        inst->substitute(req, rhs);
+                        block->set_instructions(std::move(insts));
+                        changed = true;
+                        break;
                     }
 
                     auto* bridge = task.arena().create<Assignment>(lhs, rhs);
@@ -5582,7 +5779,7 @@ void DeadComponentPrunerStage::execute(DecompilerTask& task) {
                                 break;
                             }
 
-                            return prior_op;
+                            return prior_op->operands()[0];
                         }
 
                         return ptr_expr;
@@ -5615,7 +5812,25 @@ void DeadComponentPrunerStage::execute(DecompilerTask& task) {
                     }
 
                     const std::size_t fp_width = ret_width;
-                    auto* ts_ptr = timespec_ptr;
+                    auto* ts_local = task.arena().create<Variable>("ts", 16);
+                    ts_local->set_kind(VariableKind::StackLocal);
+                    ts_local->set_stack_offset(-0x10);
+                    auto* ts_addr = task.arena().create<Operation>(
+                        OperationType::address_of,
+                        std::vector<Expression*>{ts_local},
+                        fp_width);
+
+                    if (auto* call = dyn_cast<Call>(call_expr)) {
+                        if (call->mutable_operands().size() >= 3) {
+                            call->mutable_operands()[2] = ts_addr->copy(task.arena());
+                        }
+                    } else if (auto* op = dyn_cast<Operation>(call_expr)) {
+                        if (op->type() == OperationType::call && op->mutable_operands().size() >= 3) {
+                            op->mutable_operands()[2] = ts_addr->copy(task.arena());
+                        }
+                    }
+
+                    auto* ts_ptr = ts_addr;
                     auto* sec = task.arena().create<Operation>(
                         OperationType::deref,
                         std::vector<Expression*>{ts_ptr},

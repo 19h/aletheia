@@ -126,12 +126,17 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
     // SSA versioning has desynchronized it from its uses — do NOT mark it
     // dead, as deleting it would orphan data flow.
     std::unordered_set<VarKey, VarKeyHash> keys_with_uses;
+    std::unordered_set<VarKey, VarKeyHash> keys_used_by_phi;
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
             // Skip the defining instruction itself
             for (Variable* req : inst->requirements()) {
                 auto key = var_key(req);
                 if (substitutions.contains(key)) {
+                    if (isa<Phi>(inst)) {
+                        keys_used_by_phi.insert(key);
+                        continue;
+                    }
                     // Check this isn't the defining instruction
                     auto def_it = def_instructions.find(key);
                     if (def_it == def_instructions.end() || def_it->second != inst) {
@@ -146,7 +151,7 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
     // have verified uses in the CFG.
     std::unordered_set<Instruction*> dead_instructions;
     for (auto& [key, inst] : def_instructions) {
-        if (keys_with_uses.contains(key)) {
+        if (keys_with_uses.contains(key) && !keys_used_by_phi.contains(key)) {
             dead_instructions.insert(inst);
         }
     }
