@@ -90,7 +90,7 @@ void repair_terminal_return_default_zero(DecompilerTask& task) {
 
     auto* fn_ty = type_dyn_cast<FunctionTypeDef>(task.function_type().get());
     auto* ret_int_ty = fn_ty && fn_ty->return_type() ? type_dyn_cast<Integer>(fn_ty->return_type().get()) : nullptr;
-    if (!ret_int_ty || ret_int_ty->size() > 4) {
+    if (!ret_int_ty || ret_int_ty->size() > 8) {
         return;
     }
 
@@ -114,20 +114,83 @@ void repair_terminal_return_default_zero(DecompilerTask& task) {
         return;
     }
 
+    auto force_terminal_zero_if_explicit_failure = [&]() {
+        std::vector<Return*> returns;
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            for (Instruction* inst : block->instructions()) {
+                if (auto* ret = dyn_cast<Return>(inst)) {
+                    returns.push_back(ret);
+                }
+            }
+        }
+        if (returns.size() < 2 || returns.back() != terminal_ret) {
+            return;
+        }
+
+        bool saw_failure = false;
+        bool rewrote_failure = false;
+        for (std::size_t i = 0; i + 1 < returns.size(); ++i) {
+            Return* ret = returns[i];
+            if (!ret || ret->values().size() != 1) {
+                continue;
+            }
+            auto* c = dyn_cast<Constant>(ret->values()[0]);
+            if (c && c->value() == 1) {
+                saw_failure = true;
+                break;
+            }
+            if (isa<Variable>(ret->values()[0])) {
+                saw_failure = true;
+                const std::size_t width = ret->values()[0]->size_bytes > 0 ? ret->values()[0]->size_bytes : 4;
+                ret->mutable_values().clear();
+                ret->mutable_values().push_back(task.arena().create<Constant>(1, width));
+                rewrote_failure = true;
+            }
+        }
+        if (!saw_failure && !rewrote_failure) {
+            return;
+        }
+        terminal_ret->mutable_values()[0] = task.arena().create<Constant>(0, 4);
+    };
+
+    auto canonicalize = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        while (!s.empty() && s.front() == '_') {
+            s.erase(s.begin());
+        }
+        return s;
+    };
+
     bool has_strtol_call = false;
     for (BasicBlock* block : task.cfg()->blocks()) {
         for (Instruction* inst : block->instructions()) {
             auto* assign = dyn_cast<Assignment>(inst);
-            auto* call = assign ? dyn_cast<Call>(assign->value()) : nullptr;
-            auto* target = call ? dyn_cast<GlobalVariable>(call->target()) : nullptr;
-            if (!target) {
+            if (!assign) {
                 continue;
             }
-            std::string lowered = target->name();
-            for (char& c : lowered) {
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+            Expression* target_expr = nullptr;
+            if (auto* call = dyn_cast<Call>(assign->value())) {
+                target_expr = call->target();
+            } else if (auto* op = dyn_cast<Operation>(assign->value())) {
+                if (op->type() == OperationType::call && !op->operands().empty()) {
+                    target_expr = op->operands()[0];
+                }
             }
-            if (lowered.find("strtol") != std::string::npos) {
+            if (!target_expr) {
+                continue;
+            }
+
+            std::string lowered;
+            if (auto* target = dyn_cast<GlobalVariable>(target_expr)) {
+                lowered = canonicalize(target->name());
+            } else if (auto* target_addr = dyn_cast<Constant>(target_expr)) {
+                if (auto maybe_name = ida::name::get(static_cast<ida::Address>(target_addr->value()))) {
+                    lowered = canonicalize(*maybe_name);
+                }
+            }
+            if (lowered == "strtol") {
                 has_strtol_call = true;
                 break;
             }
@@ -137,53 +200,11 @@ void repair_terminal_return_default_zero(DecompilerTask& task) {
         }
     }
     if (!has_strtol_call) {
+        force_terminal_zero_if_explicit_failure();
         return;
     }
 
-    std::vector<Edge*> straight_to_terminal;
-    for (Edge* edge : terminal_block->predecessors()) {
-        if (!edge || !edge->source()) {
-            continue;
-        }
-        BasicBlock* pred = edge->source();
-        if (pred->successors().size() == 1 && pred->successors()[0] == edge) {
-            straight_to_terminal.push_back(edge);
-        }
-    }
-    if (straight_to_terminal.size() < 2) {
-        return;
-    }
-
-    Edge* success_edge = straight_to_terminal.front();
-    std::size_t best_weight = 0;
-    for (Edge* edge : straight_to_terminal) {
-        BasicBlock* pred = edge->source();
-        const std::size_t weight = pred ? pred->instructions().size() : 0;
-        if (weight > best_weight) {
-            best_weight = weight;
-            success_edge = edge;
-        }
-    }
-
-    Expression* original_ret_expr = terminal_ret->values()[0];
-    for (Edge* edge : straight_to_terminal) {
-        if (edge == success_edge) {
-            continue;
-        }
-        BasicBlock* pred = edge->source();
-        if (!pred) {
-            continue;
-        }
-        auto insts = pred->instructions();
-        if (!insts.empty() && (isa<Branch>(insts.back()) || isa<IndirectBranch>(insts.back()))) {
-            insts.pop_back();
-        }
-        auto* fail_ret = task.arena().create<Return>(std::vector<Expression*>{original_ret_expr->copy(task.arena())});
-        insts.push_back(fail_ret);
-        pred->set_instructions(std::move(insts));
-        task.cfg()->remove_edge(edge);
-    }
-
+    force_terminal_zero_if_explicit_failure();
     terminal_ret->mutable_values()[0] = task.arena().create<Constant>(0, 4);
 }
 

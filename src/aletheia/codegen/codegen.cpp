@@ -181,6 +181,38 @@ std::size_t ast_node_weight(AstNode* node) {
     return 1;
 }
 
+bool ast_node_guarantees_termination(AstNode* node) {
+    if (!node) {
+        return false;
+    }
+
+    if (auto* cnode = ast_dyn_cast<CodeNode>(node)) {
+        BasicBlock* block = cnode->block();
+        if (!block || block->instructions().empty()) {
+            return false;
+        }
+        Instruction* tail = block->instructions().back();
+        return tail && (isa<Return>(tail)
+            || isa<IndirectBranch>(tail)
+            || isa<BreakInstr>(tail)
+            || isa<ContinueInstr>(tail));
+    }
+
+    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+        if (seq->nodes().empty()) {
+            return false;
+        }
+        return ast_node_guarantees_termination(seq->nodes().back());
+    }
+
+    if (auto* inode = ast_dyn_cast<IfNode>(node)) {
+        return ast_node_guarantees_termination(inode->true_branch())
+            && ast_node_guarantees_termination(inode->false_branch());
+    }
+
+    return false;
+}
+
 bool should_swap_if_branches(IfNode* inode) {
     if (!inode || !inode->true_branch() || !inode->false_branch()) {
         return false;
@@ -190,6 +222,12 @@ bool should_swap_if_branches(IfNode* inode) {
     const bool false_is_if = ast_dyn_cast<IfNode>(inode->false_branch()) != nullptr;
     if (true_is_if != false_is_if) {
         return true_is_if;
+    }
+
+    const bool true_terminates = ast_node_guarantees_termination(inode->true_branch());
+    const bool false_terminates = ast_node_guarantees_termination(inode->false_branch());
+    if (true_terminates != false_terminates) {
+        return false;
     }
 
     const IfBranchPreference pref = configured_if_branch_preference();
@@ -1689,9 +1727,10 @@ bool CodeVisitor::node_emits_code(AstNode* node) {
                 continue;
             }
             if (isa<Branch>(inst)) {
-                // Non-fallback branch placeholders are suppressed during
-                // emission, so they do not contribute executable output.
-                continue;
+                // Branch placeholders are not text-emitted directly, but they
+                // still encode control-flow structure. Treat them as emitting
+                // so if/else chains keep both semantic arms during shaping.
+                return true;
             }
             if (isa<IndirectBranch>(inst)) {
                 return true;
