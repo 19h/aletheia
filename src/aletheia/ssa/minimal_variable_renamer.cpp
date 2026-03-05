@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -45,6 +46,14 @@ using Adjacency = std::unordered_map<VarKey, VarSet, VarKeyHash>;
 
 std::vector<VarKey> sorted_var_keys(const VarSet& vars);
 std::vector<VarKey> sorted_var_keys(const std::vector<VarKey>& vars);
+
+bool is_aarch64_x0_family(std::string_view name) {
+    return name == "x0" || name == "w0";
+}
+
+bool is_aarch64_x0_parameter_role(const VarKey& key, const VarInfo&) {
+    return key.version == 0;
+}
 
 VarKey key_of(const Variable* var) {
     return VarKey{var->name(), var->ssa_version()};
@@ -91,6 +100,14 @@ void add_clique(Adjacency& graph, const VarSet& vars) {
 }
 
 std::string compatibility_group_of(const VarKey& key, const VarInfo& info) {
+    if (is_aarch64_x0_family(key.name)) {
+        if (is_aarch64_x0_parameter_role(key, info)) {
+            // Treat x0/w0 entry parameter aliases as one compatibility class
+            // so out-of-SSA can preserve a single argument owner.
+            return "aarch64_x0:param";
+        }
+        return "aarch64_x0:nonparam:" + key.name;
+    }
     if (info.aliased) {
         return "alias:" + key.name + "#" + std::to_string(key.version);
     }
@@ -537,6 +554,10 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             best_size = std::max(best_size, mi.size_bytes);
             if (!best_type && mi.type) {
                 best_type = mi.type;
+            }
+            if (is_aarch64_x0_family(key.name) && key.version == 0) {
+                best_kind = VariableKind::Parameter;
+                best_param_index = 0;
             }
             if (mi.kind == VariableKind::Parameter && mi.parameter_index >= 0) {
                 best_kind = VariableKind::Parameter;

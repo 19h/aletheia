@@ -258,7 +258,9 @@ std::string allocate_name_for_variable(const Variable* var, RenameState& state) 
                 if (is_return_sink_variable(var, state)) {
                     return "ret_" + std::to_string(state.prefix_next_id["ret"]++);
                 }
-                return "tmp_" + std::to_string(state.prefix_next_id["tmp"]++);
+                // Multiple SSA aliases can legitimately represent the same
+                // source-level parameter (e.g., AArch64 x0/w0 views).
+                return "arg_" + std::to_string(index);
             }
             if (is_return_sink_variable(var, state)) {
                 return "ret_" + std::to_string(state.prefix_next_id["ret"]++);

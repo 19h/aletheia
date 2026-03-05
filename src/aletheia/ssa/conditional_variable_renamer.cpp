@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -82,6 +83,14 @@ using DependencyWeightMap = std::unordered_map<PairKey, double, PairKeyHash>;
 
 VarKey key_of(const Variable* var) {
     return VarKey{var->name(), var->ssa_version()};
+}
+
+bool is_aarch64_x0_family(std::string_view name) {
+    return name == "x0" || name == "w0";
+}
+
+bool is_aarch64_x0_parameter_role(const VarKey& key, const VarInfo&) {
+    return key.version == 0;
 }
 
 void add_vertex_if_missing(Adjacency& graph, const VarKey& key) {
@@ -437,6 +446,25 @@ void ConditionalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph
                 return false;
             }
         }
+
+        for (const VarKey& a : lhs.members) {
+            for (const VarKey& b : rhs.members) {
+                if (!is_aarch64_x0_family(a.name) || !is_aarch64_x0_family(b.name)) {
+                    continue;
+                }
+                auto a_it = var_info.find(a);
+                auto b_it = var_info.find(b);
+                if (a_it == var_info.end() || b_it == var_info.end()) {
+                    continue;
+                }
+                const bool a_param_role = is_aarch64_x0_parameter_role(a, a_it->second);
+                const bool b_param_role = is_aarch64_x0_parameter_role(b, b_it->second);
+                if (a_param_role != b_param_role) {
+                    return false;
+                }
+            }
+        }
+
         for (const VarKey& a : lhs.members) {
             for (const VarKey& b : rhs.members) {
                 if (are_interfering(interference, a, b)) {
