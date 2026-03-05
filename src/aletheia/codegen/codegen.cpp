@@ -1157,6 +1157,7 @@ void CExpressionGenerator::visit(Operation* o) {
                             }
                         }
                     }
+                    result_ = "*(" + generate(ops[0]) + ")";
                 } else if (auto* v = dyn_cast<Variable>(ops[0])) {
                     auto* ptr = v->ir_type() ? type_dyn_cast<Pointer>(v->ir_type().get()) : nullptr;
                     if (!ptr) {

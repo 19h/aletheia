@@ -1,5 +1,7 @@
 #include "optimization_stages.hpp"
 #include <ida/data.hpp>
+#include <ida/instruction.hpp>
+#include <ida/lines.hpp>
 #include <ida/name.hpp>
 #include <ida/segment.hpp>
 #include <ida/type.hpp>
@@ -32,6 +34,7 @@ aletheia::OperationType flip_comparison(aletheia::OperationType op) {
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace aletheia {
@@ -2169,6 +2172,447 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                         for (std::size_t arg_i = 1; arg_i < ops.size(); ++arg_i) {
                             propagate_arg(ops[arg_i]);
                         }
+                    }
+                }
+            }
+        }
+
+        auto canonicalize_name = [](std::string name) {
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            while (!name.empty() && name.front() == '_') {
+                name.erase(name.begin());
+            }
+            return name;
+        };
+
+        auto parse_memory_immediate_offset = [&](const std::string& operand_text) -> std::optional<std::uint64_t> {
+            std::string text = canonicalize_name(ida::lines::tag_remove(operand_text));
+            const auto hash = text.find('#');
+            if (hash == std::string::npos) {
+                return std::nullopt;
+            }
+            std::size_t i = hash + 1;
+            if (i < text.size() && text[i] == '+') {
+                ++i;
+            }
+            bool negative = false;
+            if (i < text.size() && text[i] == '-') {
+                negative = true;
+                ++i;
+            }
+            int base = 10;
+            if (i + 1 < text.size() && text[i] == '0' && text[i + 1] == 'x') {
+                base = 16;
+                i += 2;
+            }
+            const std::size_t start = i;
+            while (i < text.size() && ((base == 16) ? std::isxdigit(static_cast<unsigned char>(text[i]))
+                                                     : std::isdigit(static_cast<unsigned char>(text[i])))) {
+                ++i;
+            }
+            if (i == start || negative) {
+                return std::nullopt;
+            }
+
+            std::uint64_t value = 0;
+            for (std::size_t j = start; j < i; ++j) {
+                const char c = text[j];
+                int digit = 0;
+                if (c >= '0' && c <= '9') digit = c - '0';
+                else if (c >= 'a' && c <= 'f') digit = 10 + (c - 'a');
+                else if (c >= 'A' && c <= 'F') digit = 10 + (c - 'A');
+                value = value * base + static_cast<std::uint64_t>(digit);
+            }
+            return value;
+        };
+
+        auto extract_memory_base_register = [&](const std::string& operand_text) -> std::optional<std::string> {
+            std::string text = canonicalize_name(ida::lines::tag_remove(operand_text));
+            const auto open = text.find('[');
+            const auto close = text.find(']');
+            if (open == std::string::npos || close == std::string::npos || close <= open + 1) {
+                return std::nullopt;
+            }
+            std::string inner = text.substr(open + 1, close - open - 1);
+            std::size_t i = 0;
+            while (i < inner.size() && std::isspace(static_cast<unsigned char>(inner[i]))) {
+                ++i;
+            }
+            const std::size_t start = i;
+            while (i < inner.size() && (std::isalnum(static_cast<unsigned char>(inner[i])) || inner[i] == '_')) {
+                ++i;
+            }
+            if (i == start) {
+                return std::nullopt;
+            }
+            return inner.substr(start, i - start);
+        };
+
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            auto& instrs = block->mutable_instructions();
+            for (std::size_t i = 0; i < instrs.size(); ++i) {
+                auto* assign = dyn_cast<Assignment>(instrs[i]);
+                auto* call = assign ? dyn_cast<Call>(assign->value()) : nullptr;
+                if (!assign || !call || call->mutable_operands().size() < 2 || assign->address() == 0) {
+                    continue;
+                }
+
+                Expression*& first_arg = call->mutable_operands()[1];
+                auto* outer_deref = dyn_cast<Operation>(strip_trivial_casts(first_arg));
+                auto* inner_deref = outer_deref && outer_deref->type() == OperationType::deref
+                    ? dyn_cast<Operation>(strip_trivial_casts(outer_deref->operands()[0]))
+                    : nullptr;
+                auto* base_const = inner_deref && inner_deref->type() == OperationType::deref
+                    ? dyn_cast<Constant>(strip_trivial_casts(inner_deref->operands()[0]))
+                    : nullptr;
+                if (!base_const || (base_const->value() & 0xfffULL) != 0) {
+                    continue;
+                }
+
+                std::optional<std::string> load_base_reg;
+                std::optional<std::uint64_t> load_offset;
+                constexpr std::size_t kMaxBackInstructions = 6;
+                for (std::size_t step = 1; step <= kMaxBackInstructions; ++step) {
+                    if (assign->address() < step * 4) {
+                        break;
+                    }
+                    const ida::Address prev_addr = assign->address() - static_cast<ida::Address>(step * 4);
+                    auto prev_insn_res = ida::instruction::decode(prev_addr);
+                    if (!prev_insn_res) {
+                        break;
+                    }
+                    const auto& prev_insn = *prev_insn_res;
+                    const std::string mnem = canonicalize_name(prev_insn.mnemonic());
+                    if (mnem == "bl" || mnem == "blr" || mnem == "blx" || mnem == "ret" || mnem == "b"
+                        || (mnem.size() > 2 && mnem[0] == 'b' && mnem[1] == '.')) {
+                        break;
+                    }
+                    if (mnem != "ldr" && mnem != "ldur") {
+                        continue;
+                    }
+                    const auto& ops = prev_insn.operands();
+                    if (ops.size() < 2 || !ops[0].is_register()) {
+                        continue;
+                    }
+                    auto mem_text = ida::instruction::operand_text(prev_addr, ops[1].index());
+                    if (!mem_text) {
+                        continue;
+                    }
+                    const std::string dst_reg = canonicalize_name(ops[0].register_name());
+                    auto mem_base = extract_memory_base_register(*mem_text);
+                    if (!mem_base.has_value()) {
+                        continue;
+                    }
+
+                    if (!load_base_reg.has_value()) {
+                        if ((dst_reg == "x0" || dst_reg == "w0") && mem_base.has_value()) {
+                            load_base_reg = *mem_base;
+                        }
+                        continue;
+                    }
+
+                    if (dst_reg == *load_base_reg && *mem_base == *load_base_reg) {
+                        load_offset = parse_memory_immediate_offset(*mem_text);
+                        if (!load_offset.has_value()) {
+                            const ida::Address target = ops[1].target_address();
+                            if (target != ida::BadAddress
+                                && static_cast<std::uint64_t>(target) >= base_const->value()) {
+                                load_offset = static_cast<std::uint64_t>(target) - base_const->value();
+                            }
+                        }
+                        if (!load_offset.has_value()) {
+                            const std::uint64_t raw = ops[1].value();
+                            if (raw > 0 && raw <= 0x1000) {
+                                load_offset = raw;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                if (!load_offset.has_value() || *load_offset == 0) {
+                    continue;
+                }
+
+                inner_deref->mutable_operands()[0] = task.arena().create<Constant>(
+                    base_const->value() + *load_offset,
+                    base_const->size_bytes > 0 ? base_const->size_bytes : 8);
+                changed = true;
+            }
+        }
+
+        auto placeholder_count_for_format = [](const std::string& fmt) {
+            std::size_t count = 0;
+            for (std::size_t j = 0; j < fmt.size(); ++j) {
+                if (fmt[j] != '%') {
+                    continue;
+                }
+                if (j + 1 < fmt.size() && fmt[j + 1] == '%') {
+                    ++j;
+                    continue;
+                }
+                ++count;
+            }
+            return count;
+        };
+
+        auto format_string_from_expr = [&](Expression* expr) -> std::optional<std::string> {
+            expr = strip_trivial_casts(expr);
+            if (auto* c = dyn_cast<Constant>(expr)) {
+                auto maybe = ida::data::read_string(static_cast<ida::Address>(c->value()));
+                if (maybe && !maybe->empty()) {
+                    return *maybe;
+                }
+            }
+            if (auto* gv = dyn_cast<GlobalVariable>(expr)) {
+                if (!gv->name().empty() && gv->name().front() == '"') {
+                    return gv->name();
+                }
+                if (auto* init = dyn_cast<Constant>(gv->initial_value())) {
+                    auto maybe = ida::data::read_string(static_cast<ida::Address>(init->value()));
+                    if (maybe && !maybe->empty()) {
+                        return *maybe;
+                    }
+                }
+            }
+            return std::nullopt;
+        };
+
+        auto is_call_or_branch_barrier = [](Instruction* inst) {
+            if (!inst || isa<Branch>(inst) || isa<IndirectBranch>(inst) || isa<Return>(inst)) {
+                return true;
+            }
+            auto* assign = dyn_cast<Assignment>(inst);
+            if (!assign) {
+                return false;
+            }
+            if (isa<Call>(assign->value())) {
+                return true;
+            }
+            if (auto* op = dyn_cast<Operation>(assign->value())) {
+                return op->type() == OperationType::call;
+            }
+            return false;
+        };
+
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            auto& instrs = block->mutable_instructions();
+            for (std::size_t i = 0; i < instrs.size(); ++i) {
+                auto* assign = dyn_cast<Assignment>(instrs[i]);
+                if (!assign) {
+                    continue;
+                }
+
+                auto augment_variadic_args = [&](auto* call_like) {
+                    Expression* target_expr = nullptr;
+                    if constexpr (std::is_same_v<std::decay_t<decltype(*call_like)>, Call>) {
+                        target_expr = call_like->target();
+                    } else {
+                        if (!call_like->operands().empty()) {
+                            target_expr = call_like->operands()[0];
+                        }
+                    }
+
+                    std::string callee;
+                    if (auto* gv = dyn_cast<GlobalVariable>(target_expr)) {
+                        callee = canonicalize_name(gv->name());
+                    } else if (auto* c = dyn_cast<Constant>(target_expr)) {
+                        if (auto maybe = ida::name::get(static_cast<ida::Address>(c->value()))) {
+                            callee = canonicalize_name(*maybe);
+                        }
+                    }
+
+                    std::size_t fixed_args = 0;
+                    std::size_t format_index = 0;
+                    if (callee == "fprintf") {
+                        fixed_args = 2;
+                        format_index = 1;
+                    } else if (callee == "printf") {
+                        fixed_args = 1;
+                        format_index = 0;
+                    } else {
+                        return;
+                    }
+
+                    auto& args = call_like->mutable_operands();
+                    const std::size_t current_arg_count = args.size() > 0 ? args.size() - 1 : 0;
+                    const std::size_t format_operand_index = format_index + 1;
+                    if (args.size() <= format_operand_index) {
+                        return;
+                    }
+
+                    auto fmt = format_string_from_expr(args[format_operand_index]);
+                    if (!fmt.has_value()) {
+                        return;
+                    }
+
+                    const std::size_t required_args = fixed_args + placeholder_count_for_format(*fmt);
+                    if (required_args <= current_arg_count) {
+                        return;
+                    }
+
+                    std::vector<Expression*> recovered;
+                    for (std::size_t back = i; back > 0; --back) {
+                        Instruction* prev = instrs[back - 1];
+                        if (is_call_or_branch_barrier(prev)) {
+                            break;
+                        }
+
+                        auto* prev_assign = dyn_cast<Assignment>(prev);
+                        auto* dst = prev_assign ? dyn_cast<Variable>(prev_assign->destination()) : nullptr;
+                        if (!prev_assign || !dst || !dst->is_stack_variable()) {
+                            continue;
+                        }
+                        if (!prev_assign->value() || !call_replacement_is_safe(prev_assign->value())) {
+                            continue;
+                        }
+
+                        Expression* value = prev_assign->value()->copy(task.arena());
+                        if (!value) {
+                            continue;
+                        }
+                        recovered.push_back(value);
+                        if (current_arg_count + recovered.size() >= required_args) {
+                            break;
+                        }
+                    }
+
+                    auto propagate_extra_arg = [&](Expression*& arg_expr) {
+                        for (std::size_t depth = 0; depth < 6; ++depth) {
+                            auto* arg_var = dyn_cast<Variable>(strip_trivial_casts(arg_expr));
+                            if (!arg_var) {
+                                return;
+                            }
+                            const VarKey arg_key = var_key(arg_var);
+
+                            Assignment* local_def = nullptr;
+                            for (std::size_t back = i; back > 0; --back) {
+                                auto* prev_assign = dyn_cast<Assignment>(instrs[back - 1]);
+                                auto* prev_dest = prev_assign ? dyn_cast<Variable>(prev_assign->destination()) : nullptr;
+                                if (!prev_dest || var_key(prev_dest) != arg_key) {
+                                    continue;
+                                }
+                                local_def = prev_assign;
+                                break;
+                            }
+
+                            auto* def_op = local_def ? dyn_cast<Operation>(local_def->value()) : nullptr;
+                            if (!local_def || isa<Call>(local_def->value())
+                                || (def_op && def_op->type() == OperationType::call)) {
+                                return;
+                            }
+                            if (!call_replacement_is_safe(local_def->value())) {
+                                return;
+                            }
+                            if (expression_references_variable(local_def->value(), arg_key.name, arg_key.ssa_version)) {
+                                return;
+                            }
+
+                            Expression* replacement = local_def->value()->copy(task.arena());
+                            if (!replacement) {
+                                return;
+                            }
+                            arg_expr = replacement;
+                            changed = true;
+
+                            if (!isa<Variable>(strip_trivial_casts(arg_expr))) {
+                                return;
+                            }
+                        }
+                    };
+
+                    if (recovered.empty() && assign->address() != 0) {
+                        auto lift_operand_value = [&](const ida::instruction::Operand& op) -> Expression* {
+                            if (op.is_register()) {
+                                return task.arena().create<Variable>(
+                                    canonicalize_name(op.register_name()), op.byte_width());
+                            }
+                            if (op.is_immediate()) {
+                                return task.arena().create<Constant>(op.value(), op.byte_width());
+                            }
+                            return nullptr;
+                        };
+
+                        auto is_stack_slot_text = [&](std::string text) {
+                            text = canonicalize_name(ida::lines::tag_remove(text));
+                            return text.find("[sp") != std::string::npos
+                                || text.find("[x29") != std::string::npos
+                                || text.find("[fp") != std::string::npos
+                                || text.find("[rsp") != std::string::npos
+                                || text.find("[rbp") != std::string::npos;
+                        };
+
+                        auto is_branch_like_mnemonic = [](const std::string& mnem) {
+                            return mnem == "b" || mnem == "br" || mnem == "ret"
+                                || mnem == "bl" || mnem == "blr" || mnem == "blx"
+                                || (mnem.size() > 2 && mnem[0] == 'b' && mnem[1] == '.');
+                        };
+
+                        constexpr std::size_t kMaxBackInstructions = 8;
+                        const ida::Address call_addr = assign->address();
+                        for (std::size_t step = 1; step <= kMaxBackInstructions; ++step) {
+                            if (call_addr < step * 4 || call_addr - static_cast<ida::Address>(step * 4) < task.function_address()) {
+                                break;
+                            }
+                            const ida::Address prev_addr = call_addr - static_cast<ida::Address>(step * 4);
+                            auto prev_insn_res = ida::instruction::decode(prev_addr);
+                            if (!prev_insn_res) {
+                                break;
+                            }
+                            const auto& prev_insn = *prev_insn_res;
+                            const std::string prev_mnem = canonicalize_name(prev_insn.mnemonic());
+                            if (is_branch_like_mnemonic(prev_mnem)) {
+                                break;
+                            }
+
+                            const auto& prev_ops = prev_insn.operands();
+                            if ((prev_mnem == "str" || prev_mnem == "stur") && prev_ops.size() >= 2) {
+                                auto text_res = ida::instruction::operand_text(prev_addr, prev_ops[1].index());
+                                if (!text_res || !is_stack_slot_text(*text_res)) {
+                                    continue;
+                                }
+                                if (Expression* value = lift_operand_value(prev_ops[0])) {
+                                    recovered.push_back(value);
+                                }
+                            } else if (prev_mnem == "stp" && prev_ops.size() >= 3) {
+                                auto text_res = ida::instruction::operand_text(prev_addr, prev_ops[2].index());
+                                if (!text_res || !is_stack_slot_text(*text_res)) {
+                                    continue;
+                                }
+                                if (Expression* value0 = lift_operand_value(prev_ops[0])) {
+                                    recovered.push_back(value0);
+                                }
+                                if (current_arg_count + recovered.size() < required_args) {
+                                    if (Expression* value1 = lift_operand_value(prev_ops[1])) {
+                                        recovered.push_back(value1);
+                                    }
+                                }
+                            }
+
+                            if (current_arg_count + recovered.size() >= required_args) {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (recovered.empty()) {
+                        return;
+                    }
+
+                    std::reverse(recovered.begin(), recovered.end());
+                    for (Expression* extra : recovered) {
+                        propagate_extra_arg(extra);
+                        args.push_back(extra);
+                        changed = true;
+                    }
+                };
+
+                if (auto* call = dyn_cast<Call>(assign->value())) {
+                    augment_variadic_args(call);
+                } else if (auto* op = dyn_cast<Operation>(assign->value())) {
+                    if (op->type() == OperationType::call) {
+                        augment_variadic_args(op);
                     }
                 }
             }
@@ -6365,6 +6809,7 @@ void DeadComponentPrunerStage::execute(DecompilerTask& task) {
     if (graph.sinks.empty()) return;
 
     const std::unordered_set<Instruction*> live = compute_live_component(graph);
+
     for (BasicBlock* block : task.cfg()->blocks()) {
         std::vector<Instruction*> kept;
         kept.reserve(block->instructions().size());
