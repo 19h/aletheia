@@ -117,6 +117,26 @@ bool is_zero_constant(Expression* expr) {
     return c != nullptr && c->value() == 0;
 }
 
+std::string strip_macho_linker_prefix(std::string name) {
+    if (name.empty() || name.front() != '_') {
+        return name;
+    }
+
+    std::size_t first_non_underscore = 0;
+    while (first_non_underscore < name.size() && name[first_non_underscore] == '_') {
+        ++first_non_underscore;
+    }
+    if (first_non_underscore >= name.size()) {
+        return name;
+    }
+
+    const unsigned char ch = static_cast<unsigned char>(name[first_non_underscore]);
+    if (std::islower(ch)) {
+        name.erase(name.begin());
+    }
+    return name;
+}
+
 std::optional<std::size_t> integer_bit_width(Expression* expr) {
     if (!expr) {
         return std::nullopt;
@@ -1007,7 +1027,8 @@ void CExpressionGenerator::visit(Constant* c) {
         return;
     }
 
-    const bool use_hex = threshold == 0 || value > threshold;
+    const bool prefer_small_decimal = value <= 9;
+    const bool use_hex = !prefer_small_decimal && (threshold == 0 || value > threshold);
 
     if (use_hex) {
         formatted = "0x" + hex_u64(value);
@@ -1015,7 +1036,9 @@ void CExpressionGenerator::visit(Constant* c) {
         formatted = std::to_string(value);
     }
 
-    formatted += integer_suffix(c);
+    if (!prefer_small_decimal) {
+        formatted += integer_suffix(c);
+    }
     result_ = formatted;
 }
 
@@ -1050,7 +1073,7 @@ void CExpressionGenerator::visit(Variable* v) {
 
 void CExpressionGenerator::visit(GlobalVariable* v) {
     // Global names are rendered without SSA suffixes for stable declarations.
-    result_ = v->name();
+    result_ = strip_macho_linker_prefix(v->name());
 }
 
 void CExpressionGenerator::visit(Operation* o) {
@@ -1181,6 +1204,7 @@ void CExpressionGenerator::visit(Operation* o) {
                             if (!resolved.empty() && std::isdigit(static_cast<unsigned char>(resolved.front()))) {
                                 resolved = "g_" + resolved;
                             }
+                            resolved = strip_macho_linker_prefix(std::move(resolved));
                         }
                     }
                     if (!resolved.empty()) {
@@ -1438,7 +1462,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
         lines_.push_back("");
     }
 
-    std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : task.function_name();
+    std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : strip_macho_linker_prefix(task.function_name());
 
     // Generate function signature (with void->non-void reconciliation when needed)
     std::string return_type = "void";

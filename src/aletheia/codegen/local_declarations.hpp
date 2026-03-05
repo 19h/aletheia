@@ -11,6 +11,26 @@
 
 namespace aletheia {
 
+inline std::string strip_macho_linker_prefix_for_codegen(std::string name) {
+    if (name.empty() || name.front() != '_') {
+        return name;
+    }
+
+    std::size_t first_non_underscore = 0;
+    while (first_non_underscore < name.size() && name[first_non_underscore] == '_') {
+        ++first_non_underscore;
+    }
+    if (first_non_underscore >= name.size()) {
+        return name;
+    }
+
+    const unsigned char ch = static_cast<unsigned char>(name[first_non_underscore]);
+    if (std::islower(ch)) {
+        name.erase(name.begin());
+    }
+    return name;
+}
+
 class VariableCollector : public DataflowObjectVisitorInterface {
 public:
     void visit(Constant* c) override {}
@@ -555,7 +575,7 @@ public:
         for (auto* var : collector.variables()) {
             auto* gv = dyn_cast<GlobalVariable>(var);
             if (!gv) continue;
-            globals_by_name.try_emplace(gv->name(), gv);
+            globals_by_name.try_emplace(strip_macho_linker_prefix_for_codegen(gv->name()), gv);
         }
 
         std::vector<std::string> decls;
