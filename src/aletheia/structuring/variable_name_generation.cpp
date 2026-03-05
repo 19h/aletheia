@@ -879,6 +879,21 @@ std::size_t count_variable_uses_in_instruction(Instruction* inst, Variable* targ
     return 0;
 }
 
+bool instruction_requires_variable(Instruction* inst, Variable* target) {
+    if (!inst || !target) {
+        return false;
+    }
+    std::unordered_set<Variable*> reqs;
+    inst->collect_requirements(reqs);
+    for (Variable* req : reqs) {
+        auto* req_var = dyn_cast<Variable>(req);
+        if (same_variable_identity(req_var, target)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool substitute_variable_once_in_instruction(Instruction* inst, Variable* target, Expression* replacement) {
     if (!inst || !target || !replacement) {
         return false;
@@ -1148,6 +1163,24 @@ void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* aren
 
     for (std::size_t i = 0; i < insts.size(); ++i) {
         Instruction* inst = insts[i];
+
+        // Drop dead call-result capture in terminal error-path shape:
+        //   v = call(...)
+        //   return <non-v>
+        // into:
+        //   call(...)
+        //   return <non-v>
+        if (auto* assign = dyn_cast<Assignment>(inst);
+            assign && contains_call_expression(assign->value())) {
+            auto* dst = dyn_cast<Variable>(assign->destination());
+            if (dst && i + 1 < insts.size()) {
+                auto* ret = dyn_cast<Return>(insts[i + 1]);
+                const bool is_terminal_pair = ret != nullptr && (i + 2 == insts.size());
+                if (ret && is_terminal_pair && !instruction_requires_variable(ret, dst)) {
+                    assign->set_destination(nullptr);
+                }
+            }
+        }
 
         // Fold adjacent call-result forwarding:
         //   v = call(...)

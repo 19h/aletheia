@@ -6,6 +6,8 @@
 #include <map>
 #include <set>
 #include <string>
+#include <functional>
+#include <optional>
 
 namespace aletheia {
 
@@ -145,9 +147,13 @@ public:
         }
 
         std::unordered_set<std::string> declared_param_names;
+        std::unordered_map<int, TypePtr> declared_param_types;
         if (task.function_type()) {
             if (auto* fn_ty = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
                 const int declared_param_count = static_cast<int>(fn_ty->parameters().size());
+                for (int i = 0; i < declared_param_count; ++i) {
+                    declared_param_types[i] = fn_ty->parameters()[static_cast<std::size_t>(i)];
+                }
                 std::unordered_map<int, std::string> best_name_for_index;
                 for (const auto& [reg, param] : task.parameter_registers()) {
                     if (param.index < 0 || param.index >= declared_param_count) {
@@ -171,8 +177,182 @@ public:
             declared_param_names = task.parameter_names();
         }
 
-        // Group by type string -> sorted set of variable names.
-        std::map<std::string, std::set<std::string>> type_to_vars;
+        TypePtr signed_return_integer_type = nullptr;
+        if (task.function_type()) {
+            if (auto* fn_ty = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
+                if (auto* ret_int = type_dyn_cast<Integer>(fn_ty->return_type().get())) {
+                    if (ret_int->is_signed()) {
+                        signed_return_integer_type = fn_ty->return_type();
+                    }
+                }
+            }
+        }
+
+        std::unordered_map<const Variable*, TypePtr> preferred_decl_types;
+
+        auto integer_width_bits_for_type = [](const TypePtr& type) -> std::optional<std::size_t> {
+            if (!type) {
+                return std::nullopt;
+            }
+            if (auto* integer = type_dyn_cast<Integer>(type.get())) {
+                return integer->size();
+            }
+            return std::nullopt;
+        };
+
+        auto integer_width_bits_for_var = [&](const Variable* var) -> std::optional<std::size_t> {
+            if (!var) {
+                return std::nullopt;
+            }
+            if (auto bits = integer_width_bits_for_type(var->ir_type()); bits.has_value()) {
+                return bits;
+            }
+            if (var->size_bytes > 0) {
+                return var->size_bytes * 8;
+            }
+            return std::nullopt;
+        };
+
+        auto maybe_prefer_signed_copy_type = [&](Variable* dst, Variable* src) {
+            if (!dst || !src) {
+                return;
+            }
+            const auto dst_bits = integer_width_bits_for_var(dst);
+            if (!dst_bits.has_value()) {
+                return;
+            }
+
+            if (src->is_parameter() && src->parameter_index() >= 0) {
+                auto pit = declared_param_types.find(src->parameter_index());
+                if (pit != declared_param_types.end() && pit->second) {
+                    if (auto* param_int = type_dyn_cast<Integer>(pit->second.get())) {
+                        const auto param_bits = integer_width_bits_for_type(pit->second);
+                        if (param_int->is_signed()
+                            && param_bits.has_value()
+                            && *param_bits == *dst_bits) {
+                            preferred_decl_types[dst] = pit->second;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (!src->ir_type()) {
+                return;
+            }
+            auto* src_int = type_dyn_cast<Integer>(src->ir_type().get());
+            if (!src_int || !src_int->is_signed()) {
+                return;
+            }
+
+            const auto src_bits = integer_width_bits_for_var(src);
+            if (!src_bits.has_value() || *src_bits != *dst_bits) {
+                return;
+            }
+
+            preferred_decl_types[dst] = src->ir_type();
+        };
+
+        auto maybe_prefer_return_type = [&](Variable* value_var) {
+            if (!value_var || !signed_return_integer_type) {
+                return;
+            }
+            const auto ret_bits = integer_width_bits_for_type(signed_return_integer_type);
+            const auto var_bits = integer_width_bits_for_var(value_var);
+            if (!ret_bits.has_value() || !var_bits.has_value() || *ret_bits != *var_bits) {
+                return;
+            }
+
+            preferred_decl_types[value_var] = signed_return_integer_type;
+        };
+
+        std::function<void(AstNode*)> analyze_for_type_hints = [&](AstNode* node) {
+            if (!node) {
+                return;
+            }
+
+            if (auto* cnode = ast_dyn_cast<CodeNode>(node)) {
+                if (!cnode->block()) {
+                    return;
+                }
+                for (Instruction* inst : cnode->block()->instructions()) {
+                    if (!inst) {
+                        continue;
+                    }
+
+                    if (auto* assign = dyn_cast<Assignment>(inst)) {
+                        auto* dst = dyn_cast<Variable>(assign->destination());
+                        auto* src = dyn_cast<Variable>(assign->value());
+                        if (dst && src) {
+                            maybe_prefer_signed_copy_type(dst, src);
+                        }
+                    } else if (auto* ret = dyn_cast<Return>(inst)) {
+                        if (ret->values().size() == 1) {
+                            auto* ret_var = dyn_cast<Variable>(ret->values()[0]);
+                            if (ret_var) {
+                                maybe_prefer_return_type(ret_var);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            if (auto* snode = ast_dyn_cast<SeqNode>(node)) {
+                for (AstNode* child : snode->nodes()) {
+                    analyze_for_type_hints(child);
+                }
+                return;
+            }
+
+            if (auto* inode = ast_dyn_cast<IfNode>(node)) {
+                analyze_for_type_hints(inode->true_branch());
+                analyze_for_type_hints(inode->false_branch());
+                return;
+            }
+
+            if (auto* lnode = ast_dyn_cast<LoopNode>(node)) {
+                analyze_for_type_hints(lnode->body());
+                return;
+            }
+
+            if (auto* swnode = ast_dyn_cast<SwitchNode>(node)) {
+                for (CaseNode* c : swnode->cases()) {
+                    analyze_for_type_hints(c);
+                }
+                return;
+            }
+
+            if (auto* casenode = ast_dyn_cast<CaseNode>(node)) {
+                analyze_for_type_hints(casenode->body());
+            }
+        };
+
+        if (task.ast() && task.ast()->root()) {
+            analyze_for_type_hints(task.ast()->root());
+        }
+
+        auto strip_unsigned_prefix = [](const std::string& type_name) {
+            constexpr std::string_view kPrefix{"unsigned "};
+            if (type_name.rfind(std::string(kPrefix), 0) == 0) {
+                return type_name.substr(kPrefix.size());
+            }
+            return type_name;
+        };
+
+        auto prefer_type_for_name = [&](const std::string& existing, const std::string& candidate) {
+            const std::string existing_base = strip_unsigned_prefix(existing);
+            const std::string candidate_base = strip_unsigned_prefix(candidate);
+            const bool existing_unsigned = existing_base != existing;
+            const bool candidate_unsigned = candidate_base != candidate;
+
+            if (existing_base == candidate_base && existing_unsigned && !candidate_unsigned) {
+                return candidate;
+            }
+            return existing;
+        };
+
+        std::map<std::string, std::string> var_to_type;
         
         for (auto* var : collector.variables()) {
             // Skip global variables.
@@ -188,9 +368,24 @@ public:
             }
 
             std::string type_str = "int"; // Default fallback.
-            if (var->ir_type()) {
-                type_str = var->ir_type()->to_string();
+            TypePtr decl_type = var->ir_type();
+            if (auto it = preferred_decl_types.find(var); it != preferred_decl_types.end() && it->second) {
+                decl_type = it->second;
             }
+            if (decl_type) {
+                type_str = decl_type->to_string();
+            }
+            auto it = var_to_type.find(var_name);
+            if (it == var_to_type.end()) {
+                var_to_type[var_name] = type_str;
+            } else {
+                it->second = prefer_type_for_name(it->second, type_str);
+            }
+        }
+
+        // Group by type string -> sorted set of variable names.
+        std::map<std::string, std::set<std::string>> type_to_vars;
+        for (const auto& [var_name, type_str] : var_to_type) {
             type_to_vars[type_str].insert(var_name);
         }
 
