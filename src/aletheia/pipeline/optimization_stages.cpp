@@ -3138,8 +3138,17 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
         Variable* rep = representative_for_identity_component(members, sample_of);
         if (!rep) continue;
 
+        // Use a fresh canonical node. `sample_of` selects one of several
+        // pointer-distinct occurrences of the representative VarKey; using
+        // that in-place occurrence makes sequential substitutions order-
+        // dependent when another component also references it. A fresh node
+        // cannot be matched by the current instruction's old-variable set,
+        // so the rewrite is simultaneous with respect to component identity.
+        auto* canonical = dyn_cast<Variable>(rep->copy(task.arena()));
+        if (!canonical) continue;
+
         for (const VarKey& k : members) {
-            replacement_for[k] = rep;
+            replacement_for[k] = canonical;
         }
     }
 
@@ -4129,18 +4138,21 @@ std::optional<FoldedConstant> collapse_binary_constants(
         case OperationType::bit_xor:
             return make(l ^ r);
         case OperationType::shl: {
-            const uint64_t shift = r & 63ULL;
-            return make(l << shift);
+            const std::size_t width_bits = std::min<std::size_t>(size, sizeof(uint64_t)) * 8;
+            if (r >= width_bits) return make(0);
+            return make(l << static_cast<unsigned>(r));
         }
         case OperationType::shr:
         case OperationType::sar: {
-            const uint64_t shift = r & 63ULL;
             const int64_t sl = as_signed(l, size);
-            return make(static_cast<uint64_t>(sl >> shift));
+            const std::size_t width_bits = std::min<std::size_t>(size, sizeof(uint64_t)) * 8;
+            if (r >= width_bits) return make(sl < 0 ? mask : 0);
+            return make(static_cast<uint64_t>(sl >> static_cast<unsigned>(r)));
         }
         case OperationType::shr_us: {
-            const uint64_t shift = r & 63ULL;
-            return make(l >> shift);
+            const std::size_t width_bits = std::min<std::size_t>(size, sizeof(uint64_t)) * 8;
+            if (r >= width_bits) return make(0);
+            return make(l >> static_cast<unsigned>(r));
         }
         case OperationType::logical_and:
             return make((l != 0 && r != 0) ? 1 : 0);
@@ -5409,17 +5421,13 @@ bool is_non_primitive_type(const TypePtr& type) {
     return true;
 }
 
-void collect_rhs_variables(Expression* expr, std::vector<Variable*>& out) {
-    if (!expr) {
-        return;
-    }
-    std::unordered_set<Variable*> seen;
-    collect_variables_iterative(expr, seen);
-    out.reserve(out.size() + seen.size());
-    for (Variable* var : seen) {
-        if (var != nullptr) {
-            out.push_back(var);
-        }
+void collect_type_equivalent_rhs_variables(Expression* expr, std::vector<Variable*>& out) {
+    // Type equivalence is justified for a storage copy only. Traversing an
+    // arbitrary RHS crosses semantic boundaries: in `p = &slot`, for example,
+    // `p` is a pointer while `slot` is its pointee. Arithmetic indices, deref,
+    // member access, and casts have analogous non-equivalence relationships.
+    if (auto* var = dyn_cast<Variable>(expr)) {
+        out.push_back(var);
     }
 }
 
@@ -5558,18 +5566,30 @@ void TypePropagationStage::execute(DecompilerTask& task) {
                 continue;
             }
 
-            std::vector<Variable*> rhs_vars;
-            collect_rhs_variables(assign->value(), rhs_vars);
-            for (Variable* rhs_var : rhs_vars) {
-                if (!rhs_var) {
-                    continue;
+            auto* call_value = dyn_cast<Call>(assign->value());
+            auto* legacy_call_value = dyn_cast<Operation>(assign->value());
+            const bool is_call_assignment = call_value != nullptr
+                || (legacy_call_value
+                    && legacy_call_value->type() == OperationType::call);
+
+            // A call result is not type-equivalent to its target or
+            // arguments. Linking every RHS variable to the destination here
+            // lets a pointer argument dominate the result's component (for
+            // example, char **argv contaminating long strtol(...)).
+            if (!is_call_assignment) {
+                std::vector<Variable*> rhs_vars;
+                collect_type_equivalent_rhs_variables(assign->value(), rhs_vars);
+                for (Variable* rhs_var : rhs_vars) {
+                    if (!rhs_var) {
+                        continue;
+                    }
+                    note_variable(rhs_var);
+                    add_type_graph_edge(var_key(dst), var_key(rhs_var), type_graph);
                 }
-                note_variable(rhs_var);
-                add_type_graph_edge(var_key(dst), var_key(rhs_var), type_graph);
             }
 
             // Propagate known call return types into destination variables.
-            if (auto* call = dyn_cast<Call>(assign->value())) {
+            if (auto* call = call_value) {
                 TypePtr ret_type = nullptr;
 
                 auto infer_from_function_type = [&](TypePtr ftype) {
@@ -6244,6 +6264,17 @@ void ExpressionSimplificationStage::execute(DecompilerTask& task) {
                     continue;
                 }
                 const VarKey key = var_key(dst_var);
+
+                // A phi's ListOperation is an edge-indexed set of reaching
+                // values, not a scalar expression.  Treating Phi as an
+                // ordinary Assignment here substitutes the complete operand
+                // list into later scalar uses and discards predecessor-edge
+                // selection semantics.
+                if (isa<Phi>(inst) || isa<ListOperation>(assign->value())) {
+                    local_defs.erase(key);
+                    continue;
+                }
+
                 Expression* value = assign->value();
                 Expression* tracked_value = value;
                 if (tracked_value && contains_dereference(tracked_value)) {

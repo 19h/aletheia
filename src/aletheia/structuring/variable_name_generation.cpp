@@ -13,6 +13,15 @@ namespace aletheia {
 
 namespace {
 
+// After structuring, branch conditions live in AST nodes rather than in their
+// originating CFG blocks.  Post-rename forwarding based on a single block (or
+// a single SeqNode suffix) therefore cannot prove that a definition has only
+// one use.  It is also unsafe after SSA versions have been coalesced to the
+// same display name.  Keep the forwarding implementation available for a
+// future AST-wide def-use rewrite, but do not delete definitions without that
+// proof.
+constexpr bool kEnablePostRenameForwarding = false;
+
 struct VarKey {
     std::string name;
     std::size_t version = 0;
@@ -1100,7 +1109,7 @@ bool substitute_variable_once_in_ast_node(AstNode* node, Variable* target, Expre
 }
 
 void fold_single_use_pure_assignments_across_seq(SeqNode* seq, DecompilerArena* arena) {
-    if (!seq || !arena) {
+    if (!kEnablePostRenameForwarding || !seq || !arena) {
         return;
     }
 
@@ -1188,7 +1197,8 @@ void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* aren
         // into:
         //   x = <... call(...) ...>
         if (auto* assign = dyn_cast<Assignment>(inst);
-            assign && arena && i + 1 < insts.size() && contains_call_expression(assign->value())) {
+            kEnablePostRenameForwarding && assign && arena && i + 1 < insts.size()
+                && contains_call_expression(assign->value())) {
             auto* dst = dyn_cast<Variable>(assign->destination());
             auto* next_assign = dyn_cast<Assignment>(insts[i + 1]);
             auto* next_dst = next_assign ? dyn_cast<Variable>(next_assign->destination()) : nullptr;
@@ -1209,7 +1219,8 @@ void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* aren
         //   use(v)
         // where v has exactly one reachable use before redefinition.
         if (auto* assign = dyn_cast<Assignment>(inst);
-            assign && arena && !contains_call_expression(assign->value())) {
+            kEnablePostRenameForwarding && assign && arena
+                && !contains_call_expression(assign->value())) {
             auto* dst = dyn_cast<Variable>(assign->destination());
             if (dst
                 && count_variable_uses(assign->value(), dst) == 0
@@ -1262,7 +1273,7 @@ void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* aren
         //   return <expr>
         // This avoids disconnected return-via-parameter artifacts after
         // SSA rename/coalescing while preserving expression semantics.
-        if (i + 1 < insts.size()) {
+        if (kEnablePostRenameForwarding && i + 1 < insts.size()) {
             auto* assign = dyn_cast<Assignment>(inst);
             auto* ret = dyn_cast<Return>(insts[i + 1]);
             auto* dst = assign ? dyn_cast<Variable>(assign->destination()) : nullptr;
@@ -1290,7 +1301,8 @@ void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* aren
         //   v = <expr>
         //   ... (no v use/redef)
         //   return <...v...>
-        if (auto* assign = dyn_cast<Assignment>(inst)) {
+        if (auto* assign = dyn_cast<Assignment>(inst);
+            kEnablePostRenameForwarding && assign) {
             auto* dst = dyn_cast<Variable>(assign->destination());
             if (dst
                 && !contains_call_expression(assign->value())

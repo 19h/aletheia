@@ -73,15 +73,28 @@ public:
         if (i->expression()) i->expression()->accept(*this);
     }
     void visit_return(Return* i) override {
-        if (!i) return;
-        // Keep return traversal conservative: malformed ASTs may contain
-        // non-expression payloads in return value slots, which can recurse
-        // indefinitely via visitor dispatch. Collect direct globals only.
-        for (auto* v : i->values()) {
-            if (auto* gv = dyn_cast<GlobalVariable>(v)) {
-                variables_.insert(gv);
+        if (!i || !active_returns_.insert(i).second) return;
+        for (Expression* value : i->values()) {
+            if (!value) continue;
+            switch (value->node_kind()) {
+                case NodeKind::Constant:
+                case NodeKind::Variable:
+                case NodeKind::GlobalVariable:
+                case NodeKind::Operation:
+                case NodeKind::Call:
+                case NodeKind::ListOperation:
+                case NodeKind::Condition:
+                    value->accept(*this);
+                    break;
+                default:
+                    // A malformed Return can contain an Instruction pointer
+                    // cast into its expression payload. Never dispatch it as
+                    // an expression; the invariant checker reports the IR
+                    // defect independently.
+                    break;
             }
         }
+        active_returns_.erase(i);
     }
     void visit_phi(Phi* i) override {
         if (i->dest_var()) i->dest_var()->accept(*this);
@@ -140,7 +153,11 @@ private:
 
 class LocalDeclarationGenerator {
 public:
-    static std::vector<std::string> generate(DecompilerTask& task, CExpressionGenerator& expr_gen) {
+    static std::vector<std::string> generate(
+        DecompilerTask& task,
+        CExpressionGenerator& expr_gen,
+        bool one_variable_per_declaration = false,
+        const std::unordered_set<std::string>* emitted_parameter_names = nullptr) {
         VariableCollector collector;
         if (task.ast() && task.ast()->root()) {
             collector.traverse(task.ast()->root());
@@ -148,9 +165,10 @@ public:
 
         std::unordered_set<std::string> declared_param_names;
         std::unordered_map<int, TypePtr> declared_param_types;
+        int declared_param_count = 0;
         if (task.function_type()) {
             if (auto* fn_ty = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
-                const int declared_param_count = static_cast<int>(fn_ty->parameters().size());
+                declared_param_count = static_cast<int>(fn_ty->parameters().size());
                 for (int i = 0; i < declared_param_count; ++i) {
                     declared_param_types[i] = fn_ty->parameters()[static_cast<std::size_t>(i)];
                 }
@@ -175,6 +193,11 @@ public:
             }
         } else {
             declared_param_names = task.parameter_names();
+            for (const auto& [_, param] : task.parameter_registers()) {
+                if (param.index >= 0) {
+                    declared_param_count = std::max(declared_param_count, param.index + 1);
+                }
+            }
         }
 
         TypePtr signed_return_integer_type = nullptr;
@@ -362,8 +385,12 @@ public:
             
             std::string var_name = expr_gen.generate(var);
 
-            // Skip names that are already declared in the function signature.
-            if (declared_param_names.contains(var_name)) {
+            // Use the exact identifiers emitted by the caller. Recomputing a
+            // preferred name here from unordered ABI aliases can select a
+            // different equal-length alias and suppress a real local.
+            const auto& signature_names = emitted_parameter_names
+                ? *emitted_parameter_names : declared_param_names;
+            if (signature_names.contains(var_name)) {
                 continue;
             }
 
@@ -372,8 +399,16 @@ public:
             if (auto it = preferred_decl_types.find(var); it != preferred_decl_types.end() && it->second) {
                 decl_type = it->second;
             }
-            if (decl_type) {
+            if (decl_type && !type_isa<UnknownType>(decl_type.get())
+                && decl_type->to_string() != "unknown type") {
                 type_str = decl_type->to_string();
+                expr_gen.set_local_declared_type(var_name, decl_type);
+            } else {
+                const std::size_t width_bits = var->size_bytes > 0
+                    ? var->size_bytes * 8 : 32;
+                TypePtr fallback_type = std::make_shared<const Integer>(width_bits, false);
+                type_str = fallback_type->to_string();
+                expr_gen.set_local_declared_type(var_name, fallback_type);
             }
             auto it = var_to_type.find(var_name);
             if (it == var_to_type.end()) {
@@ -391,6 +426,12 @@ public:
 
         std::vector<std::string> decls;
         for (const auto& [type_str, vars] : type_to_vars) {
+            if (one_variable_per_declaration) {
+                for (const auto& var : vars) {
+                    decls.push_back(type_str + " " + var + ";");
+                }
+                continue;
+            }
             std::string line = type_str + " ";
             bool first = true;
             for (const auto& v : vars) {

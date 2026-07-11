@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cstdint>
 #include <vector>
 #include <cstdlib>
 #include <stdexcept>
@@ -88,6 +89,27 @@ void test_arena() {
     for (int i = 0; i < 10000; i++) {
         arena.create<BasicBlock>(i);
     }
+
+    // Reuse must scan past undersized existing blocks after reset. The prior
+    // implementation advanced once and wrote beyond the second 64-byte block.
+    DecompilerArena reusable(64);
+    reusable.allocate(48, 1);
+    reusable.allocate(48, 1);
+    reusable.reset();
+    auto* large = static_cast<std::uint8_t*>(reusable.allocate(96, 1));
+    for (std::size_t i = 0; i < 96; ++i) {
+        large[i] = static_cast<std::uint8_t>(i);
+    }
+    void* aligned = reusable.allocate(8, 64);
+    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(aligned) % 64, 0U);
+
+    bool rejected_bad_alignment = false;
+    try {
+        reusable.allocate(8, 0);
+    } catch (const std::invalid_argument&) {
+        rejected_bad_alignment = true;
+    }
+    ASSERT_TRUE(rejected_bad_alignment);
     
     std::cout << "[+] test_arena passed.\n";
 }
@@ -1164,6 +1186,133 @@ void test_minimal_variable_renamer() {
     std::cout << "[+] test_minimal_variable_renamer passed.\n";
 }
 
+void test_graph_expression_folding_rewrites_store_address() {
+    DecompilerTask task(0x6050);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(305);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* address = task.arena().create<Variable>("store_address", 8);
+    address->set_ssa_version(1);
+    address->set_kind(VariableKind::Temporary);
+    auto* address_def = task.arena().create<Assignment>(
+        address,
+        task.arena().create<Constant>(0x12345000, 8));
+    auto* destination = task.arena().create<Operation>(
+        OperationType::deref,
+        std::vector<Expression*>{address},
+        4);
+    auto* store = task.arena().create<Assignment>(
+        destination,
+        task.arena().create<Constant>(42, 4));
+    bb->add_instruction(address_def);
+    bb->add_instruction(store);
+
+    GraphExpressionFoldingStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(bb->instructions().size(), 1U);
+    ASSERT_TRUE(bb->instructions()[0] == store);
+    auto* rewritten_destination = dyn_cast<Operation>(store->destination());
+    ASSERT_TRUE(rewritten_destination != nullptr);
+    ASSERT_EQ(rewritten_destination->type(), OperationType::deref);
+    auto* concrete_address = dyn_cast<Constant>(rewritten_destination->operands()[0]);
+    ASSERT_TRUE(concrete_address != nullptr);
+    ASSERT_EQ(concrete_address->value(), 0x12345000U);
+
+    std::cout << "[+] test_graph_expression_folding_rewrites_store_address passed.\n";
+}
+
+void test_graph_expression_folding_preserves_per_use_type() {
+    DecompilerTask task(0x6060);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(306);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto make_bits = [&](TypePtr type) {
+        auto* value = task.arena().create<Variable>("bits", 8);
+        value->set_ssa_version(1);
+        value->set_kind(VariableKind::Temporary);
+        value->set_ir_type(std::move(type));
+        return value;
+    };
+
+    auto* bits_definition = make_bits(Integer::uint64_t());
+    auto* bits_as_float = make_bits(Float::float64());
+    auto* bits_as_integer = make_bits(Integer::uint64_t());
+    auto* bit_pattern = task.arena().create<Constant>(0x3e112e0be826d695ULL, 8);
+    bit_pattern->set_ir_type(Integer::uint64_t());
+    bb->add_instruction(task.arena().create<Assignment>(bits_definition, bit_pattern));
+
+    auto* float_output = task.arena().create<Variable>("float_output", 8);
+    auto* float_one = task.arena().create<Constant>(0x3ff0000000000000ULL, 8);
+    float_one->set_ir_type(Float::float64());
+    auto* float_product = task.arena().create<Operation>(
+        OperationType::mul_float,
+        std::vector<Expression*>{bits_as_float, float_one},
+        8);
+    float_product->set_ir_type(Float::float64());
+    bb->add_instruction(task.arena().create<Assignment>(float_output, float_product));
+
+    auto* integer_output = task.arena().create<Variable>("integer_output", 8);
+    auto* integer_sum = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{bits_as_integer, task.arena().create<Constant>(1, 8)},
+        8);
+    integer_sum->set_ir_type(Integer::uint64_t());
+    bb->add_instruction(task.arena().create<Assignment>(integer_output, integer_sum));
+
+    GraphExpressionFoldingStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(bb->instructions().size(), 2U);
+    auto* folded_float = dyn_cast<Constant>(float_product->operands()[0]);
+    auto* folded_integer = dyn_cast<Constant>(integer_sum->operands()[0]);
+    ASSERT_TRUE(folded_float != nullptr && folded_integer != nullptr);
+    ASSERT_TRUE(folded_float != folded_integer);
+    ASSERT_TRUE(type_isa<Float>(folded_float->ir_type().get()));
+    ASSERT_TRUE(type_isa<Integer>(folded_integer->ir_type().get()));
+    ASSERT_EQ(folded_float->value(), bit_pattern->value());
+    ASSERT_EQ(folded_integer->value(), bit_pattern->value());
+
+    std::cout << "[+] test_graph_expression_folding_preserves_per_use_type passed.\n";
+}
+
+void test_graph_expression_folding_rejects_identity_cycles() {
+    DecompilerTask task(0x6070);
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(307);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* a = task.arena().create<Variable>("a", 8);
+    auto* b = task.arena().create<Variable>("b", 8);
+    a->set_ssa_version(1);
+    b->set_ssa_version(1);
+    a->set_kind(VariableKind::Temporary);
+    b->set_kind(VariableKind::Temporary);
+    bb->add_instruction(task.arena().create<Assignment>(a, b));
+    bb->add_instruction(task.arena().create<Assignment>(b, a));
+    bb->add_instruction(task.arena().create<Return>(
+        std::vector<Expression*>{a}));
+
+    GraphExpressionFoldingStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(bb->instructions().size(), 3U);
+    ASSERT_TRUE(dyn_cast<Variable>(
+        dyn_cast<Return>(bb->instructions()[2])->values()[0]) == a);
+
+    std::cout << "[+] test_graph_expression_folding_rejects_identity_cycles passed.\n";
+}
+
 void test_conditional_variable_renamer() {
     DecompilerTask task(0x6100);
 
@@ -1626,6 +1775,19 @@ void test_codegen_constant_formatting() {
     ASSERT_EQ(gen.generate(u64), "1");
     ASSERT_EQ(gen.generate(s64), "1");
 
+    auto* raw_float_bits = arena.create<aletheia::Constant>(0x3e112e0be826d695ULL, 8);
+    raw_float_bits->set_ir_type(aletheia::Integer::uint64_t());
+    auto* float_value = arena.create<aletheia::Variable>("float_value", 8);
+    float_value->set_ir_type(aletheia::Float::float64());
+    auto* float_product = arena.create<aletheia::Operation>(
+        aletheia::OperationType::mul_float,
+        std::vector<aletheia::Expression*>{float_value, raw_float_bits},
+        8);
+    float_product->set_ir_type(aletheia::Float::float64());
+    const std::string float_product_text = gen.generate(float_product);
+    ASSERT_TRUE(float_product_text.find("union { uint64_t u; double f; }") != std::string::npos);
+    ASSERT_TRUE(float_product_text.find("0x3e112e0be826d695ULL") != std::string::npos);
+
     std::cout << "[+] test_codegen_constant_formatting passed.\n";
 }
 
@@ -1661,6 +1823,30 @@ void test_codegen_unknown_operation_placeholder() {
     ASSERT_TRUE(found_placeholder);
 
     std::cout << "[+] test_codegen_unknown_operation_placeholder passed.\n";
+}
+
+void test_codegen_scalar_list_is_explicitly_unresolved() {
+    aletheia::DecompilerArena arena;
+    auto* list = arena.create<aletheia::ListOperation>(
+        std::vector<aletheia::Expression*>{
+            arena.create<aletheia::Variable>("path_value", 8),
+            arena.create<aletheia::Constant>(40, 8)},
+        8);
+
+    aletheia::CExpressionGenerator readable;
+    const std::string readable_text = readable.generate(list);
+    ASSERT_TRUE(readable_text.starts_with("__aletheia_unresolved_list("));
+    ASSERT_TRUE(readable_text.find("path_value") != std::string::npos);
+    ASSERT_TRUE(readable_text.ends_with(")"));
+
+    aletheia::CExpressionGenerator portable({.portable_c = true});
+    const std::string portable_text = portable.generate(list);
+    ASSERT_TRUE(portable_text.starts_with("__aletheia_unresolved_list("));
+    ASSERT_TRUE(portable_text.find("path_value") != std::string::npos);
+    ASSERT_TRUE(portable_text.ends_with(")"));
+    ASSERT_TRUE(portable.has_unresolved_semantics());
+
+    std::cout << "[+] test_codegen_scalar_list_is_explicitly_unresolved passed.\n";
 }
 
 void test_codegen_fallback_branch_marker() {
@@ -2125,6 +2311,65 @@ void test_variable_name_generation_skips_globals() {
     std::cout << "[+] test_variable_name_generation_skips_globals passed.\n";
 }
 
+void test_post_rename_cleanup_preserves_ast_condition_definition() {
+    aletheia::DecompilerArena arena;
+
+    auto* source = arena.create<aletheia::Variable>("source", 4);
+    auto* condition_value = arena.create<aletheia::Variable>("condition_value", 4);
+    auto* body_block = arena.create<aletheia::BasicBlock>(173);
+    body_block->add_instruction(arena.create<aletheia::Assignment>(
+        condition_value,
+        arena.create<aletheia::Operation>(
+            aletheia::OperationType::add,
+            std::vector<aletheia::Expression*>{
+                source,
+                arena.create<aletheia::Constant>(1, 4),
+            },
+            4)));
+    body_block->add_instruction(arena.create<aletheia::Return>(
+        std::vector<aletheia::Expression*>{condition_value}));
+
+    auto* loop_condition = arena.create<aletheia::Condition>(
+        aletheia::OperationType::neq,
+        condition_value,
+        arena.create<aletheia::Constant>(0, 4));
+    auto* loop = arena.create<aletheia::WhileLoopNode>(
+        arena.create<aletheia::CodeNode>(body_block),
+        loop_condition);
+    auto* forest = arena.create<aletheia::AbstractSyntaxForest>();
+    forest->set_root(loop);
+
+    // The return is a block-local use, while the loop condition is owned by
+    // the AST.  A block-local "single-use" fold must not delete the shared
+    // definition and leave the loop condition unbound.
+    aletheia::VariableNameGeneration::remove_self_assignments_ast(forest, &arena);
+
+    ASSERT_EQ(body_block->instructions().size(), 2U);
+    ASSERT_TRUE(aletheia::isa<aletheia::Assignment>(body_block->instructions()[0]));
+    ASSERT_TRUE(loop->condition() == loop_condition);
+    ASSERT_TRUE(loop_condition->lhs() == condition_value);
+
+    std::cout << "[+] test_post_rename_cleanup_preserves_ast_condition_definition passed.\n";
+}
+
+void test_ast_code_node_ownership_rejects_duplicate_blocks() {
+    aletheia::DecompilerArena arena;
+    auto* first = arena.create<aletheia::BasicBlock>(174);
+    auto* second = arena.create<aletheia::BasicBlock>(175);
+
+    auto* valid = arena.create<aletheia::SeqNode>();
+    valid->add_node(arena.create<aletheia::CodeNode>(first));
+    valid->add_node(arena.create<aletheia::CodeNode>(second));
+    ASSERT_TRUE(aletheia::ast_has_unique_code_node_ownership(valid));
+
+    auto* duplicated = arena.create<aletheia::SeqNode>();
+    duplicated->add_node(arena.create<aletheia::CodeNode>(first));
+    duplicated->add_node(arena.create<aletheia::CodeNode>(first));
+    ASSERT_TRUE(!aletheia::ast_has_unique_code_node_ownership(duplicated));
+
+    std::cout << "[+] test_ast_code_node_ownership_rejects_duplicate_blocks passed.\n";
+}
+
 void test_loop_name_generator_for_counters() {
     aletheia::DecompilerArena arena;
 
@@ -2431,8 +2676,10 @@ void test_transition_cfg_switch_tags() {
 }
 
 void test_cbr_complementary_conditions() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    // Arena-held TransitionEdge values can own z3::expr handles. The context
+    // must therefore be declared first so it is destroyed after the arena.
+    aletheia::DecompilerArena arena;
 
     auto* x = arena.create<aletheia::Variable>("x", 4);
     auto* c0 = arena.create<aletheia::Constant>(0, 4);
@@ -2471,8 +2718,8 @@ void test_cbr_complementary_conditions() {
 }
 
 void test_cbr_cnf_subexpression_grouping() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    aletheia::DecompilerArena arena;
 
     auto* x = arena.create<aletheia::Variable>("x", 4);
     auto* y = arena.create<aletheia::Variable>("y", 4);
@@ -2550,8 +2797,8 @@ void test_cbr_cnf_subexpression_grouping() {
 }
 
 void test_car_initial_switch_constructor() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    aletheia::DecompilerArena arena;
 
     auto* x = arena.create<aletheia::Variable>("x", 4);
 
@@ -2591,8 +2838,8 @@ void test_car_initial_switch_constructor() {
 }
 
 void test_car_switch_extractor_and_missing_case_sequence() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    aletheia::DecompilerArena arena;
 
     auto* x = arena.create<aletheia::Variable>("x", 4);
 
@@ -2647,8 +2894,8 @@ void test_car_switch_extractor_and_missing_case_sequence() {
 }
 
 void test_car_missing_case_finder_condition() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    aletheia::DecompilerArena arena;
 
     auto* x = arena.create<aletheia::Variable>("x", 4);
 
@@ -2691,8 +2938,8 @@ void test_car_missing_case_finder_condition() {
 }
 
 void test_guarded_do_while_rewrite() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    aletheia::DecompilerArena arena;
 
     auto* i = arena.create<aletheia::Variable>("i", 4);
     auto* cond = arena.create<aletheia::Condition>(
@@ -2735,8 +2982,8 @@ void test_guarded_do_while_rewrite() {
 }
 
 void test_while_loop_replacer() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    aletheia::DecompilerArena arena;
 
     auto* i = arena.create<aletheia::Variable>("i", 4);
     auto* sum = arena.create<aletheia::Variable>("sum", 4);
@@ -2801,8 +3048,8 @@ void test_while_loop_replacer() {
 }
 
 void test_sibling_reachability() {
-    aletheia::DecompilerArena arena;
     z3::context ctx;
+    aletheia::DecompilerArena arena;
 
     auto* b1 = arena.create<aletheia::TransitionBlock>(arena.create<aletheia::SeqNode>());
     auto* b2 = arena.create<aletheia::TransitionBlock>(arena.create<aletheia::SeqNode>());
@@ -4387,6 +4634,55 @@ void test_expression_simplification_linear_sub_chain() {
     std::cout << "[+] test_expression_simplification_linear_sub_chain passed.\n";
 }
 
+void test_expression_simplification_preserves_phi_edge_selection() {
+    DecompilerTask task(0x7720);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(742);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* merged = task.arena().create<Variable>("merged", 8);
+    merged->set_ssa_version(3);
+    auto* incoming = task.arena().create<Variable>("incoming", 8);
+    incoming->set_ssa_version(1);
+    auto* phi_values = task.arena().create<ListOperation>(
+        std::vector<Expression*>{
+            incoming,
+            task.arena().create<Constant>(40, 8)},
+        8);
+    auto* phi = task.arena().create<Phi>(merged, phi_values);
+    auto* branch = task.arena().create<Branch>(
+        task.arena().create<Condition>(
+            OperationType::lt_us,
+            task.arena().create<Operation>(
+                OperationType::cast,
+                std::vector<Expression*>{merged},
+                4),
+            task.arena().create<Constant>(46, 4),
+            1));
+    bb->add_instruction(phi);
+    bb->add_instruction(branch);
+
+    ExpressionSimplificationStage stage;
+    stage.execute(task);
+
+    auto* comparison = branch->condition();
+    ASSERT_TRUE(comparison != nullptr);
+    auto* cast = dyn_cast<Operation>(comparison->lhs());
+    ASSERT_TRUE(cast != nullptr);
+    ASSERT_EQ(cast->type(), OperationType::cast);
+    ASSERT_EQ(cast->operands().size(), 1U);
+    auto* retained = dyn_cast<Variable>(cast->operands()[0]);
+    ASSERT_TRUE(retained != nullptr);
+    ASSERT_EQ(retained->name(), std::string("merged"));
+    ASSERT_EQ(retained->ssa_version(), 3U);
+    ASSERT_TRUE(!isa<ListOperation>(cast->operands()[0]));
+
+    std::cout << "[+] test_expression_simplification_preserves_phi_edge_selection passed.\n";
+}
+
 void test_dead_component_pruner_stage() {
     DecompilerTask task(0x7800);
 
@@ -4732,15 +5028,39 @@ void test_type_propagation_stage() {
     auto* v3 = task.arena().create<Variable>("v3", 8);
     auto* prim_src = task.arena().create<Variable>("prim_src", 4);
     auto* prim_dst = task.arena().create<Variable>("prim_dst", 4);
+    auto* call_target = task.arena().create<Variable>("call_target", 8);
+    auto* pointer_arg = task.arena().create<Variable>("pointer_arg", 8);
+    auto* call_result = task.arena().create<Variable>("call_result", 8);
+    auto* stack_slot = task.arena().create<Variable>("stack_slot", 8);
+    auto* stack_address = task.arena().create<Variable>("stack_address", 8);
 
     v1->set_ir_type(ptr_widget_type);
     v2->set_ir_type(Integer::int32_t());
     prim_src->set_ir_type(Integer::int32_t());
+    pointer_arg->set_ir_type(ptr_widget_type);
+    stack_slot->set_kind(VariableKind::StackLocal);
+    stack_slot->set_ir_type(Integer::uint64_t());
+    auto stack_pointer_type = std::make_shared<const Pointer>(Integer::uint64_t(), 64);
+    stack_address->set_ir_type(stack_pointer_type);
 
     bb->add_instruction(task.arena().create<Assignment>(v0, v1));
     bb->add_instruction(task.arena().create<Assignment>(v2, v0));
     bb->add_instruction(task.arena().create<Assignment>(v3, v2));
     bb->add_instruction(task.arena().create<Assignment>(prim_dst, prim_src));
+    auto* call = task.arena().create<Call>(
+        call_target,
+        std::vector<Expression*>{pointer_arg},
+        8);
+    call->set_ir_type(std::make_shared<const FunctionTypeDef>(
+        Integer::int64_t(),
+        std::vector<TypePtr>{ptr_widget_type}));
+    bb->add_instruction(task.arena().create<Assignment>(call_result, call));
+    auto* address_of_slot = task.arena().create<Operation>(
+        OperationType::address_of,
+        std::vector<Expression*>{stack_slot},
+        8);
+    address_of_slot->set_ir_type(stack_pointer_type);
+    bb->add_instruction(task.arena().create<Assignment>(stack_address, address_of_slot));
 
     TypePropagationStage stage;
     stage.execute(task);
@@ -4755,6 +5075,15 @@ void test_type_propagation_stage() {
     ASSERT_TRUE(*(v3->ir_type()) == *ptr_widget_type);
 
     ASSERT_TRUE(prim_dst->ir_type() == nullptr);
+
+    ASSERT_TRUE(call_result->ir_type() != nullptr);
+    ASSERT_TRUE(*(call_result->ir_type()) == *Integer::int64_t());
+    ASSERT_TRUE(pointer_arg->ir_type() != nullptr);
+    ASSERT_TRUE(*(pointer_arg->ir_type()) == *ptr_widget_type);
+    ASSERT_TRUE(stack_slot->ir_type() != nullptr);
+    ASSERT_TRUE(*(stack_slot->ir_type()) == *Integer::uint64_t());
+    ASSERT_TRUE(stack_address->ir_type() != nullptr);
+    ASSERT_TRUE(*(stack_address->ir_type()) == *stack_pointer_type);
 
     std::cout << "[+] test_type_propagation_stage passed.\n";
 }
@@ -5690,6 +6019,7 @@ int main() {
     test_codegen_compound_assignment_increment();
     test_codegen_constant_formatting();
     test_codegen_unknown_operation_placeholder();
+    test_codegen_scalar_list_is_explicitly_unresolved();
     test_codegen_fallback_branch_marker();
     test_codegen_if_branch_swapping();
     test_codegen_return_type_reconciliation();
@@ -5699,6 +6029,8 @@ int main() {
     test_variable_name_generation_default();
     test_variable_name_generation_system_hungarian();
     test_variable_name_generation_skips_globals();
+    test_post_rename_cleanup_preserves_ast_condition_definition();
+    test_ast_code_node_ownership_rejects_duplicate_blocks();
     test_loop_name_generator_for_counters();
     test_loop_name_generator_while_counters();
     test_instruction_length_handler();
@@ -5722,6 +6054,9 @@ int main() {
     test_phi_lifting_edge_splitting();
     test_instruction_hierarchy();
     test_minimal_variable_renamer();
+    test_graph_expression_folding_rewrites_store_address();
+    test_graph_expression_folding_preserves_per_use_type();
+    test_graph_expression_folding_rejects_identity_cycles();
     test_conditional_variable_renamer();
     test_out_of_ssa_mode_config();
     test_compiler_idiom_handling_stage();
@@ -5745,6 +6080,7 @@ int main() {
     test_expression_simplification_sub_to_add();
     test_expression_simplification_collapse_nested_constants();
     test_expression_simplification_linear_sub_chain();
+    test_expression_simplification_preserves_phi_edge_selection();
     test_dead_component_pruner_stage();
     test_redundant_casts_elimination_stage();
     test_coherence_stage();

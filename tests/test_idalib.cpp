@@ -96,20 +96,24 @@ std::string read_text_file_or_empty(const std::string& path) {
 }
 
 std::string generate_production_fibonacci_output_or_empty() {
-    const std::string input_path = "../meta/fibonacci";
-    const std::string output_path = "../meta/fibonacci.c";
+    static const std::string cached_output = [] {
+        const std::string input_path = "../meta/fibonacci";
+        const std::string output_path = "../meta/fibonacci.c";
 
-    std::ifstream probe(input_path);
-    if (!probe.good()) {
-        return {};
-    }
+        std::ifstream probe(input_path);
+        if (!probe.good()) {
+            return std::string{};
+        }
 
-    const int rc = std::system("timeout 120 ../build-release-optimized/idump ../meta/fibonacci > /dev/null 2>&1");
-    if (rc != 0) {
-        return {};
-    }
+        const int rc = std::system(
+            "timeout 120 ../build-release-optimized/idump ../meta/fibonacci > /dev/null 2>&1");
+        if (rc != 0) {
+            return std::string{};
+        }
 
-    return read_text_file_or_empty(output_path);
+        return read_text_file_or_empty(output_path);
+    }();
+    return cached_output;
 }
 
 void test_x86_call_result_uses_rax(const std::string& func_name) {

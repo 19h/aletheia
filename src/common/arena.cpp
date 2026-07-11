@@ -1,36 +1,48 @@
 #include "arena.hpp"
 #include <algorithm>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 namespace aletheia {
 
 DecompilerArena::DecompilerArena(std::size_t block_size)
-    : block_size_(block_size) {
+    : block_size_(std::max<std::size_t>(block_size, 1)) {
     add_block(block_size_);
 }
 
 void* DecompilerArena::allocate(std::size_t size, std::size_t alignment) {
-    if (blocks_.empty()) {
-        add_block(std::max(size, block_size_));
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        throw std::invalid_argument("DecompilerArena alignment must be a non-zero power of two");
+    }
+    if (size > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
+        throw std::bad_alloc();
     }
 
-    Block* block = blocks_[current_block_].get();
-    
-    // Calculate alignment adjustment
-    std::size_t current_addr = reinterpret_cast<std::size_t>(block->data.data() + block->used);
-    std::size_t offset = (alignment - (current_addr % alignment)) % alignment;
+    if (blocks_.empty()) {
+        add_block(std::max(size + alignment - 1, block_size_));
+    }
 
-    if (block->used + offset + size > block->data.size()) {
-        // Need a new block
+    Block* block = nullptr;
+    std::size_t offset = 0;
+    for (;;) {
+        block = blocks_[current_block_].get();
+        const std::size_t current_addr =
+            reinterpret_cast<std::size_t>(block->data.data() + block->used);
+        offset = (alignment - (current_addr % alignment)) % alignment;
+        const std::size_t available = block->data.size() - block->used;
+        if (offset <= available && size <= available - offset) {
+            break;
+        }
+
+        // A reset arena can contain several previously allocated blocks of
+        // different sizes. Scan all reusable blocks and re-check capacity at
+        // each one before growing the arena.
         if (current_block_ + 1 < blocks_.size()) {
             current_block_++;
-            block = blocks_[current_block_].get();
         } else {
-            add_block(std::max(size + alignment, block_size_));
-            block = blocks_[current_block_].get();
+            add_block(std::max(size + alignment - 1, block_size_));
         }
-        
-        current_addr = reinterpret_cast<std::size_t>(block->data.data() + block->used);
-        offset = (alignment - (current_addr % alignment)) % alignment;
     }
 
     block->used += offset;

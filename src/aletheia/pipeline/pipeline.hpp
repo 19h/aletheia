@@ -1,5 +1,6 @@
 #pragma once
 #include "../common/arena.hpp"
+#include "../frontend/frontend_types.hpp"
 #include "../structures/cfg.hpp"
 #include "../structuring/ast.hpp"
 #include "../structures/types.hpp"
@@ -66,6 +67,20 @@ public:
     OutOfSsaMode out_of_ssa_mode() const { return out_of_ssa_mode_; }
     void set_out_of_ssa_mode(OutOfSsaMode mode) { out_of_ssa_mode_ = mode; }
 
+    FrontendKind frontend_kind() const { return frontend_kind_; }
+    void set_frontend_kind(FrontendKind kind) { frontend_kind_ = kind; }
+
+    const std::vector<FrontendDiagnostic>& frontend_diagnostics() const { return frontend_diagnostics_; }
+    std::vector<FrontendDiagnostic>& mutable_frontend_diagnostics() { return frontend_diagnostics_; }
+    void clear_frontend_diagnostics() { frontend_diagnostics_.clear(); }
+    void add_frontend_diagnostic(FrontendDiagnostic diagnostic) {
+        frontend_diagnostics_.push_back(std::move(diagnostic));
+    }
+
+    const FrontendSupportReport& frontend_support_report() const { return frontend_support_report_; }
+    FrontendSupportReport& mutable_frontend_support_report() { return frontend_support_report_; }
+    void reset_frontend_support_report() { frontend_support_report_ = FrontendSupportReport{}; }
+
     const std::vector<StageExecutionRecord>& stage_records() const { return stage_records_; }
     bool failed() const { return failed_; }
     const std::string& failure_stage() const { return failure_stage_; }
@@ -99,6 +114,7 @@ public:
     const std::unordered_map<std::string, ParameterInfo>& parameter_registers() const {
         return parameter_registers_;
     }
+    void clear_parameter_registers() { parameter_registers_.clear(); }
     void set_parameter_register(const std::string& reg_name, ParameterInfo info) {
         parameter_registers_[reg_name] = std::move(info);
     }
@@ -114,15 +130,22 @@ public:
 
 private:
     ida::Address function_address_;
-    DecompilerArena arena_;
+    // The Z3 context must outlive every arena object: arena-held dataflow and
+    // structuring objects may retain expressions owned by this context.
+    // Members are destroyed in reverse declaration order, so keep the context
+    // before the arena and the CFG/AST after it.
     z3::context z3_ctx_;
+    DecompilerArena arena_;
     std::unique_ptr<ControlFlowGraph> cfg_;
     std::unique_ptr<AbstractSyntaxForest> ast_;
     std::string function_name_;
     TypePtr function_type_;
     std::vector<idiomata::IdiomTag> idiom_tags_;
     OutOfSsaMode out_of_ssa_mode_ = OutOfSsaMode::LiftMinimal;
+    FrontendKind frontend_kind_ = FrontendKind::Native;
     std::unordered_map<std::string, ParameterInfo> parameter_registers_;
+    std::vector<FrontendDiagnostic> frontend_diagnostics_;
+    FrontendSupportReport frontend_support_report_;
     std::vector<StageExecutionRecord> stage_records_;
     bool failed_ = false;
     std::string failure_stage_;

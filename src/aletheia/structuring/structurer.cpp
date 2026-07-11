@@ -686,7 +686,9 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
 
             // Improved DREAM subset search:
             // try trimming each dominated subtree rooted at a potential exit node.
-            for (TransitionBlock* possible_exit : full_region) {
+            std::vector<TransitionBlock*> possible_exits(full_region.begin(), full_region.end());
+            sort_transition_blocks_deterministically(possible_exits);
+            for (TransitionBlock* possible_exit : possible_exits) {
                 if (possible_exit == header) continue;
 
                 std::unordered_set<TransitionBlock*> trimmed = full_region;
@@ -728,13 +730,17 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
             if (best_exit) {
                 cfg.add_edge(collapsed_block, best_exit, logos::LogicCondition(task_.z3_ctx().bool_val(true)));
                 
-                for (auto* node : best_region) {
+                std::vector<TransitionBlock*> ordered_region(best_region.begin(), best_region.end());
+                sort_transition_blocks_deterministically(ordered_region);
+                for (auto* node : ordered_region) {
                     cfg.remove_edge_between(node, best_exit);
                 }
             }
             
             bool was_entry = (cfg.entry() == best_header);
-            for (auto* node : best_region) {
+            std::vector<TransitionBlock*> ordered_region(best_region.begin(), best_region.end());
+            sort_transition_blocks_deterministically(ordered_region);
+            for (auto* node : ordered_region) {
                 cfg.remove_block(node);
             }
             cfg.add_block(collapsed_block);
@@ -776,7 +782,9 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
             restructure_region(&cfg, cfg.entry(), all_blocks);
             
             TransitionBlock* collapsed_block = arena_.create<TransitionBlock>(cfg.entry()->ast_node());
-            for (auto* node : all_blocks) cfg.remove_block(node);
+            std::vector<TransitionBlock*> ordered_blocks(all_blocks.begin(), all_blocks.end());
+            sort_transition_blocks_deterministically(ordered_blocks);
+            for (auto* node : ordered_blocks) cfg.remove_block(node);
             cfg.add_block(collapsed_block);
             cfg.set_entry(collapsed_block);
             

@@ -40,10 +40,87 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
 FetchContent_Declare(
     idax
     GIT_REPOSITORY https://github.com/19h/idax.git
-    GIT_TAG        master
+    # Pinned for reproducible IDA/Sleigh API and build behavior.
+    GIT_TAG        07a6f750cbdb9aa6a2eae32475ca53469b5a6cd6
 )
 
 FetchContent_MakeAvailable(idax)
+
+option(ALETHEIA_ENABLE_PCODE "Enable experimental Sleigh-backed P-Code frontend when available" OFF)
+option(ALETHEIA_PCODE_BUILD_SPECS "Build the Sleigh specifications required by the P-Code frontend" ON)
+set(ALETHEIA_HAS_PCODE OFF)
+set(ALETHEIA_SLEIGH_SECURITY_VERIFIED OFF)
+set(ALETHEIA_SLEIGH_SOURCE_DIR "${idax_SOURCE_DIR}/third-party/sleigh"
+    CACHE PATH "Path to Sleigh source tree for experimental P-Code support")
+set(ALETHEIA_SLEIGH_SPEC_ROOT "" CACHE PATH
+    "Root containing adjacent Ghidra processor .sla and .pspec files")
+
+if(ALETHEIA_ENABLE_PCODE)
+    if(NOT TARGET sleigh::sla)
+        if(EXISTS "${ALETHEIA_SLEIGH_SOURCE_DIR}/CMakeLists.txt")
+            # Ghidra 12.0.3's public Sleigh::oneInstruction path contains the
+            # PcodeCacher UAF fixed in 12.1 (GHSA-gqh9-2c72-wpjc). Backport the
+            # upstream deque-based pointer-stability fix through Sleigh's
+            # supported additional-patch mechanism.
+            set(_aletheia_sleigh_security_patch
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ghidra-12.0.3-sleigh-pcodecacher-uaf.patch")
+            set(_aletheia_sleigh_patches "${_aletheia_sleigh_security_patch}")
+            if(DEFINED sleigh_ADDITIONAL_PATCHES AND sleigh_ADDITIONAL_PATCHES)
+                foreach(_sleigh_patch IN LISTS sleigh_ADDITIONAL_PATCHES)
+                    if(NOT _sleigh_patch STREQUAL _aletheia_sleigh_security_patch)
+                        list(APPEND _aletheia_sleigh_patches "${_sleigh_patch}")
+                    endif()
+                endforeach()
+            endif()
+            set(sleigh_ADDITIONAL_PATCHES "${_aletheia_sleigh_patches}"
+                CACHE STRING "Additional patches applied to the pinned Ghidra source" FORCE)
+            set(sleigh_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+            set(sleigh_BUILD_EXTRATOOLS OFF CACHE BOOL "" FORCE)
+            set(sleigh_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+            set(sleigh_BUILD_SUPPORT ON CACHE BOOL "" FORCE)
+            set(sleigh_BUILD_SLEIGHSPECS ${ALETHEIA_PCODE_BUILD_SPECS} CACHE BOOL "" FORCE)
+            add_subdirectory("${ALETHEIA_SLEIGH_SOURCE_DIR}"
+                             "${CMAKE_CURRENT_BINARY_DIR}/third-party/sleigh"
+                             EXCLUDE_FROM_ALL)
+
+            FetchContent_GetProperties(GhidraSource)
+            if(ghidrasource_SOURCE_DIR)
+                set(_aletheia_sleigh_header
+                    "${ghidrasource_SOURCE_DIR}/Ghidra/Features/Decompiler/src/decompile/cpp/sleigh.hh")
+                if(NOT EXISTS "${_aletheia_sleigh_header}")
+                    message(FATAL_ERROR
+                        "Cannot verify Sleigh security state: expected header is missing: "
+                        "${_aletheia_sleigh_header}")
+                endif()
+                file(READ "${_aletheia_sleigh_header}" _aletheia_sleigh_header_text)
+                if(NOT _aletheia_sleigh_header_text MATCHES "deque<PcodeData>[ \t]+issued")
+                    message(FATAL_ERROR
+                        "Refusing vulnerable Sleigh source: PcodeCacher::issued is not pointer-stable "
+                        "(GHSA-gqh9-2c72-wpjc / CVE-2026-49496).")
+                endif()
+                set(ALETHEIA_SLEIGH_SECURITY_VERIFIED ON)
+            endif()
+        else()
+            find_package(sleigh QUIET COMPONENTS Support)
+        endif()
+    endif()
+
+    if(TARGET sleigh::sla AND TARGET sleigh::decomp AND TARGET sleigh::support)
+        if(NOT ALETHEIA_SLEIGH_SECURITY_VERIFIED)
+            message(FATAL_ERROR
+                "Refusing unverified external Sleigh targets. Set ALETHEIA_SLEIGH_SOURCE_DIR "
+                "to the pinned source tree so the PcodeCacher security check can run.")
+        endif()
+        set(ALETHEIA_HAS_PCODE ON)
+        message(STATUS "Experimental P-Code frontend enabled")
+    else()
+        message(FATAL_ERROR
+            "ALETHEIA_ENABLE_PCODE=ON but required Sleigh targets are unavailable. "
+            "Set ALETHEIA_SLEIGH_SOURCE_DIR to a compatible source tree.")
+    endif()
+else()
+    message(STATUS "Experimental P-Code frontend disabled by ALETHEIA_ENABLE_PCODE=OFF")
+endif()
 
 # ── Z3 dependency ───────────────────────────────────────────────────────
 # Prefer a system-installed Z3 (e.g. Homebrew, apt, vcpkg) for vastly faster
@@ -268,7 +345,11 @@ add_library(aletheia STATIC
     src/common/types.cpp
     src/common/arena.cpp
     src/aletheia/structures/cfg.cpp
+    src/aletheia/frontend/frontend.cpp
+    src/aletheia/frontend/shared_support.cpp
     src/aletheia/lifter.cpp
+    src/aletheia/pcode/pcode_lifter.cpp
+    src/aletheia/pcode/pcode_lowering.cpp
     src/aletheia/ssa/dominators.cpp
     src/aletheia/ssa/liveness/liveness.cpp
     src/aletheia/ssa/ssa_constructor.cpp
@@ -288,6 +369,7 @@ add_library(aletheia STATIC
     src/aletheia/structuring/variable_name_generation.cpp
     src/aletheia/structuring/loop_name_generator.cpp
     src/aletheia/codegen/codegen.cpp
+    src/aletheia/codegen/portable_c.cpp
     src/aletheia/structuring/graph_slice/graph_slice.cpp
     src/aletheia/structuring/reaching_conditions/reaching_conditions.cpp
     src/aletheia/structuring/cbr/cbr.cpp
@@ -304,8 +386,22 @@ add_library(aletheia STATIC
     src/aletheia/debug/debug_observer.cpp
 )
 target_link_libraries(aletheia PUBLIC idax::idax logos idiomata aletheia_aggressive_opts)
+if(ALETHEIA_HAS_PCODE)
+    target_link_libraries(aletheia PRIVATE sleigh::sla sleigh::decomp sleigh::support)
+    if(ALETHEIA_PCODE_BUILD_SPECS AND TARGET sleigh_spec_AARCH64)
+        add_dependencies(aletheia sleigh_spec_AARCH64)
+    endif()
+    if(ALETHEIA_SLEIGH_SPEC_ROOT)
+        target_compile_definitions(aletheia PRIVATE
+            ALETHEIA_SLEIGH_SPEC_ROOT_DIR="${ALETHEIA_SLEIGH_SPEC_ROOT}")
+    elseif(ALETHEIA_PCODE_BUILD_SPECS)
+        target_compile_definitions(aletheia PRIVATE
+            ALETHEIA_SLEIGH_SPEC_ROOT_DIR="${CMAKE_CURRENT_BINARY_DIR}/third-party/sleigh/specfiles")
+    endif()
+endif()
 target_include_directories(aletheia PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
 target_compile_options(aletheia PRIVATE $<$<CONFIG:Release>:-O3>)
+target_compile_definitions(aletheia PRIVATE ALETHEIA_HAS_PCODE=$<BOOL:${ALETHEIA_HAS_PCODE}>)
 
 # ── IDA Plugin target (requires IDA installation) ───────────────────────
 if(IDA_INSTALL_DIR AND COMMAND ida_add_plugin)
@@ -323,6 +419,7 @@ add_library(aletheia_core STATIC
     src/common/types.cpp
     src/common/arena.cpp
     src/aletheia/structures/cfg.cpp
+    src/aletheia/pcode/pcode_lowering.cpp
     src/aletheia/ssa/dominators.cpp
     src/aletheia/ssa/liveness/liveness.cpp
     src/aletheia/ssa/ssa_constructor.cpp
@@ -342,6 +439,7 @@ add_library(aletheia_core STATIC
     src/aletheia/structuring/variable_name_generation.cpp
     src/aletheia/structuring/loop_name_generator.cpp
     src/aletheia/codegen/codegen.cpp
+    src/aletheia/codegen/portable_c.cpp
     src/aletheia/structuring/graph_slice/graph_slice.cpp
     src/aletheia/structuring/reaching_conditions/reaching_conditions.cpp
     src/aletheia/structuring/cbr/cbr.cpp
@@ -360,6 +458,7 @@ add_library(aletheia_core STATIC
 target_link_libraries(aletheia_core PUBLIC logos aletheia_aggressive_opts)
 target_include_directories(aletheia_core PUBLIC src/aletheia src/common ${ALETHEIA_Z3_INCLUDE_DIRS})
 target_compile_options(aletheia_core PRIVATE $<$<CONFIG:Release>:-O3>)
+target_compile_definitions(aletheia_core PUBLIC ALETHEIA_HAS_PCODE=0)
 # Provide idax include directories (for headers only) without linking the idax
 # static library (which pulls in IDA kernel symbols like _callui).
 target_include_directories(aletheia_core PUBLIC ${IDAX_INC_DIRS})
@@ -382,6 +481,44 @@ if(APPLE)
     set_target_properties(aletheia_debug_tests PROPERTIES LINK_FLAGS "-Wl,-undefined,dynamic_lookup")
 endif()
 add_test(NAME aletheia_debug_tests COMMAND aletheia_debug_tests)
+
+# Raw P-Code lowering tests are deliberately independent of Sleigh and IDA.
+add_executable(aletheia_pcode_lowering_tests tests/test_pcode_lowering.cpp)
+target_link_libraries(aletheia_pcode_lowering_tests aletheia_core logos)
+if(APPLE)
+    set_target_properties(aletheia_pcode_lowering_tests PROPERTIES
+        LINK_FLAGS "-Wl,-undefined,dynamic_lookup")
+endif()
+add_test(NAME aletheia_pcode_lowering_tests COMMAND aletheia_pcode_lowering_tests)
+
+# Portable-C codegen + runtime differential fixture (no IDA runtime).
+add_executable(aletheia_portable_c_fixture_generator
+    tests/portable_c_fixture_generator.cpp)
+target_link_libraries(aletheia_portable_c_fixture_generator aletheia_core logos)
+if(APPLE)
+    set_target_properties(aletheia_portable_c_fixture_generator PROPERTIES
+        LINK_FLAGS "-Wl,-undefined,dynamic_lookup")
+endif()
+find_program(ALETHEIA_PORTABLE_C_COMPILER NAMES clang cc)
+if(ALETHEIA_PORTABLE_C_COMPILER)
+    set(ALETHEIA_PORTABLE_C_SDKROOT "")
+    if(APPLE)
+        execute_process(
+            COMMAND xcrun --show-sdk-path
+            OUTPUT_VARIABLE ALETHEIA_PORTABLE_C_SDKROOT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endif()
+    add_test(NAME aletheia_portable_c_runtime_test
+        COMMAND "${CMAKE_COMMAND}"
+            "-DGENERATOR=$<TARGET_FILE:aletheia_portable_c_fixture_generator>"
+            "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-runtime-test"
+            "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+            "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_runtime.cmake")
+else()
+    message(WARNING "Portable-C runtime gate disabled: no clang/cc executable found")
+endif()
 
 # Idiom resolver unit test
 add_executable(test_idiom_resolver tests/test_idiom_resolver.cpp)
@@ -437,4 +574,22 @@ if(IDA_INSTALL_DIR)
         BUILD_RPATH "${IDA_INSTALL_DIR}"
         INSTALL_RPATH "${IDA_INSTALL_DIR}"
     )
+
+    if(ALETHEIA_HAS_PCODE)
+        if(ALETHEIA_PORTABLE_C_COMPILER)
+            add_test(NAME aletheia_portable_c_test
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DIDUMP=$<TARGET_FILE:idump>"
+                    "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/test_binary"
+                    "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-test"
+                    "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c.cmake")
+            set_tests_properties(aletheia_portable_c_test PROPERTIES
+                RUN_SERIAL TRUE
+                TIMEOUT 600
+                ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+        else()
+            message(WARNING "Portable-C compiler gate disabled: no clang/cc executable found")
+        endif()
+    endif()
 endif()

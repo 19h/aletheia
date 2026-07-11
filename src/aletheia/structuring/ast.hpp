@@ -8,6 +8,7 @@
 namespace aletheia {
 
 // Forward declarations for recursive type queries
+class AstNode;
 class CodeNode;
 class SeqNode;
 class IfNode;
@@ -17,6 +18,11 @@ class DoWhileLoopNode;
 class ForLoopNode;
 class SwitchNode;
 class CaseNode;
+
+/// Returns false when the same BasicBlock is owned by more than one CodeNode
+/// position in the structured tree. Re-execution belongs to LoopNode edges;
+/// duplicating a block node across branches/tails changes CFG semantics.
+bool ast_has_unique_code_node_ownership(const AstNode* root);
 
 // =============================================================================
 // LoopType enum -- matches the Python reference's LoopType

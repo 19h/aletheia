@@ -1,5 +1,8 @@
 #include "ast.hpp"
 
+#include <functional>
+#include <unordered_set>
+
 namespace aletheia {
 
 // =============================================================================
@@ -214,6 +217,44 @@ void IfNode::get_descendant_code_nodes_interrupting_ancestor_loop(
     std::vector<CodeNode*>& out) {
     if (true_branch_) true_branch_->get_descendant_code_nodes_interrupting_ancestor_loop(out);
     if (false_branch_) false_branch_->get_descendant_code_nodes_interrupting_ancestor_loop(out);
+}
+
+bool ast_has_unique_code_node_ownership(const AstNode* root) {
+    std::unordered_set<const BasicBlock*> owned_blocks;
+    std::function<bool(const AstNode*)> visit = [&](const AstNode* node) -> bool {
+        if (!node) {
+            return true;
+        }
+        if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+            return !code->block() || owned_blocks.insert(code->block()).second;
+        }
+        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+            for (const AstNode* child : seq->nodes()) {
+                if (!visit(child)) return false;
+            }
+            return true;
+        }
+        if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
+            return visit(if_node->cond())
+                && visit(if_node->true_branch())
+                && visit(if_node->false_branch());
+        }
+        if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+            return visit(loop->body());
+        }
+        if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
+            if (!visit(sw->cond())) return false;
+            for (const CaseNode* case_node : sw->cases()) {
+                if (!visit(case_node)) return false;
+            }
+            return true;
+        }
+        if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+            return visit(case_node->body());
+        }
+        return true;
+    };
+    return visit(root);
 }
 
 } // namespace aletheia

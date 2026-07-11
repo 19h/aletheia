@@ -31,17 +31,47 @@ static VarKey var_key(Variable* v) {
     return {v->name(), v->ssa_version()};
 }
 
-static void substitute_uses(Expression* expr, const std::unordered_map<VarKey, Expression*, VarKeyHash>& subs) {
+static bool is_float_arithmetic(OperationType type) {
+    return type == OperationType::add_float
+        || type == OperationType::sub_float
+        || type == OperationType::mul_float
+        || type == OperationType::div_float;
+}
+
+static Expression* copy_for_use(Expression* replacement,
+                                Variable* use,
+                                DecompilerArena& arena,
+                                bool floating_context = false) {
+    if (!replacement) {
+        return nullptr;
+    }
+    Expression* copy = replacement->copy(arena);
+    if (floating_context) {
+        copy->set_ir_type(std::make_shared<const Float>(copy->size_bytes * 8));
+    } else if (use && use->ir_type()) {
+        // A raw P-Code varnode can have a storage definition and a different
+        // per-use interpretation (notably IEEE-754 bits in FLOAT_* ops).
+        // Preserve the use-site interpretation when folding the storage copy.
+        copy->set_ir_type(use->ir_type());
+    }
+    return copy;
+}
+
+static void substitute_uses(Expression* expr,
+                            const std::unordered_map<VarKey, Expression*, VarKeyHash>& subs,
+                            DecompilerArena& arena) {
     if (!expr) return;
     if (auto* op = dyn_cast<Operation>(expr)) {
+        const bool floating_context = is_float_arithmetic(op->type());
         for (size_t i = 0; i < op->operands().size(); ++i) {
             if (auto* v = dyn_cast<Variable>(op->operands()[i])) {
                 auto it = subs.find(var_key(v));
                 if (it != subs.end()) {
-                    op->mutable_operands()[i] = it->second;
+                    op->mutable_operands()[i] = copy_for_use(
+                        it->second, v, arena, floating_context);
                 }
             } else {
-                substitute_uses(op->operands()[i], subs);
+                substitute_uses(op->operands()[i], subs, arena);
             }
         }
     } else if (auto* list = dyn_cast<ListOperation>(expr)) {
@@ -49,10 +79,10 @@ static void substitute_uses(Expression* expr, const std::unordered_map<VarKey, E
             if (auto* v = dyn_cast<Variable>(list->operands()[i])) {
                 auto it = subs.find(var_key(v));
                 if (it != subs.end()) {
-                    list->mutable_operands()[i] = it->second;
+                    list->mutable_operands()[i] = copy_for_use(it->second, v, arena);
                 }
             } else {
-                substitute_uses(list->operands()[i], subs);
+                substitute_uses(list->operands()[i], subs, arena);
             }
         }
     }
@@ -102,23 +132,31 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
         }
     }
 
-    // Resolve chains (e.g. A = B, B = C -> A = C)
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto& [target_key, value] : substitutions) {
-            if (auto* v_val = dyn_cast<Variable>(value)) {
-                if (is_unstable_version_zero(v_val)) {
-                    continue;
-                }
-                auto chain_key = var_key(v_val);
-                auto chain_it = substitutions.find(chain_key);
-                if (chain_it != substitutions.end()) {
-                    value = chain_it->second;
-                    changed = true;
-                }
+    // Resolve chains (e.g. A = B, B = C -> A = C). Cyclic identity
+    // assignments are retained at the first repeated key rather than causing
+    // an unbounded fixed-point loop.
+    std::unordered_set<VarKey, VarKeyHash> cyclic_chain_keys;
+    for (auto& [target_key, value] : substitutions) {
+        std::unordered_set<VarKey, VarKeyHash> visited{target_key};
+        while (auto* v_val = dyn_cast<Variable>(value)) {
+            if (is_unstable_version_zero(v_val)) {
+                break;
             }
+            const auto chain_key = var_key(v_val);
+            if (!visited.insert(chain_key).second) {
+                cyclic_chain_keys.insert(visited.begin(), visited.end());
+                break;
+            }
+            auto chain_it = substitutions.find(chain_key);
+            if (chain_it == substitutions.end()) {
+                break;
+            }
+            value = chain_it->second;
         }
+    }
+    for (const VarKey& key : cyclic_chain_keys) {
+        substitutions.erase(key);
+        def_instructions.erase(key);
     }
 
     // Pass 1.5: Verify that each substitution key has at least one use in
@@ -171,7 +209,15 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
             }
 
             if (auto* assign = dyn_cast<Assignment>(inst)) {
-                // Substitute in the value (RHS) only
+                // A non-variable destination (for example *(ptr + off)) has
+                // address requirements. Those uses participate in dead-mark
+                // decisions above and must be rewritten before their defining
+                // identity assignments are removed.
+                if (assign->destination() && !isa<Variable>(assign->destination())) {
+                    substitute_uses(assign->destination(), substitutions, task.arena());
+                }
+
+                // Substitute in the value (RHS).
                 Expression* value = assign->value();
                 if (auto* v = dyn_cast<Variable>(value)) {
                     if (is_unstable_version_zero(v)) {
@@ -180,25 +226,25 @@ void GraphExpressionFoldingStage::execute(DecompilerTask& task) {
                     }
                     auto it = substitutions.find(var_key(v));
                     if (it != substitutions.end()) {
-                        assign->set_value(it->second);
+                        assign->set_value(copy_for_use(it->second, v, task.arena()));
                     }
                 } else {
-                    substitute_uses(value, substitutions);
+                    substitute_uses(value, substitutions, task.arena());
                 }
             } else if (auto* branch = dyn_cast<Branch>(inst)) {
                 // Substitute in branch condition
-                substitute_uses(branch->condition(), substitutions);
+                substitute_uses(branch->condition(), substitutions, task.arena());
             } else if (auto* ret = dyn_cast<Return>(inst)) {
                 // Return values: rewrite direct variable roots and nested uses.
                 for (Expression*& val : ret->mutable_values()) {
                     if (auto* v = dyn_cast<Variable>(val)) {
                         auto it = substitutions.find(var_key(v));
                         if (it != substitutions.end()) {
-                            val = it->second;
+                            val = copy_for_use(it->second, v, task.arena());
                             continue;
                         }
                     }
-                    substitute_uses(val, substitutions);
+                    substitute_uses(val, substitutions, task.arena());
                 }
             }
             

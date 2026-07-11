@@ -106,7 +106,14 @@ std::string compatibility_group_of(const VarKey& key, const VarInfo& info) {
             // so out-of-SSA can preserve a single argument owner.
             return "aarch64_x0:param";
         }
-        return "aarch64_x0:nonparam:" + key.name;
+        // x0 is also the AArch64 return-value register. Distinct calls can
+        // reuse it for incompatible values (for example, int and int *).
+        // Coalescing those non-parameter SSA values solely by register name
+        // creates pointer/integer source-level aliases and lossy casts.
+        const std::string value_shape = info.type
+            ? "type:" + info.type->to_string()
+            : "size:" + std::to_string(info.size_bytes);
+        return "aarch64_x0:nonparam:" + key.name + ":" + value_shape;
     }
     if (info.aliased) {
         return "alias:" + key.name + "#" + std::to_string(key.version);

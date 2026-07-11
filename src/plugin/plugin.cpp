@@ -1,8 +1,8 @@
 #include <ida/idax.hpp>
 #include <aletheia.hpp>
 #include "../aletheia/pipeline/pipeline.hpp"
+#include "../aletheia/frontend/frontend.hpp"
 #include "../aletheia/codegen/codegen.hpp"
-#include "../aletheia/lifter.hpp"
 #include "../aletheia/ssa/ssa_constructor.hpp"
 #include "../aletheia/ssa/ssa_destructor.hpp"
 #include "../aletheia/pipeline/preprocessing_stages.hpp"
@@ -47,11 +47,31 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         auto screen_ea_res = ida::ui::screen_address();
         if (!screen_ea_res) return std::unexpected(screen_ea_res.error());
 
-        ida::Address ea = *screen_ea_res;
+        auto function_res = ida::function::at(*screen_ea_res);
+        if (!function_res) {
+            ida::ui::warning("Cursor is not inside a function.");
+            return std::unexpected(function_res.error());
+        }
+        const ida::Address ea = function_res->start();
 
         ida::ui::message("Aletheia: Decompiling function at " + std::to_string(ea) + "...\n");
 
         aletheia::DecompilerTask task(ea);
+        aletheia::FrontendKind frontend = aletheia::FrontendKind::Native;
+        if (const char* frontend_env = std::getenv("ALETHEIA_FRONTEND");
+            frontend_env != nullptr && *frontend_env != '\0') {
+            if (!aletheia::parse_frontend_kind(frontend_env, frontend)) {
+                ida::ui::warning(std::string("Unknown ALETHEIA_FRONTEND='")
+                    + frontend_env + "' (expected native or pcode).");
+                return std::unexpected(ida::Error::validation(
+                    "Unknown Aletheia frontend", frontend_env));
+            }
+        }
+        task.set_frontend_kind(frontend);
+        std::string frontend_message = "Aletheia: frontend=";
+        frontend_message.append(aletheia::frontend_kind_name(frontend));
+        frontend_message.push_back('\n');
+        ida::ui::message(frontend_message);
 
         if (const char* mode_env = std::getenv("ALETHEIA_OUT_OF_SSA_MODE"); mode_env != nullptr) {
             auto parsed = aletheia::SsaDestructor::parse_mode(mode_env);
@@ -64,12 +84,16 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         }
 
         idiomata::IdiomMatcher matcher;
-        aletheia::Lifter lifter(task.arena(), matcher);
+        auto frontend_res = aletheia::create_frontend(task.frontend_kind(), task.arena(), matcher);
+        if (!frontend_res) {
+            ida::ui::warning("Failed to create requested frontend.");
+            return std::unexpected(frontend_res.error());
+        }
         std::vector<idiomata::IdiomTag> idiom_tags;
 
-        lifter.populate_task_signature(task);
+        (*frontend_res)->populate_task_signature(task);
 
-        auto cfg_res = lifter.lift_function(ea, &idiom_tags);
+        auto cfg_res = (*frontend_res)->lift_function(task, &idiom_tags);
         if (!cfg_res) {
             ida::ui::warning("Failed to lift function.");
             return std::unexpected(cfg_res.error());
@@ -118,6 +142,21 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         pipeline.add_stage(std::make_unique<aletheia::AstExpressionSimplificationStage>());
         
         pipeline.run(task);
+
+        if (task.ast() && task.ast()->root()
+            && !aletheia::ast_has_unique_code_node_ownership(task.ast()->root())) {
+            auto fallback = std::make_unique<aletheia::AbstractSyntaxForest>();
+            auto* sequence = task.arena().create<aletheia::SeqNode>();
+            if (task.cfg()) {
+                for (aletheia::BasicBlock* block : task.cfg()->blocks()) {
+                    if (block) {
+                        sequence->add_node(task.arena().create<aletheia::CodeNode>(block));
+                    }
+                }
+            }
+            fallback->set_root(sequence);
+            task.set_ast(std::move(fallback));
+        }
 
         aletheia::InstructionLengthHandler::apply(task.ast(), task.arena());
 

@@ -3,6 +3,7 @@
 #include <ida/graph.hpp>
 #include <ida/instruction.hpp>
 #include <ida/function.hpp>
+#include "frontend/shared_support.hpp"
 #include "structures/cfg.hpp"
 #include "../common/arena.hpp"
 #include "../idiomata/idioms.hpp"
@@ -13,21 +14,6 @@
 #include <unordered_map>
 
 namespace aletheia {
-
-/// Cached frame layout information for stack variable recovery during lifting.
-struct FrameLayout {
-    /// Map from frame-base-relative byte offset to FrameVariable info.
-    /// Frame base is typically the saved frame pointer (RBP/X29).
-    std::unordered_map<std::int64_t, ida::function::FrameVariable> offset_to_var;
-
-    /// Sizes of each frame area.
-    std::size_t local_size = 0;
-    std::size_t regs_size = 0;
-    std::size_t args_size = 0;
-    std::size_t total_size = 0;
-
-    bool valid = false;
-};
 
 class Lifter {
 public:
@@ -44,7 +30,7 @@ private:
     idiomata::IdiomMatcher& idiom_matcher_;
 
     /// Per-function frame layout, populated at the start of lift_function().
-    FrameLayout frame_layout_;
+    frontend::FrameLayout frame_layout_;
 
     /// Current function address (for SP delta queries).
     ida::Address current_function_ea_ = ida::BadAddress;

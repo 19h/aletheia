@@ -487,6 +487,25 @@ std::string hex_u64(std::uint64_t value) {
     return out;
 }
 
+std::string format_float_bit_pattern(const Constant* constant, std::size_t width_bytes) {
+    if (!constant) {
+        return {};
+    }
+    if (width_bytes == 2) {
+        return "((union { uint16_t u; _Float16 f; }){ .u = 0x"
+            + hex_u64(constant->value() & 0xffffULL) + "U }).f";
+    }
+    if (width_bytes == 4) {
+        return "((union { uint32_t u; float f; }){ .u = 0x"
+            + hex_u64(constant->value() & 0xffffffffULL) + "U }).f";
+    }
+    if (width_bytes == 8) {
+        return "((union { uint64_t u; double f; }){ .u = 0x"
+            + hex_u64(constant->value()) + "ULL }).f";
+    }
+    return {};
+}
+
 bool is_printable_ascii(std::uint8_t byte) {
     return byte >= 32 && byte <= 126;
 }
@@ -803,6 +822,7 @@ std::string lowercase_copy(const std::string& text) {
 struct ParameterDisplayInfo {
     std::unordered_map<std::string, std::string> expr_name_map;
     std::unordered_map<int, std::string> index_to_name;
+    std::unordered_map<std::string, TypePtr> declared_type_by_name;
 };
 
 ParameterDisplayInfo build_parameter_display_info(const DecompilerTask& task) {
@@ -850,6 +870,18 @@ ParameterDisplayInfo build_parameter_display_info(const DecompilerTask& task) {
 
     for (const auto& [idx, name] : info.index_to_name) {
         info.expr_name_map["arg_" + std::to_string(idx)] = name;
+    }
+
+    if (task.function_type()) {
+        if (auto* function = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
+            for (std::size_t index = 0; index < function->parameters().size(); ++index) {
+                auto name_it = info.index_to_name.find(static_cast<int>(index));
+                const std::string display_name = name_it != info.index_to_name.end()
+                    && !name_it->second.empty()
+                    ? name_it->second : "a" + std::to_string(index + 1);
+                info.declared_type_by_name[display_name] = function->parameters()[index];
+            }
+        }
     }
 
     return info;
@@ -984,26 +1016,63 @@ std::string format_unknown_operation(Operation* o, CExpressionGenerator& gen, st
     return rendered;
 }
 
+std::string portable_explicit_cast(
+    std::string expression,
+    const TypePtr& destination_type) {
+    if (!destination_type || destination_type->to_string() == "unknown type") {
+        return expression;
+    }
+    if (destination_type->type_kind() == TypeKind::Array
+        || destination_type->type_kind() == TypeKind::Struct
+        || destination_type->type_kind() == TypeKind::Union) {
+        return expression;
+    }
+    const std::string destination_name = destination_type->to_string();
+    const bool destination_pointer = destination_type->type_kind() == TypeKind::Pointer;
+    if (destination_pointer) {
+        return "(" + destination_name + ")(uintptr_t)(" + expression + ")";
+    }
+    return "(" + destination_name + ")(" + expression + ")";
+}
+
 } // namespace
 
 std::string CExpressionGenerator::generate(DataflowObject* obj) {
     if (!obj) {
-        return "";
+        if (options_.portable_c) unresolved_semantics_ = true;
+        return options_.portable_c ? "__aletheia_undefined_u64()" : "";
     }
 
     if (!active_nodes_.insert(obj).second) {
+        if (options_.portable_c) unresolved_semantics_ = true;
         return "__aletheia_expr_cycle";
     }
 
     result_.clear();
     obj->accept(*this);
-    const std::string rendered = result_;
+    std::string rendered = result_;
+    if (options_.portable_c && rendered.empty()) {
+        unresolved_semantics_ = true;
+        rendered = "__aletheia_undefined_u64()";
+    }
     active_nodes_.erase(obj);
     return rendered;
 }
 
 void CExpressionGenerator::visit(Constant* c) {
     std::string formatted;
+
+    if (c->ir_type() && type_dyn_cast<Float>(c->ir_type().get()) != nullptr) {
+        if (std::string exact_bits = format_float_bit_pattern(c, c->size_bytes);
+            !exact_bits.empty()) {
+            result_ = std::move(exact_bits);
+            return;
+        }
+        result_ = "__aletheia_float_bits_" + std::to_string(c->size_bytes * 8)
+            + "(0x" + hex_u64(c->value()) + ")";
+        if (options_.portable_c) unresolved_semantics_ = true;
+        return;
+    }
 
     if (try_format_string_array(c, formatted)) {
         result_ = formatted;
@@ -1044,6 +1113,10 @@ void CExpressionGenerator::visit(Constant* c) {
 
 void CExpressionGenerator::visit(Variable* v) {
     std::string base_name = v->name();
+    if (options_.portable_c && base_name.empty()) {
+        result_ = "__aletheia_undefined_u64()";
+        return;
+    }
 
     // Check if this variable is a parameter register with a display name.
     if (v->is_parameter() || !param_display_names_.empty()) {
@@ -1073,12 +1146,19 @@ void CExpressionGenerator::visit(Variable* v) {
 
 void CExpressionGenerator::visit(GlobalVariable* v) {
     // Global names are rendered without SSA suffixes for stable declarations.
-    result_ = v->name();
+    result_ = options_.portable_c && v->name().empty()
+        ? "__aletheia_undefined_u64()" : v->name();
 }
 
 void CExpressionGenerator::visit(Operation* o) {
     auto type = o->type();
     auto& ops = o->operands();
+
+    if (options_.portable_c && type == OperationType::power && ops.size() == 2) {
+        result_ = "__aletheia_pow_u64((uint64_t)(" + generate(ops[0])
+            + "), (uint64_t)(" + generate(ops[1]) + "))";
+        return;
+    }
 
     // --- Binary infix operators ---
     if (ops.size() == 2) {
@@ -1129,8 +1209,20 @@ void CExpressionGenerator::visit(Operation* o) {
         }
         if (infix) {
             const int parent_prec = precedence_for_operation(type);
+            const bool floating_arithmetic = type == OperationType::add_float
+                || type == OperationType::sub_float
+                || type == OperationType::mul_float
+                || type == OperationType::div_float;
             auto render_operand = [&](Expression* operand, bool is_rhs) {
-                std::string rendered = generate(operand);
+                std::string rendered;
+                if (floating_arithmetic) {
+                    if (auto* constant = dyn_cast<Constant>(operand)) {
+                        rendered = format_float_bit_pattern(constant, operand->size_bytes);
+                    }
+                }
+                if (rendered.empty()) {
+                    rendered = generate(operand);
+                }
                 const int child_prec = precedence_for_expression(operand);
                 const bool needs_brackets =
                     (child_prec < parent_prec) ||
@@ -1161,6 +1253,15 @@ void CExpressionGenerator::visit(Operation* o) {
             case OperationType::deref:
                 if (auto* g = dyn_cast<GlobalVariable>(ops[0])) {
                     result_ = generate(g);
+                } else if (options_.portable_c) {
+                    std::string value_type = "uint8_t";
+                    if (o->ir_type() && o->ir_type()->to_string() != "unknown type") {
+                        value_type = o->ir_type()->to_string();
+                    } else if (o->size_bytes > 0) {
+                        value_type = "uint" + std::to_string(o->size_bytes * 8) + "_t";
+                    }
+                    result_ = "(*((" + value_type + " *)(uintptr_t)("
+                        + generate(ops[0]) + ")))";
                 } else if (o->array_access().has_value() && o->array_access()->base && o->array_access()->index) {
                     result_ = generate(o->array_access()->base) + "[" + generate(o->array_access()->index) + "]";
                 } else if (auto* add = dyn_cast<Operation>(ops[0])) {
@@ -1266,6 +1367,7 @@ void CExpressionGenerator::visit(Operation* o) {
             default: break;
         }
         if (rot_name) {
+            if (options_.portable_c) unresolved_semantics_ = true;
             result_ = std::string(rot_name) + "(" + generate(ops[0]) + ", " + generate(ops[1]) + ")";
             return;
         }
@@ -1300,26 +1402,65 @@ void CExpressionGenerator::visit(Operation* o) {
 
     // --- Unknown operation ---
     if (type == OperationType::unknown) {
+        if (options_.portable_c) unresolved_semantics_ = true;
         result_ = format_unknown_operation(o, *this, "__aletheia_unknown_op");
         return;
     }
 
     // --- Fallback ---
+    if (options_.portable_c) unresolved_semantics_ = true;
     result_ = format_unknown_operation(o, *this, "__aletheia_unhandled_op");
+}
+
+void CExpressionGenerator::visit(ListOperation* o) {
+    // ListOperation carries ordered operands for structural IR constructs
+    // (notably phi functions and tuple-like call data).  It has no standalone
+    // scalar C semantics, so expose the invariant violation instead of
+    // silently rendering an empty operand.
+    if (options_.portable_c) unresolved_semantics_ = true;
+    std::string rendered = "__aletheia_unresolved_list(";
+    for (std::size_t i = 0; i < o->operands().size(); ++i) {
+        if (i > 0) rendered += ", ";
+        rendered += generate(o->operands()[i]);
+    }
+    rendered += ")";
+    result_ = std::move(rendered);
 }
 
 void CExpressionGenerator::visit(Call* c) {
     std::string func = generate(c->target());
+    if (options_.portable_c && func.starts_with("__pcode_userop_")) {
+        unresolved_semantics_ = true;
+    }
     std::string args;
+    const FunctionTypeDef* function_type = c->ir_type()
+        ? type_dyn_cast<FunctionTypeDef>(c->ir_type().get()) : nullptr;
     for (size_t i = 0; i < c->arg_count(); ++i) {
         if (i > 0) args += ", ";
         std::string arg = generate(c->arg(i));
         if (arg.empty()) {
             arg = "a" + std::to_string(i + 1);
         }
+        if (options_.portable_c && function_type
+            && i < function_type->parameters().size()) {
+            arg = portable_explicit_cast(
+                std::move(arg),
+                function_type->parameters()[i]);
+        }
         args += arg;
     }
-    result_ = func + "(" + args + ")";
+    if (options_.portable_c
+        && !func.starts_with("__pcode_")
+        && !func.starts_with("__aletheia_")) {
+        std::string return_type = "uintptr_t";
+        if (function_type && function_type->return_type()
+            && function_type->return_type()->to_string() != "unknown type") {
+            return_type = function_type->return_type()->to_string();
+        }
+        result_ = "((" + return_type + " (*)())(uintptr_t)(" + func + "))(" + args + ")";
+    } else {
+        result_ = func + "(" + args + ")";
+    }
 }
 
 void CExpressionGenerator::visit(Condition* c) {
@@ -1360,6 +1501,10 @@ void CExpressionGenerator::visit(Condition* c) {
 }
 
 void CExpressionGenerator::visit_assignment(Assignment* i) {
+    if (i->destination() == nullptr) {
+        result_ = generate(i->value());
+        return;
+    }
     if (auto* rhs_op = dyn_cast<Operation>(i->value());
         rhs_op != nullptr && rhs_op->operands().size() == 2) {
         const OperationType op_type = rhs_op->type();
@@ -1401,6 +1546,20 @@ void CExpressionGenerator::visit_assignment(Assignment* i) {
         // Void call assignment: just print the RHS
         result_ = rhs;
     } else {
+        if (options_.portable_c) {
+            TypePtr destination_type;
+            const auto parameter_type = param_declared_types_.find(lhs);
+            if (parameter_type != param_declared_types_.end()) {
+                destination_type = parameter_type->second;
+            } else {
+                const auto local_type = local_declared_types_.find(lhs);
+                if (local_type != local_declared_types_.end()) {
+                    destination_type = local_type->second;
+                }
+            }
+            rhs = portable_explicit_cast(
+                std::move(rhs), destination_type);
+        }
         result_ = lhs + " = " + rhs;
     }
 }
@@ -1414,6 +1573,7 @@ void CExpressionGenerator::visit_return(Return* i) {
 }
 
 void CExpressionGenerator::visit_phi(Phi* i) {
+    if (options_.portable_c) unresolved_semantics_ = true;
     std::string dest = generate(i->dest_var());
     result_ = dest + " = phi(";
     if (i->operand_list()) {
@@ -1446,6 +1606,8 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     current_line_.clear();
     indent_level_ = 0;
     cfg_fallback_mode_ = false;
+    emitted_blocks_.clear();
+    expr_gen_.reset_diagnostics();
 
     // Set up parameter display name mapping for the expression generator.
     // Include both raw register names AND post-rename "arg_N" names so that
@@ -1453,6 +1615,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     // prototype parameter name (e.g., "arg_0" → "cmd").
     const ParameterDisplayInfo param_display = build_parameter_display_info(task);
     expr_gen_.set_parameter_names(param_display.expr_name_map);
+    expr_gen_.set_parameter_types(param_display.declared_type_by_name);
 
     auto global_decls = GlobalDeclarationGenerator::generate(task);
     for (const auto& decl : global_decls) {
@@ -1482,6 +1645,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
 
     std::string sig = return_type + " ";
     sig += name + "(";
+    std::unordered_set<std::string> emitted_parameter_names;
 
     bool params_emitted = false;
     if (task.function_type()) {
@@ -1494,6 +1658,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
                     ? it->second
                     : "a" + std::to_string(i + 1);
                 sig += params[i]->to_string() + " " + pname;
+                emitted_parameter_names.insert(pname);
             }
             params_emitted = true;
         }
@@ -1528,6 +1693,7 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
                     : "a" + std::to_string(i + 1);
                 // Use a generic type for untyped parameters.
                 sig += "unsigned long " + pname;
+                emitted_parameter_names.insert(pname);
             }
             params_emitted = true;
         }
@@ -1537,7 +1703,8 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     lines_.push_back(sig);
     indent_level_++;
 
-    auto decls = LocalDeclarationGenerator::generate(task, expr_gen_);
+    auto decls = LocalDeclarationGenerator::generate(
+        task, expr_gen_, options_.portable_c, &emitted_parameter_names);
     for (const auto& decl : decls) {
         indent();
         lines_.push_back(current_line_ + decl);
@@ -1551,6 +1718,16 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     if (task.ast() && task.ast()->root()) {
         cfg_fallback_mode_ = is_cfg_fallback_root(task.ast()->root());
         visit_node(task.ast()->root());
+        if (cfg_fallback_mode_ && task.cfg()) {
+            // A fallback AST may omit a reachable target after partial
+            // structuring. Emit every remaining CFG block so every generated
+            // goto has a definition and no machine block silently disappears.
+            for (BasicBlock* block : task.cfg()->blocks()) {
+                if (block && !emitted_blocks_.contains(block)) {
+                    visit_node(task.arena().create<CodeNode>(block));
+                }
+            }
+        }
     }
 
     if (!current_line_.empty()) {
@@ -1569,6 +1746,8 @@ std::vector<std::string> CodeVisitor::generate_code(AbstractSyntaxForest* forest
     current_line_.clear();
     indent_level_ = 0;
     cfg_fallback_mode_ = false;
+    emitted_blocks_.clear();
+    expr_gen_.reset_diagnostics();
 
     if (forest && forest->root()) {
         cfg_fallback_mode_ = is_cfg_fallback_root(forest->root());
@@ -1588,6 +1767,7 @@ void CodeVisitor::visit_node(AstNode* node) {
     if (CodeNode* cnode = ast_dyn_cast<CodeNode>(node)) {
         BasicBlock* block = cnode->block();
         if (block) {
+            emitted_blocks_.insert(block);
             if (cfg_fallback_mode_) {
                 const int label_indent = indent_level_ > 0 ? indent_level_ - 1 : 0;
                 lines_.push_back(std::string(label_indent * 4, ' ') + block_label(block) + ":");

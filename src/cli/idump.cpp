@@ -1,9 +1,12 @@
 #include <ida/database.hpp>
 #include <ida/function.hpp>
+#include <ida/segment.hpp>
 
 #include "../aletheia/pipeline/pipeline.hpp"
+#include "../aletheia/frontend/frontend.hpp"
 #include "../aletheia/codegen/codegen.hpp"
 #include "../aletheia/codegen/local_declarations.hpp"
+#include "../aletheia/codegen/portable_c.hpp"
 #include "../aletheia/lifter.hpp"
 #include "../aletheia/ssa/ssa_constructor.hpp"
 #include "../aletheia/ssa/ssa_destructor.hpp"
@@ -41,6 +44,8 @@ namespace {
 struct CliOptions {
     std::string input_binary;
     std::string output_path;
+    aletheia::FrontendKind frontend = aletheia::FrontendKind::Native;
+    bool portable_c = false;
     bool explicit_headless = false;
     bool trace_pass_pseudocode = false;
     // Debug flags
@@ -271,11 +276,114 @@ struct DecompileDebugOutput {
     std::vector<aletheia::debug::StageMetrics> stage_metrics;
     std::string summary;
     std::string provenance_trace;
+    aletheia::FrontendSupportReport frontend_support;
 };
 
 struct RunScopedDebugState {
     std::unordered_set<std::string> emitted_unknown_selector_once;
 };
+
+struct EmittedFunction {
+    ida::Address address = 0;
+    bool ok = false;
+    std::string error_message;
+    std::vector<std::string> lines;
+    bool declaration_only = false;
+};
+
+bool is_external_linkage_thunk(const ida::function::Function& function) {
+    if (!function.is_thunk()) {
+        return false;
+    }
+
+    auto segment_result = ida::segment::at(function.start());
+    if (!segment_result) {
+        return false;
+    }
+
+    const ida::segment::Segment& segment = *segment_result;
+    if (segment.type() == ida::segment::Type::External
+        || segment.type() == ida::segment::Type::Import) {
+        return true;
+    }
+
+    // Executable import-stub section names used by Mach-O and ELF linkers.
+    // FUNC_THUNK is also required above, so an ordinary function located in a
+    // similarly named user section is not reclassified by the name alone.
+    static const std::unordered_set<std::string> external_stub_sections = {
+        "__stubs",
+        "__auth_stubs",
+        "__symbol_stub",
+        "__symbol_stub1",
+        ".plt",
+        ".plt.sec",
+        ".plt.got",
+        ".iplt",
+    };
+    return external_stub_sections.contains(segment.name());
+}
+
+std::optional<std::string> extract_function_prototype(const std::vector<std::string>& lines) {
+    for (const std::string& line : lines) {
+        if (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) {
+            continue;
+        }
+        if (line.find('(') == std::string::npos || !line.ends_with('{')) {
+            continue;
+        }
+        std::string prototype = line.substr(0, line.size() - 1);
+        while (!prototype.empty() && std::isspace(static_cast<unsigned char>(prototype.back()))) {
+            prototype.pop_back();
+        }
+        // IDA may provide a bounded but incomplete prototype (notably for
+        // variadic functions). An empty GNU C11 parameter list preserves the
+        // recovered return type and symbol while deferring argument checking
+        // to definitions that are already authoritative in this unit.
+        const std::size_t open_paren = prototype.find('(');
+        prototype.erase(open_paren);
+        prototype += "();";
+        return prototype;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> portable_c_unresolved_marker(
+    const std::vector<std::string>& lines) {
+    static constexpr std::string_view markers[] = {
+        "__aletheia_undefined_u64(",
+        "__aletheia_expr_cycle",
+        "__aletheia_unknown_op(",
+        "__aletheia_unhandled_op(",
+        "__aletheia_unresolved_list(",
+        "__pcode_userop_",
+        " = phi(",
+        "/* indirect branch ",
+    };
+    for (const std::string& line : lines) {
+        for (std::string_view marker : markers) {
+            if (line.find(marker) != std::string::npos) {
+                return std::string(marker);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+void emit_portable_c_preamble(
+    std::ostream& out,
+    const std::vector<EmittedFunction>& functions) {
+    out << aletheia::portable_c_runtime_preamble();
+
+    for (const EmittedFunction& function : functions) {
+        if (!function.ok) {
+            continue;
+        }
+        if (auto prototype = extract_function_prototype(function.lines)) {
+            out << *prototype << '\n';
+        }
+    }
+    out << '\n';
+}
 
 std::string dedupe_selector_diagnostic_per_run(
     std::string summary,
@@ -360,7 +468,7 @@ private:
 };
 
 void print_usage() {
-    std::cerr << "Usage: idump <binary> [-o <output.c>] [--headless] [--trace-pass-pseudocode]\n"
+    std::cerr << "Usage: idump <binary> [-o <output.c>] [--frontend=native|pcode] [--emit=pseudocode|portable-c] [--headless] [--trace-pass-pseudocode]\n"
               << "  Debug options:\n"
               << "    --stage-metrics           Print per-stage timing and IR size table\n"
               << "    --stage-metrics=json      Print per-stage timing/size as JSON\n"
@@ -386,6 +494,22 @@ bool parse_args(int argc, char** argv, CliOptions& options) {
         }
         if (arg == "--trace-pass-pseudocode") {
             options.trace_pass_pseudocode = true;
+            continue;
+        }
+        if (arg.starts_with("--frontend=")) {
+            aletheia::FrontendKind parsed = aletheia::FrontendKind::Native;
+            if (!aletheia::parse_frontend_kind(arg.substr(11), parsed)) {
+                return false;
+            }
+            options.frontend = parsed;
+            continue;
+        }
+        if (arg == "--emit=portable-c") {
+            options.portable_c = true;
+            continue;
+        }
+        if (arg == "--emit=pseudocode") {
+            options.portable_c = false;
             continue;
         }
         if (arg == "-o") {
@@ -611,12 +735,28 @@ std::string lowercase_copy(const std::string& text) {
 struct ParameterDisplayInfo {
     std::unordered_map<std::string, std::string> expr_name_map;
     std::unordered_map<int, std::string> index_to_name;
+    std::unordered_map<std::string, aletheia::TypePtr> declared_type_by_name;
 };
 
 ParameterDisplayInfo build_parameter_display_info(const aletheia::DecompilerTask& task) {
     ParameterDisplayInfo info;
 
+    std::optional<int> max_declared_param_index;
+    if (task.function_type()) {
+        if (auto* function = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
+            max_declared_param_index = function->parameters().empty()
+                ? -1 : static_cast<int>(function->parameters().size()) - 1;
+        }
+    }
+    auto include_param_index = [&](int index) {
+        return !max_declared_param_index.has_value()
+            || (index >= 0 && index <= *max_declared_param_index);
+    };
+
     for (const auto& [reg, param] : task.parameter_registers()) {
+        if (!include_param_index(param.index)) {
+            continue;
+        }
         auto it = info.index_to_name.find(param.index);
         if (it == info.index_to_name.end() || param.name.size() > it->second.size()) {
             info.index_to_name[param.index] = param.name;
@@ -624,6 +764,9 @@ ParameterDisplayInfo build_parameter_display_info(const aletheia::DecompilerTask
     }
 
     for (const auto& [reg, param] : task.parameter_registers()) {
+        if (!include_param_index(param.index)) {
+            continue;
+        }
         std::string chosen = param.name;
         auto best_it = info.index_to_name.find(param.index);
         if (best_it != info.index_to_name.end() && !best_it->second.empty()) {
@@ -634,6 +777,18 @@ ParameterDisplayInfo build_parameter_display_info(const aletheia::DecompilerTask
 
     for (const auto& [idx, name] : info.index_to_name) {
         info.expr_name_map["arg_" + std::to_string(idx)] = name;
+    }
+
+    if (task.function_type()) {
+        if (auto* function = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
+            for (std::size_t index = 0; index < function->parameters().size(); ++index) {
+                auto name_it = info.index_to_name.find(static_cast<int>(index));
+                const std::string display_name = name_it != info.index_to_name.end()
+                    && !name_it->second.empty()
+                    ? name_it->second : "a" + std::to_string(index + 1);
+                info.declared_type_by_name[display_name] = function->parameters()[index];
+            }
+        }
     }
 
     return info;
@@ -685,14 +840,17 @@ aletheia::Expression* find_value_return_in_cfg(aletheia::ControlFlowGraph* cfg) 
     return nullptr;
 }
 
-std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& task) {
+std::vector<std::string> generate_cfg_fallback_code(
+    aletheia::DecompilerTask& task,
+    bool portable_c = false) {
     std::vector<std::string> lines;
-    aletheia::CExpressionGenerator expr_gen;
+    aletheia::CExpressionGenerator expr_gen({.portable_c = portable_c});
 
     // Set up parameter display name mapping.
     // Include both raw register names AND post-rename "arg_N" names.
     const ParameterDisplayInfo param_display = build_parameter_display_info(task);
     expr_gen.set_parameter_names(param_display.expr_name_map);
+    expr_gen.set_parameter_types(param_display.declared_type_by_name);
 
     auto global_decls = aletheia::GlobalDeclarationGenerator::generate(task);
     for (const auto& decl : global_decls) {
@@ -723,6 +881,7 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
         ? "sub_" + std::to_string(task.function_address())
         : task.function_name();
     sig += name + "(";
+    std::unordered_set<std::string> emitted_parameter_names;
 
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
@@ -734,13 +893,15 @@ std::vector<std::string> generate_cfg_fallback_code(aletheia::DecompilerTask& ta
                     ? it->second
                     : "a" + std::to_string(i + 1);
                 sig += params[i]->to_string() + " " + pname;
+                emitted_parameter_names.insert(pname);
             }
         }
     }
     sig += ") {";
     lines.push_back(sig);
 
-    auto decls = aletheia::LocalDeclarationGenerator::generate(task, expr_gen);
+    auto decls = aletheia::LocalDeclarationGenerator::generate(
+        task, expr_gen, portable_c, &emitted_parameter_names);
     for (const auto& decl : decls) {
         lines.push_back("    " + decl);
     }
@@ -900,12 +1061,6 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
     pipeline.add_stage(std::make_unique<aletheia::SwitchVariableDetectionStage>());
     pipeline.add_stage(std::make_unique<aletheia::CoherenceStage>());
 
-    if (!enable_structuring) {
-        pipeline.add_stage(std::make_unique<aletheia::GraphExpressionFoldingStage>());
-        pipeline.add_stage(std::make_unique<aletheia::ExpressionSimplificationStage>());
-        return pipeline;
-    }
-
     pipeline.add_stage(std::make_unique<aletheia::FallthroughBlockMergeStage>());
     pipeline.add_stage(std::make_unique<aletheia::LocalConstantFoldingStage>());
     pipeline.add_stage(std::make_unique<aletheia::InsertMissingDefinitionsStage>());
@@ -937,27 +1092,35 @@ aletheia::DecompilerPipeline build_pipeline(bool enable_structuring) {
     pipeline.add_stage(std::make_unique<aletheia::SsaDestructor>());
     pipeline.add_stage(std::make_unique<aletheia::RedundantAssignmentEliminationStage>());
     pipeline.add_stage(std::make_unique<aletheia::EmptyBasicBlockRemoverStage>());
-    pipeline.add_stage(std::make_unique<aletheia::PatternIndependentRestructuringStage>());
-    pipeline.add_stage(std::make_unique<aletheia::AstExpressionSimplificationStage>());
+    if (enable_structuring) {
+        pipeline.add_stage(std::make_unique<aletheia::PatternIndependentRestructuringStage>());
+        pipeline.add_stage(std::make_unique<aletheia::AstExpressionSimplificationStage>());
+    }
     return pipeline;
 }
 
 std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     ida::Address ea,
     idiomata::IdiomMatcher& matcher,
+    aletheia::FrontendKind frontend_kind,
+    bool portable_c,
     PassPseudocodeTracer* pass_tracer,
     aletheia::debug::DebugObserver* debug_observer) {
     aletheia::DecompilerTask fallback_task(ea);
+    fallback_task.set_frontend_kind(frontend_kind);
     configure_out_of_ssa_mode(fallback_task);
 
-    aletheia::Lifter fallback_lifter(fallback_task.arena(), matcher);
+    auto frontend_res = aletheia::create_frontend(frontend_kind, fallback_task.arena(), matcher);
+    if (!frontend_res) {
+        return std::nullopt;
+    }
     std::vector<idiomata::IdiomTag> idiom_tags;
 
-    fallback_lifter.populate_task_signature(fallback_task);
+    (*frontend_res)->populate_task_signature(fallback_task);
     if (debug_observer) {
         (*debug_observer)("Lifter", true, fallback_task);
     }
-    auto cfg_res = fallback_lifter.lift_function(ea, &idiom_tags);
+    auto cfg_res = (*frontend_res)->lift_function(fallback_task, &idiom_tags);
     if (!cfg_res) {
         return std::nullopt;
     }
@@ -1010,7 +1173,9 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
         (*debug_observer)("VariableNameGeneration", false, fallback_task);
     }
 
-    return generate_cfg_fallback_code(fallback_task);
+    aletheia::CodeVisitor visitor({.portable_c = portable_c});
+    std::vector<std::string> lines = visitor.generate_code(fallback_task);
+    return lines;
 }
 
 std::vector<std::string> decompile_function(
@@ -1026,6 +1191,7 @@ std::vector<std::string> decompile_function(
     error_message.clear();
 
     aletheia::DecompilerTask task(ea);
+    task.set_frontend_kind(cli_options.frontend);
     PassPseudocodeTracer pass_tracer(ea, trace_pass_pseudocode);
     configure_out_of_ssa_mode(task);
 
@@ -1033,6 +1199,7 @@ std::vector<std::string> decompile_function(
         debug_output->stage_metrics.clear();
         debug_output->summary.clear();
         debug_output->provenance_trace.clear();
+        debug_output->frontend_support = {};
     }
 
     // Setup debug observer
@@ -1061,6 +1228,9 @@ std::vector<std::string> decompile_function(
     const bool emit_human_debug = has_debug && !debug_opts.stage_metrics_json;
 
     auto emit_debug_outputs = [&]() {
+        if (debug_output) {
+            debug_output->frontend_support = task.frontend_support_report();
+        }
         if (!has_debug || !debug_observer.has_value()) {
             return;
         }
@@ -1089,19 +1259,30 @@ std::vector<std::string> decompile_function(
         }
     };
 
-    aletheia::Lifter lifter(task.arena(), matcher);
+    auto frontend_res = aletheia::create_frontend(cli_options.frontend, task.arena(), matcher);
+    if (!frontend_res) {
+        error_message = frontend_res.error().message;
+        if (!frontend_res.error().context.empty()) {
+            error_message += ": " + frontend_res.error().context;
+        }
+        return {};
+    }
     std::vector<idiomata::IdiomTag> idiom_tags;
 
-    lifter.populate_task_signature(task);
+    (*frontend_res)->populate_task_signature(task);
 
     // Capture pre-lifter state as synthetic stage boundary (baseline for metrics/provenance)
     if (has_debug) {
         (*debug_observer)("Lifter", true, task);
     }
 
-    auto cfg_res = lifter.lift_function(ea, &idiom_tags);
+    auto cfg_res = (*frontend_res)->lift_function(task, &idiom_tags);
     if (!cfg_res) {
-        error_message = "lift failed";
+        emit_debug_outputs();
+        error_message = cfg_res.error().message;
+        if (!cfg_res.error().context.empty()) {
+            error_message += ": " + cfg_res.error().context;
+        }
         return {};
     }
 
@@ -1141,9 +1322,12 @@ std::vector<std::string> decompile_function(
         std::cerr << "\n";
     }
 
+    const bool duplicate_ast_ownership = task.ast() && task.ast()->root()
+        && !aletheia::ast_has_unique_code_node_ownership(task.ast()->root());
     bool using_cfg_fallback = !task.ast() || !task.ast()->root();
-    if (!using_cfg_fallback && enable_structuring && !ast_has_executable_content(task.ast()->root())) {
-        using_cfg_fallback = true;
+    if (!using_cfg_fallback && enable_structuring) {
+        using_cfg_fallback = !ast_has_executable_content(task.ast()->root())
+            || duplicate_ast_ownership;
     }
 
     if (using_cfg_fallback) {
@@ -1161,7 +1345,8 @@ std::vector<std::string> decompile_function(
     if (using_cfg_fallback) {
         if (enable_structuring && !force_structured_output) {
             if (auto rebuilt = regenerate_conservative_fallback(
-                    ea, matcher, &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
+                    ea, matcher, cli_options.frontend, cli_options.portable_c,
+                    &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
                 rebuilt.has_value()) {
                 emit_debug_outputs();
                 ok = true;
@@ -1189,7 +1374,7 @@ std::vector<std::string> decompile_function(
         emit_debug_outputs();
 
         ok = true;
-        return generate_cfg_fallback_code(task);
+        return generate_cfg_fallback_code(task, cli_options.portable_c);
     }
 
     if (has_debug) {
@@ -1210,7 +1395,7 @@ std::vector<std::string> decompile_function(
 
     emit_debug_outputs();
 
-    aletheia::CodeVisitor visitor;
+    aletheia::CodeVisitor visitor({.portable_c = cli_options.portable_c});
     auto structured_lines = visitor.generate_code(task);
 
     if (enable_structuring && !force_structured_output
@@ -1225,12 +1410,18 @@ std::vector<std::string> decompile_function(
             std::cerr << "FALLING BACK FOR FUNCTION " << std::hex << ea << std::dec << std::endl;
         }
         if (auto rebuilt = regenerate_conservative_fallback(
-                ea, matcher, &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
+                ea, matcher, cli_options.frontend, cli_options.portable_c,
+                &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
             rebuilt.has_value()) {
             emit_debug_outputs();
             ok = true;
             return *rebuilt;
         }
+    }
+
+    if (cli_options.portable_c && visitor.has_unresolved_semantics()) {
+        error_message = "portable-C code generation encountered unresolved semantics";
+        return {};
     }
 
     ok = true;
@@ -1248,6 +1439,14 @@ int main(int argc, char** argv) {
 
     const bool json_metrics_mode = options.stage_metrics_json;
     ScopedStdoutSilencer stdout_silencer(json_metrics_mode);
+
+    if (!aletheia::frontend_is_available(options.frontend)) {
+        if (!json_metrics_mode) {
+            std::cerr << "idump: --frontend=" << aletheia::frontend_kind_name(options.frontend)
+                      << " is unavailable: " << aletheia::frontend_unavailable_reason(options.frontend) << "\n";
+        }
+        return 1;
+    }
 
     const bool trace_pass_pseudocode = !json_metrics_mode && should_trace_pass_pseudocode(options);
 
@@ -1288,11 +1487,15 @@ int main(int argc, char** argv) {
 
     std::size_t total_functions = 0;
     std::size_t decompiled_functions = 0;
+    aletheia::FrontendSupportReport frontend_support_total;
     RunScopedDebugState run_debug_state;
     std::vector<JsonMetricsPerFunction> json_metrics_functions;
+    std::vector<EmittedFunction> emitted_functions;
 
     for (const auto& fn : ida::function::all()) {
         ++total_functions;
+        const bool declaration_only = options.portable_c
+            && is_external_linkage_thunk(fn);
         bool ok = false;
         std::string error_message;
         DecompileDebugOutput debug_output;
@@ -1306,9 +1509,25 @@ int main(int argc, char** argv) {
             &run_debug_state,
             &debug_output);
 
+        frontend_support_total.implemented_ops += debug_output.frontend_support.implemented_ops;
+        frontend_support_total.fallback_ops += debug_output.frontend_support.fallback_ops;
+        frontend_support_total.unsupported_ops += debug_output.frontend_support.unsupported_ops;
+
+        if (ok && options.portable_c && !declaration_only) {
+            if (auto marker = portable_c_unresolved_marker(lines)) {
+                ok = false;
+                error_message = "portable-C output contains unresolved semantic marker '"
+                    + *marker + "'";
+            }
+        }
+
         if (!ok) {
-            out << "/* decompilation failed at " << std::hex << fn.start() << std::dec << ": "
-                << error_message << " */\n\n";
+            if (!json_metrics_mode) {
+                std::cerr << "idump: decompilation failed at 0x" << std::hex << fn.start()
+                          << std::dec << ": " << error_message << '\n';
+            }
+            emitted_functions.push_back(EmittedFunction{
+                fn.start(), false, std::move(error_message), {}, false});
             continue;
         }
 
@@ -1321,7 +1540,23 @@ int main(int argc, char** argv) {
         }
 
         ++decompiled_functions;
-        for (const auto& line : lines) {
+        emitted_functions.push_back(EmittedFunction{
+            fn.start(), true, {}, std::move(lines), declaration_only});
+    }
+
+    if (options.portable_c) {
+        emit_portable_c_preamble(out, emitted_functions);
+    }
+    for (const EmittedFunction& function : emitted_functions) {
+        if (!function.ok) {
+            out << "/* decompilation failed at " << std::hex << function.address << std::dec
+                << ": " << function.error_message << " */\n\n";
+            continue;
+        }
+        if (function.declaration_only) {
+            continue;
+        }
+        for (const std::string& line : function.lines) {
             out << line << '\n';
         }
         out << '\n';
@@ -1352,10 +1587,15 @@ int main(int argc, char** argv) {
             total_functions,
             decompiled_functions,
             functions);
-        return 0;
+        return decompiled_functions == total_functions ? 0 : 2;
     }
 
+    if (options.frontend == aletheia::FrontendKind::Pcode) {
+        std::cerr << "idump: pcode support implemented=" << frontend_support_total.implemented_ops
+                  << " fallback=" << frontend_support_total.fallback_ops
+                  << " unsupported=" << frontend_support_total.unsupported_ops << '\n';
+    }
     std::cerr << "idump: wrote " << decompiled_functions << "/" << total_functions
               << " functions to " << output_path << "\n";
-    return 0;
+    return decompiled_functions == total_functions ? 0 : 2;
 }
