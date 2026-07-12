@@ -1,0 +1,15 @@
+#define _main decompiled_main
+#define _printf printf
+#include "@GENERATED_C@"
+#undef _printf
+#undef _main
+
+int main(int argc, char **argv, char **envp) {
+#ifdef ALETHEIA_VERIFY_JOINED_FLOAT_STACK_CALL
+    const double joined_first = _joined_float_stack_call(1);
+    const double joined_second = _joined_float_stack_call(0);
+    if (joined_first != 9.0) return 20;
+    if (joined_second != 18.0) return 21;
+#endif
+    return decompiled_main(argc, argv, envp);
+}

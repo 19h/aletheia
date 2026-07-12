@@ -13,37 +13,6 @@ namespace {
 constexpr std::string_view kX86_64SysVIntRegs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
 constexpr std::string_view kArm64IntRegs[] = {"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"};
 
-bool has_direct_recursive_call(ida::Address function_ea) {
-    auto flowchart_res = ida::graph::flowchart(function_ea);
-    if (!flowchart_res) {
-        return false;
-    }
-
-    for (const auto& ida_block : *flowchart_res) {
-        for (ida::Address addr = ida_block.start; addr < ida_block.end; ) {
-            auto insn_res = ida::instruction::decode(addr);
-            if (!insn_res) {
-                break;
-            }
-            const auto& insn = *insn_res;
-            const std::string mnemonic = to_lower_ascii(insn.mnemonic());
-            if (mnemonic == "bl" || mnemonic == "blr" || mnemonic == "blx") {
-                const auto& ops = insn.operands();
-                if (!ops.empty()) {
-                    const auto& target_op = ops[0];
-                    if ((target_op.type() == ida::instruction::OperandType::NearAddress
-                         || target_op.type() == ida::instruction::OperandType::FarAddress)
-                        && target_op.target_address() == function_ea) {
-                        return true;
-                    }
-                }
-            }
-            addr += insn.size();
-        }
-    }
-    return false;
-}
-
 } // namespace
 
 std::string strip_ida_address_prefix(const std::string& name) {
@@ -197,7 +166,6 @@ std::optional<std::size_t> known_call_min_arity(const std::string& canon_name) {
     if (canon_name == "putchar") return 1;
     if (canon_name == "printf") return 1;
     if (canon_name == "fprintf") return 2;
-    if (canon_name == "fib_naive" || canon_name == "fib_memo") return 1;
     return std::nullopt;
 }
 
@@ -211,9 +179,6 @@ std::optional<bool> known_call_arg_prefers_w(const std::string& canon_name, std:
 TypePtr known_call_return_type(const std::string& canon_name) {
     if (canon_name == "error") {
         return std::make_shared<Pointer>(Integer::int32_t());
-    }
-    if (canon_name == "get_time_seconds") {
-        return Float::float64();
     }
     return nullptr;
 }
@@ -231,12 +196,14 @@ SignatureState populate_task_signature(DecompilerTask& task) {
 
     const std::string arch = detect_arch();
     std::size_t param_count = 0;
+    bool function_prototype_known = false;
 
     if (auto type_res = ida::type::retrieve(ea)) {
         auto& type_info = *type_res;
         TypeParser parser;
 
         if (type_info.is_function()) {
+            function_prototype_known = true;
             auto ret_res = type_info.function_return_type();
             auto args_res = type_info.function_argument_types();
 
@@ -258,7 +225,17 @@ SignatureState populate_task_signature(DecompilerTask& task) {
                 }
             }
 
-            task.set_function_type(std::make_shared<const FunctionTypeDef>(ret_type, params));
+            bool variadic = false;
+            if (auto retrieved_variadic = type_info.is_variadic_function()) {
+                variadic = *retrieved_variadic;
+            }
+            const std::string canonical_name = canonical_function_name(name);
+            if (canonical_name == "printf" || canonical_name == "fprintf") {
+                variadic = true;
+            }
+
+            task.set_function_type(std::make_shared<const FunctionTypeDef>(
+                ret_type, params, variadic));
             param_count = params.size();
             state.current_function_param_count_hint = param_count;
             state.current_function_prefers_w_args = first_parameter_prefers_w_reg(task.function_type());
@@ -318,10 +295,11 @@ SignatureState populate_task_signature(DecompilerTask& task) {
         }
     }
 
-    if (state.param_register_map.empty()) {
+    if (state.param_register_map.empty() && !function_prototype_known) {
         auto [reg_table, reg_count] = param_register_table_for_arch(arch);
         if (reg_table && reg_count > 0) {
-            const std::size_t fallback_count = std::min<std::size_t>(reg_count, 6);
+            const std::size_t fallback_count = arch == "arm64"
+                ? reg_count : std::min<std::size_t>(reg_count, 6);
             for (std::size_t i = 0; i < fallback_count; ++i) {
                 std::string reg_name(reg_table[i]);
                 const int idx = static_cast<int>(i);
@@ -345,35 +323,9 @@ SignatureState populate_task_signature(DecompilerTask& task) {
         }
     }
 
-    const std::string canon_name = canonical_function_name(name);
-    if (!task.function_type()) {
-        if (arch == "arm64") {
-            if ((canon_name == "fib_naive" || canon_name == "fib_memo") && has_direct_recursive_call(ea)) {
-                std::vector<TypePtr> params{Integer::int32_t()};
-                task.set_function_type(std::make_shared<const FunctionTypeDef>(Integer::int64_t(), params));
-                state.current_function_param_count_hint = 1;
-                state.current_function_prefers_w_args = true;
-                state.current_function_prefers_w_return = false;
-                state.param_register_map["x0"] = 0;
-                state.param_register_map["w0"] = 0;
-                task.set_parameter_register("x0", DecompilerTask::ParameterInfo{"a1", 0, Integer::int32_t()});
-                task.set_parameter_register("w0", DecompilerTask::ParameterInfo{"a1", 0, Integer::int32_t()});
-            } else if (canon_name == "get_time_seconds") {
-                task.set_function_type(std::make_shared<const FunctionTypeDef>(Float::float64(), std::vector<TypePtr>{}));
-            } else if (canon_name == "reset_memo_cache") {
-                task.set_function_type(std::make_shared<const FunctionTypeDef>(CustomType::void_type(), std::vector<TypePtr>{}));
-            }
-        }
-    } else {
+    if (task.function_type()) {
         state.current_function_prefers_w_args = first_parameter_prefers_w_reg(task.function_type());
         state.current_function_prefers_w_return = return_prefers_w_reg(task.function_type());
-        if (canon_name == "reset_memo_cache") {
-            task.set_function_type(std::make_shared<const FunctionTypeDef>(CustomType::void_type(), std::vector<TypePtr>{}));
-            state.current_function_prefers_w_return = false;
-        } else if (canon_name == "get_time_seconds") {
-            task.set_function_type(std::make_shared<const FunctionTypeDef>(Float::float64(), std::vector<TypePtr>{}));
-            state.current_function_prefers_w_return = false;
-        }
     }
 
     return state;

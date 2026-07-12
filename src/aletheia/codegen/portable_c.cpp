@@ -15,10 +15,10 @@ typedef int clockid_t;
 typedef struct __aletheia_timespec timespec;
 typedef struct __aletheia_FILE FILE;
 
-static inline uint64_t __aletheia_undefined_u64(void) {
+static inline __attribute__((unused)) uint64_t __aletheia_undefined_u64(void) {
     __builtin_trap();
 }
-static inline uint64_t __aletheia_pow_u64(uint64_t base, uint64_t exponent) {
+static inline __attribute__((unused)) uint64_t __aletheia_pow_u64(uint64_t base, uint64_t exponent) {
     uint64_t result = UINT64_C(1);
     while (exponent != 0) {
         if ((exponent & UINT64_C(1)) != 0) result *= base;
@@ -27,12 +27,12 @@ static inline uint64_t __aletheia_pow_u64(uint64_t base, uint64_t exponent) {
     }
     return result;
 }
-static inline uint64_t __pcode_popcount(uint64_t value, size_t bits) {
+static inline __attribute__((unused)) uint64_t __pcode_popcount(uint64_t value, size_t bits) {
     if (bits == 0 || bits > 64) __builtin_trap();
     if (bits < 64) value &= (UINT64_C(1) << bits) - UINT64_C(1);
     return (uint64_t)__builtin_popcountll(value);
 }
-static inline uint64_t __pcode_lzcount(uint64_t value, size_t bits) {
+static inline __attribute__((unused)) uint64_t __pcode_lzcount(uint64_t value, size_t bits) {
     if (bits == 0 || bits > 64) __builtin_trap();
     if (bits < 64) value &= (UINT64_C(1) << bits) - UINT64_C(1);
     if (value == 0) return (uint64_t)bits;

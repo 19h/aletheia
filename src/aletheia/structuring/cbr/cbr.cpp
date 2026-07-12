@@ -14,61 +14,6 @@ namespace {
 
 using namespace aletheia;
 
-bool ast_contains(AstNode* parent, AstNode* target) {
-    if (parent == target) return true;
-    if (!parent) return false;
-    if (auto* seq = ast_dyn_cast<SeqNode>(parent)) {
-        for (auto* c : seq->nodes()) if (ast_contains(c, target)) return true;
-    } else if (auto* ifn = ast_dyn_cast<IfNode>(parent)) {
-        if (ast_contains(ifn->true_branch(), target)) return true;
-        if (ast_contains(ifn->false_branch(), target)) return true;
-    } else if (auto* loop = ast_dyn_cast<LoopNode>(parent)) {
-        if (ast_contains(loop->body(), target)) return true;
-    } else if (auto* sw = ast_dyn_cast<SwitchNode>(parent)) {
-        for (auto* c : sw->cases()) if (ast_contains(c, target)) return true;
-    } else if (auto* c = ast_dyn_cast<CaseNode>(parent)) {
-        if (ast_contains(c->body(), target)) return true;
-    }
-    return false;
-}
-
-bool ast_contains_original_block(AstNode* node, BasicBlock* target) {
-    if (!node || !target) {
-        return false;
-    }
-
-    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
-        return code->block() == target;
-    }
-    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-        for (AstNode* child : seq->nodes()) {
-            if (ast_contains_original_block(child, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
-        return ast_contains_original_block(ifn->true_branch(), target)
-            || ast_contains_original_block(ifn->false_branch(), target);
-    }
-    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        return ast_contains_original_block(loop->body(), target);
-    }
-    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-        for (CaseNode* case_node : sw->cases()) {
-            if (ast_contains_original_block(case_node, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-        return ast_contains_original_block(case_node->body(), target);
-    }
-    return false;
-}
-
 bool ast_node_matches_transition_block(AstNode* node, TransitionBlock* tb) {
     if (!node || !tb) {
         return false;
@@ -79,7 +24,7 @@ bool ast_node_matches_transition_block(AstNode* node, TransitionBlock* tb) {
         return false;
     }
 
-    if (tb_node == node || ast_contains(tb_node, node) || ast_contains(node, tb_node)) {
+    if (tb_node == node || ast_contains_node(tb_node, node) || ast_contains_node(node, tb_node)) {
         return true;
     }
 
@@ -111,7 +56,7 @@ int ast_node_transition_match_score(AstNode* node, TransitionBlock* tb) {
         score = std::max(score, 100);
     }
 
-    if (ast_contains(tb_node, node) || ast_contains(node, tb_node)) {
+    if (ast_contains_node(tb_node, node) || ast_contains_node(node, tb_node)) {
         score = std::max(score, 80);
     }
 
@@ -132,83 +77,13 @@ std::uint64_t transition_block_order_key(TransitionBlock* tb) {
         return std::numeric_limits<std::uint64_t>::max();
     }
 
-    auto min_original_block_id = [&](AstNode* node, auto& self) -> std::optional<std::uint64_t> {
-        if (!node) {
-            return std::nullopt;
-        }
-        if (BasicBlock* bb = node->get_original_block()) {
-            return static_cast<std::uint64_t>(bb->id());
-        }
-
-        std::optional<std::uint64_t> best;
-        auto take_best = [&](AstNode* child) {
-            auto child_id = self(child, self);
-            if (child_id.has_value() && (!best.has_value() || child_id.value() < best.value())) {
-                best = child_id;
-            }
-        };
-
-        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-            for (AstNode* child : seq->nodes()) {
-                take_best(child);
-            }
-        } else if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-            take_best(if_node->true_branch());
-            take_best(if_node->false_branch());
-        } else if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-            take_best(loop->body());
-        } else if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-            for (CaseNode* case_node : sw->cases()) {
-                take_best(case_node->body());
-            }
-        } else if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-            take_best(case_node->body());
-        }
-
-        return best;
-    };
-
-    if (auto min_id = min_original_block_id(tb->ast_node(), min_original_block_id); min_id.has_value()) {
-        return min_id.value();
+    std::vector<std::uint64_t> ids;
+    if (collect_ast_original_block_ids(tb->ast_node(), ids) && !ids.empty()) {
+        return *std::min_element(ids.begin(), ids.end());
     }
 
     const auto kind_bias = static_cast<std::uint64_t>(tb->ast_node()->ast_kind());
     return std::numeric_limits<std::uint64_t>::max() - kind_bias;
-}
-
-void collect_original_block_ids(AstNode* node, std::vector<std::uint64_t>& ids) {
-    if (!node) {
-        return;
-    }
-
-    if (BasicBlock* bb = node->get_original_block()) {
-        ids.push_back(static_cast<std::uint64_t>(bb->id()));
-    }
-
-    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-        for (AstNode* child : seq->nodes()) {
-            collect_original_block_ids(child, ids);
-        }
-        return;
-    }
-    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        collect_original_block_ids(if_node->true_branch(), ids);
-        collect_original_block_ids(if_node->false_branch(), ids);
-        return;
-    }
-    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        collect_original_block_ids(loop->body(), ids);
-        return;
-    }
-    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-        for (CaseNode* case_node : sw->cases()) {
-            collect_original_block_ids(case_node->body(), ids);
-        }
-        return;
-    }
-    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-        collect_original_block_ids(case_node->body(), ids);
-    }
 }
 
 std::string transition_block_signature(TransitionBlock* tb) {
@@ -217,7 +92,7 @@ std::string transition_block_signature(TransitionBlock* tb) {
     }
 
     std::vector<std::uint64_t> ids;
-    collect_original_block_ids(tb->ast_node(), ids);
+    collect_ast_original_block_ids(tb->ast_node(), ids);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
@@ -331,33 +206,13 @@ bool ast_node_appears_later(const std::vector<AstNode*>& nodes, std::size_t star
         if (!candidate) {
             continue;
         }
-        if (candidate == needle || ast_contains(candidate, needle) || ast_contains(needle, candidate)) {
+        if (candidate == needle
+            || ast_contains_node(candidate, needle)
+            || ast_contains_node(needle, candidate)) {
             return true;
         }
     }
     return false;
-}
-
-std::string expr_fingerprint(Expression* expr) {
-    if (!expr) return "<null>";
-    if (auto* c = dyn_cast<Constant>(expr)) {
-        return "C:" + std::to_string(c->value()) + ":" + std::to_string(c->size_bytes);
-    }
-    if (auto* v = dyn_cast<Variable>(expr)) {
-        return "V:" + v->name() + ":" + std::to_string(v->ssa_version());
-    }
-    if (auto* op = dyn_cast<Operation>(expr)) {
-        std::string out = "O:" + std::to_string(static_cast<int>(op->type())) + "(";
-        bool first = true;
-        for (auto* child : op->operands()) {
-            if (!first) out += ",";
-            first = false;
-            out += expr_fingerprint(child);
-        }
-        out += ")";
-        return out;
-    }
-    return "E:unknown";
 }
 
 void flatten_conjunction(Expression* expr, std::vector<Expression*>& out) {
@@ -366,17 +221,6 @@ void flatten_conjunction(Expression* expr, std::vector<Expression*>& out) {
     if (op && op->type() == OperationType::logical_and && op->operands().size() == 2) {
         flatten_conjunction(op->operands()[0], out);
         flatten_conjunction(op->operands()[1], out);
-        return;
-    }
-    out.push_back(expr);
-}
-
-void flatten_disjunction(Expression* expr, std::vector<Expression*>& out) {
-    if (!expr) return;
-    auto* op = dyn_cast<Operation>(expr);
-    if (op && op->type() == OperationType::logical_or && op->operands().size() == 2) {
-        flatten_disjunction(op->operands()[0], out);
-        flatten_disjunction(op->operands()[1], out);
         return;
     }
     out.push_back(expr);
@@ -397,7 +241,10 @@ Expression* rebuild_conjunction(DecompilerArena& arena, const std::vector<Expres
     return acc;
 }
 
-Expression* remove_clause_from_condition(DecompilerArena& arena, Expression* cond_expr, const std::string& clause_id) {
+Expression* remove_clause_from_condition(
+    DecompilerArena& arena,
+    Expression* cond_expr,
+    const Expression* clause) {
     std::vector<Expression*> clauses;
     flatten_conjunction(cond_expr, clauses);
     if (clauses.empty()) return cond_expr;
@@ -406,12 +253,12 @@ Expression* remove_clause_from_condition(DecompilerArena& arena, Expression* con
     remaining.reserve(clauses.size());
 
     bool removed = false;
-    for (Expression* clause : clauses) {
-        if (!removed && expr_fingerprint(clause) == clause_id) {
+    for (Expression* candidate : clauses) {
+        if (!removed && expressions_structurally_equal(candidate, clause)) {
             removed = true;
             continue;
         }
-        remaining.push_back(clause);
+        remaining.push_back(candidate);
     }
 
     if (!removed) return cond_expr;
@@ -426,28 +273,22 @@ public:
         }
     }
 
-    bool shared_clause(IfNode* a, IfNode* b, std::string* shared_clause_id) const {
+    bool shared_clause(IfNode* a, IfNode* b, Expression** shared_clause) const {
         auto ia = formula_to_clauses_.find(a);
         auto ib = formula_to_clauses_.find(b);
         if (ia == formula_to_clauses_.end() || ib == formula_to_clauses_.end()) return false;
 
-        for (const std::string& clause_a : ia->second) {
-            for (const std::string& clause_b : ib->second) {
-                if (clause_a == clause_b) {
-                    if (shared_clause_id) {
-                        *shared_clause_id = clause_a;
+        for (Expression* clause_a : ia->second) {
+            for (Expression* clause_b : ib->second) {
+                if (expressions_structurally_equal(clause_a, clause_b)) {
+                    if (shared_clause) {
+                        *shared_clause = clause_a;
                     }
                     return true;
                 }
             }
         }
         return false;
-    }
-
-    Expression* clause_expression(const std::string& clause_id) const {
-        auto it = clause_to_expression_.find(clause_id);
-        if (it == clause_to_expression_.end()) return nullptr;
-        return it->second;
     }
 
 private:
@@ -458,26 +299,13 @@ private:
         std::vector<Expression*> clauses;
         flatten_conjunction(cond, clauses);
 
-        auto& clause_ids = formula_to_clauses_[candidate];
+        auto& registered_clauses = formula_to_clauses_[candidate];
         for (Expression* clause_expr : clauses) {
-            const std::string clause_id = expr_fingerprint(clause_expr);
-            clause_ids.push_back(clause_id);
-            if (!clause_to_expression_.contains(clause_id)) {
-                clause_to_expression_[clause_id] = clause_expr;
-            }
-
-            std::vector<Expression*> symbols;
-            flatten_disjunction(clause_expr, symbols);
-            auto& symbol_set = clause_to_symbols_[clause_id];
-            for (Expression* symbol_expr : symbols) {
-                symbol_set.insert(expr_fingerprint(symbol_expr));
-            }
+            registered_clauses.push_back(clause_expr);
         }
     }
 
-    std::unordered_map<IfNode*, std::vector<std::string>> formula_to_clauses_;
-    std::unordered_map<std::string, std::unordered_set<std::string>> clause_to_symbols_;
-    std::unordered_map<std::string, Expression*> clause_to_expression_;
+    std::unordered_map<IfNode*, std::vector<Expression*>> formula_to_clauses_;
 };
 
 void apply_complementary_condition_pairing(
@@ -533,23 +361,25 @@ void apply_cnf_subexpression_grouping(DecompilerArena& arena, std::vector<AstNod
         for (std::size_t i = 0; i + 1 < candidates.size(); ++i) {
             if (candidate_indices[i + 1] != candidate_indices[i] + 1) continue;
 
-            std::string shared_clause;
-            if (!graph.shared_clause(candidates[i], candidates[i + 1], &shared_clause)) continue;
+            Expression* shared_clause = nullptr;
+            if (!graph.shared_clause(
+                    candidates[i], candidates[i + 1], &shared_clause)) {
+                continue;
+            }
 
             std::size_t run_end = i + 1;
             while (run_end + 1 < candidates.size() &&
                    candidate_indices[run_end + 1] == candidate_indices[run_end] + 1) {
-                std::string run_clause;
+                Expression* run_clause = nullptr;
                 if (graph.shared_clause(candidates[i], candidates[run_end + 1], &run_clause) &&
-                    run_clause == shared_clause) {
+                    expressions_structurally_equal(run_clause, shared_clause)) {
                     run_end++;
                 } else {
                     break;
                 }
             }
 
-            Expression* shared_expr = graph.clause_expression(shared_clause);
-            if (!shared_expr) continue;
+            if (!shared_clause) continue;
 
             auto* grouped_body = arena.create<SeqNode>();
             for (std::size_t k = i; k <= run_end; ++k) {
@@ -565,7 +395,8 @@ void apply_cnf_subexpression_grouping(DecompilerArena& arena, std::vector<AstNod
                 }
             }
 
-            auto* outer_if = arena.create<IfNode>(arena.create<ExprAstNode>(shared_expr), grouped_body);
+            auto* outer_if = arena.create<IfNode>(
+                arena.create<ExprAstNode>(shared_clause), grouped_body);
 
             const std::size_t start = candidate_indices[i];
             const std::size_t end = candidate_indices[run_end];

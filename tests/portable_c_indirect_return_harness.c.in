@@ -1,0 +1,31 @@
+#include <limits.h>
+
+#define _main decompiled_main
+#define _printf printf
+#include "@GENERATED_C@"
+#undef _printf
+#undef _main
+
+static int verify_indirect_returns(void) {
+    static const uint64_t values[] = {
+        UINT64_C(0), UINT64_C(1), UINT64_C(7),
+        UINT64_C(0x7fffffffffffffff), UINT64_C(0x8000000000000000),
+        UINT64_MAX,
+    };
+    for (size_t index = 0; index < sizeof(values) / sizeof(values[0]); ++index) {
+        const uint64_t value = values[index];
+        unsigned long words[3] = {ULONG_MAX, ULONG_MAX, ULONG_MAX};
+        _make_triple64((unsigned char *)words, value);
+        if (words[0] != (unsigned long)(value + UINT64_C(1))) return 10;
+        if (words[1] != (unsigned long)(value * UINT64_C(3))) return 11;
+        if (words[2] != (unsigned long)(
+                value ^ UINT64_C(0xa5a5a5a5a5a5a5a5))) return 12;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp) {
+    const int direct_result = verify_indirect_returns();
+    if (direct_result != 0) return direct_result;
+    return decompiled_main(argc, argv, envp);
+}

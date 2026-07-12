@@ -1,0 +1,32 @@
+#define _main decompiled_main
+#define _printf printf
+#include "@GENERATED_C@"
+#undef _printf
+#undef _main
+
+static int verify_hfa_returns(void) {
+    static const double values[] = {
+        0.0, -0.0, 1.0, -1.0, 7.0, 0x1p40,
+    };
+    for (size_t index = 0; index < sizeof(values) / sizeof(values[0]); ++index) {
+        const double value = values[index];
+        double result[3] = {0.0, 0.0, 0.0};
+        _make_triple_double(result, value);
+        if (result[0] != value + 1.25) return 10;
+        if (result[1] != value * 3.5) return 11;
+        if (result[2] != value - 9.75) return 12;
+        double quad[4] = {0.0, 0.0, 0.0, 0.0};
+        _make_quad_double(quad, value);
+        if (quad[0] != value + 2.0) return 13;
+        if (quad[1] != value - 3.0) return 14;
+        if (quad[2] != value * 4.0) return 15;
+        if (quad[3] != value / 5.0) return 16;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp) {
+    const int direct_result = verify_hfa_returns();
+    if (direct_result != 0) return direct_result;
+    return decompiled_main(argc, argv, envp);
+}

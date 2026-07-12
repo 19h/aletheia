@@ -1,0 +1,28 @@
+#define _main decompiled_main
+#define _printf printf
+#include "@GENERATED_C@"
+#undef _printf
+#undef _main
+
+static int verify_pair_returns(void) {
+    static const uint64_t values[] = {
+        UINT64_C(0), UINT64_C(1), UINT64_C(7),
+        UINT64_C(0x7fffffffffffffff), UINT64_C(0x8000000000000000),
+        UINT64_MAX,
+    };
+    for (size_t index = 0; index < sizeof(values) / sizeof(values[0]); ++index) {
+        const uint64_t value = values[index];
+        const uint128_t result = _make_pair64(value);
+        const uint64_t first = (uint64_t)result;
+        const uint64_t second = (uint64_t)(result >> 64);
+        if (first != value + UINT64_C(1)) return 10;
+        if (second != value * UINT64_C(3)) return 11;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp) {
+    const int pair_result = verify_pair_returns();
+    if (pair_result != 0) return pair_result;
+    return decompiled_main(argc, argv, envp);
+}

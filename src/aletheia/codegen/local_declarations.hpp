@@ -24,7 +24,14 @@ public:
         if (!active_expr_nodes_.insert(o).second) {
             return;
         }
-        for (auto* op : o->operands()) if (op) op->accept(*this);
+        for (std::size_t index = 0; index < o->operands().size(); ++index) {
+            if (index == 1
+                && (o->type() == OperationType::member_access
+                    || o->type() == OperationType::field)) {
+                continue;
+            }
+            if (o->operands()[index]) o->operands()[index]->accept(*this);
+        }
         active_expr_nodes_.erase(o);
     }
     void visit(Call* c) override {
@@ -212,6 +219,9 @@ public:
         }
 
         std::unordered_map<const Variable*, TypePtr> preferred_decl_types;
+        std::unordered_set<std::string> pointer_role_names;
+        std::unordered_map<std::string, std::unordered_set<std::string>>
+            identity_copy_sources;
 
         auto integer_width_bits_for_type = [](const TypePtr& type) -> std::optional<std::size_t> {
             if (!type) {
@@ -304,10 +314,74 @@ public:
                     }
 
                     if (auto* assign = dyn_cast<Assignment>(inst)) {
-                        auto* dst = dyn_cast<Variable>(assign->destination());
+                        Expression* destination = assign->destination();
+                        while (auto* cast = dyn_cast<Operation>(destination)) {
+                            if (cast->type() != OperationType::cast
+                                || cast->operands().size() != 1) {
+                                break;
+                            }
+                            destination = cast->operands()[0];
+                        }
+                        auto* dst = dyn_cast<Variable>(destination);
                         auto* src = dyn_cast<Variable>(assign->value());
                         if (dst && src) {
                             maybe_prefer_signed_copy_type(dst, src);
+                            identity_copy_sources[expr_gen.generate(dst)].insert(
+                                expr_gen.generate(src));
+                        }
+                        if (dst && assign->value()) {
+                            TypePtr value_type = assign->value()->ir_type();
+                            const std::size_t typed_width = value_type
+                                ? value_type->size_bytes() : 0;
+                            const std::size_t value_width = std::max(
+                                typed_width, assign->value()->size_bytes);
+                            if (value_width > dst->size_bytes) {
+                                preferred_decl_types[dst] = value_type
+                                    && typed_width == value_width
+                                    ? value_type
+                                    : std::make_shared<const Integer>(value_width * 8, false);
+                            } else if (value_type
+                                       && value_type->type_kind() == TypeKind::Float
+                                       && typed_width == dst->size_bytes
+                                       && ((!dst->is_stack_variable())
+                                           || (dst->ir_type()
+                                               && dst->ir_type()->type_kind()
+                                                   == TypeKind::Float))) {
+                                preferred_decl_types[dst] = value_type;
+                            }
+                        }
+                        if (auto* call = dyn_cast<Call>(assign->value())) {
+                            auto* function_type = call->ir_type()
+                                ? type_dyn_cast<FunctionTypeDef>(call->ir_type().get())
+                                : nullptr;
+                            if (function_type) {
+                                const std::size_t count = std::min(
+                                    call->arg_count(), function_type->parameters().size());
+                                for (std::size_t argument_index = 0;
+                                     argument_index < count;
+                                     ++argument_index) {
+                                    const TypePtr& parameter_type =
+                                        function_type->parameters()[argument_index];
+                                    if (!parameter_type
+                                        || parameter_type->type_kind() != TypeKind::Pointer) {
+                                        continue;
+                                    }
+                                    Expression* argument = call->arg(argument_index);
+                                    while (auto* cast = dyn_cast<Operation>(argument)) {
+                                        if (cast->type() != OperationType::cast
+                                            || cast->operands().size() != 1) {
+                                            break;
+                                        }
+                                        argument = cast->operands()[0];
+                                    }
+                                    if (auto* argument_variable = dyn_cast<Variable>(argument)) {
+                                        preferred_decl_types[argument_variable] =
+                                            std::make_shared<const CustomType>("uintptr_t", 64);
+                                        pointer_role_names.insert(
+                                            expr_gen.generate(argument_variable));
+                                    }
+                                }
+                            }
                         }
                     } else if (auto* ret = dyn_cast<Return>(inst)) {
                         if (ret->values().size() == 1) {
@@ -355,6 +429,24 @@ public:
             analyze_for_type_hints(task.ast()->root());
         }
 
+        // Pointer use can occur after a register/load value has been copied
+        // into a return/argument temporary. Propagate that role backward over
+        // identity copies so the source is not declared as a 32-bit call
+        // result and truncated before the pointer-typed sink.
+        bool pointer_roles_changed = true;
+        while (pointer_roles_changed) {
+            pointer_roles_changed = false;
+            std::vector<std::string> known_roles(
+                pointer_role_names.begin(), pointer_role_names.end());
+            for (const std::string& destination_name : known_roles) {
+                auto sources = identity_copy_sources.find(destination_name);
+                if (sources == identity_copy_sources.end()) continue;
+                for (const std::string& source_name : sources->second) {
+                    pointer_roles_changed |= pointer_role_names.insert(source_name).second;
+                }
+            }
+        }
+
         auto strip_unsigned_prefix = [](const std::string& type_name) {
             constexpr std::string_view kPrefix{"unsigned "};
             if (type_name.rfind(std::string(kPrefix), 0) == 0) {
@@ -376,6 +468,8 @@ public:
         };
 
         std::map<std::string, std::string> var_to_type;
+        std::map<std::string, std::size_t> var_to_width;
+        std::map<std::string, TypePtr> var_to_decl_type;
         
         for (auto* var : collector.variables()) {
             // Skip global variables.
@@ -396,35 +490,105 @@ public:
 
             std::string type_str = "int"; // Default fallback.
             TypePtr decl_type = var->ir_type();
-            if (auto it = preferred_decl_types.find(var); it != preferred_decl_types.end() && it->second) {
-                decl_type = it->second;
+            if (auto extent = task.local_byte_array_extents().find(var_name);
+                extent != task.local_byte_array_extents().end()
+                && extent->second > 0) {
+                decl_type = std::make_shared<const ArrayType>(
+                    Integer::uint8_t(), extent->second);
+            }
+            if ((!decl_type || decl_type->type_kind() != TypeKind::Array)
+                && (preferred_decl_types.find(var) != preferred_decl_types.end())) {
+                auto it = preferred_decl_types.find(var);
+                if (it != preferred_decl_types.end() && it->second) {
+                    decl_type = it->second;
+                }
             }
             if (decl_type && !type_isa<UnknownType>(decl_type.get())
                 && decl_type->to_string() != "unknown type") {
-                type_str = decl_type->to_string();
+                type_str = render_codegen_type(
+                    decl_type, one_variable_per_declaration);
                 expr_gen.set_local_declared_type(var_name, decl_type);
             } else {
                 const std::size_t width_bits = var->size_bytes > 0
                     ? var->size_bytes * 8 : 32;
                 TypePtr fallback_type = std::make_shared<const Integer>(width_bits, false);
                 type_str = fallback_type->to_string();
+                decl_type = fallback_type;
                 expr_gen.set_local_declared_type(var_name, fallback_type);
             }
             auto it = var_to_type.find(var_name);
             if (it == var_to_type.end()) {
                 var_to_type[var_name] = type_str;
+                var_to_width[var_name] = std::max(
+                    var->size_bytes, decl_type ? decl_type->size_bytes() : std::size_t{0});
+                var_to_decl_type[var_name] = decl_type;
             } else {
-                it->second = prefer_type_for_name(it->second, type_str);
+                const std::size_t existing_width = var_to_width[var_name];
+                const std::size_t candidate_width = std::max(
+                    var->size_bytes, decl_type ? decl_type->size_bytes() : std::size_t{0});
+                const bool existing_pointer = var_to_decl_type[var_name]
+                    && var_to_decl_type[var_name]->type_kind() == TypeKind::Pointer;
+                const bool candidate_pointer = decl_type
+                    && decl_type->type_kind() == TypeKind::Pointer;
+                if (existing_pointer != candidate_pointer
+                    && std::max(existing_width, candidate_width) >= 8) {
+                    it->second = "uintptr_t";
+                    var_to_width[var_name] = std::max(existing_width, candidate_width);
+                    var_to_decl_type[var_name] = std::make_shared<const CustomType>(
+                        "uintptr_t", var_to_width[var_name] * 8);
+                } else if (candidate_width > existing_width) {
+                    it->second = type_str;
+                    var_to_width[var_name] = candidate_width;
+                    var_to_decl_type[var_name] = decl_type;
+                } else if (candidate_width == existing_width) {
+                    const bool existing_float = var_to_decl_type[var_name]
+                        && var_to_decl_type[var_name]->type_kind() == TypeKind::Float;
+                    const bool candidate_float = decl_type
+                        && decl_type->type_kind() == TypeKind::Float;
+                    const std::string preferred = candidate_float && !existing_float
+                        ? type_str : prefer_type_for_name(it->second, type_str);
+                    if (preferred != it->second || (candidate_float && !existing_float)) {
+                        it->second = type_str;
+                        var_to_decl_type[var_name] = decl_type;
+                    }
+                }
             }
+        }
+
+        for (const std::string& name : pointer_role_names) {
+            if (!var_to_type.contains(name)) continue;
+            var_to_type[name] = "uintptr_t";
+            var_to_width[name] = std::max<std::size_t>(var_to_width[name], 8);
+            var_to_decl_type[name] = std::make_shared<const CustomType>(
+                "uintptr_t", 64);
+        }
+
+        for (const auto& [name, type] : var_to_decl_type) {
+            if (type) expr_gen.set_local_declared_type(name, type);
         }
 
         // Group by type string -> sorted set of variable names.
         std::map<std::string, std::set<std::string>> type_to_vars;
+        std::vector<std::string> array_decls;
         for (const auto& [var_name, type_str] : var_to_type) {
+            auto declared = var_to_decl_type.find(var_name);
+            auto* array = declared != var_to_decl_type.end() && declared->second
+                ? type_dyn_cast<ArrayType>(declared->second.get()) : nullptr;
+            if (array && array->element() && array->count() > 0) {
+                const bool abi_result_buffer =
+                    task.local_byte_array_extents().contains(var_name);
+                array_decls.push_back(
+                    std::string(abi_result_buffer ? "_Alignas(16) " : "")
+                    + render_codegen_declaration(
+                        declared->second,
+                        var_name,
+                        one_variable_per_declaration) + ";");
+                continue;
+            }
             type_to_vars[type_str].insert(var_name);
         }
 
-        std::vector<std::string> decls;
+        std::vector<std::string> decls = std::move(array_decls);
         for (const auto& [type_str, vars] : type_to_vars) {
             if (one_variable_per_declaration) {
                 for (const auto& var : vars) {
@@ -511,13 +675,8 @@ public:
     }
     void visit_return(Return* i) override {
         if (!i) return;
-        // Keep return traversal conservative: malformed ASTs may contain
-        // non-expression payloads in return value slots, which can recurse
-        // indefinitely via visitor dispatch. Collect direct globals only.
         for (auto* v : i->values()) {
-            if (auto* gv = dyn_cast<GlobalVariable>(v)) {
-                variables_.insert(gv);
-            }
+            if (v) v->accept(*this);
         }
     }
     void visit_phi(Phi* i) override {
@@ -574,46 +733,53 @@ private:
 
 class GlobalDeclarationGenerator {
 public:
-    static std::vector<std::string> generate(DecompilerTask& task) {
-        auto is_valid_identifier = [](const std::string& name) {
-            if (name.empty()) return false;
-            const unsigned char first = static_cast<unsigned char>(name.front());
-            if (!(std::isalpha(first) || first == '_')) return false;
-            for (unsigned char c : name) {
-                if (!(std::isalnum(c) || c == '_')) {
-                    return false;
-                }
-            }
-            return true;
-        };
-
+    static std::vector<std::string> generate(
+        DecompilerTask& task,
+        const std::unordered_map<std::string, std::string>* identifier_names = nullptr,
+        bool portable_c = false) {
         GlobalVariableCollector collector;
         if (task.ast() && task.ast()->root()) {
             collector.traverse(task.ast()->root());
+        }
+        if (task.cfg()) {
+            for (BasicBlock* block : task.cfg()->blocks()) {
+                if (!block) continue;
+                for (Instruction* instruction : block->instructions()) {
+                    if (instruction) instruction->accept(collector);
+                }
+            }
         }
 
         std::map<std::string, GlobalVariable*> globals_by_name;
         for (auto* var : collector.variables()) {
             auto* gv = dyn_cast<GlobalVariable>(var);
             if (!gv) continue;
-            globals_by_name.try_emplace(gv->name(), gv);
+            if (is_c_quoted_literal(gv->name())) continue;
+            std::string emitted_name = normalize_distinct_c_identifier(
+                gv->name(), "symbol");
+            if (identifier_names) {
+                if (auto it = identifier_names->find(gv->name());
+                    it != identifier_names->end()) {
+                    emitted_name = it->second;
+                }
+            }
+            globals_by_name.try_emplace(std::move(emitted_name), gv);
         }
 
         std::vector<std::string> decls;
         for (const auto& [name, gv] : globals_by_name) {
-            if (!is_valid_identifier(name)) {
-                continue;
-            }
-            std::string type_str = "int";
-            if (gv->ir_type()) {
-                type_str = gv->ir_type()->to_string();
-            }
-
             std::string line = "extern ";
-            if (gv->is_constant()) {
+            if (gv->is_constant() && !gv->represents_address()) {
                 line += "const ";
             }
-            line += type_str + " " + name + ";";
+            if (gv->represents_address()) {
+                line += "unsigned char " + name + "[];";
+            } else {
+                line += render_codegen_declaration(
+                    gv->ir_type() ? gv->ir_type() : Integer::int32_t(),
+                    name,
+                    portable_c) + ";";
+            }
             decls.push_back(std::move(line));
         }
 

@@ -404,7 +404,30 @@ static ReplaceResult replace_variable_cow_impl(
 
     // Leaf: Variable match → deep-copy replacement
     if (is_target_var(expr, target_name, target_ssa)) {
-        return {replacement->copy(arena), true};
+        Expression* copied = replacement->copy(arena);
+        const TypePtr expected_type = expr->ir_type();
+        const TypePtr replacement_type = replacement->ir_type();
+        const bool expected_float = expected_type
+            && expected_type->type_kind() == TypeKind::Float;
+        const bool replacement_float = replacement_type
+            && replacement_type->type_kind() == TypeKind::Float;
+
+        // Register and stack SSA identities are bit containers.  Different
+        // occurrences can carry different semantic views (for example, an
+        // integer P-Code definition of d16 consumed by a floating STORE).
+        // Substitution must preserve the use-site view; a C numeric cast of
+        // IEEE-754 payload bits changes the value.
+        if (expected_type && expected_float != replacement_float
+            && expr->size_bytes > 0
+            && expr->size_bytes == replacement->size_bytes) {
+            auto* bitcast = arena.create<Operation>(
+                OperationType::bitcast,
+                std::vector<Expression*>{copied},
+                expr->size_bytes);
+            bitcast->set_ir_type(expected_type);
+            copied = bitcast;
+        }
+        return {copied, true};
     }
 
     // Leaf: Constant or non-matching Variable — unchanged
@@ -502,31 +525,7 @@ static Expression* replace_variable_ptr(
 /// shared subtrees O(2^depth) times.
 static void collect_variables_iterative(Expression* expr,
                                         std::unordered_set<Variable*>& out) {
-    if (!expr) return;
-    SmallVector<Expression*, 64> stack;
-    std::unordered_set<Expression*> visited;
-    stack.push_back(expr);
-    visited.insert(expr);
-    while (!stack.empty()) {
-        Expression* node = stack.back();
-        stack.pop_back();
-        if (!node) continue;
-        if (auto* v = dyn_cast<Variable>(node)) {
-            out.insert(v);
-        } else if (auto* op = dyn_cast<Operation>(node)) {
-            for (auto* child : op->operands()) {
-                if (child && visited.insert(child).second) {
-                    stack.push_back(child);
-                }
-            }
-        } else if (auto* list = dyn_cast<ListOperation>(node)) {
-            for (auto* child : list->operands()) {
-                if (child && visited.insert(child).second) {
-                    stack.push_back(child);
-                }
-            }
-        }
-    }
+    collect_expression_requirements_iterative(expr, out);
 }
 
 /// Iterative collect_requirements for an Instruction.
@@ -2297,6 +2296,7 @@ void ExpressionPropagationFunctionCallStage::execute(DecompilerTask& task) {
                     base_const->size_bytes,
                     base_const->copy(task.arena()),
                     false);
+                rewritten_gv->set_represents_address(true);
                 rewritten_gv->set_ir_type(base_const->ir_type());
 
                 auto* rewritten_inner = task.arena().create<Operation>(
@@ -3099,6 +3099,23 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
             auto it_dest = id_of.find(phi.dest);
             if (it_dest == id_of.end() || phi.operands.empty()) continue;
 
+            // Aliased storage is path-sensitive even when copy identities
+            // happen to connect its incoming SSA names.  Collapsing such a
+            // phi to one representative selects one predecessor's memory
+            // value globally (for example, a stack boolean written on both
+            // arms of a return-status diamond).
+            Variable* dest_var = sample_of[phi.dest];
+            bool aliased_storage = dest_var && dest_var->is_aliased();
+            for (const VarKey& operand : phi.operands) {
+                auto sample = sample_of.find(operand);
+                if (sample != sample_of.end() && sample->second
+                    && sample->second->is_aliased()) {
+                    aliased_storage = true;
+                    break;
+                }
+            }
+            if (aliased_storage) continue;
+
             auto it_first = id_of.find(phi.operands[0]);
             if (it_first == id_of.end()) continue;
             int first_root = dsu.find(it_first->second);
@@ -3113,7 +3130,6 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
             }
             if (!all_same) continue;
 
-            Variable* dest_var = sample_of[phi.dest];
             Variable* src_var = sample_of[phi.operands[0]];
             if (!type_compatible_for_identity(dest_var, src_var)) continue;
 
@@ -3232,6 +3248,7 @@ void IdentityEliminationStage::execute(DecompilerTask& task) {
 namespace {
 
 struct ExistingSubexpressionDef {
+    Expression* exemplar = nullptr;
     Variable* variable = nullptr;
     BasicBlock* block = nullptr;
     std::size_t index = 0;
@@ -3389,10 +3406,18 @@ private:
                     auto it = defining_variable_of_.find(fp);
                     if (it == defining_variable_of_.end() || it->second.empty()) continue;
 
-                    const ExistingSubexpressionDef& def = it->second.back();
-                    if (!can_replace_subexpression(def, block, idx)) continue;
+                    auto definition = std::find_if(
+                        it->second.rbegin(), it->second.rend(),
+                        [&](const ExistingSubexpressionDef& candidate) {
+                            return candidate.exemplar
+                                && expressions_structurally_equal(
+                                    subexpr, candidate.exemplar)
+                                && can_replace_subexpression(
+                                    candidate, block, idx);
+                        });
+                    if (definition == it->second.rend()) continue;
 
-                    inst->substitute(subexpr, def.variable);
+                    inst->substitute(subexpr, definition->variable);
                     changed = true;
                     break;
                 }
@@ -3408,9 +3433,17 @@ private:
             if (contains_dereference(value) || contains_call_expression(value)) continue;
 
             std::uint64_t fp = expression_fp(value);
-            if (defining_variable_of_.contains(fp) && !defining_variable_of_[fp].empty()) continue;
+            auto& definitions = defining_variable_of_[fp];
+            const bool already_defined = std::any_of(
+                definitions.begin(), definitions.end(),
+                [&](const ExistingSubexpressionDef& definition) {
+                    return definition.exemplar
+                        && expressions_structurally_equal(
+                            value, definition.exemplar);
+                });
+            if (already_defined) continue;
 
-            defining_variable_of_[fp].push_back({dest, block, idx});
+            definitions.push_back({value, dest, block, idx});
             inserted_keys.push_back(fp);
         }
 
@@ -3447,6 +3480,9 @@ struct SubexpressionStats {
     std::vector<SubexpressionUsage> usages;
 };
 
+using SubexpressionUsageMap =
+    std::unordered_map<std::uint64_t, std::vector<SubexpressionStats>>;
+
 class DefinitionGenerator {
 public:
     DefinitionGenerator(DecompilerTask& task, ControlFlowGraph& cfg, DominatorTree& dom)
@@ -3460,11 +3496,13 @@ public:
             auto usage_map = collect_usage_map();
             auto candidates = sorted_candidates(usage_map);
 
-            for (const std::uint64_t fp : candidates) {
+            for (const auto& [fp, bucket_index] : candidates) {
                 auto it = usage_map.find(fp);
-                if (it == usage_map.end()) continue;
+                if (it == usage_map.end() || bucket_index >= it->second.size()) {
+                    continue;
+                }
 
-                if (apply_candidate(fp, it->second)) {
+                if (apply_candidate(fp, it->second[bucket_index])) {
                     applied = true;
                     break;
                 }
@@ -3473,8 +3511,8 @@ public:
     }
 
 private:
-    std::unordered_map<std::uint64_t, SubexpressionStats> collect_usage_map() {
-        std::unordered_map<std::uint64_t, SubexpressionStats> usage_map;
+    SubexpressionUsageMap collect_usage_map() {
+        SubexpressionUsageMap usage_map;
 
         for (BasicBlock* block : cfg_.blocks()) {
             const auto& insts = block->instructions();
@@ -3486,12 +3524,20 @@ private:
                 for (Expression* expr : subexprs) {
                     if (!expr) continue;
                     std::uint64_t fp = expression_fp(expr);
-                    auto& stats = usage_map[fp];
-                    if (!stats.exemplar) {
-                        stats.exemplar = expr;
-                        stats.complexity = expression_complexity(expr);
+                    auto& bucket = usage_map[fp];
+                    auto stats = std::find_if(
+                        bucket.begin(), bucket.end(),
+                        [&](const SubexpressionStats& candidate) {
+                            return candidate.exemplar
+                                && expressions_structurally_equal(
+                                    expr, candidate.exemplar);
+                        });
+                    if (stats == bucket.end()) {
+                        bucket.push_back(SubexpressionStats{
+                            expr, expression_complexity(expr), {}});
+                        stats = std::prev(bucket.end());
                     }
-                    stats.usages.push_back({expr, inst, block, idx});
+                    stats->usages.push_back({expr, inst, block, idx});
                 }
             }
         }
@@ -3499,30 +3545,39 @@ private:
         return usage_map;
     }
 
-    std::vector<std::uint64_t> sorted_candidates(const std::unordered_map<std::uint64_t, SubexpressionStats>& usage_map) {
-        std::vector<std::pair<std::uint64_t, const SubexpressionStats*>> rows;
-        rows.reserve(usage_map.size());
+    std::vector<std::pair<std::uint64_t, std::size_t>> sorted_candidates(
+        const SubexpressionUsageMap& usage_map) {
+        struct CandidateRow {
+            std::uint64_t fingerprint = 0;
+            std::size_t bucket_index = 0;
+            const SubexpressionStats* stats = nullptr;
+        };
+        std::vector<CandidateRow> rows;
 
-        for (const auto& [fp, stats] : usage_map) {
-            if (!is_candidate(stats)) continue;
-            rows.push_back({fp, &stats});
+        for (const auto& [fp, bucket] : usage_map) {
+            for (std::size_t index = 0; index < bucket.size(); ++index) {
+                if (!is_candidate(bucket[index])) continue;
+                rows.push_back({fp, index, &bucket[index]});
+            }
         }
 
         std::sort(rows.begin(), rows.end(), [](const auto& lhs, const auto& rhs) {
-            if (lhs.second->complexity != rhs.second->complexity) {
-                return lhs.second->complexity > rhs.second->complexity;
+            if (lhs.stats->complexity != rhs.stats->complexity) {
+                return lhs.stats->complexity > rhs.stats->complexity;
             }
-            if (lhs.second->usages.size() != rhs.second->usages.size()) {
-                return lhs.second->usages.size() > rhs.second->usages.size();
+            if (lhs.stats->usages.size() != rhs.stats->usages.size()) {
+                return lhs.stats->usages.size() > rhs.stats->usages.size();
             }
-            return lhs.first < rhs.first;
+            if (lhs.fingerprint != rhs.fingerprint) {
+                return lhs.fingerprint < rhs.fingerprint;
+            }
+            return lhs.bucket_index < rhs.bucket_index;
         });
 
-        std::vector<std::uint64_t> out;
+        std::vector<std::pair<std::uint64_t, std::size_t>> out;
         out.reserve(rows.size());
-        for (auto& [fp, _] : rows) {
-            (void)_;
-            out.push_back(fp);
+        for (const CandidateRow& row : rows) {
+            out.emplace_back(row.fingerprint, row.bucket_index);
         }
         return out;
     }
@@ -3539,10 +3594,12 @@ private:
 
     static bool replace_in_expression(Expression*& expr,
                                       std::uint64_t target_fp,
+                                      const Expression* target,
                                       Variable* replacement) {
         if (!expr) return false;
 
-        if (expression_fp(expr) == target_fp) {
+        if (expression_fp(expr) == target_fp
+            && expressions_structurally_equal(expr, target)) {
             expr = replacement;
             return true;
         }
@@ -3550,11 +3607,13 @@ private:
         bool changed = false;
         if (auto* op = dyn_cast<Operation>(expr)) {
             for (Expression*& child : op->mutable_operands()) {
-                changed = replace_in_expression(child, target_fp, replacement) || changed;
+                changed = replace_in_expression(
+                    child, target_fp, target, replacement) || changed;
             }
         } else if (auto* list = dyn_cast<ListOperation>(expr)) {
             for (Expression*& child : list->mutable_operands()) {
-                changed = replace_in_expression(child, target_fp, replacement) || changed;
+                changed = replace_in_expression(
+                    child, target_fp, target, replacement) || changed;
             }
         }
 
@@ -3563,19 +3622,22 @@ private:
 
     static bool rewrite_instruction(Instruction* inst,
                                     std::uint64_t target_fp,
+                                    const Expression* target,
                                     Variable* replacement) {
         bool changed = false;
 
         if (auto* assign = dyn_cast<Assignment>(inst)) {
             Expression* value = assign->value();
-            if (replace_in_expression(value, target_fp, replacement)) {
+            if (replace_in_expression(
+                    value, target_fp, target, replacement)) {
                 assign->set_value(value);
                 changed = true;
             }
 
             if (assign->destination() && !isa<Variable>(assign->destination())) {
                 Expression* dest = assign->destination();
-                if (replace_in_expression(dest, target_fp, replacement)) {
+                if (replace_in_expression(
+                        dest, target_fp, target, replacement)) {
                     assign->set_destination(dest);
                     changed = true;
                 }
@@ -3586,7 +3648,8 @@ private:
         if (auto* branch = dyn_cast<Branch>(inst)) {
             if (auto* cond = branch->condition()) {
                 for (Expression*& child : cond->mutable_operands()) {
-                    changed = replace_in_expression(child, target_fp, replacement) || changed;
+                    changed = replace_in_expression(
+                        child, target_fp, target, replacement) || changed;
                 }
             }
             return changed;
@@ -3595,7 +3658,8 @@ private:
         if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
             Expression* before = ib->expression();
             Expression* after = before;
-            if (replace_in_expression(after, target_fp, replacement)) {
+            if (replace_in_expression(
+                    after, target_fp, target, replacement)) {
                 if (after != before) {
                     ib->substitute(before, after);
                 }
@@ -3607,7 +3671,8 @@ private:
         if (auto* ret = dyn_cast<Return>(inst)) {
             for (Expression* value : ret->values()) {
                 Expression* rewritten = value;
-                if (replace_in_expression(rewritten, target_fp, replacement)) {
+                if (replace_in_expression(
+                        rewritten, target_fp, target, replacement)) {
                     if (rewritten != value) {
                         ret->substitute(value, rewritten);
                     }
@@ -3701,7 +3766,8 @@ private:
         for (const auto& usage : stats.usages) {
             if (!usage.instruction || usage.instruction == def_inst) continue;
             if (!touched.insert(usage.instruction).second) continue;
-            any_rewrite = rewrite_instruction(usage.instruction, fp, temp) || any_rewrite;
+            any_rewrite = rewrite_instruction(
+                usage.instruction, fp, stats.exemplar, temp) || any_rewrite;
         }
 
         if (!any_rewrite) {
@@ -4310,15 +4376,21 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             op->mutable_operands()[0] = cond;
 
 
-            auto recompute_condition_fingerprints = [&](Expression* current_cond, std::string& cond_fp_out, std::string& not_cond_fp_out) {
+            auto recompute_condition_fingerprints = [&](
+                Expression* current_cond,
+                std::string& cond_fp_out,
+                std::string& not_cond_fp_out,
+                Expression*& negated_cond_out) {
                 cond_fp_out = expr_fingerprint(current_cond);
-                Expression* negated_cond = negate_ternary_condition(task, current_cond);
-                not_cond_fp_out = expr_fingerprint(negated_cond);
+                negated_cond_out = negate_ternary_condition(task, current_cond);
+                not_cond_fp_out = expr_fingerprint(negated_cond_out);
             };
 
             std::string cond_fp;
             std::string not_cond_fp;
-            recompute_condition_fingerprints(cond, cond_fp, not_cond_fp);
+            Expression* negated_cond = nullptr;
+            recompute_condition_fingerprints(
+                cond, cond_fp, not_cond_fp, negated_cond);
 
             std::string t_fp = expr_fingerprint(t_branch);
             std::string f_fp = expr_fingerprint(f_branch);
@@ -4329,13 +4401,15 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                 op->mutable_operands()[1] = t_branch;
                 op->mutable_operands()[2] = f_branch;
 
-                recompute_condition_fingerprints(cond, cond_fp, not_cond_fp);
+                recompute_condition_fingerprints(
+                    cond, cond_fp, not_cond_fp, negated_cond);
                 t_fp = expr_fingerprint(t_branch);
                 f_fp = expr_fingerprint(f_branch);
             }
 
             // cond ? X : X -> X
-            if (t_fp == f_fp) {
+            if (t_fp == f_fp
+                && expressions_structurally_equal(t_branch, f_branch)) {
                 return t_branch;
             }
 
@@ -4344,14 +4418,18 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             if (auto* f_ternary = dyn_cast<Operation>(f_branch)) {
                 if (f_ternary->type() == OperationType::ternary && f_ternary->operands().size() == 3) {
                     std::string f_cond_fp = expr_fingerprint(f_ternary->operands()[0]);
-                    if (cond_fp == f_cond_fp) {
+                    if (cond_fp == f_cond_fp
+                        && expressions_structurally_equal(
+                            cond, f_ternary->operands()[0])) {
                         auto* new_ternary = task.arena().create<Operation>(
                             OperationType::ternary,
                             std::vector<Expression*>{cond, t_branch, f_ternary->operands()[2]},
                             op->size_bytes);
                         new_ternary->set_ir_type(op->ir_type());
                         return simplify_expression_tree(task, new_ternary);
-                    } else if (not_cond_fp == f_cond_fp) {
+                    } else if (not_cond_fp == f_cond_fp
+                               && expressions_structurally_equal(
+                                   negated_cond, f_ternary->operands()[0])) {
                         auto* new_ternary = task.arena().create<Operation>(
                             OperationType::ternary,
                             std::vector<Expression*>{cond, t_branch, f_ternary->operands()[1]},
@@ -4367,14 +4445,18 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
             if (auto* t_ternary = dyn_cast<Operation>(t_branch)) {
                 if (t_ternary->type() == OperationType::ternary && t_ternary->operands().size() == 3) {
                     std::string t_cond_fp = expr_fingerprint(t_ternary->operands()[0]);
-                    if (cond_fp == t_cond_fp) {
+                    if (cond_fp == t_cond_fp
+                        && expressions_structurally_equal(
+                            cond, t_ternary->operands()[0])) {
                         auto* new_ternary = task.arena().create<Operation>(
                             OperationType::ternary,
                             std::vector<Expression*>{cond, t_ternary->operands()[1], f_branch},
                             op->size_bytes);
                         new_ternary->set_ir_type(op->ir_type());
                         return simplify_expression_tree(task, new_ternary);
-                    } else if (not_cond_fp == t_cond_fp) {
+                    } else if (not_cond_fp == t_cond_fp
+                               && expressions_structurally_equal(
+                                   negated_cond, t_ternary->operands()[0])) {
                         auto* new_ternary = task.arena().create<Operation>(
                             OperationType::ternary,
                             std::vector<Expression*>{cond, t_ternary->operands()[2], f_branch},
@@ -4473,7 +4555,8 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
         match_term(lhs_expr, base1, coeff1);
         match_term(rhs_expr, base2, coeff2);
 
-        if (base1 && base2 && expr_fingerprint(base1) == expr_fingerprint(base2)) {
+        if (base1 && base2
+            && expressions_structurally_equal(base1, base2)) {
             std::uint64_t new_coeff = coeff1 + coeff2;
             if (new_coeff == 0) {
                 return make_simplified_constant(task, op, 0);
@@ -4538,7 +4621,7 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                 }
                 if (is_all_ones_constant(lhs_expr, op->size_bytes)) return rhs_expr;
                 if (is_all_ones_constant(rhs_expr, op->size_bytes)) return lhs_expr;
-                if (expr_fingerprint(lhs_expr) == expr_fingerprint(rhs_expr)) {
+                if (expressions_structurally_equal(lhs_expr, rhs_expr)) {
                     return lhs_expr;
                 }
                 break;
@@ -4550,7 +4633,7 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                         (op->size_bytes >= 8) ? ~0ULL : ((1ULL << (op->size_bytes * 8)) - 1));
                 }
                 // x | x -> x (idempotent)
-                if (expr_fingerprint(lhs_expr) == expr_fingerprint(rhs_expr)) {
+                if (expressions_structurally_equal(lhs_expr, rhs_expr)) {
                     return lhs_expr;
                 }
                 break;
@@ -4558,7 +4641,7 @@ Expression* simplify_expression_tree(DecompilerTask& task, Expression* expr) {
                 if (is_constant_value(lhs_expr, 0)) return rhs_expr;
                 if (is_constant_value(rhs_expr, 0)) return lhs_expr;
                 // x ^ x -> 0 (self-cancellation)
-                if (expr_fingerprint(lhs_expr) == expr_fingerprint(rhs_expr)) {
+                if (expressions_structurally_equal(lhs_expr, rhs_expr)) {
                     return make_simplified_constant(task, op, 0);
                 }
                 break;
@@ -5076,7 +5159,17 @@ ExpressionGraph build_expression_graph(ControlFlowGraph* cfg) {
         for (std::size_t i = 0; i < insts.size(); ++i) {
             Instruction* inst = insts[i];
             if (auto* assign = dyn_cast<Assignment>(inst)) {
-                if (assignment_has_call_value(assign) || assignment_has_side_effect_destination(assign)) {
+                auto* destination = dyn_cast<Variable>(assign->destination());
+                // An aliased variable models storage observable outside the
+                // ordinary SSA use chain.  The final retention loop already
+                // preserves the write itself; seed it as a graph sink as well
+                // so every expression needed to compute that write remains
+                // live.  Otherwise CSE definitions used only by the aliased
+                // RHS can be pruned while the aliased assignment survives.
+                const bool aliased_write = destination && destination->is_aliased();
+                if (assignment_has_call_value(assign)
+                    || assignment_has_side_effect_destination(assign)
+                    || aliased_write) {
                     graph.sinks.insert(inst);
                 }
             } else {
@@ -6026,172 +6119,6 @@ void ReturnDefinitionSanityStage::execute(DecompilerTask& task) {
         }
     }
 
-    auto canonicalize = [](std::string name) {
-        std::transform(name.begin(), name.end(), name.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        while (!name.empty() && name.front() == '_') {
-            name.erase(name.begin());
-        }
-        return name;
-    };
-
-    bool has_strtol_call = false;
-    for (BasicBlock* block : task.cfg()->blocks()) {
-        for (Instruction* inst : block->instructions()) {
-            auto* assign = dyn_cast<Assignment>(inst);
-            if (!assign) {
-                continue;
-            }
-            Expression* target_expr = nullptr;
-            if (auto* call = dyn_cast<Call>(assign->value())) {
-                target_expr = call->target();
-            } else if (auto* op = dyn_cast<Operation>(assign->value())) {
-                if (op->type() == OperationType::call && !op->operands().empty()) {
-                    target_expr = op->operands()[0];
-                }
-            }
-            if (!target_expr) {
-                continue;
-            }
-            if (auto* gv = dyn_cast<GlobalVariable>(target_expr)) {
-                if (canonicalize(gv->name()) == "strtol") {
-                    has_strtol_call = true;
-                    break;
-                }
-            } else if (auto* c = dyn_cast<Constant>(target_expr)) {
-                if (auto maybe_name = ida::name::get(static_cast<ida::Address>(c->value()))) {
-                    if (canonicalize(*maybe_name) == "strtol") {
-                        has_strtol_call = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (has_strtol_call) {
-            break;
-        }
-    }
-
-    if (!has_strtol_call) {
-        return;
-    }
-
-    auto is_usage_fprintf_call = [&](Expression* call_expr) {
-        auto has_usage_literal = [](Expression* expr) {
-            if (auto* gv = dyn_cast<GlobalVariable>(expr)) {
-                return gv->name().find("Usage: %s [n]") != std::string::npos;
-            }
-            if (auto* c = dyn_cast<Constant>(expr)) {
-                auto maybe_str = ida::data::read_string(static_cast<ida::Address>(c->value()));
-                return maybe_str && maybe_str->find("Usage: %s [n]") != std::string::npos;
-            }
-            return false;
-        };
-
-        if (auto* call = dyn_cast<Call>(call_expr)) {
-            Expression* target = call->target();
-            std::string callee;
-            if (auto* gv = dyn_cast<GlobalVariable>(target)) {
-                callee = canonicalize(gv->name());
-            } else if (auto* c = dyn_cast<Constant>(target)) {
-                if (auto maybe_name = ida::name::get(static_cast<ida::Address>(c->value()))) {
-                    callee = canonicalize(*maybe_name);
-                }
-            }
-            if (callee != "fprintf") {
-                return false;
-            }
-            for (std::size_t i = 1; i < call->operands().size(); ++i) {
-                if (has_usage_literal(call->operands()[i])) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        auto* op = dyn_cast<Operation>(call_expr);
-        if (!op || op->type() != OperationType::call || op->operands().empty()) {
-            return false;
-        }
-        std::string callee;
-        if (auto* gv = dyn_cast<GlobalVariable>(op->operands()[0])) {
-            callee = canonicalize(gv->name());
-        } else if (auto* c = dyn_cast<Constant>(op->operands()[0])) {
-            if (auto maybe_name = ida::name::get(static_cast<ida::Address>(c->value()))) {
-                callee = canonicalize(*maybe_name);
-            }
-        }
-        if (callee != "fprintf") {
-            return false;
-        }
-        for (std::size_t i = 1; i < op->operands().size(); ++i) {
-            if (has_usage_literal(op->operands()[i])) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    for (BasicBlock* block : task.cfg()->blocks()) {
-        bool usage_block = false;
-        bool has_return = false;
-        for (Instruction* inst : block->instructions()) {
-            if (isa<Return>(inst)) {
-                has_return = true;
-            }
-            auto* assign = dyn_cast<Assignment>(inst);
-            if (assign && is_usage_fprintf_call(assign->value())) {
-                usage_block = true;
-            }
-        }
-        if (!usage_block || has_return) {
-            continue;
-        }
-        auto insts = block->instructions();
-        std::size_t insert_idx = insts.size();
-        if (!insts.empty() && (isa<Branch>(insts.back()) || isa<IndirectBranch>(insts.back()))) {
-            insert_idx = insts.size() - 1;
-        }
-        insts.insert(insts.begin() + static_cast<std::ptrdiff_t>(insert_idx),
-            task.arena().create<Return>(std::vector<Expression*>{task.arena().create<Constant>(1, 4)}));
-        block->set_instructions(std::move(insts));
-    }
-
-    std::vector<Return*> returns;
-    Return* terminal_ret = nullptr;
-    ida::Address terminal_addr = 0;
-    for (BasicBlock* block : task.cfg()->blocks()) {
-        for (Instruction* inst : block->instructions()) {
-            auto* ret = dyn_cast<Return>(inst);
-            if (!ret || ret->values().size() != 1) {
-                continue;
-            }
-            returns.push_back(ret);
-            if (!terminal_ret || ret->address() >= terminal_addr) {
-                terminal_ret = ret;
-                terminal_addr = ret->address();
-            }
-        }
-    }
-    if (!terminal_ret) {
-        return;
-    }
-
-    for (Return* ret : returns) {
-        if (!ret || ret == terminal_ret || ret->values().size() != 1) {
-            continue;
-        }
-        auto* c = dyn_cast<Constant>(ret->values()[0]);
-        if (c && c->value() == 1) {
-            continue;
-        }
-        const std::size_t width = ret->values()[0]->size_bytes > 0 ? ret->values()[0]->size_bytes : 4;
-        ret->mutable_values().clear();
-        ret->mutable_values().push_back(task.arena().create<Constant>(1, width));
-    }
-
-    terminal_ret->mutable_values().clear();
-    terminal_ret->mutable_values().push_back(task.arena().create<Constant>(0, 4));
 }
 void BitFieldComparisonUnrollingStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
@@ -6447,6 +6374,463 @@ void ArrayAccessDetectionStage::execute(DecompilerTask& task) {
 
 void DeadComponentPrunerStage::execute(DecompilerTask& task) {
     if (!task.cfg()) return;
+
+    // Recover a 16-byte timespec object when clock_gettime receives the
+    // address of the first of two adjacent 8-byte stack scalars. Keeping the
+    // fields as unrelated C locals produces false uninitialized reads because
+    // the compiler cannot see that the call defines both words.
+    DominatorTree timespec_dominators(*task.cfg());
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!block) {
+            continue;
+        }
+        auto& instructions = block->mutable_instructions();
+        for (std::size_t call_index = 0; call_index < instructions.size(); ++call_index) {
+            auto* call_assign = dyn_cast<Assignment>(instructions[call_index]);
+            auto* call = call_assign ? dyn_cast<Call>(call_assign->value()) : nullptr;
+            if (!call || call->operands().size() < 3) {
+                continue;
+            }
+
+            auto canonical_name = [](std::string name) {
+                std::transform(name.begin(), name.end(), name.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                while (!name.empty() && name.front() == '_') {
+                    name.erase(name.begin());
+                }
+                return name;
+            };
+            auto* target = dyn_cast<GlobalVariable>(call->target());
+            if (!target || canonical_name(target->name()) != "clock_gettime") {
+                continue;
+            }
+
+            auto* pointer_var = dyn_cast<Variable>(strip_trivial_casts(call->operands()[2]));
+            Assignment* pointer_definition = nullptr;
+            std::size_t pointer_definition_index = 0;
+            Operation* address_of = nullptr;
+            for (std::size_t prior = call_index; pointer_var && prior > 0; --prior) {
+                auto* candidate = dyn_cast<Assignment>(instructions[prior - 1]);
+                auto* destination = candidate ? dyn_cast<Variable>(candidate->destination()) : nullptr;
+                if (!destination || var_key(destination) != var_key(pointer_var)) {
+                    continue;
+                }
+                auto* operation = dyn_cast<Operation>(candidate->value());
+                if (operation && operation->type() == OperationType::address_of
+                    && operation->operands().size() == 1) {
+                    pointer_definition = candidate;
+                    pointer_definition_index = prior - 1;
+                    address_of = operation;
+                }
+                break;
+            }
+            if (!pointer_definition || !address_of) {
+                continue;
+            }
+
+            auto* first_field = dyn_cast<Variable>(strip_trivial_casts(address_of->operands()[0]));
+            if (!first_field || !first_field->is_stack_variable()
+                || first_field->size_bytes != 8) {
+                continue;
+            }
+            const VarKey first_key = var_key(first_field);
+            const std::int64_t first_offset = first_field->stack_offset();
+
+            Variable* second_field = nullptr;
+            for (BasicBlock* candidate_block : task.cfg()->blocks()) {
+                for (Instruction* candidate_instruction : candidate_block->instructions()) {
+                    std::vector<Variable*> variables = candidate_instruction->requirements();
+                    auto definitions = candidate_instruction->definitions();
+                    variables.insert(variables.end(), definitions.begin(), definitions.end());
+                    for (Variable* variable : variables) {
+                        if (variable && variable->is_stack_variable()
+                            && variable->size_bytes == 8
+                            && variable->stack_offset() == first_offset + 8) {
+                            second_field = variable;
+                            break;
+                        }
+                    }
+                    if (second_field) break;
+                }
+                if (second_field) break;
+            }
+            if (!second_field) {
+                continue;
+            }
+            const VarKey second_key = var_key(second_field);
+
+            auto* aggregate = task.arena().create<Variable>(
+                first_offset == 0 ? "ts" : "ts_" + std::to_string(first_offset), 16);
+            // This is a recovered source-level object with a lifetime distinct
+            // from earlier scalars that reused the same physical stack bytes.
+            // Keeping StackLocal metadata would make name generation merge the
+            // lifetimes back together by offset.
+            aggregate->set_kind(VariableKind::Temporary);
+            aggregate->set_aliased(true);
+
+            address_of->mutable_operands()[0] = aggregate->copy(task.arena());
+
+            // The compiler commonly reuses the same timespec storage for a
+            // later measurement in the same block. Redirect each later
+            // clock_gettime pointer whose address definition names the same
+            // stack offset to this recovered aggregate as well.
+            std::vector<std::size_t> reused_call_indices;
+            for (std::size_t later_index = call_index + 1;
+                 later_index < instructions.size(); ++later_index) {
+                auto* later_assignment = dyn_cast<Assignment>(instructions[later_index]);
+                auto* later_call = later_assignment
+                    ? dyn_cast<Call>(later_assignment->value()) : nullptr;
+                auto* later_target = later_call
+                    ? dyn_cast<GlobalVariable>(later_call->target()) : nullptr;
+                if (!later_call || later_call->operands().size() < 3 || !later_target
+                    || canonical_name(later_target->name()) != "clock_gettime") {
+                    continue;
+                }
+                auto* later_pointer = dyn_cast<Variable>(
+                    strip_trivial_casts(later_call->operands()[2]));
+                for (std::size_t prior = later_index; later_pointer && prior > call_index; --prior) {
+                    auto* candidate = dyn_cast<Assignment>(instructions[prior - 1]);
+                    auto* destination = candidate
+                        ? dyn_cast<Variable>(candidate->destination()) : nullptr;
+                    if (!destination || var_key(destination) != var_key(later_pointer)) {
+                        continue;
+                    }
+                    auto* candidate_address = dyn_cast<Operation>(candidate->value());
+                    auto* candidate_base = candidate_address
+                        && candidate_address->type() == OperationType::address_of
+                        && candidate_address->operands().size() == 1
+                        ? dyn_cast<Variable>(strip_trivial_casts(
+                            candidate_address->operands()[0])) : nullptr;
+                    bool derived_from_first_field = false;
+                    if (candidate_base && !candidate_base->is_stack_variable()) {
+                        for (std::size_t definition_search = prior - 1;
+                             definition_search > call_index; --definition_search) {
+                            auto* definition = dyn_cast<Assignment>(
+                                instructions[definition_search - 1]);
+                            auto* definition_destination = definition
+                                ? dyn_cast<Variable>(definition->destination()) : nullptr;
+                            if (!definition_destination
+                                || var_key(definition_destination) != var_key(candidate_base)) {
+                                continue;
+                            }
+                            for (Variable* requirement : definition->requirements()) {
+                                if (requirement && var_key(requirement) == first_key) {
+                                    derived_from_first_field = true;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (candidate_base
+                        && ((candidate_base->is_stack_variable()
+                                && candidate_base->stack_offset() == first_offset)
+                            || derived_from_first_field)) {
+                        candidate_address->mutable_operands()[0] = aggregate->copy(task.arena());
+                        reused_call_indices.push_back(later_index);
+                    }
+                    break;
+                }
+            }
+
+            const auto make_field_read = [&](std::int64_t relative_offset) -> Expression* {
+                Expression* word = aggregate->copy(task.arena());
+                if (relative_offset == 8) {
+                    word = task.arena().create<Operation>(
+                        OperationType::shr_us,
+                        std::vector<Expression*>{
+                            word,
+                            task.arena().create<Constant>(64, 8)},
+                        16);
+                }
+                auto* read = task.arena().create<Operation>(
+                    OperationType::cast,
+                    std::vector<Expression*>{word},
+                    8);
+                read->set_ir_type(Integer::uint64_t());
+                return read;
+            };
+
+            for (BasicBlock* candidate_block : task.cfg()->blocks()) {
+                if (candidate_block != block
+                    && !timespec_dominators.strictly_dominates(block, candidate_block)) {
+                    continue;
+                }
+                const auto& candidate_instructions = candidate_block->instructions();
+                const std::size_t first_instruction = candidate_block == block
+                    ? pointer_definition_index + 1 : 0;
+                for (std::size_t candidate_index = first_instruction;
+                     candidate_index < candidate_instructions.size(); ++candidate_index) {
+                    Instruction* candidate_instruction = candidate_instructions[candidate_index];
+                    if (candidate_instruction == pointer_definition) {
+                        continue;
+                    }
+                    bool reads_recovered_field = false;
+                    for (Variable* requirement : candidate_instruction->requirements()) {
+                        if (!requirement) {
+                            continue;
+                        }
+                        if (var_key(requirement) == first_key) {
+                            candidate_instruction->substitute(requirement, make_field_read(0));
+                            reads_recovered_field = true;
+                        } else if (var_key(requirement) == second_key) {
+                            candidate_instruction->substitute(requirement, make_field_read(8));
+                            reads_recovered_field = true;
+                        }
+                    }
+                    if (reads_recovered_field) {
+                        auto* field_assignment = dyn_cast<Assignment>(candidate_instruction);
+                        auto* field_destination = field_assignment
+                            ? dyn_cast<Variable>(field_assignment->destination()) : nullptr;
+                        if (field_destination) {
+                            // A read before a later clock_gettime call is a
+                            // snapshot. Keep its SSA value distinct from the
+                            // post-call read during out-of-SSA coalescing.
+                            field_destination->set_aliased(true);
+                        }
+                    }
+                }
+            }
+
+            const auto make_float_field_read = [&](std::int64_t relative_offset) -> Expression* {
+                Expression* word = make_field_read(relative_offset);
+                auto* signed_word = task.arena().create<Operation>(
+                    OperationType::cast,
+                    std::vector<Expression*>{word},
+                    8);
+                signed_word->set_ir_type(Integer::int64_t());
+                auto* floating = task.arena().create<Operation>(
+                    OperationType::cast,
+                    std::vector<Expression*>{signed_word},
+                    8);
+                floating->set_ir_type(Float::float64());
+                return floating;
+            };
+
+            for (const std::size_t reused_call_index : reused_call_indices) {
+                for (std::size_t later = reused_call_index + 1;
+                     later < instructions.size(); ++later) {
+                    auto* elapsed_assignment = dyn_cast<Assignment>(instructions[later]);
+                    auto* elapsed_add = elapsed_assignment
+                        ? dyn_cast<Operation>(elapsed_assignment->value()) : nullptr;
+                    if (!elapsed_add || elapsed_add->type() != OperationType::add_float
+                        || elapsed_add->mutable_operands().size() != 2) {
+                        continue;
+                    }
+                    auto* seconds_delta = dyn_cast<Operation>(
+                        elapsed_add->mutable_operands()[0]);
+                    auto* scaled_nsec = dyn_cast<Operation>(
+                        elapsed_add->mutable_operands()[1]);
+                    auto* nanoseconds_delta = scaled_nsec
+                        && scaled_nsec->type() == OperationType::mul_float
+                        && !scaled_nsec->mutable_operands().empty()
+                        ? dyn_cast<Operation>(scaled_nsec->mutable_operands()[0]) : nullptr;
+                    if (!seconds_delta || seconds_delta->type() != OperationType::sub_float
+                        || seconds_delta->mutable_operands().size() != 2
+                        || !nanoseconds_delta
+                        || nanoseconds_delta->type() != OperationType::sub_float
+                        || nanoseconds_delta->mutable_operands().size() != 2) {
+                        continue;
+                    }
+
+                    seconds_delta->mutable_operands()[0] = make_float_field_read(0);
+                    nanoseconds_delta->mutable_operands()[0] = make_float_field_read(8);
+                    break;
+                }
+            }
+        }
+    }
+
+    // A later timing region may take the address of a temporary forwarded
+    // from the low word of an already recovered timespec. Resolve that
+    // one-step provenance before paired-call repair so clock_gettime again
+    // receives the 16-byte aggregate rather than an 8-byte snapshot.
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!block) continue;
+        const auto& instructions = block->instructions();
+        for (std::size_t call_index = 0; call_index < instructions.size(); ++call_index) {
+            auto* call_assignment = dyn_cast<Assignment>(instructions[call_index]);
+            auto* call = call_assignment ? dyn_cast<Call>(call_assignment->value()) : nullptr;
+            auto* target = call ? dyn_cast<GlobalVariable>(call->target()) : nullptr;
+            if (!call || call->operands().size() < 3 || !target) continue;
+            std::string target_name = target->name();
+            std::transform(target_name.begin(), target_name.end(), target_name.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            while (!target_name.empty() && target_name.front() == '_') {
+                target_name.erase(target_name.begin());
+            }
+            if (target_name != "clock_gettime") continue;
+
+            auto* pointer = dyn_cast<Variable>(
+                strip_trivial_casts(call->operands()[2]));
+            Operation* pointer_address = nullptr;
+            Variable* forwarded_base = nullptr;
+            for (std::size_t prior = call_index; pointer && prior > 0; --prior) {
+                auto* definition = dyn_cast<Assignment>(instructions[prior - 1]);
+                auto* destination = definition
+                    ? dyn_cast<Variable>(definition->destination()) : nullptr;
+                if (!destination || var_key(destination) != var_key(pointer)) continue;
+                pointer_address = dyn_cast<Operation>(definition->value());
+                forwarded_base = pointer_address
+                    && pointer_address->type() == OperationType::address_of
+                    && pointer_address->operands().size() == 1
+                    ? dyn_cast<Variable>(strip_trivial_casts(
+                        pointer_address->operands()[0])) : nullptr;
+                break;
+            }
+            if (!pointer_address || !forwarded_base || forwarded_base->size_bytes == 16) {
+                continue;
+            }
+
+            Variable* recovered_aggregate = nullptr;
+            for (BasicBlock* definition_block : task.cfg()->blocks()) {
+                for (Instruction* instruction : definition_block->instructions()) {
+                    auto* definition = dyn_cast<Assignment>(instruction);
+                    auto* destination = definition
+                        ? dyn_cast<Variable>(definition->destination()) : nullptr;
+                    if (!destination
+                        || var_key(destination) != var_key(forwarded_base)) {
+                        continue;
+                    }
+                    for (Variable* requirement : definition->requirements()) {
+                        if (requirement && requirement->size_bytes == 16
+                            && requirement->is_aliased()) {
+                            recovered_aggregate = requirement;
+                            break;
+                        }
+                    }
+                    if (recovered_aggregate) break;
+                }
+                if (recovered_aggregate) break;
+            }
+            if (recovered_aggregate) {
+                pointer_address->mutable_operands()[0] =
+                    recovered_aggregate->copy(task.arena());
+            }
+        }
+    }
+
+    // Re-run the paired-call elapsed-time repair after the aggregate already
+    // exists. The first DeadComponentPruner invocation may precede the float
+    // expression simplification that exposes the canonical add(sub, mul(sub))
+    // shape; the later invocation reaches this path with a 16-byte pointer base.
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        if (!block) continue;
+        const auto& instructions = block->instructions();
+        struct ClockCallSite {
+            std::size_t index = 0;
+            VarKey pointer_key;
+        };
+        std::vector<ClockCallSite> sites;
+        for (std::size_t index = 0; index < instructions.size(); ++index) {
+            auto* assignment = dyn_cast<Assignment>(instructions[index]);
+            auto* call = assignment ? dyn_cast<Call>(assignment->value()) : nullptr;
+            auto* target = call ? dyn_cast<GlobalVariable>(call->target()) : nullptr;
+            auto* pointer = call && call->operands().size() >= 3
+                ? dyn_cast<Variable>(strip_trivial_casts(call->operands()[2])) : nullptr;
+            if (!target || !pointer) continue;
+            std::string name = target->name();
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            while (!name.empty() && name.front() == '_') name.erase(name.begin());
+            if (name == "clock_gettime") {
+                sites.push_back(ClockCallSite{index, var_key(pointer)});
+            }
+        }
+
+        for (std::size_t site_index = 1; site_index < sites.size(); ++site_index) {
+            const ClockCallSite& first = sites[site_index - 1];
+            const ClockCallSite& second = sites[site_index];
+            bool same_pointer = first.pointer_key == second.pointer_key;
+            if (!same_pointer) {
+                for (std::size_t prior = second.index; prior > first.index; --prior) {
+                    auto* definition = dyn_cast<Assignment>(instructions[prior - 1]);
+                    auto* destination = definition
+                        ? dyn_cast<Variable>(definition->destination()) : nullptr;
+                    if (!destination || var_key(destination) != second.pointer_key) continue;
+                    auto* source = dyn_cast<Variable>(strip_trivial_casts(definition->value()));
+                    same_pointer = source && var_key(source) == first.pointer_key;
+                    break;
+                }
+            }
+            if (!same_pointer) continue;
+
+            Variable* aggregate = nullptr;
+            for (std::size_t prior = first.index; prior > 0; --prior) {
+                auto* definition = dyn_cast<Assignment>(instructions[prior - 1]);
+                auto* destination = definition
+                    ? dyn_cast<Variable>(definition->destination()) : nullptr;
+                if (!destination || var_key(destination) != first.pointer_key) continue;
+                auto* address = dyn_cast<Operation>(definition->value());
+                aggregate = address && address->type() == OperationType::address_of
+                    && address->operands().size() == 1
+                    ? dyn_cast<Variable>(strip_trivial_casts(address->operands()[0])) : nullptr;
+                break;
+            }
+            if (!aggregate || aggregate->size_bytes != 16) continue;
+
+            const auto make_float_word = [&](bool high) -> Expression* {
+                Expression* word = aggregate->copy(task.arena());
+                if (high) {
+                    word = task.arena().create<Operation>(
+                        OperationType::shr_us,
+                        std::vector<Expression*>{
+                            word, task.arena().create<Constant>(64, 8)},
+                        16);
+                }
+                auto* narrow = task.arena().create<Operation>(
+                    OperationType::cast, std::vector<Expression*>{word}, 8);
+                narrow->set_ir_type(Integer::uint64_t());
+                auto* signed_word = task.arena().create<Operation>(
+                    OperationType::cast, std::vector<Expression*>{narrow}, 8);
+                signed_word->set_ir_type(Integer::int64_t());
+                auto* floating = task.arena().create<Operation>(
+                    OperationType::cast, std::vector<Expression*>{signed_word}, 8);
+                floating->set_ir_type(Float::float64());
+                return floating;
+            };
+
+            for (std::size_t index = second.index + 1; index < instructions.size(); ++index) {
+                auto* assignment = dyn_cast<Assignment>(instructions[index]);
+                auto* add = assignment ? dyn_cast<Operation>(assignment->value()) : nullptr;
+                if (!add || add->type() != OperationType::add_float
+                    || add->mutable_operands().size() != 2) continue;
+                auto* sec_sub = dyn_cast<Operation>(add->mutable_operands()[0]);
+                auto* mul = dyn_cast<Operation>(add->mutable_operands()[1]);
+                auto* nsec_sub = mul && mul->type() == OperationType::mul_float
+                    && !mul->mutable_operands().empty()
+                    ? dyn_cast<Operation>(mul->mutable_operands()[0]) : nullptr;
+                if (!sec_sub || sec_sub->type() != OperationType::sub_float
+                    || sec_sub->mutable_operands().size() != 2
+                    || !nsec_sub || nsec_sub->type() != OperationType::sub_float
+                    || nsec_sub->mutable_operands().size() != 2) continue;
+
+                const auto repair_start_snapshot = [&](Expression* operand, bool high) {
+                    auto* snapshot = dyn_cast<Variable>(strip_trivial_casts(operand));
+                    if (!snapshot) return;
+                    for (std::size_t definition_index = first.index + 1;
+                         definition_index < second.index; ++definition_index) {
+                        auto* definition = dyn_cast<Assignment>(
+                            instructions[definition_index]);
+                        auto* destination = definition
+                            ? dyn_cast<Variable>(definition->destination()) : nullptr;
+                        if (!destination
+                            || var_key(destination) != var_key(snapshot)) {
+                            continue;
+                        }
+                        definition->set_value(make_float_word(high));
+                        destination->set_aliased(true);
+                        break;
+                    }
+                };
+                repair_start_snapshot(sec_sub->mutable_operands()[1], false);
+                repair_start_snapshot(nsec_sub->mutable_operands()[1], true);
+                sec_sub->mutable_operands()[0] = make_float_word(false);
+                nsec_sub->mutable_operands()[0] = make_float_word(true);
+                break;
+            }
+        }
+    }
 
     auto* fn_ty = task.function_type() ? type_dyn_cast<FunctionTypeDef>(task.function_type().get()) : nullptr;
     auto* ret_float_ty = fn_ty && fn_ty->return_type() ? type_dyn_cast<Float>(fn_ty->return_type().get()) : nullptr;
@@ -6821,7 +7205,12 @@ void DeadComponentPrunerStage::execute(DecompilerTask& task) {
         std::vector<Instruction*> kept;
         kept.reserve(block->instructions().size());
         for (Instruction* inst : block->instructions()) {
-            if (live.contains(inst)) {
+            bool aliased_write = false;
+            if (auto* assignment = dyn_cast<Assignment>(inst)) {
+                auto* destination = dyn_cast<Variable>(assignment->destination());
+                aliased_write = destination && destination->is_aliased();
+            }
+            if (live.contains(inst) || aliased_write) {
                 kept.push_back(inst);
             }
         }
@@ -6850,10 +7239,15 @@ struct EdgePrunerCandidate {
     std::vector<std::size_t> instruction_indices;
 };
 
-bool edge_replace_in_expression(Expression*& expr, std::uint64_t fingerprint, Variable* replacement) {
+bool edge_replace_in_expression(
+    Expression*& expr,
+    std::uint64_t fingerprint,
+    const Expression* exemplar,
+    Variable* replacement) {
     if (!expr) return false;
 
-    if (expression_fp(expr) == fingerprint) {
+    if (expression_fp(expr) == fingerprint
+        && expressions_structurally_equal(expr, exemplar)) {
         expr = replacement;
         return true;
     }
@@ -6861,30 +7255,38 @@ bool edge_replace_in_expression(Expression*& expr, std::uint64_t fingerprint, Va
     bool changed = false;
     if (auto* op = dyn_cast<Operation>(expr)) {
         for (Expression*& child : op->mutable_operands()) {
-            changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
+            changed = edge_replace_in_expression(
+                child, fingerprint, exemplar, replacement) || changed;
         }
     } else if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression*& child : list->mutable_operands()) {
-            changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
+            changed = edge_replace_in_expression(
+                child, fingerprint, exemplar, replacement) || changed;
         }
     }
     return changed;
 }
 
-bool edge_rewrite_instruction(Instruction* inst, std::uint64_t fingerprint, Variable* replacement) {
+bool edge_rewrite_instruction(
+    Instruction* inst,
+    std::uint64_t fingerprint,
+    const Expression* exemplar,
+    Variable* replacement) {
     if (!inst) return false;
 
     bool changed = false;
     if (auto* assign = dyn_cast<Assignment>(inst)) {
         Expression* value = assign->value();
-        if (edge_replace_in_expression(value, fingerprint, replacement)) {
+        if (edge_replace_in_expression(
+                value, fingerprint, exemplar, replacement)) {
             assign->set_value(value);
             changed = true;
         }
 
         if (assign->destination() && !isa<Variable>(assign->destination())) {
             Expression* dest = assign->destination();
-            if (edge_replace_in_expression(dest, fingerprint, replacement)) {
+            if (edge_replace_in_expression(
+                    dest, fingerprint, exemplar, replacement)) {
                 assign->set_destination(dest);
                 changed = true;
             }
@@ -6895,7 +7297,8 @@ bool edge_rewrite_instruction(Instruction* inst, std::uint64_t fingerprint, Vari
     if (auto* branch = dyn_cast<Branch>(inst)) {
         if (auto* cond = branch->condition()) {
             for (Expression*& child : cond->mutable_operands()) {
-                changed = edge_replace_in_expression(child, fingerprint, replacement) || changed;
+                changed = edge_replace_in_expression(
+                    child, fingerprint, exemplar, replacement) || changed;
             }
         }
         return changed;
@@ -6904,7 +7307,8 @@ bool edge_rewrite_instruction(Instruction* inst, std::uint64_t fingerprint, Vari
     if (auto* ib = dyn_cast<IndirectBranch>(inst)) {
         Expression* before = ib->expression();
         Expression* after = before;
-        if (edge_replace_in_expression(after, fingerprint, replacement)) {
+        if (edge_replace_in_expression(
+                after, fingerprint, exemplar, replacement)) {
             if (after != before) {
                 ib->substitute(before, after);
             }
@@ -6916,7 +7320,8 @@ bool edge_rewrite_instruction(Instruction* inst, std::uint64_t fingerprint, Vari
     if (auto* ret = dyn_cast<Return>(inst)) {
         for (Expression* value : ret->values()) {
             Expression* rewritten = value;
-            if (edge_replace_in_expression(rewritten, fingerprint, replacement)) {
+            if (edge_replace_in_expression(
+                    rewritten, fingerprint, exemplar, replacement)) {
                 if (rewritten != value) {
                     ret->substitute(value, rewritten);
                 }
@@ -6932,7 +7337,7 @@ bool edge_rewrite_instruction(Instruction* inst, std::uint64_t fingerprint, Vari
 std::optional<EdgePrunerCandidate> select_edge_pruner_candidate(BasicBlock* block) {
     if (!block) return std::nullopt;
 
-    std::unordered_map<std::uint64_t, EdgePrunerCandidate> candidates;
+    std::unordered_map<std::uint64_t, std::vector<EdgePrunerCandidate>> candidates;
 
     const auto& insts = block->instructions();
     for (std::size_t idx = 0; idx < insts.size(); ++idx) {
@@ -6948,16 +7353,34 @@ std::optional<EdgePrunerCandidate> select_edge_pruner_candidate(BasicBlock* bloc
             if (contains_dereference(expr) || contains_call_expression(expr)) {
                 continue;
             }
+            // Reads from address-taken storage are not referentially
+            // transparent across calls: a callee may update the object
+            // through a pointer even though the expression contains no
+            // explicit dereference. Hoisting such a repeated expression to
+            // its first occurrence would reuse the pre-call value for every
+            // post-call occurrence.
+            if (contains_aliased_variable(expr)) {
+                continue;
+            }
 
             const std::size_t complexity = expression_complexity(expr);
             if (complexity < 2) continue;
 
             const std::uint64_t fp = expression_fp(expr);
-            auto& candidate = candidates[fp];
-            candidate.fingerprint = fp;
-            candidate.exemplar = expr;
-            candidate.complexity = complexity;
-            candidate.instruction_indices.push_back(idx);
+            auto& bucket = candidates[fp];
+            auto candidate = std::find_if(
+                bucket.begin(), bucket.end(),
+                [&](const EdgePrunerCandidate& existing) {
+                    return existing.exemplar
+                        && expressions_structurally_equal(
+                            expr, existing.exemplar);
+                });
+            if (candidate == bucket.end()) {
+                bucket.push_back(EdgePrunerCandidate{
+                    fp, expr, complexity, {}});
+                candidate = std::prev(bucket.end());
+            }
+            candidate->instruction_indices.push_back(idx);
         }
     }
 
@@ -6965,16 +7388,19 @@ std::optional<EdgePrunerCandidate> select_edge_pruner_candidate(BasicBlock* bloc
     std::size_t best_score = 0;
     constexpr std::size_t kScoreThreshold = 6; // complexity * occurrences
 
-    for (auto& [_, candidate] : candidates) {
-        const std::size_t occurrences = candidate.instruction_indices.size();
-        if (occurrences < 2) continue;
-        const std::size_t score = candidate.complexity * occurrences;
-        if (score < kScoreThreshold) continue;
+    for (auto& [_, bucket] : candidates) {
+        for (EdgePrunerCandidate& candidate : bucket) {
+            const std::size_t occurrences = candidate.instruction_indices.size();
+            if (occurrences < 2) continue;
+            const std::size_t score = candidate.complexity * occurrences;
+            if (score < kScoreThreshold) continue;
 
-        if (!best || score > best_score ||
-            (score == best_score && candidate.complexity > best->complexity)) {
-            best = candidate;
-            best_score = score;
+            if (!best || score > best_score ||
+                (score == best_score
+                 && candidate.complexity > best->complexity)) {
+                best = candidate;
+                best_score = score;
+            }
         }
     }
 
@@ -7004,7 +7430,9 @@ bool apply_edge_pruner_candidate(
 
     bool any_rewrite = false;
     for (std::size_t i = insert_idx + 1; i < insts.size(); ++i) {
-        any_rewrite = edge_rewrite_instruction(insts[i], candidate.fingerprint, temp) || any_rewrite;
+        any_rewrite = edge_rewrite_instruction(
+            insts[i], candidate.fingerprint, candidate.exemplar, temp)
+            || any_rewrite;
     }
 
     if (!any_rewrite) {
@@ -7080,7 +7508,155 @@ bool assignments_are_identical(const Assignment* lhs, const Assignment* rhs) {
         return false;
     }
 
-    return expression_fingerprint_hash(lhs->value()) == expression_fingerprint_hash(rhs->value());
+    return expressions_structurally_equal(lhs->value(), rhs->value());
+}
+
+using LiveVariableSet = std::unordered_set<VarKey, VarKeyHash>;
+
+LiveVariableSet live_keys(const std::vector<Variable*>& variables) {
+    LiveVariableSet keys;
+    for (Variable* variable : variables) {
+        if (variable && !isa<GlobalVariable>(variable)) {
+            keys.insert(var_key(variable));
+        }
+    }
+    return keys;
+}
+
+bool remove_dead_out_of_ssa_assignments(DecompilerTask& task) {
+    if (!task.cfg()) return false;
+
+    std::unordered_map<BasicBlock*, LiveVariableSet> uses;
+    std::unordered_map<BasicBlock*, LiveVariableSet> definitions;
+    std::unordered_map<BasicBlock*, LiveVariableSet> live_in;
+    std::unordered_map<BasicBlock*, LiveVariableSet> live_out;
+    LiveVariableSet address_taken;
+    std::unordered_set<std::string> observed_aliased_storage;
+
+    const auto storage_identity = [](const Variable* variable) {
+        if (!variable) return std::string{};
+        if (variable->is_stack_variable()) {
+            // Width propagation may widen a later load while it still names
+            // the same byte-addressed frame slot.
+            return "stack:" + std::to_string(variable->stack_offset());
+        }
+        return variable->name();
+    };
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        for (Instruction* instruction : block->instructions()) {
+            for (Variable* requirement : instruction->requirements()) {
+                if (requirement && requirement->is_aliased()) {
+                    observed_aliased_storage.insert(storage_identity(requirement));
+                }
+            }
+            for (Expression* expression : instruction_subexpressions(instruction)) {
+                auto* operation = dyn_cast<Operation>(expression);
+                if (!operation || operation->type() != OperationType::address_of
+                    || operation->operands().size() != 1) {
+                    continue;
+                }
+                if (auto* variable = dyn_cast<Variable>(
+                        strip_trivial_casts(operation->operands()[0]));
+                    variable && !isa<GlobalVariable>(variable)) {
+                    address_taken.insert(var_key(variable));
+                }
+            }
+        }
+    }
+
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        LiveVariableSet block_uses;
+        LiveVariableSet block_definitions;
+        for (Instruction* instruction : block->instructions()) {
+            for (const VarKey& requirement : live_keys(instruction->requirements())) {
+                if (!block_definitions.contains(requirement)) {
+                    block_uses.insert(requirement);
+                }
+            }
+            for (const VarKey& definition : live_keys(instruction->definitions())) {
+                block_definitions.insert(definition);
+            }
+        }
+        uses[block] = std::move(block_uses);
+        definitions[block] = std::move(block_definitions);
+    }
+
+    bool dataflow_changed = true;
+    while (dataflow_changed) {
+        dataflow_changed = false;
+        auto blocks = task.cfg()->blocks();
+        for (auto block_it = blocks.rbegin(); block_it != blocks.rend(); ++block_it) {
+            BasicBlock* block = *block_it;
+            LiveVariableSet next_out;
+            for (Edge* edge : block->successors()) {
+                if (!edge || !edge->target()) continue;
+                const auto& successor_in = live_in[edge->target()];
+                next_out.insert(successor_in.begin(), successor_in.end());
+            }
+
+            LiveVariableSet next_in = uses[block];
+            for (const VarKey& live : next_out) {
+                if (!definitions[block].contains(live)) {
+                    next_in.insert(live);
+                }
+            }
+            if (next_in != live_in[block] || next_out != live_out[block]) {
+                live_in[block] = std::move(next_in);
+                live_out[block] = std::move(next_out);
+                dataflow_changed = true;
+            }
+        }
+    }
+
+    bool removed = false;
+    for (BasicBlock* block : task.cfg()->blocks()) {
+        LiveVariableSet live = live_out[block];
+        const auto& instructions = block->instructions();
+        std::vector<Instruction*> kept_reverse;
+        kept_reverse.reserve(instructions.size());
+
+        for (auto instruction_it = instructions.rbegin();
+             instruction_it != instructions.rend(); ++instruction_it) {
+            Instruction* instruction = *instruction_it;
+            const LiveVariableSet instruction_definitions =
+                live_keys(instruction->definitions());
+            const LiveVariableSet instruction_requirements =
+                live_keys(instruction->requirements());
+
+            bool dead_assignment = false;
+            if (auto* assignment = dyn_cast<Assignment>(instruction)) {
+                auto* destination = dyn_cast<Variable>(assignment->destination());
+                const bool observed_alias = destination && destination->is_aliased()
+                    && observed_aliased_storage.contains(storage_identity(destination));
+                if (destination && !isa<GlobalVariable>(destination)
+                    && !observed_alias
+                    && (!destination->is_aliased()
+                        || !address_taken.contains(var_key(destination)))
+                    && !contains_call_expression(assignment->value())
+                    && !assignment_has_side_effect_destination(assignment)) {
+                    dead_assignment = !live.contains(var_key(destination));
+                }
+            }
+
+            if (dead_assignment) {
+                removed = true;
+                continue;
+            }
+
+            for (const VarKey& definition : instruction_definitions) {
+                live.erase(definition);
+            }
+            live.insert(instruction_requirements.begin(), instruction_requirements.end());
+            kept_reverse.push_back(instruction);
+        }
+
+        if (kept_reverse.size() != instructions.size()) {
+            std::reverse(kept_reverse.begin(), kept_reverse.end());
+            block->set_instructions(std::move(kept_reverse));
+        }
+    }
+    return removed;
 }
 
 } // namespace
@@ -7121,6 +7697,12 @@ void RedundantAssignmentEliminationStage::execute(DecompilerTask& task) {
             block->set_instructions(std::move(compacted));
         }
     }
+
+    // This stage runs after SSA destruction in the production pipeline.
+    // Apply reaching-definition-aware liveness rather than a global name-use
+    // count, because multiple imperative definitions now share one name.
+    while (remove_dead_out_of_ssa_assignments(task)) {
+    }
 }
 
 void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
@@ -7132,35 +7714,55 @@ void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
         return simplified;
     };
 
-    std::function<bool(AstNode*)> node_guarantees_termination = [&](AstNode* node) -> bool {
-        if (!node) {
-            return false;
-        }
-        if (auto* code = ast_dyn_cast<CodeNode>(node)) {
-            if (!code->block() || code->block()->instructions().empty()) {
+    constexpr std::size_t kMaxAstSimplificationDepth = 256;
+    constexpr std::size_t kMaxAstSimplificationExpansions = 1'000'000;
+    const auto node_guarantees_termination = [](AstNode* root) {
+        if (!root) return false;
+        std::unordered_set<AstNode*> visited;
+        std::vector<AstNode*> work{root};
+        std::size_t expansions = 0;
+        bool found_terminal = false;
+        while (!work.empty()) {
+            AstNode* node = work.back();
+            work.pop_back();
+            if (!node || !visited.insert(node).second) return false;
+            if (++expansions > kMaxAstSimplificationExpansions) return false;
+            if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+                if (!code->block() || code->block()->instructions().empty()) {
+                    return false;
+                }
+                Instruction* tail = code->block()->instructions().back();
+                if (!tail || (!isa<Return>(tail)
+                    && !isa<IndirectBranch>(tail)
+                    && !isa<BreakInstr>(tail)
+                    && !isa<ContinueInstr>(tail))) {
+                    return false;
+                }
+                found_terminal = true;
+            } else if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
+                if (seq->nodes().empty()) return false;
+                work.push_back(seq->nodes().back());
+            } else if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
+                if (!ifn->true_branch() || !ifn->false_branch()) return false;
+                work.push_back(ifn->false_branch());
+                work.push_back(ifn->true_branch());
+            } else {
                 return false;
             }
-            Instruction* tail = code->block()->instructions().back();
-            return tail && (isa<Return>(tail)
-                || isa<IndirectBranch>(tail)
-                || isa<BreakInstr>(tail)
-                || isa<ContinueInstr>(tail));
         }
-        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-            if (seq->nodes().empty()) {
-                return false;
-            }
-            return node_guarantees_termination(seq->nodes().back());
-        }
-        if (auto* ifn = ast_dyn_cast<IfNode>(node)) {
-            return node_guarantees_termination(ifn->true_branch())
-                && node_guarantees_termination(ifn->false_branch());
-        }
-        return false;
+        return found_terminal;
     };
 
-    std::function<void(AstNode*)> traverse = [&](AstNode* node) {
+    std::unordered_set<AstNode*> active_ast_nodes;
+    std::size_t ast_expansions = 0;
+    std::function<void(AstNode*, std::size_t)> traverse =
+        [&](AstNode* node, std::size_t depth) {
         if (!node) return;
+        if (depth > kMaxAstSimplificationDepth
+            || ++ast_expansions > kMaxAstSimplificationExpansions
+            || !active_ast_nodes.insert(node).second) {
+            return;
+        }
 
         if (auto* code = ast_dyn_cast<CodeNode>(node)) {
             if (code->block()) {
@@ -7193,8 +7795,8 @@ void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
                     ifn->set_cond(task.arena().create<ExprAstNode>(simpl));
                 }
             }
-            traverse(ifn->true_branch());
-            traverse(ifn->false_branch());
+            traverse(ifn->true_branch(), depth + 1);
+            traverse(ifn->false_branch(), depth + 1);
         } else if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
             if (auto* wh = ast_dyn_cast<WhileLoopNode>(loop)) {
                 Expression* simpl = simplify_expr(wh->condition());
@@ -7207,13 +7809,13 @@ void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
                     dw->set_condition(simpl);
                 }
             }
-            traverse(loop->body());
+            traverse(loop->body(), depth + 1);
         } else if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
             auto children = seq->nodes();
             std::vector<AstNode*> compact;
             compact.reserve(children.size());
             for (auto* child : children) {
-                traverse(child);
+                traverse(child, depth + 1);
                 compact.push_back(child);
                 if (node_guarantees_termination(child)) {
                     break;
@@ -7223,16 +7825,17 @@ void AstExpressionSimplificationStage::execute(DecompilerTask& task) {
         } else if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
             for (auto* case_node : sw->cases()) {
                 if (auto* c = ast_dyn_cast<CaseNode>(case_node)) {
-                    traverse(c->body());
+                    traverse(c->body(), depth + 1);
                 }
             }
         }
+        active_ast_nodes.erase(node);
     };
 
     if (!task.ast() || !task.ast()->root()) {
         return;
     }
-    traverse(task.ast()->root());
+    traverse(task.ast()->root(), 0);
 
 }
 
@@ -7387,6 +7990,7 @@ static Expression* resolve_via_alias_base(DecompilerArena& arena,
     const auto width = c->size_bytes > 0 ? c->size_bytes : 8U;
     auto* init = arena.create<Constant>(*best_base, width);
     auto* gv = arena.create<GlobalVariable>(best_name, width, init, false);
+    gv->set_represents_address(true);
     if (best_delta == 0) {
         return gv;
     }
@@ -7416,7 +8020,11 @@ Expression* try_resolve_address_constant(
     if (str_res && !str_res->empty()) {
         std::string escaped = addr_res_escape_c_string(*str_res);
         auto* init = arena.create<Constant>(value, width);
-        return arena.create<GlobalVariable>(escaped, width, init, /*is_const=*/true);
+        auto* string = arena.create<GlobalVariable>(
+            escaped, width, init, /*is_const=*/true);
+        string->set_ir_type(std::make_shared<Pointer>(
+            Integer::uint8_t(), width * 8));
+        return string;
     }
 
     // Try symbol name.
@@ -7429,7 +8037,9 @@ Expression* try_resolve_address_constant(
                 is_const = !seg->permissions().write;
             }
             auto* init = arena.create<Constant>(value, width);
-            return arena.create<GlobalVariable>(sym, width, init, is_const);
+            auto* global = arena.create<GlobalVariable>(sym, width, init, is_const);
+            global->set_represents_address(true);
+            return global;
         }
     }
 
@@ -7437,7 +8047,10 @@ Expression* try_resolve_address_constant(
     auto ait = aliases.find(value);
     if (ait != aliases.end() && !ait->second.empty()) {
         auto* init = arena.create<Constant>(value, width);
-        return arena.create<GlobalVariable>(ait->second, width, init, /*is_const=*/false);
+        auto* global = arena.create<GlobalVariable>(
+            ait->second, width, init, /*is_const=*/false);
+        global->set_represents_address(true);
+        return global;
     }
 
     if (Expression* via_base = resolve_via_alias_base(arena, c, aliases)) {
@@ -7664,7 +8277,10 @@ bool rewrite_degenerate_global_self_index(
                 auto alias_it = global_alias_by_var.find(var_key(lhs_var));
                 if (alias_it != global_alias_by_var.end() && !alias_it->second.empty()) {
                     const std::size_t base_width = lhs_var->size_bytes > 0 ? lhs_var->size_bytes : 8;
-                    op->mutable_operands()[0] = task.arena().create<GlobalVariable>(alias_it->second, base_width);
+                    auto* global = task.arena().create<GlobalVariable>(
+                        alias_it->second, base_width);
+                    global->set_represents_address(true);
+                    op->mutable_operands()[0] = global;
                     changed = true;
                 }
             }
@@ -8032,6 +8648,7 @@ void AddressResolutionStage::execute(DecompilerTask& task) {
                                     auto alias_it = global_alias_by_var.find(var_key(base_var));
                                     if (alias_it != global_alias_by_var.end() && alias_it->second == "__MergedGlobals") {
                                         auto* gv = task.arena().create<GlobalVariable>("__MergedGlobals", base_var->size_bytes > 0 ? base_var->size_bytes : 8);
+                                        gv->set_represents_address(true);
                                         auto* rooted_deref = task.arena().create<Operation>(
                                             OperationType::deref,
                                             std::vector<Expression*>{gv},
@@ -8078,6 +8695,85 @@ void AddressResolutionStage::execute(DecompilerTask& task) {
             }
         }
         canonicalize_global_index_temporaries_in_block(task, block);
+    }
+
+    // Address resolution runs after the main type-propagation passes. Carry
+    // newly discovered pointer roles through copy/phi chains here so the
+    // out-of-SSA allocator cannot merge a string-bearing register live range
+    // with an integer return-value live range of the same width.
+    std::unordered_map<VarKey, TypePtr, VarKeyHash> pointer_types;
+    const auto pointer_type_of = [&](Expression* expression) -> TypePtr {
+        if (!expression) return nullptr;
+        TypePtr type = expression->ir_type();
+        return type && type->type_kind() == TypeKind::Pointer ? type : nullptr;
+    };
+
+    bool pointer_changed = true;
+    while (pointer_changed) {
+        pointer_changed = false;
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            for (Instruction* instruction : block->instructions()) {
+                auto* assignment = dyn_cast<Assignment>(instruction);
+                auto* destination = assignment
+                    ? dyn_cast<Variable>(assignment->destination()) : nullptr;
+                if (!assignment || !destination) continue;
+
+                TypePtr discovered = pointer_type_of(assignment->value());
+                if (!discovered) {
+                    if (auto* source = dyn_cast<Variable>(
+                            strip_trivial_casts(assignment->value()))) {
+                        auto source_type = pointer_types.find(var_key(source));
+                        if (source_type != pointer_types.end()) {
+                            discovered = source_type->second;
+                        }
+                    }
+                }
+
+                if (auto* phi = dyn_cast<Phi>(assignment)) {
+                    TypePtr common;
+                    bool all_pointer = !phi->operand_list()->operands().empty();
+                    for (Expression* operand : phi->operand_list()->operands()) {
+                        TypePtr operand_type = pointer_type_of(operand);
+                        if (!operand_type) {
+                            if (auto* variable = dyn_cast<Variable>(operand)) {
+                                auto known = pointer_types.find(var_key(variable));
+                                if (known != pointer_types.end()) {
+                                    operand_type = known->second;
+                                }
+                            }
+                        }
+                        if (!operand_type) {
+                            all_pointer = false;
+                            break;
+                        }
+                        if (!common) common = operand_type;
+                    }
+                    discovered = all_pointer ? common : nullptr;
+                }
+
+                if (discovered
+                    && pointer_types.emplace(var_key(destination), discovered).second) {
+                    pointer_changed = true;
+                }
+            }
+        }
+    }
+
+    if (!pointer_types.empty()) {
+        for (BasicBlock* block : task.cfg()->blocks()) {
+            for (Instruction* instruction : block->instructions()) {
+                std::vector<Variable*> variables = instruction->requirements();
+                auto definitions = instruction->definitions();
+                variables.insert(variables.end(), definitions.begin(), definitions.end());
+                for (Variable* variable : variables) {
+                    if (!variable || isa<GlobalVariable>(variable)) continue;
+                    auto known = pointer_types.find(var_key(variable));
+                    if (known != pointer_types.end()) {
+                        variable->set_ir_type(known->second);
+                    }
+                }
+            }
+        }
     }
 }
 

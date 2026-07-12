@@ -1,0 +1,46 @@
+#define _main decompiled_main
+#define _printf printf
+#include "@GENERATED_C@"
+#undef _printf
+#undef _main
+
+static int verify_decompiled_functions(void) {
+    static const uint32_t arithmetic_values[] = {
+        UINT32_C(0), UINT32_C(1), UINT32_C(2), UINT32_C(5),
+        UINT32_C(0x7fffffff), UINT32_C(0x80000000), UINT32_MAX,
+    };
+    for (size_t i = 0; i < sizeof(arithmetic_values) / sizeof(arithmetic_values[0]); ++i) {
+        for (size_t j = 0; j < sizeof(arithmetic_values) / sizeof(arithmetic_values[0]); ++j) {
+            const uint32_t a = arithmetic_values[i];
+            const uint32_t b = arithmetic_values[j];
+            const uint32_t expected = (uint32_t)(a * b + UINT32_C(42));
+            if ((uint32_t)_simple_math(a, b) != expected) return 10;
+        }
+    }
+
+    for (int64_t value = -32; value <= 32; ++value) {
+        const int32_t input = (int32_t)value;
+        const uint32_t expected_diamond = input <= 5
+            ? (uint32_t)input - UINT32_C(1)
+            : (uint32_t)input + UINT32_C(1);
+        const uint32_t expected_nested = input <= 0 ? UINT32_C(3)
+            : (input >= 10 ? UINT32_C(2) : UINT32_C(1));
+        if ((uint32_t)_diamond_cfg((uint32_t)input) != expected_diamond) return 11;
+        if ((uint32_t)_nested_cfg((uint32_t)input) != expected_nested) return 12;
+    }
+
+    for (int32_t count = -8; count <= 128; ++count) {
+        const uint32_t expected = count <= 0
+            ? UINT32_C(0)
+            : (uint32_t)(((uint64_t)(uint32_t)count
+                * (uint64_t)(uint32_t)(count - 1)) / UINT64_C(2));
+        if ((uint32_t)_loop_cfg((uint32_t)count) != expected) return 13;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp) {
+    const int function_result = verify_decompiled_functions();
+    if (function_result != 0) return function_result;
+    return decompiled_main(argc, argv, envp);
+}

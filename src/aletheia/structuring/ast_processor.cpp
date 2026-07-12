@@ -18,7 +18,7 @@ bool same_if_condition(AstNode* lhs_cond, AstNode* rhs_cond) {
         return false;
     }
 
-    return expression_fingerprint_hash(lhs_expr->expr()) == expression_fingerprint_hash(rhs_expr->expr());
+    return expressions_structurally_equal(lhs_expr->expr(), rhs_expr->expr());
 }
 
 std::string variable_key(const Variable* v) {
@@ -272,7 +272,7 @@ std::optional<bool> compare_with_constant_implication(const CompareWithConstant&
     if (!outer.expr || !inner.expr || !outer.constant || !inner.constant) {
         return std::nullopt;
     }
-    if (expression_fingerprint_hash(outer.expr) != expression_fingerprint_hash(inner.expr)) {
+    if (!expressions_structurally_equal(outer.expr, inner.expr)) {
         return std::nullopt;
     }
 
@@ -431,9 +431,15 @@ bool conditions_contradict(Expression* outer_expr, Expression* inner_expr) {
     const std::uint64_t inner_rhs_fp = expression_fingerprint_hash(inner.rhs);
 
     OperationType aligned_inner_op = OperationType::unknown;
-    if (outer_lhs_fp == inner_lhs_fp && outer_rhs_fp == inner_rhs_fp) {
+    if (outer_lhs_fp == inner_lhs_fp
+        && outer_rhs_fp == inner_rhs_fp
+        && expressions_structurally_equal(outer.lhs, inner.lhs)
+        && expressions_structurally_equal(outer.rhs, inner.rhs)) {
         aligned_inner_op = inner.op;
-    } else if (outer_lhs_fp == inner_rhs_fp && outer_rhs_fp == inner_lhs_fp) {
+    } else if (outer_lhs_fp == inner_rhs_fp
+               && outer_rhs_fp == inner_lhs_fp
+               && expressions_structurally_equal(outer.lhs, inner.rhs)
+               && expressions_structurally_equal(outer.rhs, inner.lhs)) {
         aligned_inner_op = flipped_compare(inner.op);
     } else {
         return false;
@@ -468,9 +474,15 @@ std::optional<bool> condition_truth_under_outer(Expression* outer_expr, Expressi
     const std::uint64_t inner_rhs_fp = expression_fingerprint_hash(inner.rhs);
 
     OperationType aligned_inner_op = OperationType::unknown;
-    if (outer_lhs_fp == inner_lhs_fp && outer_rhs_fp == inner_rhs_fp) {
+    if (outer_lhs_fp == inner_lhs_fp
+        && outer_rhs_fp == inner_rhs_fp
+        && expressions_structurally_equal(outer.lhs, inner.lhs)
+        && expressions_structurally_equal(outer.rhs, inner.rhs)) {
         aligned_inner_op = inner.op;
-    } else if (outer_lhs_fp == inner_rhs_fp && outer_rhs_fp == inner_lhs_fp) {
+    } else if (outer_lhs_fp == inner_rhs_fp
+               && outer_rhs_fp == inner_lhs_fp
+               && expressions_structurally_equal(outer.lhs, inner.rhs)
+               && expressions_structurally_equal(outer.rhs, inner.lhs)) {
         aligned_inner_op = flipped_compare(inner.op);
     } else {
         return std::nullopt;

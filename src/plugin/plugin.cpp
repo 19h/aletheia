@@ -143,6 +143,16 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         
         pipeline.run(task);
 
+        if (task.failed()) {
+            const std::string detail = task.failure_stage()
+                + (task.failure_message().empty()
+                    ? std::string{}
+                    : ": " + task.failure_message());
+            ida::ui::warning("Aletheia pipeline failed: " + detail);
+            return std::unexpected(ida::Error::internal(
+                "Aletheia pipeline failed", detail));
+        }
+
         if (task.ast() && task.ast()->root()
             && !aletheia::ast_has_unique_code_node_ownership(task.ast()->root())) {
             auto fallback = std::make_unique<aletheia::AbstractSyntaxForest>();
@@ -174,6 +184,13 @@ struct AletheiaPlugin : ida::plugin::Plugin {
         aletheia::LoopNameGenerator::apply_while_loop_counters(task.ast());
         aletheia::VariableNameGeneration::remove_self_assignments(task.cfg(), &task.arena());
         aletheia::VariableNameGeneration::remove_self_assignments_ast(task.ast(), &task.arena());
+
+        if (auto validation = aletheia::validate_task_for_codegen(task)) {
+            ida::ui::warning(
+                "Aletheia rejected invalid final IR: " + *validation);
+            return std::unexpected(ida::Error::validation(
+                "Aletheia rejected invalid final IR", *validation));
+        }
 
         std::vector<std::string> lines;
         lines.push_back(ida::lines::colstr("// Aletheia Decompiled Output", ida::lines::Color::RegularComment));

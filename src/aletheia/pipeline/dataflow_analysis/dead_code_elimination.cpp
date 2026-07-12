@@ -137,6 +137,15 @@ void DeadCodeEliminationStage::execute(DecompilerTask& task) {
                     }
                     // Uses from the RHS
                     extract_uses(assign->value(), global_uses);
+                    if (auto* phi = dyn_cast<Phi>(inst)) {
+                        // Several CFG-repair stages update the authoritative
+                        // predecessor-to-value map without rebuilding the
+                        // positional ListOperation. Treat both representations
+                        // as uses so DCE cannot orphan a live phi operand.
+                        for (const auto& [_, origin_value] : phi->origin_block()) {
+                            extract_uses(origin_value, global_uses);
+                        }
+                    }
                     // If destination is a complex expression (e.g., deref), its
                     // sub-expressions are also uses
                     if (!isa<Variable>(assign->destination())) {

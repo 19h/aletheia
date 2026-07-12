@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -261,20 +262,71 @@ private:
 // FunctionTypeDef -- Function type: return_type(param1, param2, ...)
 // =============================================================================
 
+enum class AbiParameterStorage : std::uint8_t {
+    Default,
+    GeneralRegister,
+    FloatingRegister,
+    Stack,
+};
+
+/// Explicit lowered-ABI placement for a source parameter. Most function
+/// types use Default and are allocated from their scalar type. Front-ends use
+/// an explicit location when a composite ABI value has been flattened into C
+/// scalar parameters, or when binary evidence establishes a non-default stack
+/// layout that cannot be recovered from those scalar types alone.
+struct AbiParameterLocation {
+    std::size_t parameter_index = 0;
+    AbiParameterStorage storage = AbiParameterStorage::Default;
+    std::size_t register_index = 0;
+    std::int64_t stack_offset = 0;
+
+    bool operator==(const AbiParameterLocation&) const = default;
+};
+
 class FunctionTypeDef final : public Type {
 public:
-    FunctionTypeDef(TypePtr return_type, std::vector<TypePtr> parameters)
+    FunctionTypeDef(TypePtr return_type,
+                    std::vector<TypePtr> parameters,
+                    bool variadic = false,
+                    std::size_t abi_indirect_result_size = 0,
+                    std::size_t abi_hfa_result_element_size = 0,
+                    std::size_t abi_hfa_result_count = 0,
+                    std::vector<AbiParameterLocation> abi_parameter_locations = {})
         : Type(0), return_type_(std::move(return_type)),
-          parameters_(std::move(parameters)) { type_kind_ = TypeKind::FunctionTypeDef; }
+          parameters_(std::move(parameters)),
+          variadic_(variadic),
+          abi_indirect_result_size_(abi_indirect_result_size),
+          abi_hfa_result_element_size_(abi_hfa_result_element_size),
+          abi_hfa_result_count_(abi_hfa_result_count),
+          abi_parameter_locations_(std::move(abi_parameter_locations)) {
+        type_kind_ = TypeKind::FunctionTypeDef;
+    }
 
     const TypePtr& return_type() const { return return_type_; }
     const std::vector<TypePtr>& parameters() const { return parameters_; }
+    bool variadic() const { return variadic_; }
+    std::size_t abi_indirect_result_size() const {
+        return abi_indirect_result_size_;
+    }
+    std::size_t abi_hfa_result_element_size() const {
+        return abi_hfa_result_element_size_;
+    }
+    std::size_t abi_hfa_result_count() const {
+        return abi_hfa_result_count_;
+    }
+    const std::vector<AbiParameterLocation>& abi_parameter_locations() const {
+        return abi_parameter_locations_;
+    }
 
     std::string to_string() const override {
         std::string result = return_type_->to_string() + "(";
         for (std::size_t i = 0; i < parameters_.size(); ++i) {
             if (i > 0) result += ", ";
             result += parameters_[i]->to_string();
+        }
+        if (variadic_) {
+            if (!parameters_.empty()) result += ", ";
+            result += "...";
         }
         result += ")";
         return result;
@@ -284,6 +336,11 @@ public:
         if (other.type_kind() != TypeKind::FunctionTypeDef) return false;
         auto* o = static_cast<const FunctionTypeDef*>(&other);
         if (*return_type_ != *o->return_type_) return false;
+        if (variadic_ != o->variadic_) return false;
+        if (abi_indirect_result_size_ != o->abi_indirect_result_size_) return false;
+        if (abi_hfa_result_element_size_ != o->abi_hfa_result_element_size_) return false;
+        if (abi_hfa_result_count_ != o->abi_hfa_result_count_) return false;
+        if (abi_parameter_locations_ != o->abi_parameter_locations_) return false;
         if (parameters_.size() != o->parameters_.size()) return false;
         for (std::size_t i = 0; i < parameters_.size(); ++i)
             if (*parameters_[i] != *o->parameters_[i]) return false;
@@ -293,6 +350,11 @@ public:
 private:
     TypePtr return_type_;
     std::vector<TypePtr> parameters_;
+    bool variadic_ = false;
+    std::size_t abi_indirect_result_size_ = 0;
+    std::size_t abi_hfa_result_element_size_ = 0;
+    std::size_t abi_hfa_result_count_ = 0;
+    std::vector<AbiParameterLocation> abi_parameter_locations_;
 };
 
 // =============================================================================

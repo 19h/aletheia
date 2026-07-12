@@ -216,7 +216,15 @@ void DebugObserver::operator()(const char* stage_name, bool before_stage,
             (name_ordinal_it == stage_name_occurrence_.end()) ? 0 : name_ordinal_it->second;
         if (should_run_invariants_for_stage(stage_name_str, name_ordinal)) {
             selector_match_count_ += 1;
-            auto violations = invariant_checker_.check_all(task.cfg(), current_phase_);
+            std::optional<std::size_t> declared_parameter_count;
+            if (task.function_type()) {
+                if (const auto* function = type_dyn_cast<FunctionTypeDef>(
+                        task.function_type().get())) {
+                    declared_parameter_count = function->parameters().size();
+                }
+            }
+            auto violations = invariant_checker_.check_all(
+                task.cfg(), current_phase_, declared_parameter_count);
             if (!violations.empty()) {
                 std::vector<InvariantViolation> new_violations;
                 std::unordered_set<std::string> current_fingerprints;

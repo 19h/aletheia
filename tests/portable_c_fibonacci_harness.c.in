@@ -1,0 +1,27 @@
+#define _main decompiled_main
+#define ___error __error
+#define _bzero bzero
+#define _clock_gettime clock_gettime
+#define _fprintf fprintf
+#define _printf printf
+#define _putchar putchar
+#define _puts puts
+#define _strtol strtol
+#include "@GENERATED_C@"
+#undef _strtol
+#undef _puts
+#undef _putchar
+#undef _printf
+#undef _fprintf
+#undef _clock_gettime
+#undef _bzero
+#undef ___error
+#undef _main
+
+extern unsigned char __stderrp[];
+unsigned char ___stderrp_ptr[sizeof(uintptr_t)];
+
+int main(int argc, char **argv, char **envp) {
+    *((uintptr_t *)(void *)___stderrp_ptr) = (uintptr_t)__stderrp;
+    return decompiled_main(argc, argv, envp);
+}

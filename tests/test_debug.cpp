@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <iostream>
+#include <limits>
 #include <cstdlib>
 #include <cctype>
 #include <string>
@@ -397,6 +399,25 @@ void test_expression_depth() {
     auto* op = arena.create<Operation>(OperationType::add, std::move(ops), 4);
     ASSERT_EQ(expression_depth(op), 2);
 
+    Expression* deep = c;
+    constexpr std::size_t deep_levels = 4096;
+    for (std::size_t index = 0; index < deep_levels; ++index) {
+        deep = arena.create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{deep},
+            1);
+    }
+    ASSERT_EQ(expression_depth(deep), deep_levels + 1);
+
+    auto* cycle = arena.create<Operation>(
+        OperationType::logical_not,
+        std::vector<Expression*>{c},
+        1);
+    cycle->mutable_operands()[0] = cycle;
+    ASSERT_EQ(
+        expression_depth(cycle),
+        std::numeric_limits<std::size_t>::max());
+
     ASSERT_EQ(expression_depth(nullptr), 0);
     std::cout << "[+] test_expression_depth passed.\n";
 }
@@ -410,6 +431,21 @@ void test_expression_weight() {
     SmallVector<Expression*, 4> ops{v, c};
     auto* op = arena.create<Operation>(OperationType::add, std::move(ops), 4);
     ASSERT_EQ(expression_weight(op), 3); // op + v + c
+
+    auto* shared_root = arena.create<Operation>(
+        OperationType::bit_xor,
+        std::vector<Expression*>{op, op},
+        4);
+    ASSERT_EQ(expression_weight(shared_root), 7U);
+
+    auto* cycle = arena.create<Operation>(
+        OperationType::logical_not,
+        std::vector<Expression*>{c},
+        1);
+    cycle->mutable_operands()[0] = cycle;
+    ASSERT_EQ(
+        expression_weight(cycle),
+        std::numeric_limits<std::size_t>::max());
 
     ASSERT_EQ(expression_weight(nullptr), 0);
     std::cout << "[+] test_expression_weight passed.\n";
@@ -662,6 +698,178 @@ void test_invariant_checker_cfg_consistency() {
     }
     ASSERT_TRUE(found_edge_sym);
     std::cout << "[+] test_invariant_checker_cfg_consistency passed.\n";
+}
+
+void test_invariant_checker_expression_acyclicity() {
+    IrInvariantChecker checker;
+
+    {
+        DecompilerArena arena;
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = arena.create<BasicBlock>(77);
+        cfg->add_block(block);
+        cfg->set_entry_block(block);
+
+        auto* self_cycle = arena.create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{arena.create<Constant>(0, 1)},
+            1);
+        self_cycle->mutable_operands()[0] = self_cycle;
+        auto* assignment = arena.create<Assignment>(
+            arena.create<Variable>("cycle", 1),
+            self_cycle);
+        assignment->set_address(0x1234);
+        block->add_instruction(assignment);
+
+        auto direct = checker.check_expression_acyclicity(cfg.get());
+        ASSERT_EQ(direct.size(), 1U);
+        ASSERT_EQ(direct[0].invariant_name, "expression_cycle");
+        ASSERT_TRUE(
+            direct[0].description.find("bb_77 instruction[0] root 'value'")
+            != std::string::npos);
+        ASSERT_TRUE(
+            direct[0].description.find("operation(")
+            != std::string::npos);
+        ASSERT_TRUE(
+            direct[0].context.find("address=0x1234")
+            != std::string::npos);
+
+        // check_all must stop before recursive liveness walkers and return the
+        // controlled cycle diagnostic rather than recursing indefinitely.
+        auto all = checker.check_all(cfg.get(), PipelinePhase::PreSSA);
+        ASSERT_EQ(all.size(), 1U);
+        ASSERT_EQ(all[0].invariant_name, "expression_cycle");
+    }
+
+    {
+        DecompilerArena arena;
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = arena.create<BasicBlock>(78);
+        cfg->add_block(block);
+        cfg->set_entry_block(block);
+
+        auto* first = arena.create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{arena.create<Constant>(0, 1)},
+            1);
+        auto* second = arena.create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{first},
+            1);
+        first->mutable_operands()[0] = second;
+        block->add_instruction(arena.create<Return>(
+            std::vector<Expression*>{first}));
+
+        auto violations =
+            checker.check_expression_acyclicity(cfg.get());
+        ASSERT_EQ(violations.size(), 1U);
+        ASSERT_TRUE(
+            violations[0].description.find("return-value[0]")
+            != std::string::npos);
+    }
+
+    {
+        DecompilerArena arena;
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = arena.create<BasicBlock>(79);
+        cfg->add_block(block);
+        cfg->set_entry_block(block);
+
+        auto* shared = arena.create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{
+                arena.create<Variable>("x", 8),
+                arena.create<Constant>(1, 8),
+            },
+            8);
+        auto* dag = arena.create<Operation>(
+            OperationType::bit_xor,
+            std::vector<Expression*>{shared, shared},
+            8);
+        block->add_instruction(arena.create<Assignment>(
+            arena.create<Variable>("out", 8),
+            dag));
+
+        ASSERT_TRUE(
+            checker.check_expression_acyclicity(cfg.get()).empty());
+        ASSERT_TRUE(
+            checker.check_all(cfg.get(), PipelinePhase::PreSSA).empty());
+    }
+
+    std::cout
+        << "[+] test_invariant_checker_expression_acyclicity passed.\n";
+}
+
+void test_invariant_checker_parameter_metadata() {
+    DecompilerArena arena;
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* block = arena.create<BasicBlock>(80);
+    cfg->add_block(block);
+    cfg->set_entry_block(block);
+
+    auto* missing_index = arena.create<Variable>("missing", 8);
+    missing_index->set_kind(VariableKind::Parameter);
+
+    auto* non_parameter_index = arena.create<Variable>("local", 8);
+    non_parameter_index->set_parameter_index(0);
+
+    auto* out_of_range = arena.create<Variable>("far", 8);
+    out_of_range->set_kind(VariableKind::Parameter);
+    out_of_range->set_parameter_index(3);
+
+    auto* malformed_return = arena.create<Return>(
+        std::vector<Expression*>{
+            missing_index,
+            non_parameter_index,
+            out_of_range,
+            out_of_range,
+        });
+    malformed_return->set_address(0x5678);
+    block->add_instruction(malformed_return);
+
+    IrInvariantChecker checker;
+    auto violations = checker.check_parameter_metadata(cfg.get(), 1U);
+    ASSERT_EQ(violations.size(), 3U);
+    for (const auto& violation : violations) {
+        ASSERT_EQ(violation.invariant_name, "parameter_metadata");
+        ASSERT_CONTAINS(violation.description, "bb_80 instruction[0]");
+        ASSERT_CONTAINS(violation.context, "address=0x5678");
+    }
+    ASSERT_TRUE(std::any_of(
+        violations.begin(), violations.end(), [](const auto& violation) {
+            return violation.description.find("no non-negative parameter index")
+                != std::string::npos;
+        }));
+    ASSERT_TRUE(std::any_of(
+        violations.begin(), violations.end(), [](const auto& violation) {
+            return violation.description.find("non-parameter variable")
+                != std::string::npos;
+        }));
+    ASSERT_TRUE(std::any_of(
+        violations.begin(), violations.end(), [](const auto& violation) {
+            return violation.description.find("outside declared parameter count 1")
+                != std::string::npos;
+        }));
+
+    auto all = checker.check_all(cfg.get(), PipelinePhase::PreSSA, 1U);
+    ASSERT_EQ(std::count_if(
+        all.begin(), all.end(), [](const auto& violation) {
+            return violation.invariant_name == "parameter_metadata";
+        }), 3);
+
+    DecompilerArena valid_arena;
+    auto valid_cfg = std::make_unique<ControlFlowGraph>();
+    auto* valid_block = valid_arena.create<BasicBlock>(81);
+    valid_cfg->add_block(valid_block);
+    valid_cfg->set_entry_block(valid_block);
+    auto* parameter = valid_arena.create<Variable>("renamed", 8);
+    parameter->set_kind(VariableKind::Parameter);
+    parameter->set_parameter_index(0);
+    valid_block->add_instruction(valid_arena.create<Return>(
+        std::vector<Expression*>{parameter}));
+    ASSERT_TRUE(checker.check_parameter_metadata(valid_cfg.get(), 1U).empty());
+
+    std::cout << "[+] test_invariant_checker_parameter_metadata passed.\n";
 }
 
 void test_invariant_checker_phi_arg_mismatch() {
@@ -1552,6 +1760,277 @@ void test_invariant_checker_well_formed_cfg() {
 // Main
 // ============================================================================
 
+void test_expression_fingerprint_includes_semantic_type() {
+    DecompilerArena arena;
+    auto* integer_view = arena.create<Operation>(
+        OperationType::bitcast,
+        std::vector<Expression*>{arena.create<Constant>(0x3ff0000000000000ULL, 8)},
+        8);
+    integer_view->set_ir_type(Integer::uint64_t());
+    auto* float_view = arena.create<Operation>(
+        OperationType::bitcast,
+        std::vector<Expression*>{arena.create<Constant>(0x3ff0000000000000ULL, 8)},
+        8);
+    float_view->set_ir_type(Float::float64());
+
+    ASSERT_NE(
+        expression_fingerprint_hash(integer_view),
+        expression_fingerprint_hash(float_view));
+}
+
+void test_structural_equality_rejects_matching_hash_non_equivalence() {
+    DecompilerArena arena;
+    auto make_add = [&](std::size_t width) {
+        return arena.create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{
+                arena.create<Variable>("x0", 8),
+                arena.create<Constant>(1, 8),
+            },
+            width);
+    };
+
+    Operation* narrow = make_add(4);
+    Operation* wide = make_add(8);
+    ASSERT_EQ(
+        expression_fingerprint_hash(narrow),
+        expression_fingerprint_hash(wide));
+    ASSERT_TRUE(!expression_structurally_equal_exact(narrow, wide));
+    ASSERT_TRUE(!expressions_structurally_equal(narrow, wide));
+
+    auto* original = make_add(8);
+    auto* clone = dyn_cast<Operation>(original->copy(arena));
+    ASSERT_TRUE(expression_structurally_equal_exact(original, clone));
+    ASSERT_TRUE(expressions_structurally_equal(original, clone));
+
+    auto* value_global = arena.create<GlobalVariable>("global", 8);
+    auto* address_global = arena.create<GlobalVariable>("global", 8);
+    address_global->set_represents_address(true);
+    ASSERT_EQ(
+        expression_fingerprint_hash(value_global),
+        expression_fingerprint_hash(address_global));
+    ASSERT_TRUE(!expressions_structurally_equal(value_global, address_global));
+}
+
+void test_expression_graph_fingerprinting_is_cycle_safe() {
+    DecompilerArena arena;
+    const auto make_unary = [&](OperationType type) {
+        return arena.create<Operation>(
+            type,
+            std::vector<Expression*>{arena.create<Constant>(0, 1)},
+            1);
+    };
+
+    auto* self_left = make_unary(OperationType::logical_not);
+    auto* self_right = make_unary(OperationType::logical_not);
+    self_left->mutable_operands()[0] = self_left;
+    self_right->mutable_operands()[0] = self_right;
+    ASSERT_EQ(
+        expression_fingerprint_hash(self_left),
+        expression_fingerprint_hash(self_right));
+    ASSERT_TRUE(expression_structurally_equal_exact(
+        self_left, self_right));
+    ASSERT_TRUE(expressions_structurally_equal(
+        self_left, self_right));
+
+    auto* different_self = make_unary(OperationType::bit_not);
+    different_self->mutable_operands()[0] = different_self;
+    ASSERT_EQ(
+        expression_fingerprint_hash(self_left),
+        expression_fingerprint_hash(different_self));
+    ASSERT_TRUE(!expressions_structurally_equal(
+        self_left, different_self));
+
+    auto* mutual_left_first = make_unary(OperationType::logical_not);
+    auto* mutual_left_second = make_unary(OperationType::logical_not);
+    mutual_left_first->mutable_operands()[0] = mutual_left_second;
+    mutual_left_second->mutable_operands()[0] = mutual_left_first;
+    auto* mutual_right_first = make_unary(OperationType::logical_not);
+    auto* mutual_right_second = make_unary(OperationType::logical_not);
+    mutual_right_first->mutable_operands()[0] = mutual_right_second;
+    mutual_right_second->mutable_operands()[0] = mutual_right_first;
+    ASSERT_TRUE(expressions_structurally_equal(
+        mutual_left_first, mutual_right_first));
+    ASSERT_TRUE(!expressions_structurally_equal(
+        self_left, mutual_left_first));
+
+    auto* shared = arena.create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{
+            arena.create<Variable>("x", 8),
+            arena.create<Constant>(1, 8),
+        },
+        8);
+    auto* dag = arena.create<Operation>(
+        OperationType::bit_xor,
+        std::vector<Expression*>{shared, shared},
+        8);
+    auto* duplicated = arena.create<Operation>(
+        OperationType::bit_xor,
+        std::vector<Expression*>{
+            shared->copy(arena),
+            shared->copy(arena),
+        },
+        8);
+    ASSERT_EQ(
+        expression_fingerprint_hash(dag),
+        expression_fingerprint_hash(duplicated));
+    ASSERT_TRUE(expressions_structurally_equal(dag, duplicated));
+}
+
+void test_expression_clone_is_stack_safe_and_cycle_rejecting() {
+    DecompilerArena arena;
+    auto* leaf = arena.create<Variable>("deep", 8);
+    leaf->set_ssa_version(17);
+    leaf->set_aliased(true);
+    leaf->set_kind(VariableKind::StackLocal);
+    leaf->set_stack_offset(-32);
+    leaf->set_ir_type(Integer::int64_t());
+
+    Expression* deep = leaf;
+    constexpr std::size_t depth = 4096;
+    for (std::size_t index = 0; index < depth; ++index) {
+        deep = arena.create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{deep},
+            1);
+    }
+    Expression* cloned = deep->copy(arena);
+    ASSERT_NE(cloned, deep);
+    std::size_t observed_depth = 0;
+    Expression* cursor = cloned;
+    while (auto* operation = dyn_cast<Operation>(cursor)) {
+        ASSERT_EQ(operation->operands().size(), 1U);
+        cursor = operation->operands()[0];
+        ++observed_depth;
+    }
+    ASSERT_EQ(observed_depth, depth);
+    auto* cloned_leaf = dyn_cast<Variable>(cursor);
+    ASSERT_TRUE(cloned_leaf != nullptr);
+    ASSERT_NE(cloned_leaf, leaf);
+    ASSERT_EQ(cloned_leaf->name(), leaf->name());
+    ASSERT_EQ(cloned_leaf->ssa_version(), 17U);
+    ASSERT_TRUE(cloned_leaf->is_aliased());
+    ASSERT_EQ(cloned_leaf->kind(), VariableKind::StackLocal);
+    ASSERT_EQ(cloned_leaf->stack_offset(), -32);
+    ASSERT_TRUE(cloned_leaf->ir_type() == Integer::int64_t());
+
+    auto* shared = arena.create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{
+            arena.create<Variable>("shared", 8),
+            arena.create<Constant>(1, 8),
+        },
+        8);
+    auto* dag = arena.create<Operation>(
+        OperationType::bit_xor,
+        std::vector<Expression*>{shared, shared},
+        8);
+    auto* dag_clone = dyn_cast<Operation>(dag->copy(arena));
+    ASSERT_TRUE(dag_clone != nullptr);
+    ASSERT_NE(dag_clone->operands()[0], dag_clone->operands()[1]);
+    ASSERT_TRUE(expressions_structurally_equal(dag, dag_clone));
+
+    auto* global = arena.create<GlobalVariable>(
+        "global", 8, arena.create<Constant>(9, 8), true);
+    global->set_represents_address(true);
+    auto* global_clone = dyn_cast<GlobalVariable>(global->copy(arena));
+    ASSERT_TRUE(global_clone != nullptr);
+    ASSERT_NE(global_clone->initial_value(), global->initial_value());
+    ASSERT_TRUE(global_clone->is_constant());
+    ASSERT_TRUE(global_clone->represents_address());
+
+    DecompilerArena target_arena;
+    Operation* cross_arena_clone = nullptr;
+    const Expression* source_base_address = nullptr;
+    const Expression* source_index_address = nullptr;
+    {
+        DecompilerArena source_arena;
+        auto* source_base = source_arena.create<Variable>("array", 8);
+        auto* source_index = source_arena.create<Variable>("index", 8);
+        source_base_address = source_base;
+        source_index_address = source_index;
+        auto* source_address = source_arena.create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{source_base, source_index},
+            8);
+        auto* source_deref = source_arena.create<Operation>(
+            OperationType::deref,
+            std::vector<Expression*>{source_address},
+            8);
+        source_deref->set_array_access({
+            .base = source_base,
+            .index = source_index,
+            .element_size = 8,
+            .confidence = true,
+        });
+        cross_arena_clone = dyn_cast<Operation>(
+            source_deref->copy(target_arena));
+    }
+    ASSERT_TRUE(cross_arena_clone != nullptr);
+    ASSERT_TRUE(cross_arena_clone->array_access().has_value());
+    auto* cloned_address = dyn_cast<Operation>(
+        cross_arena_clone->operands()[0]);
+    ASSERT_TRUE(cloned_address != nullptr);
+    ASSERT_EQ(
+        cross_arena_clone->array_access()->base,
+        cloned_address->operands()[0]);
+    ASSERT_EQ(
+        cross_arena_clone->array_access()->index,
+        cloned_address->operands()[1]);
+    ASSERT_NE(
+        cross_arena_clone->array_access()->base,
+        source_base_address);
+    ASSERT_NE(
+        cross_arena_clone->array_access()->index,
+        source_index_address);
+    ASSERT_EQ(cross_arena_clone->array_access()->base->name(), "array");
+    ASSERT_EQ(
+        dyn_cast<Variable>(cross_arena_clone->array_access()->index)->name(),
+        "index");
+    ASSERT_EQ(cross_arena_clone->array_access()->element_size, 8U);
+    ASSERT_TRUE(cross_arena_clone->array_access()->confidence);
+
+    auto* detached_base = arena.create<Variable>("detached", 8);
+    auto* detached_access = arena.create<Operation>(
+        OperationType::deref,
+        std::vector<Expression*>{arena.create<Constant>(0x1000, 8)},
+        8);
+    detached_access->set_array_access({
+        .base = detached_base,
+        .index = arena.create<Constant>(0, 8),
+        .element_size = 8,
+        .confidence = false,
+    });
+    bool rejected_detached_annotation = false;
+    try {
+        (void)detached_access->copy(arena);
+    } catch (const std::runtime_error& error) {
+        rejected_detached_annotation =
+            std::string(error.what()).find("detached array-access")
+            != std::string::npos;
+    }
+    ASSERT_TRUE(rejected_detached_annotation);
+
+    auto* cycle = arena.create<Operation>(
+        OperationType::logical_not,
+        std::vector<Expression*>{arena.create<Constant>(0, 1)},
+        1);
+    cycle->mutable_operands()[0] = cycle;
+    bool rejected_cycle = false;
+    try {
+        (void)cycle->copy(arena);
+    } catch (const std::runtime_error& error) {
+        rejected_cycle =
+            std::string(error.what()).find("cyclic source graph")
+            != std::string::npos;
+    }
+    ASSERT_TRUE(rejected_cycle);
+
+    std::cout
+        << "[+] test_expression_clone_is_stack_safe_and_cycle_rejecting passed.\n";
+}
+
 int main() {
     std::cout << "=== Debug Infrastructure Unit Tests ===\n\n";
 
@@ -1575,6 +2054,10 @@ int main() {
     test_cfg_to_string();
     test_ast_to_string();
     test_variable_info();
+    test_expression_fingerprint_includes_semantic_type();
+    test_structural_equality_rejects_matching_hash_non_equivalence();
+    test_expression_graph_fingerprinting_is_cycle_safe();
+    test_expression_clone_is_stack_safe_and_cycle_rejecting();
 
     // Phase 3: Expression Tree
     test_expression_tree_simple();
@@ -1600,6 +2083,8 @@ int main() {
 
     // Phase 6: Invariant Checker
     test_invariant_checker_cfg_consistency();
+    test_invariant_checker_expression_acyclicity();
+    test_invariant_checker_parameter_metadata();
     test_invariant_checker_phi_arg_mismatch();
     test_invariant_checker_undefined_variable();
     test_invariant_checker_entry_block_preds();

@@ -391,6 +391,9 @@ if(ALETHEIA_HAS_PCODE)
     if(ALETHEIA_PCODE_BUILD_SPECS AND TARGET sleigh_spec_AARCH64)
         add_dependencies(aletheia sleigh_spec_AARCH64)
     endif()
+    if(ALETHEIA_PCODE_BUILD_SPECS AND TARGET sleigh_spec_x86-64)
+        add_dependencies(aletheia sleigh_spec_x86-64)
+    endif()
     if(ALETHEIA_SLEIGH_SPEC_ROOT)
         target_compile_definitions(aletheia PRIVATE
             ALETHEIA_SLEIGH_SPEC_ROOT_DIR="${ALETHEIA_SLEIGH_SPEC_ROOT}")
@@ -583,11 +586,150 @@ if(IDA_INSTALL_DIR)
                     "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/test_binary"
                     "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-test"
                     "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                    "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c.cmake")
             set_tests_properties(aletheia_portable_c_test PROPERTIES
                 RUN_SERIAL TRUE
                 TIMEOUT 600
                 ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+            if(APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/meta/fibonacci")
+                add_test(NAME aletheia_fibonacci_portable_c_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/meta/fibonacci"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/fibonacci-portable-c-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_fibonacci_portable_c.cmake")
+                set_tests_properties(aletheia_fibonacci_portable_c_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 900
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+            endif()
+            if(APPLE)
+                add_test(NAME aletheia_portable_c_x86_64_basic_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/native_x86_64_basic.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-x86-64-basic-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_x86_64_basic.cmake")
+                set_tests_properties(aletheia_portable_c_x86_64_basic_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_x86_64_stack_arguments_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_stack_arguments.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-x86-64-stack-arguments-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        "-DTARGET_ARCH=x86_64"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_stack_arguments.cmake")
+                set_tests_properties(aletheia_portable_c_x86_64_stack_arguments_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_x86_64_float_stack_arguments_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_float_stack_arguments.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-x86-64-float-stack-arguments-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        "-DTARGET_ARCH=x86_64"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_float_stack_arguments.cmake")
+                set_tests_properties(aletheia_portable_c_x86_64_float_stack_arguments_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_relocation_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_data_relocation.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-relocation-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_relocation.cmake")
+                set_tests_properties(aletheia_portable_c_relocation_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_stack_arguments_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_stack_arguments.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-stack-arguments-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_stack_arguments.cmake")
+                set_tests_properties(aletheia_portable_c_stack_arguments_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_float_stack_arguments_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_float_stack_arguments.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-float-stack-arguments-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_float_stack_arguments.cmake")
+                set_tests_properties(aletheia_portable_c_float_stack_arguments_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_pair_return_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_pair_return.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-pair-return-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_pair_return.cmake")
+                set_tests_properties(aletheia_portable_c_pair_return_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_indirect_return_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_indirect_return.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-indirect-return-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_indirect_return.cmake")
+                set_tests_properties(aletheia_portable_c_indirect_return_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_hfa_return_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_hfa_return.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-hfa-return-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_hfa_return.cmake")
+                set_tests_properties(aletheia_portable_c_hfa_return_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+                add_test(NAME aletheia_portable_c_hfa_arguments_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DIDUMP=$<TARGET_FILE:idump>"
+                        "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/targets/pcode_hfa_arguments.c"
+                        "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/portable-c-hfa-arguments-test"
+                        "-DC_COMPILER=${ALETHEIA_PORTABLE_C_COMPILER}"
+                        "-DSDKROOT=${ALETHEIA_PORTABLE_C_SDKROOT}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_portable_c_hfa_arguments.cmake")
+                set_tests_properties(aletheia_portable_c_hfa_arguments_test PROPERTIES
+                    RUN_SERIAL TRUE
+                    TIMEOUT 600
+                    ENVIRONMENT "IDADIR=${IDA_INSTALL_DIR}")
+            endif()
         else()
             message(WARNING "Portable-C compiler gate disabled: no clang/cc executable found")
         endif()

@@ -2,6 +2,7 @@
 #include "../../common/arena_allocated.hpp"
 #include "../structures/cfg.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 #include <memory>
 
@@ -23,6 +24,25 @@ class CaseNode;
 /// position in the structured tree. Re-execution belongs to LoopNode edges;
 /// duplicating a block node across branches/tails changes CFG semantics.
 bool ast_has_unique_code_node_ownership(const AstNode* root);
+
+/// Returns whether target occurs in root's structural statement subtree.
+/// Condition-expression wrappers are intentionally excluded, matching the
+/// transition-block matching contract. The traversal is bounded and
+/// cycle-safe.
+bool ast_contains_node(const AstNode* root, const AstNode* target);
+
+/// Returns whether root's structural statement subtree contains a CodeNode
+/// owning target. The traversal is bounded and cycle-safe.
+bool ast_contains_original_block(
+    const AstNode* root,
+    const BasicBlock* target);
+
+/// Appends original BasicBlock identifiers in historical preorder. Returns
+/// false without modifying ids for a structural cycle or expansion-limit
+/// exhaustion. Shared acyclic subtrees retain occurrence semantics.
+bool collect_ast_original_block_ids(
+    const AstNode* root,
+    std::vector<std::uint64_t>& ids);
 
 // =============================================================================
 // LoopType enum -- matches the Python reference's LoopType

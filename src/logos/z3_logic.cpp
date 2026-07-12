@@ -178,6 +178,7 @@ z3::expr Z3Converter::convert_operation(aletheia::Operation* o) {
         }
 
         case OperationType::cast:
+        case OperationType::bitcast:
         case OperationType::low:
             return bv_at(0);
 
@@ -250,6 +251,10 @@ z3::expr Z3Converter::convert_operation(aletheia::Operation* o) {
             return z3::urem(bv_at(0), bv_at(1));
         case OperationType::power:
             return fresh_bv(result_width, "pow_op");
+        case OperationType::popcount:
+            return fresh_bv(result_width, "popcount_op");
+        case OperationType::lzcount:
+            return fresh_bv(result_width, "lzcount_op");
         case OperationType::negate:
             return -bv_at(0);
 

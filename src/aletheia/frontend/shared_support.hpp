@@ -37,6 +37,28 @@ std::string strip_ida_address_prefix(const std::string& name);
 std::string to_lower_ascii(std::string text);
 std::string detect_arch();
 std::string canonical_function_name(std::string name);
+inline std::string sanitize_c_block_comment_text(std::string_view text) {
+    std::string sanitized;
+    sanitized.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char current = text[index];
+        const char next = index + 1 < text.size() ? text[index + 1] : '\0';
+        if (current == '/' && next == '*') {
+            sanitized += "/ *";
+            ++index;
+        } else if (current == '*' && next == '/') {
+            sanitized += "* /";
+            ++index;
+        } else if (current == '\n' || current == '\r' || current == '\t') {
+            sanitized.push_back(' ');
+        } else if (static_cast<unsigned char>(current) < 0x20) {
+            sanitized.push_back('?');
+        } else {
+            sanitized.push_back(current);
+        }
+    }
+    return sanitized;
+}
 
 std::vector<std::string> x86_64_sub_register_aliases(std::string_view reg64);
 std::pair<const std::string_view*, std::size_t> param_register_table_for_arch(std::string_view arch);

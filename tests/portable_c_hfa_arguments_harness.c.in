@@ -1,0 +1,58 @@
+#define _main decompiled_main
+#define _printf printf
+#include "@GENERATED_C@"
+#undef _printf
+#undef _main
+
+static int verify_hfa_arguments(void) {
+    static const double values[][4] = {
+        {0.0, 0.0, 0.0, 0.0},
+        {1.0, 2.0, 3.0, 4.0},
+        {-1.0, -2.0, -3.0, -4.0},
+        {0.5, -1.25, 2.0, 3.5},
+        {0x1p20, -0x1p19, 0x1p18, -0x1p17},
+        // Deliberate cancellation: forward and reverse association differ by
+        // 1.0, so the branch result cannot be replaced by either path.
+        {0x1p100, -0x1p99, 1.0, -1.0},
+    };
+    for (size_t index = 0; index < sizeof(values) / sizeof(values[0]); ++index) {
+        const double x = values[index][0];
+        const double y = values[index][1];
+        const double z = values[index][2];
+        const double tail = values[index][3];
+        const double nested = _consume_nested_triple(x, y, z, tail);
+        if (nested != x + 2.0 * y + 3.0 * z + tail) return 10;
+
+        const double spilled = _consume_spilled_triple(
+            1.0, -2.0, 3.0, -4.0, 5.0, -6.0, x, y, z, tail);
+        if (spilled != -21.0 + x + 2.0 * y + 3.0 * z + 7.0 * tail) {
+            return 11;
+        }
+
+        const float fx = (float)x;
+        const float fy = (float)y;
+        const float fz = (float)z;
+        const float fw = (float)tail;
+        const double packed = _consume_spilled_quad_float(
+            1.0, -2.0, 3.0, -4.0, 5.0, -6.0, fx, fy, fz, fw, tail);
+        const double packed_component = tail >= 0.0
+            ? (double)fx + 2.0 * (double)fy
+                + 3.0 * (double)fz + 4.0 * (double)fw
+            : 4.0 * (double)fw + 3.0 * (double)fz
+                + 2.0 * (double)fy + (double)fx;
+        const double packed_expected = -21.0 + packed_component + 7.0 * tail;
+        if (packed != packed_expected) {
+            printf(
+                "packed HFA row %zu mismatch: got=%a expected=%a tail=%a\n",
+                index, packed, packed_expected, tail);
+            return 12;
+        }
+    }
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp) {
+    const int direct_result = verify_hfa_arguments();
+    if (direct_result != 0) return direct_result;
+    return decompiled_main(argc, argv, envp);
+}

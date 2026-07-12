@@ -13,7 +13,8 @@ std::string expr_tree_with_dest(const Expression* expr,
                                 const Variable* assignment_dest,
                                 std::size_t max_depth = 64);
 
-// Expression metrics
+// Expression metrics. Cyclic graphs or graphs exceeding the bounded metric
+// expansion budget return std::numeric_limits<std::size_t>::max().
 std::size_t expression_depth(const Expression* expr);
 std::size_t expression_weight(const Expression* expr);
 

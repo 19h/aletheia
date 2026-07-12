@@ -1157,38 +1157,6 @@ std::pair<const std::string_view*, std::size_t> param_register_table() {
     return {nullptr, 0};
 }
 
-bool has_direct_recursive_call(ida::Address function_ea) {
-    auto flowchart_res = ida::graph::flowchart(function_ea);
-    if (!flowchart_res) {
-        return false;
-    }
-
-    for (const auto& ida_block : *flowchart_res) {
-        for (ida::Address addr = ida_block.start; addr < ida_block.end; ) {
-            auto insn_res = ida::instruction::decode(addr);
-            if (!insn_res) {
-                break;
-            }
-            const auto& insn = *insn_res;
-            std::string mnemonic = to_lower_ascii(insn.mnemonic());
-            if (is_mnemonic_in(mnemonic,
-                    {"bl", "blr", "blx", "blraa", "blrab", "blraaz", "blrabz"})) {
-                const auto& ops = insn.operands();
-                if (!ops.empty()) {
-                    const auto& target_op = ops[0];
-                    if ((target_op.type() == ida::instruction::OperandType::NearAddress
-                         || target_op.type() == ida::instruction::OperandType::FarAddress)
-                        && target_op.target_address() == function_ea) {
-                        return true;
-                    }
-                }
-            }
-            addr += insn.size();
-        }
-    }
-    return false;
-}
-
 std::string canonical_function_name(std::string name) {
     name = to_lower_ascii(name);
     while (!name.empty() && name.front() == '_') {
@@ -1224,7 +1192,6 @@ std::optional<std::size_t> known_call_min_arity(const std::string& canon_name) {
     if (canon_name == "putchar") return 1;
     if (canon_name == "printf") return 1;
     if (canon_name == "fprintf") return 2;
-    if (canon_name == "fib_naive" || canon_name == "fib_memo") return 1;
     return std::nullopt;
 }
 
@@ -1239,16 +1206,29 @@ TypePtr known_call_return_type(const std::string& canon_name) {
     if (canon_name == "error") {
         return std::make_shared<Pointer>(Integer::int32_t());
     }
-    if (canon_name == "get_time_seconds") {
-        return Float::float64();
-    }
     return nullptr;
 }
 
 } // namespace (parameter tables)
 
 void Lifter::populate_task_signature(DecompilerTask& task) {
+    current_task_ = &task;
     auto state = frontend::populate_task_signature(task);
+    if (!task.function_type()) {
+        if (TypePtr resolved = task.resolve_function_type(
+                task.function_address())) {
+            task.set_function_type(resolved);
+            if (const auto* function = type_dyn_cast<FunctionTypeDef>(
+                    resolved.get())) {
+                state.current_function_param_count_hint =
+                    function->parameters().size();
+                state.current_function_prefers_w_args =
+                    frontend::first_parameter_prefers_w_reg(resolved);
+                state.current_function_prefers_w_return =
+                    frontend::return_prefers_w_reg(resolved);
+            }
+        }
+    }
     param_register_map_ = std::move(state.param_register_map);
     regvar_alias_map_ = std::move(state.regvar_alias_map);
     current_function_param_count_hint_ = state.current_function_param_count_hint;
@@ -2023,9 +2003,106 @@ Instruction* Lifter::lift_instruction(const ida::instruction::Instruction& insn)
         for (size_t i = 1; i < operands.size(); ++i) {
             args.push_back(operands[i]);
         }
+
+        std::size_t param_count = args.size();
+        std::vector<TypePtr> parameter_types;
+        std::optional<ida::Address> direct_target_addr;
+        const auto try_retrieve_signature = [&](ida::Address target_addr) {
+            auto type_res = ida::type::retrieve(target_addr);
+            if (type_res && type_res->is_function()) {
+                auto args_res = type_res->function_argument_types();
+                if (args_res) {
+                    param_count = std::max(param_count, args_res->size());
+                    parameter_types.clear();
+                    TypeParser parser;
+                    for (const auto& argument : *args_res) {
+                        if (auto text = argument.to_string()) {
+                            parameter_types.push_back(parser.parse(*text));
+                        } else {
+                            parameter_types.push_back(nullptr);
+                        }
+                    }
+                    return true;
+                }
+            }
+            if (current_task_) {
+                TypePtr resolved = current_task_->resolve_function_type(
+                    target_addr);
+                if (const auto* function = type_dyn_cast<FunctionTypeDef>(
+                        resolved.get())) {
+                    param_count = std::max(
+                        param_count, function->parameters().size());
+                    parameter_types.assign(
+                        function->parameters().begin(),
+                        function->parameters().end());
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (auto* raw_target = dyn_cast<Constant>(
+                operands.empty() ? nullptr : operands[0])) {
+            direct_target_addr = static_cast<ida::Address>(raw_target->value());
+            try_retrieve_signature(*direct_target_addr);
+        }
+        if (auto* global_target = dyn_cast<GlobalVariable>(target)) {
+            if (auto* address = dyn_cast<Constant>(global_target->initial_value())) {
+                direct_target_addr = static_cast<ida::Address>(address->value());
+                try_retrieve_signature(*direct_target_addr);
+            }
+        }
+        if (auto xrefs = ida::xref::code_refs_from(addr)) {
+            for (const auto& ref : *xrefs) {
+                if (ref.type != ida::xref::ReferenceType::CallNear
+                    && ref.type != ida::xref::ReferenceType::CallFar) {
+                    continue;
+                }
+                direct_target_addr = ref.to;
+                if (try_retrieve_signature(ref.to)) break;
+            }
+        }
+
+        std::string target_canon_name;
+        if (auto* global_target = dyn_cast<GlobalVariable>(target)) {
+            target_canon_name = canonical_function_name(global_target->name());
+        }
+        if (auto known_arity = known_call_min_arity(target_canon_name)) {
+            param_count = std::max(param_count, *known_arity);
+        }
+        if (param_count == 0 && direct_target_addr == current_function_ea_) {
+            param_count = current_function_param_count_hint_ > 0
+                ? current_function_param_count_hint_ : 1;
+        }
+
+        static constexpr const char* kX86ArgRegs64[] = {
+            "rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        static constexpr const char* kX86ArgRegs32[] = {
+            "edi", "esi", "edx", "ecx", "r8d", "r9d"};
+        for (std::size_t index = args.size();
+             index < param_count && index < std::size(kX86ArgRegs64);
+             ++index) {
+            bool use_32_bit_view = false;
+            if (index < parameter_types.size()) {
+                if (const auto* integer = type_dyn_cast<Integer>(
+                        parameter_types[index].get())) {
+                    use_32_bit_view = integer->size_bytes() <= 4;
+                }
+            }
+            args.push_back(arena_.create<Variable>(
+                use_32_bit_view ? kX86ArgRegs32[index]
+                                : kX86ArgRegs64[index],
+                use_32_bit_view ? 4 : 8));
+        }
         auto* call = arena_.create<Call>(target, std::move(args), 8);
+        if (TypePtr known_ret = known_call_return_type(target_canon_name)) {
+            call->set_ir_type(std::make_shared<FunctionTypeDef>(
+                known_ret, std::vector<TypePtr>{}));
+        }
         // x86-64 integer/pointer return is carried in RAX.
         auto* ret_var = arena_.create<Variable>("rax", 8);
+        if (TypePtr known_ret = known_call_return_type(target_canon_name)) {
+            ret_var->set_ir_type(known_ret);
+        }
         auto* assign = arena_.create<Assignment>(ret_var, call);
         assign->set_address(addr);
         return assign;

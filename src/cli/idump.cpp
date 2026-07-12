@@ -1,9 +1,12 @@
 #include <ida/database.hpp>
+#include <ida/data.hpp>
 #include <ida/function.hpp>
+#include <ida/fixup.hpp>
 #include <ida/segment.hpp>
 
 #include "../aletheia/pipeline/pipeline.hpp"
 #include "../aletheia/frontend/frontend.hpp"
+#include "../aletheia/frontend/shared_support.hpp"
 #include "../aletheia/codegen/codegen.hpp"
 #include "../aletheia/codegen/local_declarations.hpp"
 #include "../aletheia/codegen/portable_c.hpp"
@@ -272,16 +275,181 @@ struct JsonMetricsPerFunction {
     std::vector<aletheia::debug::StageMetrics> stages;
 };
 
+struct PortableGlobalBinding {
+    std::string name;
+    ida::Address address = 0;
+    std::size_t required_size = 1;
+    ida::Address segment_start = 0;
+    ida::Address segment_end = 0;
+    std::string segment_name;
+    ida::segment::Type segment_type = ida::segment::Type::Undefined;
+    bool writable = false;
+};
+
 struct DecompileDebugOutput {
     std::vector<aletheia::debug::StageMetrics> stage_metrics;
     std::string summary;
     std::string provenance_trace;
     aletheia::FrontendSupportReport frontend_support;
+    std::vector<aletheia::FrontendDiagnostic> frontend_diagnostics;
+    std::vector<PortableGlobalBinding> portable_globals;
 };
 
 struct RunScopedDebugState {
     std::unordered_set<std::string> emitted_unknown_selector_once;
 };
+
+using FunctionSignatureRegistry =
+    std::unordered_map<ida::Address, aletheia::TypePtr>;
+
+void install_function_signature_registry(
+    aletheia::DecompilerTask& task,
+    const FunctionSignatureRegistry* signatures) {
+    if (!signatures) return;
+    task.set_function_type_resolver(
+        [signatures](ida::Address address) -> aletheia::TypePtr {
+            auto found = signatures->find(address);
+            return found != signatures->end() ? found->second : nullptr;
+        });
+}
+
+std::vector<PortableGlobalBinding> collect_portable_global_bindings(
+    aletheia::DecompilerTask& task) {
+    struct Observation {
+        ida::Address address = 0;
+        std::size_t required_size = 1;
+        bool has_address = false;
+    };
+    std::unordered_map<std::string, Observation> observations;
+    std::unordered_set<const aletheia::Expression*> active;
+
+    const auto observe = [&](aletheia::GlobalVariable* global, std::size_t extent) {
+        if (!global || !global->represents_address() || global->name().empty()
+            || global->name().front() == '"') {
+            return;
+        }
+        Observation& observation = observations[global->name()];
+        observation.required_size = std::max(
+            observation.required_size, std::max<std::size_t>(extent, 1));
+        if (auto* address = aletheia::dyn_cast<aletheia::Constant>(
+                global->initial_value())) {
+            observation.address = static_cast<ida::Address>(address->value());
+            observation.has_address = true;
+        }
+    };
+
+    const auto address_base = [&](const auto& self, aletheia::Expression* expression)
+        -> std::optional<std::pair<aletheia::GlobalVariable*, std::uint64_t>> {
+        if (!expression) return std::nullopt;
+        if (auto* global = aletheia::dyn_cast<aletheia::GlobalVariable>(expression);
+            global && global->represents_address()) {
+            return std::pair{global, std::uint64_t{0}};
+        }
+        auto* operation = aletheia::dyn_cast<aletheia::Operation>(expression);
+        if (!operation) return std::nullopt;
+        if (operation->type() == aletheia::OperationType::cast
+            && operation->operands().size() == 1) {
+            return self(self, operation->operands()[0]);
+        }
+        if (operation->type() != aletheia::OperationType::add
+            || operation->operands().size() != 2) {
+            return std::nullopt;
+        }
+        for (std::size_t base_index = 0; base_index < 2; ++base_index) {
+            auto base = self(self, operation->operands()[base_index]);
+            auto* offset = aletheia::dyn_cast<aletheia::Constant>(
+                operation->operands()[1 - base_index]);
+            if (base && offset
+                && base->second <= std::numeric_limits<std::uint64_t>::max()
+                    - offset->value()) {
+                base->second += offset->value();
+                return base;
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto scan_expression = [&](const auto& self, aletheia::Expression* expression) -> void {
+        if (!expression || !active.insert(expression).second) return;
+        if (auto* global = aletheia::dyn_cast<aletheia::GlobalVariable>(expression)) {
+            observe(global, 1);
+        }
+        if (auto* call = aletheia::dyn_cast<aletheia::Call>(expression)) {
+            auto* target = aletheia::dyn_cast<aletheia::GlobalVariable>(call->target());
+            const std::string target_name = target
+                ? aletheia::frontend::canonical_function_name(target->name()) : std::string{};
+            std::optional<std::size_t> size_index;
+            if (target_name == "bzero" && call->arg_count() >= 2) size_index = 1;
+            if (target_name == "memset" && call->arg_count() >= 3) size_index = 2;
+            if (size_index.has_value()) {
+                auto base = address_base(address_base, call->arg(0));
+                auto* size = aletheia::dyn_cast<aletheia::Constant>(call->arg(*size_index));
+                if (base && size
+                    && size->value() <= std::numeric_limits<std::size_t>::max()
+                    && base->second <= std::numeric_limits<std::size_t>::max() - size->value()) {
+                    observe(base->first,
+                        static_cast<std::size_t>(base->second + size->value()));
+                }
+            }
+            self(self, call->target());
+            for (std::size_t index = 0; index < call->arg_count(); ++index) {
+                self(self, call->arg(index));
+            }
+        } else if (auto* operation = aletheia::dyn_cast<aletheia::Operation>(expression)) {
+            if (operation->type() == aletheia::OperationType::deref
+                && operation->operands().size() == 1) {
+                if (auto base = address_base(address_base, operation->operands()[0])) {
+                    const std::uint64_t width = std::max<std::size_t>(operation->size_bytes, 1);
+                    if (base->second <= std::numeric_limits<std::size_t>::max() - width) {
+                        observe(base->first, static_cast<std::size_t>(base->second + width));
+                    }
+                }
+            }
+            for (aletheia::Expression* operand : operation->operands()) {
+                self(self, operand);
+            }
+        } else if (auto* list = aletheia::dyn_cast<aletheia::ListOperation>(expression)) {
+            for (aletheia::Expression* operand : list->operands()) self(self, operand);
+        }
+        active.erase(expression);
+    };
+
+    if (task.cfg()) {
+        for (aletheia::BasicBlock* block : task.cfg()->blocks()) {
+            if (!block) continue;
+            for (aletheia::Instruction* instruction : block->instructions()) {
+                if (auto* assignment = aletheia::dyn_cast<aletheia::Assignment>(instruction)) {
+                    scan_expression(scan_expression, assignment->destination());
+                    scan_expression(scan_expression, assignment->value());
+                } else if (auto* returned = aletheia::dyn_cast<aletheia::Return>(instruction)) {
+                    for (aletheia::Expression* value : returned->values()) {
+                        scan_expression(scan_expression, value);
+                    }
+                } else if (auto* branch = aletheia::dyn_cast<aletheia::Branch>(instruction)) {
+                    scan_expression(scan_expression, branch->condition());
+                }
+            }
+        }
+    }
+
+    std::vector<PortableGlobalBinding> bindings;
+    for (const auto& [name, observation] : observations) {
+        if (!observation.has_address) continue;
+        auto segment = ida::segment::at(observation.address);
+        if (!segment) continue;
+        bindings.push_back(PortableGlobalBinding{
+            name,
+            observation.address,
+            observation.required_size,
+            segment->start(),
+            segment->end(),
+            segment->name(),
+            segment->type(),
+            segment->permissions().write,
+        });
+    }
+    return bindings;
+}
 
 struct EmittedFunction {
     ida::Address address = 0;
@@ -335,13 +503,7 @@ std::optional<std::string> extract_function_prototype(const std::vector<std::str
         while (!prototype.empty() && std::isspace(static_cast<unsigned char>(prototype.back()))) {
             prototype.pop_back();
         }
-        // IDA may provide a bounded but incomplete prototype (notably for
-        // variadic functions). An empty GNU C11 parameter list preserves the
-        // recovered return type and symbol while deferring argument checking
-        // to definitions that are already authoritative in this unit.
-        const std::size_t open_paren = prototype.find('(');
-        prototype.erase(open_paren);
-        prototype += "();";
+        prototype += ";";
         return prototype;
     }
     return std::nullopt;
@@ -352,9 +514,14 @@ std::optional<std::string> portable_c_unresolved_marker(
     static constexpr std::string_view markers[] = {
         "__aletheia_undefined_u64(",
         "__aletheia_expr_cycle",
+        "__aletheia_expr_depth_limit",
+        "__aletheia_expr_expansion_limit",
         "__aletheia_unknown_op(",
         "__aletheia_unhandled_op(",
         "__aletheia_unresolved_list(",
+        "ALETHEIA_UNSUPPORTED_CUSTOM_TYPE_WIDTH_",
+        "ALETHEIA_UNSUPPORTED_COMPLEX_TYPE_LAYOUT",
+        "ALETHEIA_UNSUPPORTED_PORTABLE_TYPE",
         "__pcode_userop_",
         " = phi(",
         "/* indirect branch ",
@@ -362,6 +529,9 @@ std::optional<std::string> portable_c_unresolved_marker(
     for (const std::string& line : lines) {
         for (std::string_view marker : markers) {
             if (line.find(marker) != std::string::npos) {
+                if (marker.starts_with("ALETHEIA_UNSUPPORTED_")) {
+                    return line;
+                }
                 return std::string(marker);
             }
         }
@@ -371,8 +541,162 @@ std::optional<std::string> portable_c_unresolved_marker(
 
 void emit_portable_c_preamble(
     std::ostream& out,
-    const std::vector<EmittedFunction>& functions) {
+    const std::vector<EmittedFunction>& functions,
+    const std::unordered_map<std::string, PortableGlobalBinding>& globals,
+    std::unordered_set<std::string>* materialized_names) {
     out << aletheia::portable_c_runtime_preamble();
+
+    struct Region {
+        ida::Address start = 0;
+        ida::Address end = 0;
+        ida::Address segment_start = 0;
+        std::vector<const PortableGlobalBinding*> bindings;
+    };
+    std::unordered_map<ida::Address, Region> regions_by_segment;
+    const auto internal_materializable = [](const PortableGlobalBinding& binding) {
+        if (binding.segment_type == ida::segment::Type::External
+            || binding.segment_type == ida::segment::Type::Import) {
+            return false;
+        }
+        std::string segment_name = binding.segment_name;
+        std::transform(segment_name.begin(), segment_name.end(), segment_name.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return segment_name.find("got") == std::string::npos
+            && segment_name.find("symbol_ptr") == std::string::npos
+            && segment_name.find("stub") == std::string::npos;
+    };
+    for (const auto& [_, binding] : globals) {
+        if (!internal_materializable(binding)
+            || binding.address >= binding.segment_end) continue;
+        const std::size_t available = static_cast<std::size_t>(
+            binding.segment_end - binding.address);
+        // Preserve one aligned data lane around symbols used as the base of
+        // compact constant tables. Optimized code commonly indexes 8-byte
+        // elements from an IDA symbol whose nominal database extent is one
+        // byte (for example a two-entry floating constant table).
+        const std::size_t extent = std::min(
+            std::max<std::size_t>(binding.required_size, 16), available);
+        if (extent == 0) continue;
+        Region& region = regions_by_segment[binding.segment_start];
+        region.segment_start = binding.segment_start;
+        if (region.bindings.empty()) {
+            region.start = binding.address;
+            region.end = binding.address + extent;
+        } else {
+            region.start = std::min(region.start, binding.address);
+            region.end = std::max(region.end, binding.address + extent);
+        }
+        region.bindings.push_back(&binding);
+    }
+
+    std::vector<Region> regions;
+    regions.reserve(regions_by_segment.size());
+    for (auto& [_, region] : regions_by_segment) regions.push_back(std::move(region));
+    std::sort(regions.begin(), regions.end(),
+        [](const Region& lhs, const Region& rhs) { return lhs.start < rhs.start; });
+    struct Relocation {
+        std::size_t source_region = 0;
+        std::size_t source_offset = 0;
+        ida::Address source_address = 0;
+        ida::Address target_address = 0;
+    };
+    std::vector<Relocation> relocations;
+    for (std::size_t index = 0; index < regions.size(); ++index) {
+        Region& region = regions[index];
+        region.start = std::max(
+            region.segment_start,
+            static_cast<ida::Address>(region.start & ~ida::Address{0x0f}));
+        std::sort(region.bindings.begin(), region.bindings.end(),
+            [](const PortableGlobalBinding* lhs, const PortableGlobalBinding* rhs) {
+                if (lhs->address != rhs->address) return lhs->address < rhs->address;
+                return lhs->name < rhs->name;
+            });
+        const std::size_t size = static_cast<std::size_t>(region.end - region.start);
+        std::vector<std::uint8_t> bytes(size, 0);
+        if (auto read = ida::data::read_bytes(region.start, size);
+            read && read->size() == size) {
+            std::copy(read->begin(), read->end(), bytes.begin());
+        }
+        if (auto fixups = ida::fixup::in_range(region.start, region.end)) {
+            for (const ida::fixup::Descriptor& fixup : *fixups) {
+                if (fixup.type != ida::fixup::Type::Off64
+                    || fixup.source < region.start
+                    || fixup.source - region.start > size
+                    || size - static_cast<std::size_t>(fixup.source - region.start)
+                        < sizeof(std::uint64_t)) {
+                    continue;
+                }
+                const std::size_t source_offset = static_cast<std::size_t>(
+                    fixup.source - region.start);
+                std::fill_n(bytes.begin() + static_cast<std::ptrdiff_t>(source_offset),
+                    sizeof(std::uint64_t), std::uint8_t{0});
+                relocations.push_back(Relocation{
+                    index,
+                    source_offset,
+                    fixup.source,
+                    fixup.target,
+                });
+            }
+        }
+        out << "_Alignas(16) static unsigned char __aletheia_data_region_"
+            << index << '[' << size << "] = {";
+        std::size_t emitted_bytes = 0;
+        for (std::size_t byte_index = 0; byte_index < bytes.size(); ++byte_index) {
+            if (bytes[byte_index] == 0) continue;
+            if (emitted_bytes % 4 == 0) out << "\n    ";
+            static constexpr char digits[] = "0123456789abcdef";
+            const std::uint8_t byte = bytes[byte_index];
+            out << '[' << byte_index << "] = 0x"
+                << digits[byte >> 4] << digits[byte & 0x0f] << ", ";
+            ++emitted_bytes;
+        }
+        if (emitted_bytes == 0) out << "\n    0";
+        out << "\n};\n";
+        for (const PortableGlobalBinding* binding : region.bindings) {
+            if (!binding || binding->address < region.start) continue;
+            const std::uint64_t offset = binding->address - region.start;
+            out << "#define " << binding->name << " (__aletheia_data_region_"
+                << index << " + UINT64_C(" << offset << "))\n";
+            if (materialized_names) materialized_names->insert(binding->name);
+        }
+        out << '\n';
+    }
+
+    if (!relocations.empty()) {
+        out << "extern uintptr_t __aletheia_resolve_external_data("
+               "uint64_t source_address, uint64_t target_address) "
+               "__attribute__((weak));\n";
+        out << "static void __aletheia_relocate_data(void) "
+               "__attribute__((constructor));\n"
+               "static void __aletheia_relocate_data(void) {\n";
+        for (const Relocation& relocation : relocations) {
+            std::optional<std::pair<std::size_t, std::size_t>> internal_target;
+            for (std::size_t target_index = 0; target_index < regions.size(); ++target_index) {
+                if (relocation.target_address >= regions[target_index].start
+                    && relocation.target_address < regions[target_index].end) {
+                    internal_target = std::pair{
+                        target_index,
+                        static_cast<std::size_t>(
+                            relocation.target_address - regions[target_index].start)};
+                    break;
+                }
+            }
+            out << "    { uintptr_t value = ";
+            if (internal_target) {
+                out << "(uintptr_t)(__aletheia_data_region_"
+                    << internal_target->first << " + " << internal_target->second << ");";
+            } else {
+                out << "__aletheia_resolve_external_data ? "
+                    << "__aletheia_resolve_external_data(UINT64_C("
+                    << relocation.source_address << "), UINT64_C("
+                    << relocation.target_address << ")) : UINT64_C(0);";
+            }
+            out << " __builtin_memcpy(__aletheia_data_region_"
+                << relocation.source_region << " + " << relocation.source_offset
+                << ", &value, sizeof(value)); }\n";
+        }
+        out << "}\n\n";
+    }
 
     for (const EmittedFunction& function : functions) {
         if (!function.ok) {
@@ -383,6 +707,21 @@ void emit_portable_c_preamble(
         }
     }
     out << '\n';
+}
+
+bool is_materialized_global_declaration(
+    std::string_view line,
+    const std::unordered_set<std::string>& materialized_names) {
+    const std::size_t first = line.find_first_not_of(" \t");
+    if (first == std::string_view::npos
+        || !line.substr(first).starts_with("extern ")) {
+        return false;
+    }
+    for (const std::string& name : materialized_names) {
+        const std::string suffix = " " + name + "[];";
+        if (line.ends_with(suffix)) return true;
+    }
+    return false;
 }
 
 std::string dedupe_selector_diagnostic_per_run(
@@ -724,76 +1063,6 @@ void emit_inline_branch_snapshot(
     path.erase(block);
 }
 
-std::string lowercase_copy(const std::string& text) {
-    std::string out = text;
-    for (char& c : out) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return out;
-}
-
-struct ParameterDisplayInfo {
-    std::unordered_map<std::string, std::string> expr_name_map;
-    std::unordered_map<int, std::string> index_to_name;
-    std::unordered_map<std::string, aletheia::TypePtr> declared_type_by_name;
-};
-
-ParameterDisplayInfo build_parameter_display_info(const aletheia::DecompilerTask& task) {
-    ParameterDisplayInfo info;
-
-    std::optional<int> max_declared_param_index;
-    if (task.function_type()) {
-        if (auto* function = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
-            max_declared_param_index = function->parameters().empty()
-                ? -1 : static_cast<int>(function->parameters().size()) - 1;
-        }
-    }
-    auto include_param_index = [&](int index) {
-        return !max_declared_param_index.has_value()
-            || (index >= 0 && index <= *max_declared_param_index);
-    };
-
-    for (const auto& [reg, param] : task.parameter_registers()) {
-        if (!include_param_index(param.index)) {
-            continue;
-        }
-        auto it = info.index_to_name.find(param.index);
-        if (it == info.index_to_name.end() || param.name.size() > it->second.size()) {
-            info.index_to_name[param.index] = param.name;
-        }
-    }
-
-    for (const auto& [reg, param] : task.parameter_registers()) {
-        if (!include_param_index(param.index)) {
-            continue;
-        }
-        std::string chosen = param.name;
-        auto best_it = info.index_to_name.find(param.index);
-        if (best_it != info.index_to_name.end() && !best_it->second.empty()) {
-            chosen = best_it->second;
-        }
-        info.expr_name_map[lowercase_copy(reg)] = chosen;
-    }
-
-    for (const auto& [idx, name] : info.index_to_name) {
-        info.expr_name_map["arg_" + std::to_string(idx)] = name;
-    }
-
-    if (task.function_type()) {
-        if (auto* function = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
-            for (std::size_t index = 0; index < function->parameters().size(); ++index) {
-                auto name_it = info.index_to_name.find(static_cast<int>(index));
-                const std::string display_name = name_it != info.index_to_name.end()
-                    && !name_it->second.empty()
-                    ? name_it->second : "a" + std::to_string(index + 1);
-                info.declared_type_by_name[display_name] = function->parameters()[index];
-            }
-        }
-    }
-
-    return info;
-}
-
 bool is_declared_void_function(const aletheia::DecompilerTask& task) {
     if (!task.function_type()) {
         return true;
@@ -844,15 +1113,40 @@ std::vector<std::string> generate_cfg_fallback_code(
     aletheia::DecompilerTask& task,
     bool portable_c = false) {
     std::vector<std::string> lines;
+    if (auto validation =
+            aletheia::validate_cfg_for_codegen(task)) {
+        lines.push_back(
+            "/* Aletheia CFG fallback rejected invalid IR: "
+            + *validation + " */");
+        return lines;
+    }
     aletheia::CExpressionGenerator expr_gen({.portable_c = portable_c});
 
     // Set up parameter display name mapping.
     // Include both raw register names AND post-rename "arg_N" names.
-    const ParameterDisplayInfo param_display = build_parameter_display_info(task);
+    const aletheia::CIdentifierDisplayInfo identifier_display =
+        aletheia::build_c_identifier_display_info(task);
+    const aletheia::ParameterDisplayInfo& param_display =
+        identifier_display.parameters;
     expr_gen.set_parameter_names(param_display.expr_name_map);
+    expr_gen.set_parameter_index_names(param_display.index_to_name);
     expr_gen.set_parameter_types(param_display.declared_type_by_name);
+    expr_gen.set_local_identifier_names(identifier_display.local_names);
+    expr_gen.set_global_identifier_names(identifier_display.global_names);
+    if (identifier_display.unresolved_type_semantics) {
+        expr_gen.mark_unresolved_semantics();
+    }
 
-    auto global_decls = aletheia::GlobalDeclarationGenerator::generate(task);
+    if (portable_c && !identifier_display.type_declarations.empty()) {
+        lines.insert(
+            lines.end(),
+            identifier_display.type_declarations.begin(),
+            identifier_display.type_declarations.end());
+        lines.push_back("");
+    }
+
+    auto global_decls = aletheia::GlobalDeclarationGenerator::generate(
+        task, &identifier_display.global_names, portable_c);
     for (const auto& decl : global_decls) {
         lines.push_back(decl);
     }
@@ -863,9 +1157,11 @@ std::vector<std::string> generate_cfg_fallback_code(
     std::string return_type = "void";
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<aletheia::FunctionTypeDef>(task.function_type().get())) {
-            return_type = func_type->return_type()->to_string();
+            return_type = aletheia::render_codegen_type(
+                func_type->return_type(), portable_c);
         } else {
-            return_type = task.function_type()->to_string();
+            return_type = aletheia::render_codegen_type(
+                task.function_type(), portable_c);
         }
     }
 
@@ -877,10 +1173,7 @@ std::vector<std::string> generate_cfg_fallback_code(
 
     std::string sig = return_type + " ";
 
-    std::string name = task.function_name().empty()
-        ? "sub_" + std::to_string(task.function_address())
-        : task.function_name();
-    sig += name + "(";
+    sig += identifier_display.function_name + "(";
     std::unordered_set<std::string> emitted_parameter_names;
 
     if (task.function_type()) {
@@ -892,9 +1185,28 @@ std::vector<std::string> generate_cfg_fallback_code(
                 std::string pname = (it != param_display.index_to_name.end() && !it->second.empty())
                     ? it->second
                     : "a" + std::to_string(i + 1);
-                sig += params[i]->to_string() + " " + pname;
+                sig += aletheia::render_codegen_declaration(
+                    params[i], pname, portable_c);
                 emitted_parameter_names.insert(pname);
             }
+            if (func_type->variadic() && !params.empty()) {
+                sig += ", ...";
+            }
+        }
+    }
+    if (emitted_parameter_names.empty() && !param_display.index_to_name.empty()) {
+        std::vector<std::pair<int, std::string>> inferred_parameters(
+            param_display.index_to_name.begin(), param_display.index_to_name.end());
+        std::sort(inferred_parameters.begin(), inferred_parameters.end());
+        bool first_parameter = true;
+        for (const auto& [index, recovered_name] : inferred_parameters) {
+            if (index < 0 || index > 31) continue;
+            const std::string pname = recovered_name.empty()
+                ? "arg_" + std::to_string(index) : recovered_name;
+            if (!first_parameter) sig += ", ";
+            sig += "unsigned long " + pname;
+            emitted_parameter_names.insert(pname);
+            first_parameter = false;
         }
     }
     sig += ") {";
@@ -911,6 +1223,44 @@ std::vector<std::string> generate_cfg_fallback_code(
 
     if (task.cfg()) {
         const auto blocks = task.cfg()->blocks();
+        if (portable_c) {
+            for (aletheia::BasicBlock* block : blocks) {
+                if (!block) continue;
+                lines.push_back(block_label(block) + ":");
+                const auto& instructions = block->instructions();
+                aletheia::Instruction* tail = instructions.empty()
+                    ? nullptr : instructions.back();
+                const bool control_tail = aletheia::isa<aletheia::Branch>(tail)
+                    || aletheia::isa<aletheia::IndirectBranch>(tail);
+                const std::size_t limit = control_tail && !instructions.empty()
+                    ? instructions.size() - 1 : instructions.size();
+                for (std::size_t index = 0; index < limit; ++index) {
+                    const std::string statement = expr_gen.generate(instructions[index]);
+                    if (!statement.empty()) lines.push_back("    " + statement + ";");
+                }
+
+                if (auto* branch = aletheia::dyn_cast<aletheia::Branch>(tail)) {
+                    auto [true_edge, false_edge] = pick_true_false_edges(block);
+                    lines.push_back("    if (" + expr_gen.generate(branch->condition())
+                        + ") goto " + block_label(true_edge ? true_edge->target() : nullptr)
+                        + "; else goto " + block_label(false_edge ? false_edge->target() : nullptr)
+                        + ";");
+                } else if (aletheia::isa<aletheia::IndirectBranch>(tail)) {
+                    if (block->successors().size() == 1 && block->successors()[0]) {
+                        lines.push_back("    goto "
+                            + block_label(block->successors()[0]->target()) + ";");
+                    } else {
+                        lines.push_back("    __builtin_trap();");
+                    }
+                } else if (!aletheia::isa<aletheia::Return>(tail)
+                    && block->successors().size() == 1 && block->successors()[0]) {
+                    lines.push_back("    goto "
+                        + block_label(block->successors()[0]->target()) + ";");
+                }
+            }
+            lines.push_back("}");
+            return lines;
+        }
         std::unordered_set<aletheia::BasicBlock*> inlined_blocks;
         aletheia::BasicBlock* entry = task.cfg()->entry_block();
 
@@ -1105,9 +1455,11 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
     aletheia::FrontendKind frontend_kind,
     bool portable_c,
     PassPseudocodeTracer* pass_tracer,
-    aletheia::debug::DebugObserver* debug_observer) {
+    aletheia::debug::DebugObserver* debug_observer,
+    const FunctionSignatureRegistry* signatures) {
     aletheia::DecompilerTask fallback_task(ea);
     fallback_task.set_frontend_kind(frontend_kind);
+    install_function_signature_registry(fallback_task, signatures);
     configure_out_of_ssa_mode(fallback_task);
 
     auto frontend_res = aletheia::create_frontend(frontend_kind, fallback_task.arena(), matcher);
@@ -1173,9 +1525,126 @@ std::optional<std::vector<std::string>> regenerate_conservative_fallback(
         (*debug_observer)("VariableNameGeneration", false, fallback_task);
     }
 
+    if (aletheia::validate_task_for_codegen(fallback_task).has_value()) {
+        return std::nullopt;
+    }
+
     aletheia::CodeVisitor visitor({.portable_c = portable_c});
     std::vector<std::string> lines = visitor.generate_code(fallback_task);
     return lines;
+}
+
+struct SignatureDiscoveryResult {
+    FunctionSignatureRegistry signatures;
+    std::size_t passes = 0;
+    bool converged = true;
+};
+
+SignatureDiscoveryResult discover_function_signatures(
+    const std::vector<ida::Address>& function_addresses,
+    idiomata::IdiomMatcher& matcher,
+    aletheia::FrontendKind frontend_kind) {
+    SignatureDiscoveryResult result;
+    if (function_addresses.empty()) {
+        return result;
+    }
+    std::vector<ida::Address> ordered_addresses = function_addresses;
+    std::sort(ordered_addresses.begin(), ordered_addresses.end());
+    ordered_addresses.erase(
+        std::unique(ordered_addresses.begin(), ordered_addresses.end()),
+        ordered_addresses.end());
+    const bool x86_pcode_discovery =
+        frontend_kind == aletheia::FrontendKind::Pcode
+        && aletheia::frontend::detect_arch() == "x86_64";
+
+    const auto registries_equal = [](const FunctionSignatureRegistry& lhs,
+                                     const FunctionSignatureRegistry& rhs) {
+        if (lhs.size() != rhs.size()) return false;
+        for (const auto& [address, type] : lhs) {
+            auto found = rhs.find(address);
+            if (found == rhs.end() || !type || !found->second
+                || *type != *found->second) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const std::size_t maximum_passes = ordered_addresses.size() + 1;
+    result.converged = false;
+    for (std::size_t pass = 0; pass < maximum_passes; ++pass) {
+        FunctionSignatureRegistry next = result.signatures;
+        for (ida::Address address : ordered_addresses) {
+            aletheia::DecompilerTask task(address);
+            task.set_frontend_kind(frontend_kind);
+            // Make signatures discovered earlier in this deterministic
+            // address-ordered pass immediately available to their callers.
+            // This prevents a provisional caller signature from becoming a
+            // sticky fixed point merely because its callee was learned in the
+            // same pass.
+            install_function_signature_registry(
+                task,
+                x86_pcode_discovery ? &next : &result.signatures);
+            auto frontend = aletheia::create_frontend(
+                frontend_kind, task.arena(), matcher);
+            if (!frontend) continue;
+            (*frontend)->populate_task_signature(task);
+            if (!task.function_type()
+                && frontend_kind == aletheia::FrontendKind::Native) {
+                std::size_t parameter_count = 0;
+                for (const auto& [storage, parameter] :
+                     task.parameter_registers()) {
+                    (void)storage;
+                    if (parameter.index >= 0) {
+                        parameter_count = std::max(
+                            parameter_count,
+                            static_cast<std::size_t>(parameter.index) + 1);
+                    }
+                }
+                if (parameter_count > 0) {
+                    std::vector<aletheia::TypePtr> parameters(
+                        parameter_count, aletheia::Integer::uint64_t());
+                    task.set_function_type(
+                        std::make_shared<const aletheia::FunctionTypeDef>(
+                            aletheia::Integer::uint64_t(),
+                            std::move(parameters)));
+                }
+            }
+            if (frontend_kind == aletheia::FrontendKind::Pcode
+                && (x86_pcode_discovery || !task.function_type())) {
+                aletheia::TypePtr recovered_type = task.function_type();
+                if (x86_pcode_discovery) {
+                    // IDA auto-types for stripped x86-64 functions frequently
+                    // collapse XMM lanes into integer/aggregate placeholders.
+                    // Discovery must infer the current function from P-Code;
+                    // recovered database types remain available as a fallback
+                    // if the body cannot be lowered.
+                    task.set_function_type(nullptr);
+                }
+                std::vector<idiomata::IdiomTag> idiom_tags;
+                auto cfg = (*frontend)->lift_function(task, &idiom_tags);
+                if (!cfg) {
+                    if (!recovered_type) continue;
+                    task.set_function_type(std::move(recovered_type));
+                }
+            }
+            if (auto* function = task.function_type()
+                    ? aletheia::type_dyn_cast<aletheia::FunctionTypeDef>(
+                        task.function_type().get())
+                    : nullptr) {
+                (void)function;
+                next[address] = task.function_type();
+            }
+        }
+        ++result.passes;
+        if (registries_equal(result.signatures, next)) {
+            result.signatures = std::move(next);
+            result.converged = true;
+            break;
+        }
+        result.signatures = std::move(next);
+    }
+    return result;
 }
 
 std::vector<std::string> decompile_function(
@@ -1186,12 +1655,14 @@ std::vector<std::string> decompile_function(
     bool trace_pass_pseudocode,
     const CliOptions& cli_options = {},
     RunScopedDebugState* run_debug_state = nullptr,
-    DecompileDebugOutput* debug_output = nullptr) {
+    DecompileDebugOutput* debug_output = nullptr,
+    const FunctionSignatureRegistry* signatures = nullptr) {
     ok = false;
     error_message.clear();
 
     aletheia::DecompilerTask task(ea);
     task.set_frontend_kind(cli_options.frontend);
+    install_function_signature_registry(task, signatures);
     PassPseudocodeTracer pass_tracer(ea, trace_pass_pseudocode);
     configure_out_of_ssa_mode(task);
 
@@ -1200,6 +1671,8 @@ std::vector<std::string> decompile_function(
         debug_output->summary.clear();
         debug_output->provenance_trace.clear();
         debug_output->frontend_support = {};
+        debug_output->frontend_diagnostics.clear();
+        debug_output->portable_globals.clear();
     }
 
     // Setup debug observer
@@ -1230,6 +1703,8 @@ std::vector<std::string> decompile_function(
     auto emit_debug_outputs = [&]() {
         if (debug_output) {
             debug_output->frontend_support = task.frontend_support_report();
+            debug_output->frontend_diagnostics = task.frontend_diagnostics();
+            debug_output->portable_globals = collect_portable_global_bindings(task);
         }
         if (!has_debug || !debug_observer.has_value()) {
             return;
@@ -1291,6 +1766,18 @@ std::vector<std::string> decompile_function(
     task.set_cfg(std::move(*cfg_res));
     task.set_idiom_tags(std::move(idiom_tags));
 
+    std::size_t lifted_branch_count = 0;
+    if (task.cfg()) {
+        for (aletheia::BasicBlock* block : task.cfg()->blocks()) {
+            if (!block) continue;
+            for (aletheia::Instruction* instruction : block->instructions()) {
+                if (aletheia::isa<aletheia::Branch>(instruction)) {
+                    ++lifted_branch_count;
+                }
+            }
+        }
+    }
+
     // Capture lifter output as synthetic stage boundary
     if (has_debug) {
         (*debug_observer)("Lifter", false, task);
@@ -1346,7 +1833,8 @@ std::vector<std::string> decompile_function(
         if (enable_structuring && !force_structured_output) {
             if (auto rebuilt = regenerate_conservative_fallback(
                     ea, matcher, cli_options.frontend, cli_options.portable_c,
-                    &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
+                    &pass_tracer, has_debug ? &(*debug_observer) : nullptr,
+                    signatures);
                 rebuilt.has_value()) {
                 emit_debug_outputs();
                 ok = true;
@@ -1373,6 +1861,12 @@ std::vector<std::string> decompile_function(
 
         emit_debug_outputs();
 
+        if (auto validation =
+                aletheia::validate_cfg_for_codegen(task)) {
+            error_message =
+                "CFG fallback rejected invalid IR: " + *validation;
+            return {};
+        }
         ok = true;
         return generate_cfg_fallback_code(task, cli_options.portable_c);
     }
@@ -1398,6 +1892,48 @@ std::vector<std::string> decompile_function(
     aletheia::CodeVisitor visitor({.portable_c = cli_options.portable_c});
     auto structured_lines = visitor.generate_code(task);
 
+    if (cli_options.portable_c && task.cfg()) {
+        std::size_t cfg_predicates = 0;
+        for (aletheia::BasicBlock* block : task.cfg()->blocks()) {
+            if (!block) continue;
+            for (aletheia::Instruction* instruction : block->instructions()) {
+                if (aletheia::isa<aletheia::Branch>(instruction)) {
+                    ++cfg_predicates;
+                }
+            }
+        }
+        cfg_predicates = std::max(cfg_predicates, lifted_branch_count);
+        std::size_t emitted_predicates = 0;
+        for (const std::string& line : structured_lines) {
+            const std::size_t first = line.find_first_not_of(" \t");
+            const std::string_view trimmed = first == std::string::npos
+                ? std::string_view{} : std::string_view(line).substr(first);
+            if (trimmed.starts_with("if (") || trimmed.starts_with("while (")
+                || trimmed.starts_with("for (")) {
+                ++emitted_predicates;
+            }
+        }
+        if (emitted_predicates < cfg_predicates) {
+            if (auto rebuilt = regenerate_conservative_fallback(
+                    ea, matcher, cli_options.frontend, cli_options.portable_c,
+                    &pass_tracer, has_debug ? &(*debug_observer) : nullptr,
+                    signatures);
+                rebuilt.has_value()) {
+                emit_debug_outputs();
+                ok = true;
+                return *rebuilt;
+            }
+            if (auto validation =
+                    aletheia::validate_cfg_for_codegen(task)) {
+                error_message =
+                    "CFG fallback rejected invalid IR: " + *validation;
+                return {};
+            }
+            ok = true;
+            return generate_cfg_fallback_code(task, true);
+        }
+    }
+
     if (enable_structuring && !force_structured_output
         && generated_output_too_lossy(lifted_non_control_count, structured_lines)) {
         if (ea == 0 && !debug_opts.stage_metrics_json) {
@@ -1411,7 +1947,8 @@ std::vector<std::string> decompile_function(
         }
         if (auto rebuilt = regenerate_conservative_fallback(
                 ea, matcher, cli_options.frontend, cli_options.portable_c,
-                &pass_tracer, has_debug ? &(*debug_observer) : nullptr);
+                &pass_tracer, has_debug ? &(*debug_observer) : nullptr,
+                signatures);
             rebuilt.has_value()) {
             emit_debug_outputs();
             ok = true;
@@ -1488,9 +2025,21 @@ int main(int argc, char** argv) {
     std::size_t total_functions = 0;
     std::size_t decompiled_functions = 0;
     aletheia::FrontendSupportReport frontend_support_total;
+    std::unordered_map<std::string, std::size_t> frontend_diagnostic_counts;
+    std::unordered_map<std::string, PortableGlobalBinding> portable_global_bindings;
     RunScopedDebugState run_debug_state;
     std::vector<JsonMetricsPerFunction> json_metrics_functions;
     std::vector<EmittedFunction> emitted_functions;
+
+    std::vector<ida::Address> function_addresses;
+    for (const auto& fn : ida::function::all()) {
+        function_addresses.push_back(fn.start());
+    }
+    SignatureDiscoveryResult signature_discovery;
+    signature_discovery = discover_function_signatures(
+        function_addresses, matcher, options.frontend);
+    const FunctionSignatureRegistry* run_signatures =
+        &signature_discovery.signatures;
 
     for (const auto& fn : ida::function::all()) {
         ++total_functions;
@@ -1507,11 +2056,30 @@ int main(int argc, char** argv) {
             trace_pass_pseudocode,
             options,
             &run_debug_state,
-            &debug_output);
+            &debug_output,
+            run_signatures);
 
         frontend_support_total.implemented_ops += debug_output.frontend_support.implemented_ops;
         frontend_support_total.fallback_ops += debug_output.frontend_support.fallback_ops;
         frontend_support_total.unsupported_ops += debug_output.frontend_support.unsupported_ops;
+        for (const auto& diagnostic : debug_output.frontend_diagnostics) {
+            if (diagnostic.severity == aletheia::FrontendDiagnosticSeverity::Warning
+                || diagnostic.severity == aletheia::FrontendDiagnosticSeverity::Error) {
+                ++frontend_diagnostic_counts[
+                    diagnostic.code + ": " + diagnostic.message];
+            }
+        }
+        for (const PortableGlobalBinding& binding : debug_output.portable_globals) {
+            auto [it, inserted] = portable_global_bindings.try_emplace(
+                binding.name, binding);
+            if (!inserted) {
+                it->second.required_size = std::max(
+                    it->second.required_size, binding.required_size);
+                if (it->second.address == 0 && binding.address != 0) {
+                    it->second = binding;
+                }
+            }
+        }
 
         if (ok && options.portable_c && !declaration_only) {
             if (auto marker = portable_c_unresolved_marker(lines)) {
@@ -1544,19 +2112,31 @@ int main(int argc, char** argv) {
             fn.start(), true, {}, std::move(lines), declaration_only});
     }
 
+    std::unordered_set<std::string> materialized_global_names;
     if (options.portable_c) {
-        emit_portable_c_preamble(out, emitted_functions);
+        emit_portable_c_preamble(
+            out,
+            emitted_functions,
+            portable_global_bindings,
+            &materialized_global_names);
     }
     for (const EmittedFunction& function : emitted_functions) {
         if (!function.ok) {
             out << "/* decompilation failed at " << std::hex << function.address << std::dec
-                << ": " << function.error_message << " */\n\n";
+                << ": " << aletheia::frontend::sanitize_c_block_comment_text(
+                    function.error_message)
+                << " */\n\n";
             continue;
         }
         if (function.declaration_only) {
             continue;
         }
         for (const std::string& line : function.lines) {
+            if (options.portable_c
+                && is_materialized_global_declaration(
+                    line, materialized_global_names)) {
+                continue;
+            }
             out << line << '\n';
         }
         out << '\n';
@@ -1591,9 +2171,25 @@ int main(int argc, char** argv) {
     }
 
     if (options.frontend == aletheia::FrontendKind::Pcode) {
+        std::cerr << "idump: pcode signature registry functions="
+                  << signature_discovery.signatures.size()
+                  << " passes=" << signature_discovery.passes
+                  << " converged=" << (signature_discovery.converged ? "yes" : "no")
+                  << '\n';
         std::cerr << "idump: pcode support implemented=" << frontend_support_total.implemented_ops
                   << " fallback=" << frontend_support_total.fallback_ops
                   << " unsupported=" << frontend_support_total.unsupported_ops << '\n';
+        std::vector<std::pair<std::string, std::size_t>> ordered_diagnostics(
+            frontend_diagnostic_counts.begin(), frontend_diagnostic_counts.end());
+        std::sort(ordered_diagnostics.begin(), ordered_diagnostics.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.second != rhs.second
+                    ? lhs.second > rhs.second : lhs.first < rhs.first;
+            });
+        for (const auto& [diagnostic, count] : ordered_diagnostics) {
+            std::cerr << "idump: pcode diagnostic count=" << count
+                      << " " << diagnostic << '\n';
+        }
     }
     std::cerr << "idump: wrote " << decompiled_functions << "/" << total_functions
               << " functions to " << output_path << "\n";

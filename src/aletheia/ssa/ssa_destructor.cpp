@@ -107,6 +107,9 @@ void apply_simple_renamer(DecompilerArena& arena, ControlFlowGraph& cfg) {
         replacement->set_ssa_version(0);
         replacement->set_aliased(original->is_aliased());
         replacement->set_ir_type(original->ir_type());
+        replacement->set_kind(original->kind());
+        replacement->set_stack_offset(original->stack_offset());
+        replacement->set_parameter_index(original->parameter_index());
 
         replacement_for.emplace(std::move(key), replacement);
         return replacement;
@@ -265,9 +268,13 @@ void SsaDestructor::eliminate_phi_nodes(DecompilerArena& arena, ControlFlowGraph
             Edge* pred_to_bb = find_edge(pred_block, bb);
             if (!pred_to_bb) return nullptr;
 
-            const bool conditional_edge = pred_to_bb->type() != EdgeType::Unconditional ||
-                                          pred_block->successors().size() > 1;
-            if (!conditional_edge) {
+            // A phi copy requires edge splitting only when the predecessor
+            // has another successor. EdgeType::Fallthrough/True/False records
+            // branch provenance but does not by itself make a sole-successor
+            // edge critical. Splitting such an edge introduces asymmetric
+            // arms that can obscure an otherwise canonical diamond.
+            const bool critical_edge = pred_block->successors().size() > 1;
+            if (!critical_edge) {
                 return nullptr;
             }
 

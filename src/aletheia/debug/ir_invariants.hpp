@@ -1,5 +1,6 @@
 #pragma once
 #include "../structures/cfg.hpp"
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,10 +23,16 @@ class IrInvariantChecker {
 public:
     // Check all phase-appropriate invariants
     std::vector<InvariantViolation> check_all(
-        const ControlFlowGraph* cfg, PipelinePhase phase) const;
+        const ControlFlowGraph* cfg,
+        PipelinePhase phase,
+        std::optional<std::size_t> declared_parameter_count = std::nullopt) const;
 
     // Individual checks
     std::vector<InvariantViolation> check_cfg_consistency(const ControlFlowGraph* cfg) const;
+    std::vector<InvariantViolation> check_expression_acyclicity(const ControlFlowGraph* cfg) const;
+    std::vector<InvariantViolation> check_parameter_metadata(
+        const ControlFlowGraph* cfg,
+        std::optional<std::size_t> declared_parameter_count = std::nullopt) const;
     std::vector<InvariantViolation> check_ssa_consistency(const ControlFlowGraph* cfg) const;
     std::vector<InvariantViolation> check_variable_liveness(const ControlFlowGraph* cfg) const;
     std::vector<InvariantViolation> check_call_integrity(const ControlFlowGraph* cfg) const;

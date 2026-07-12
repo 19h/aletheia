@@ -27,41 +27,6 @@ bool env_flag_enabled(const char* name) {
     return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES";
 }
 
-void collect_original_block_ids(AstNode* node, std::vector<std::uint64_t>& ids) {
-    if (!node) {
-        return;
-    }
-
-    if (BasicBlock* bb = node->get_original_block()) {
-        ids.push_back(static_cast<std::uint64_t>(bb->id()));
-    }
-
-    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-        for (AstNode* child : seq->nodes()) {
-            collect_original_block_ids(child, ids);
-        }
-        return;
-    }
-    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        collect_original_block_ids(if_node->true_branch(), ids);
-        collect_original_block_ids(if_node->false_branch(), ids);
-        return;
-    }
-    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        collect_original_block_ids(loop->body(), ids);
-        return;
-    }
-    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-        for (CaseNode* case_node : sw->cases()) {
-            collect_original_block_ids(case_node->body(), ids);
-        }
-        return;
-    }
-    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-        collect_original_block_ids(case_node->body(), ids);
-    }
-}
-
 std::uint64_t transition_block_order_key(TransitionBlock* node) {
     if (!node || !node->ast_node()) {
         return std::numeric_limits<std::uint64_t>::max();
@@ -72,7 +37,7 @@ std::uint64_t transition_block_order_key(TransitionBlock* node) {
     }
 
     std::vector<std::uint64_t> ids;
-    collect_original_block_ids(node->ast_node(), ids);
+    collect_ast_original_block_ids(node->ast_node(), ids);
     if (!ids.empty()) {
         return *std::min_element(ids.begin(), ids.end());
     }
@@ -87,7 +52,7 @@ std::string transition_block_signature(TransitionBlock* node) {
     }
 
     std::vector<std::uint64_t> ids;
-    collect_original_block_ids(node->ast_node(), ids);
+    collect_ast_original_block_ids(node->ast_node(), ids);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
@@ -206,6 +171,96 @@ bool is_restructurable_region(
     if (out_exit) {
         *out_exit = exits.empty() ? nullptr : *exits.begin();
     }
+    return true;
+}
+
+std::optional<std::pair<std::unordered_set<TransitionBlock*>, TransitionBlock*>>
+canonical_diamond_region(TransitionCFG& cfg, TransitionBlock* header) {
+    if (!header) return std::nullopt;
+    std::vector<TransitionBlock*> arms = header->successors_blocks();
+    std::sort(arms.begin(), arms.end());
+    arms.erase(std::unique(arms.begin(), arms.end()), arms.end());
+    if (arms.size() != 2 || !arms[0] || !arms[1] || arms[0] == arms[1]) {
+        return std::nullopt;
+    }
+
+    auto unique_successor = [](TransitionBlock* arm) -> TransitionBlock* {
+        if (!arm) return nullptr;
+        std::vector<TransitionBlock*> successors = arm->successors_blocks();
+        std::sort(successors.begin(), successors.end());
+        successors.erase(std::unique(successors.begin(), successors.end()), successors.end());
+        return successors.size() == 1 ? successors.front() : nullptr;
+    };
+    TransitionBlock* join = unique_successor(arms[0]);
+    if (!join || join == header || join == arms[0] || join == arms[1]
+        || unique_successor(arms[1]) != join) {
+        return std::nullopt;
+    }
+
+    // Each arm must be owned by this header. An external predecessor would
+    // make folding it into the conditional duplicate or suppress a path.
+    for (TransitionBlock* arm : arms) {
+        for (TransitionBlock* predecessor : arm->predecessors_blocks()) {
+            if (predecessor != header) return std::nullopt;
+        }
+    }
+
+    std::unordered_set<TransitionBlock*> region{header, arms[0], arms[1]};
+    TransitionBlock* verified_exit = nullptr;
+    if (!is_restructurable_region(cfg, header, region, &verified_exit)
+        || verified_exit != join) {
+        return std::nullopt;
+    }
+    return std::make_pair(std::move(region), join);
+}
+
+bool restructure_canonical_diamond_ast(
+    DecompilerArena& arena,
+    TransitionBlock* header,
+    const std::unordered_set<TransitionBlock*>& region) {
+    if (!header || !header->ast_node()) return false;
+    BasicBlock* header_block = header->ast_node()->get_original_block();
+    if (!header_block || header_block->instructions().empty()) return false;
+    auto* branch = dyn_cast<Branch>(header_block->instructions().back());
+    if (!branch || !branch->condition()) return false;
+
+    TransitionBlock* true_arm = nullptr;
+    TransitionBlock* false_arm = nullptr;
+    const auto transition_arm_for = [&](BasicBlock* target) -> TransitionBlock* {
+        if (!target) return nullptr;
+        for (TransitionBlock* candidate : region) {
+            if (candidate != header && candidate && candidate->ast_node()
+                && candidate->ast_node()->get_original_block() == target) {
+                return candidate;
+            }
+        }
+        return nullptr;
+    };
+
+    for (Edge* edge : header_block->successors()) {
+        if (!edge) continue;
+        TransitionBlock* arm = transition_arm_for(edge->target());
+        if (!arm) continue;
+        if (edge->type() == EdgeType::True) {
+            true_arm = arm;
+        } else if (edge->type() == EdgeType::False
+                   || edge->type() == EdgeType::Fallthrough) {
+            false_arm = arm;
+        }
+    }
+    if (!true_arm || !false_arm || true_arm == false_arm) return false;
+
+    auto header_instructions = header_block->instructions();
+    header_instructions.pop_back();
+    header_block->set_instructions(std::move(header_instructions));
+
+    auto* sequence = arena.create<SeqNode>();
+    sequence->add_node(header->ast_node());
+    sequence->add_node(arena.create<IfNode>(
+        arena.create<ExprAstNode>(branch->condition()),
+        true_arm->ast_node(),
+        false_arm->ast_node()));
+    header->set_ast_node(sequence);
     return true;
 }
 
@@ -673,8 +728,20 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
         std::unordered_set<TransitionBlock*> best_region;
         TransitionBlock* best_header = nullptr;
         TransitionBlock* best_exit = nullptr;
+        bool best_is_diamond = false;
 
         for (TransitionBlock* header : cfg.blocks()) {
+            if (auto diamond = canonical_diamond_region(cfg, header)) {
+                auto& [diamond_region, diamond_exit] = *diamond;
+                if (!best_is_diamond || diamond_region.size() < best_region.size()) {
+                    best_region = std::move(diamond_region);
+                    best_header = header;
+                    best_exit = diamond_exit;
+                    best_is_diamond = true;
+                }
+                continue;
+            }
+
             std::unordered_set<TransitionBlock*> full_region = compute_dominated_region(cfg, header);
             TransitionBlock* full_exit = nullptr;
             if (!is_restructurable_region(cfg, header, full_region, &full_exit)) {
@@ -706,7 +773,8 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
                 }
             }
 
-            if (best_region.empty() || candidate_region.size() < best_region.size()) {
+            if (!best_is_diamond
+                && (best_region.empty() || candidate_region.size() < best_region.size())) {
                 best_region = std::move(candidate_region);
                 best_header = header;
                 best_exit = candidate_exit;
@@ -714,7 +782,12 @@ void AcyclicRegionRestructurer::process(TransitionCFG& cfg) {
         }
 
         if (!best_region.empty()) {
-            restructure_region(&cfg, best_header, best_region);
+            const bool directly_restructured_diamond = best_is_diamond
+                && restructure_canonical_diamond_ast(
+                    arena_, best_header, best_region);
+            if (!directly_restructured_diamond) {
+                restructure_region(&cfg, best_header, best_region);
+            }
             
             TransitionBlock* collapsed_block = arena_.create<TransitionBlock>(best_header->ast_node());
             

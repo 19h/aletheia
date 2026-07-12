@@ -399,22 +399,40 @@ std::uint64_t expression_fp(Expression* expr) {
     return expression_fingerprint_hash(expr);
 }
 
-void collect_deref_fingerprints(Expression* expr, std::unordered_set<std::uint64_t>& out) {
+using ExpressionBuckets =
+    std::unordered_map<std::uint64_t, std::vector<Expression*>>;
+
+bool expression_buckets_contain(
+    const ExpressionBuckets& buckets,
+    const Expression* candidate) {
+    if (!candidate) return false;
+    auto found = buckets.find(expression_fingerprint_hash(candidate));
+    if (found == buckets.end()) return false;
+    return std::any_of(
+        found->second.begin(), found->second.end(),
+        [&](const Expression* exemplar) {
+            return expressions_structurally_equal(candidate, exemplar);
+        });
+}
+
+void collect_dereference_expressions(Expression* expr, ExpressionBuckets& out) {
     if (expr == nullptr) {
         return;
     }
     if (auto* op = dyn_cast<Operation>(expr)) {
         if (op->type() == OperationType::deref) {
-            out.insert(expression_fp(expr));
+            if (!expression_buckets_contain(out, expr)) {
+                out[expression_fp(expr)].push_back(expr);
+            }
         }
         for (Expression* item : op->operands()) {
-            collect_deref_fingerprints(item, out);
+            collect_dereference_expressions(item, out);
         }
         return;
     }
     if (auto* list = dyn_cast<ListOperation>(expr)) {
         for (Expression* item : list->operands()) {
-            collect_deref_fingerprints(item, out);
+            collect_dereference_expressions(item, out);
         }
     }
 }
@@ -458,7 +476,7 @@ Variable* first_variable(Expression* expr) {
 void build_def_use_maps(ControlFlowGraph* cfg,
                         DefMap& def_map,
                         UseMap& use_map,
-                        std::unordered_set<std::uint64_t>& branch_dereferences) {
+                        ExpressionBuckets& branch_dereferences) {
     for (BasicBlock* block : cfg->blocks()) {
         for (Instruction* inst : block->instructions()) {
             if (auto* assign = dyn_cast<Assignment>(inst)) {
@@ -472,7 +490,8 @@ void build_def_use_maps(ControlFlowGraph* cfg,
             }
 
             if (auto* branch = dyn_cast<Branch>(inst)) {
-                collect_deref_fingerprints(branch->condition(), branch_dereferences);
+                collect_dereference_expressions(
+                    branch->condition(), branch_dereferences);
             }
         }
     }
@@ -533,7 +552,7 @@ bool is_used_in_branch(const Variable* value, const UseMap& use_map) {
 
 bool is_predecessor_dereferenced_in_branch(const Variable* value,
                                            const DefMap& def_map,
-                                           const std::unordered_set<std::uint64_t>& branch_dereferences) {
+                                           const ExpressionBuckets& branch_dereferences) {
     auto it = def_map.find(var_key(value));
     if (it == def_map.end() || it->second == nullptr) {
         return false;
@@ -544,15 +563,17 @@ bool is_predecessor_dereferenced_in_branch(const Variable* value,
         return false;
     }
 
-    if (branch_dereferences.contains(expression_fp(rhs))) {
+    if (expression_buckets_contain(branch_dereferences, rhs)) {
         return true;
     }
 
-    std::unordered_set<std::uint64_t> def_dereferences;
-    collect_deref_fingerprints(rhs, def_dereferences);
-    for (const std::uint64_t fp : def_dereferences) {
-        if (branch_dereferences.contains(fp)) {
-            return true;
+    ExpressionBuckets def_dereferences;
+    collect_dereference_expressions(rhs, def_dereferences);
+    for (const auto& [_, expressions] : def_dereferences) {
+        for (Expression* expression : expressions) {
+            if (expression_buckets_contain(branch_dereferences, expression)) {
+                return true;
+            }
         }
     }
     return false;
@@ -561,7 +582,7 @@ bool is_predecessor_dereferenced_in_branch(const Variable* value,
 bool is_bounds_checked(const Variable* value,
                        const DefMap& def_map,
                        const UseMap& use_map,
-                       const std::unordered_set<std::uint64_t>& branch_dereferences) {
+                       const ExpressionBuckets& branch_dereferences) {
     return is_copy_assigned(value, def_map)
         || is_used_in_condition_assignment(value, use_map)
         || is_used_in_branch(value, use_map)
@@ -571,7 +592,7 @@ bool is_bounds_checked(const Variable* value,
 Variable* find_switch_candidate(Variable* start,
                                 const DefMap& def_map,
                                 const UseMap& use_map,
-                                const std::unordered_set<std::uint64_t>& branch_dereferences) {
+                                const ExpressionBuckets& branch_dereferences) {
     if (start == nullptr) {
         return nullptr;
     }
@@ -1141,7 +1162,7 @@ void SwitchVariableDetectionStage::execute(DecompilerTask& task) {
 
     DefMap def_map;
     UseMap use_map;
-    std::unordered_set<std::uint64_t> branch_dereferences;
+    ExpressionBuckets branch_dereferences;
     build_def_use_maps(task.cfg(), def_map, use_map, branch_dereferences);
 
     for (BasicBlock* block : task.cfg()->blocks()) {
@@ -2108,7 +2129,16 @@ Expression* lcf_substitute_and_fold(Expression* expr,
         auto it = defs.find(var->name());
         if (it != defs.end()) {
             changed = true;
-            return it->second;
+            // Definitions and uses can expose different semantic views of
+            // the same P-Code storage.  Clone the constant and preserve the
+            // use-site type so IEEE-754 payload bits are not emitted as a C
+            // numeric integer-to-float conversion.  Never retag the tracked
+            // Constant in place: it can feed both integer and float uses.
+            auto* replacement = dyn_cast<Constant>(it->second->copy(arena));
+            if (replacement && var->ir_type()) {
+                replacement->set_ir_type(var->ir_type());
+            }
+            return replacement ? replacement : expr;
         }
         return expr;
     }
@@ -2143,7 +2173,9 @@ Expression* lcf_substitute_and_fold(Expression* expr,
                 auto folded = lcf_try_fold_binary(op->type(), lhs_c->value(), rhs_c->value());
                 if (folded.has_value()) {
                     changed = true;
-                    return arena.create<Constant>(*folded, op->size_bytes);
+                    auto* result = arena.create<Constant>(*folded, op->size_bytes);
+                    result->set_ir_type(op->ir_type());
+                    return result;
                 }
             }
         }

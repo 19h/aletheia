@@ -40,6 +40,7 @@ struct VarKeyHash {
 struct RenameState {
     std::unordered_map<VarKey, std::string, VarKeyHash> canonical_name;
     std::unordered_map<Variable*, std::string> pointer_name;
+    std::unordered_map<Variable*, VarKey> pointer_key;
     std::unordered_map<std::string, std::size_t> prefix_next_id;
     std::unordered_map<int, VarKey> parameter_owner;
     std::unordered_set<VarKey, VarKeyHash> return_sink_keys;
@@ -223,7 +224,14 @@ VarKey canonical_key_for(const Variable* var) {
     }
 
     if (var->kind() == VariableKind::StackLocal || var->kind() == VariableKind::StackArgument) {
-        return {"stack_" + std::to_string(var->stack_offset()), 0};
+        // One physical slot can host incompatible source-level lifetimes.
+        // Preserve coalescing for equal typed views while preventing a float
+        // spill from retyping a later integer/variadic value at that offset.
+        const std::string shape = var->ir_type()
+            ? var->ir_type()->to_string()
+            : "bytes_" + std::to_string(var->size_bytes);
+        return {"stack_" + std::to_string(var->stack_offset())
+            + ":" + shape, 0};
     }
 
     return {var->name(), var->ssa_version()};
@@ -499,7 +507,9 @@ void rename_variable(Variable* var, RenameState& state) {
         return;
     }
 
-    const VarKey key = canonical_key_for(var);
+    const auto seeded_key = state.pointer_key.find(var);
+    const VarKey key = seeded_key != state.pointer_key.end()
+        ? seeded_key->second : canonical_key_for(var);
     auto it = state.canonical_name.find(key);
     if (it == state.canonical_name.end()) {
         const std::string assigned = allocate_name_for_variable(var, state);
@@ -684,6 +694,115 @@ void collect_return_sink_keys_from_ast(AstNode* node, std::unordered_set<VarKey,
     }
 }
 
+void collect_identity_variables_from_expression(
+    Expression* expression,
+    std::vector<Variable*>& variables) {
+    if (!expression) return;
+    if (auto* variable = dyn_cast<Variable>(expression)) {
+        if (!isa<GlobalVariable>(variable)) variables.push_back(variable);
+        return;
+    }
+    if (auto* operation = dyn_cast<Operation>(expression)) {
+        for (Expression* operand : operation->operands()) {
+            collect_identity_variables_from_expression(operand, variables);
+        }
+    } else if (auto* list = dyn_cast<ListOperation>(expression)) {
+        for (Expression* operand : list->operands()) {
+            collect_identity_variables_from_expression(operand, variables);
+        }
+    }
+}
+
+void collect_identity_variables_from_instruction(
+    Instruction* instruction,
+    std::vector<Variable*>& variables) {
+    if (!instruction) return;
+    auto requirements = instruction->requirements();
+    auto definitions = instruction->definitions();
+    requirements.insert(requirements.end(), definitions.begin(), definitions.end());
+    for (Variable* variable : requirements) {
+        if (variable && !isa<GlobalVariable>(variable)) variables.push_back(variable);
+    }
+}
+
+void collect_identity_variables_from_ast(
+    AstNode* node,
+    std::vector<Variable*>& variables) {
+    if (!node) return;
+    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
+        if (code->block()) {
+            for (Instruction* instruction : code->block()->instructions()) {
+                collect_identity_variables_from_instruction(instruction, variables);
+            }
+        }
+        return;
+    }
+    if (auto* expression = ast_dyn_cast<ExprAstNode>(node)) {
+        collect_identity_variables_from_expression(expression->expr(), variables);
+        return;
+    }
+    if (auto* sequence = ast_dyn_cast<SeqNode>(node)) {
+        for (AstNode* child : sequence->nodes()) {
+            collect_identity_variables_from_ast(child, variables);
+        }
+        return;
+    }
+    if (auto* conditional = ast_dyn_cast<IfNode>(node)) {
+        collect_identity_variables_from_ast(conditional->cond(), variables);
+        collect_identity_variables_from_ast(conditional->true_branch(), variables);
+        collect_identity_variables_from_ast(conditional->false_branch(), variables);
+        return;
+    }
+    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
+        collect_identity_variables_from_expression(loop->condition(), variables);
+        if (auto* for_loop = ast_dyn_cast<ForLoopNode>(loop)) {
+            collect_identity_variables_from_instruction(for_loop->declaration(), variables);
+            collect_identity_variables_from_instruction(for_loop->modification(), variables);
+        }
+        collect_identity_variables_from_ast(loop->body(), variables);
+        return;
+    }
+    if (auto* switch_node = ast_dyn_cast<SwitchNode>(node)) {
+        collect_identity_variables_from_ast(switch_node->cond(), variables);
+        for (CaseNode* case_node : switch_node->cases()) {
+            collect_identity_variables_from_ast(case_node, variables);
+        }
+        return;
+    }
+    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
+        collect_identity_variables_from_ast(case_node->body(), variables);
+    }
+}
+
+void seed_identity_keys(const std::vector<Variable*>& variables, RenameState& state) {
+    std::unordered_map<VarKey, VarKey, VarKeyHash> preferred_key;
+    std::unordered_set<VarKey, VarKeyHash> conflicting_stack_keys;
+    for (Variable* variable : variables) {
+        if (!variable || isa<GlobalVariable>(variable)) continue;
+        const VarKey raw{variable->name(), variable->ssa_version()};
+        const VarKey candidate = canonical_key_for(variable);
+        auto [it, inserted] = preferred_key.emplace(raw, candidate);
+        if (!inserted && candidate.name.starts_with("stack_")) {
+            if (it->second.name.starts_with("stack_")
+                && it->second != candidate) {
+                conflicting_stack_keys.insert(raw);
+            } else {
+                it->second = candidate;
+            }
+        }
+    }
+    for (Variable* variable : variables) {
+        if (!variable || isa<GlobalVariable>(variable)) continue;
+        const VarKey raw{variable->name(), variable->ssa_version()};
+        const VarKey candidate = canonical_key_for(variable);
+        auto preferred = preferred_key.find(raw);
+        state.pointer_key[variable] = conflicting_stack_keys.contains(raw)
+            && candidate.name.starts_with("stack_")
+            ? candidate
+            : (preferred != preferred_key.end() ? preferred->second : candidate);
+    }
+}
+
 
 } // namespace
 
@@ -694,6 +813,9 @@ void VariableNameGeneration::apply_default(AbstractSyntaxForest* forest) {
 
     RenameState state;
     state.scheme = RenameState::Scheme::Default;
+    std::vector<Variable*> identity_variables;
+    collect_identity_variables_from_ast(forest->root(), identity_variables);
+    seed_identity_keys(identity_variables, state);
     collect_return_sink_keys_from_ast(forest->root(), state.return_sink_keys);
     for (const VarKey& key : state.return_sink_keys) {
         state.return_sink_names.insert(key.name);
@@ -709,6 +831,9 @@ void VariableNameGeneration::apply_system_hungarian(AbstractSyntaxForest* forest
 
     RenameState state;
     state.scheme = RenameState::Scheme::SystemHungarian;
+    std::vector<Variable*> identity_variables;
+    collect_identity_variables_from_ast(forest->root(), identity_variables);
+    seed_identity_keys(identity_variables, state);
     collect_return_sink_keys_from_ast(forest->root(), state.return_sink_keys);
     for (const VarKey& key : state.return_sink_keys) {
         state.return_sink_names.insert(key.name);
@@ -724,6 +849,27 @@ void VariableNameGeneration::apply_to_cfg(ControlFlowGraph* cfg) {
 
     RenameState state;
     state.scheme = RenameState::Scheme::Default;
+
+    // Capture all identities before changing any Variable object. Out-of-SSA
+    // copies can contain distinct objects for the same (name, version), with
+    // stack metadata present on only some occurrences. Resolving keys lazily
+    // after earlier occurrences have already been renamed splits one value
+    // into defined and undefined display names.
+    std::vector<Variable*> variables;
+    for (BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        for (Instruction* instruction : block->instructions()) {
+            auto requirements = instruction->requirements();
+            auto definitions = instruction->definitions();
+            requirements.insert(
+                requirements.end(), definitions.begin(), definitions.end());
+            for (Variable* variable : requirements) {
+                if (!variable || isa<GlobalVariable>(variable)) continue;
+                variables.push_back(variable);
+            }
+        }
+    }
+    seed_identity_keys(variables, state);
 
     for (BasicBlock* block : cfg->blocks()) {
         if (!block) continue;
@@ -1366,6 +1512,14 @@ void remove_self_assignments_from_block(BasicBlock* block, DecompilerArena* aren
             }
         }
         filtered.push_back(inst);
+    }
+    if (filtered.empty() && !insts.empty() && !block->successors().empty()) {
+        // Structuring has already encoded this relay block's transition.
+        // Removing its final no-op after that point can leave an empty labeled
+        // AST node with no emitted transfer to a non-lexical successor. Keep
+        // one semantic no-op as the block anchor; a later CFG rebuild can
+        // eliminate the relay and retarget its incoming edges.
+        filtered.push_back(insts.back());
     }
     if (filtered.size() != block->instructions().size()) {
         block->set_instructions(std::move(filtered));

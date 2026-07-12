@@ -4,6 +4,7 @@
 #include <stack>
 #include <unordered_set>
 #include <format>
+#include <limits>
 
 namespace aletheia::debug {
 
@@ -58,72 +59,79 @@ bool has_self_reference(const Expression* src, const Variable* dst) {
 
 // ---- Expression metrics ----
 
-std::size_t expression_depth(const Expression* expr) {
-    if (!expr) return 0;
+namespace {
 
-    switch (expr->node_kind()) {
-        case NodeKind::Constant:
-        case NodeKind::Variable:
-        case NodeKind::GlobalVariable:
-            return 1;
+struct BoundedExpressionMetrics {
+    std::size_t depth = 0;
+    std::size_t weight = 0;
+    bool invalid_or_exhausted = false;
+};
 
-        case NodeKind::Operation:
-        case NodeKind::Call:
-        case NodeKind::Condition: {
-            auto* op = cast<Operation>(expr);
-            std::size_t max_child = 0;
-            for (auto* operand : op->operands()) {
-                max_child = std::max(max_child, expression_depth(operand));
-            }
-            return 1 + max_child;
+constexpr std::size_t kMaxMetricExpansions = 1'000'000;
+
+std::vector<const Expression*> metric_children(const Expression* expression) {
+    std::vector<const Expression*> result;
+    if (const auto* list = dyn_cast<ListOperation>(expression)) {
+        result.reserve(list->operands().size());
+        for (const Expression* child : list->operands()) {
+            if (child) result.push_back(child);
         }
-
-        case NodeKind::ListOperation: {
-            auto* lo = cast<ListOperation>(expr);
-            std::size_t max_child = 0;
-            for (auto* operand : lo->operands()) {
-                max_child = std::max(max_child, expression_depth(operand));
-            }
-            return 1 + max_child;
+    } else if (const auto* operation = dyn_cast<Operation>(expression)) {
+        result.reserve(operation->operands().size());
+        for (const Expression* child : operation->operands()) {
+            if (child) result.push_back(child);
         }
-
-        default:
-            return 1;
     }
+    return result;
+}
+
+BoundedExpressionMetrics compute_expression_metrics(
+    const Expression* root) {
+    if (!root) return {};
+    struct Frame {
+        const Expression* expression = nullptr;
+        std::vector<const Expression*> children;
+        std::size_t next_child = 0;
+    };
+    std::unordered_set<const Expression*> active;
+    std::vector<Frame> stack;
+    active.insert(root);
+    stack.push_back({root, metric_children(root), 0});
+    BoundedExpressionMetrics metrics{.depth = 1, .weight = 1};
+    while (!stack.empty()) {
+        Frame& frame = stack.back();
+        if (frame.next_child >= frame.children.size()) {
+            active.erase(frame.expression);
+            stack.pop_back();
+            continue;
+        }
+        const Expression* child = frame.children[frame.next_child++];
+        if (!child) continue;
+        if (active.contains(child)
+            || metrics.weight >= kMaxMetricExpansions) {
+            metrics.invalid_or_exhausted = true;
+            return metrics;
+        }
+        ++metrics.weight;
+        active.insert(child);
+        stack.push_back({child, metric_children(child), 0});
+        metrics.depth = std::max(metrics.depth, stack.size());
+    }
+    return metrics;
+}
+
+} // namespace
+
+std::size_t expression_depth(const Expression* expr) {
+    const BoundedExpressionMetrics metrics = compute_expression_metrics(expr);
+    return metrics.invalid_or_exhausted
+        ? std::numeric_limits<std::size_t>::max() : metrics.depth;
 }
 
 std::size_t expression_weight(const Expression* expr) {
-    if (!expr) return 0;
-
-    switch (expr->node_kind()) {
-        case NodeKind::Constant:
-        case NodeKind::Variable:
-        case NodeKind::GlobalVariable:
-            return 1;
-
-        case NodeKind::Operation:
-        case NodeKind::Call:
-        case NodeKind::Condition: {
-            auto* op = cast<Operation>(expr);
-            std::size_t total = 1;
-            for (auto* operand : op->operands()) {
-                total += expression_weight(operand);
-            }
-            return total;
-        }
-
-        case NodeKind::ListOperation: {
-            auto* lo = cast<ListOperation>(expr);
-            std::size_t total = 1;
-            for (auto* operand : lo->operands()) {
-                total += expression_weight(operand);
-            }
-            return total;
-        }
-
-        default:
-            return 1;
-    }
+    const BoundedExpressionMetrics metrics = compute_expression_metrics(expr);
+    return metrics.invalid_or_exhausted
+        ? std::numeric_limits<std::size_t>::max() : metrics.weight;
 }
 
 // ---- Tree rendering helpers ----

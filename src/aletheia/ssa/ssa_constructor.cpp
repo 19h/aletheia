@@ -9,6 +9,45 @@ namespace aletheia {
 
 namespace {
 
+struct SsaVariableKey {
+    std::string name;
+    std::size_t version;
+
+    bool operator==(const SsaVariableKey&) const = default;
+};
+
+struct SsaVariableKeyHash {
+    std::size_t operator()(const SsaVariableKey& key) const {
+        return std::hash<std::string>{}(key.name)
+            ^ (std::hash<std::size_t>{}(key.version) << 1);
+    }
+};
+
+bool same_type(const TypePtr& lhs, const TypePtr& rhs) {
+    if (!lhs || !rhs) return !lhs && !rhs;
+    return *lhs == *rhs;
+}
+
+bool same_metadata(const Variable* lhs, const Variable* rhs) {
+    return lhs && rhs
+        && lhs->size_bytes == rhs->size_bytes
+        && same_type(lhs->ir_type(), rhs->ir_type())
+        && lhs->kind() == rhs->kind()
+        && lhs->stack_offset() == rhs->stack_offset()
+        && lhs->parameter_index() == rhs->parameter_index()
+        && lhs->is_aliased() == rhs->is_aliased();
+}
+
+void copy_metadata(Variable* destination, const Variable* source) {
+    if (!destination || !source) return;
+    destination->size_bytes = source->size_bytes;
+    destination->set_ir_type(source->ir_type());
+    destination->set_kind(source->kind());
+    destination->set_stack_offset(source->stack_offset());
+    destination->set_parameter_index(source->parameter_index());
+    destination->set_aliased(source->is_aliased());
+}
+
 std::uint64_t block_order_key(BasicBlock* block) {
     if (!block) {
         return std::numeric_limits<std::uint64_t>::max();
@@ -73,6 +112,7 @@ void SsaConstructor::execute(DecompilerTask& task) {
     gather_definitions(*task.cfg());
     insert_phi_nodes(task.arena(), *task.cfg(), dom_tree);
     rename_variables(task.arena(), *task.cfg(), dom_tree);
+    reconcile_phi_metadata(*task.cfg());
 }
 
 void SsaConstructor::gather_definitions(ControlFlowGraph& cfg) {
@@ -114,7 +154,11 @@ void SsaConstructor::insert_phi_nodes(DecompilerArena& arena, ControlFlowGraph& 
                     // Create a Phi node: dest = phi()
                     // Initially the phi has no source operands -- they are
                     // added during the renaming phase when successors are processed.
-                    Variable* target = arena.create<Variable>(var_name, 8);
+                    // Type and storage metadata cannot be selected from the
+                    // work-list block: one physical stack name may represent
+                    // several incompatible lifetimes.  Reconcile the target
+                    // from its exact incoming SSA definitions after renaming.
+                    auto* target = arena.create<Variable>(var_name, 8);
                     auto* phi_operands = arena.create<ListOperation>(std::vector<Expression*>{});
                     Phi* phi_node = arena.create<Phi>(target, phi_operands);
                     
@@ -131,13 +175,72 @@ void SsaConstructor::insert_phi_nodes(DecompilerArena& arena, ControlFlowGraph& 
     }
 }
 
+void SsaConstructor::reconcile_phi_metadata(ControlFlowGraph& cfg) {
+    std::unordered_map<SsaVariableKey, Variable*, SsaVariableKeyHash> definitions;
+    std::vector<Phi*> phis;
+    for (BasicBlock* block : sorted_blocks_by_id(cfg.blocks())) {
+        for (Instruction* instruction : block->instructions()) {
+            auto* assignment = dyn_cast<Assignment>(instruction);
+            auto* destination = assignment
+                ? dyn_cast<Variable>(assignment->destination()) : nullptr;
+            if (destination) {
+                definitions.emplace(
+                    SsaVariableKey{destination->name(), destination->ssa_version()},
+                    destination);
+            }
+            if (auto* phi = dyn_cast<Phi>(instruction)) phis.push_back(phi);
+        }
+    }
+
+    // Iterated dominance frontiers can produce phis whose inputs are other
+    // phis.  A bounded fixed point lets agreed metadata flow through those
+    // chains while leaving cyclic/unresolved entry values conservative.
+    for (std::size_t iteration = 0; iteration < phis.size(); ++iteration) {
+        bool changed = false;
+        for (Phi* phi : phis) {
+            Variable* agreed = nullptr;
+            bool complete = !phi->origin_block().empty();
+            for (const auto& [_, expression] : phi->origin_block()) {
+                auto* source = dyn_cast<Variable>(expression);
+                auto definition = source
+                    ? definitions.find(SsaVariableKey{source->name(), source->ssa_version()})
+                    : definitions.end();
+                if (definition == definitions.end()) {
+                    complete = false;
+                    break;
+                }
+                if (!agreed) {
+                    agreed = definition->second;
+                } else if (!same_metadata(agreed, definition->second)) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (!complete || !agreed || same_metadata(phi->dest_var(), agreed)) {
+                continue;
+            }
+
+            copy_metadata(phi->dest_var(), agreed);
+            phi->set_ir_type(agreed->ir_type());
+            for (const auto& [_, expression] : phi->origin_block()) {
+                copy_metadata(dyn_cast<Variable>(expression), agreed);
+            }
+            changed = true;
+        }
+        if (!changed) break;
+    }
+}
+
 void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& cfg, const DominatorTree& dom_tree) {
     std::unordered_map<std::string, std::stack<std::size_t>> counters;
     std::unordered_map<std::string, std::size_t> counts;
 
     for (const std::string& var_name : sorted_var_names(var_defs_)) {
+        // Version 0 denotes the value reaching function entry. Concrete
+        // definitions must start at 1 so a definition on only one branch is
+        // distinguishable from the undefined/entry value on another branch.
         counters[var_name].push(0);
-        counts[var_name] = 0;
+        counts[var_name] = 1;
     }
 
     // Recursively update SSA versions on Variable uses within an Expression tree.
@@ -220,7 +323,12 @@ void SsaConstructor::rename_variables(DecompilerArena& arena, ControlFlowGraph& 
                         std::size_t current_ver = counters[target->name()].top();
                         
                         // Create a new source variable with the current SSA version
-                        Variable* source_var = arena.create<Variable>(target->name(), target->size_bytes);
+                        auto* source_var = dyn_cast<Variable>(target->copy(arena));
+                        if (!source_var) {
+                            source_var = arena.create<Variable>(
+                                target->name(), target->size_bytes);
+                        }
+                        source_var->set_name(target->name());
                         source_var->set_ssa_version(current_ver);
                         
                         // Add to the phi's operand list

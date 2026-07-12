@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -39,6 +40,7 @@ struct VarInfo {
     VariableKind kind = VariableKind::Register;
     int parameter_index = -1;
     std::int64_t stack_offset = 0;
+    bool memory_load = false;
 };
 
 using VarSet = std::unordered_set<VarKey, VarKeyHash>;
@@ -53,6 +55,19 @@ bool is_aarch64_x0_family(std::string_view name) {
 
 bool is_aarch64_x0_parameter_role(const VarKey& key) {
     return key.version == 0;
+}
+
+std::optional<std::int64_t> inferred_stack_argument_offset(std::string_view name) {
+    if (!name.starts_with("arg_") || name.size() <= 4) return std::nullopt;
+    std::int64_t value = 0;
+    for (char c : name.substr(4)) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return std::nullopt;
+        if (value > (std::numeric_limits<std::int64_t>::max() - (c - '0')) / 10) {
+            return std::nullopt;
+        }
+        value = value * 10 + (c - '0');
+    }
+    return value;
 }
 
 VarKey key_of(const Variable* var) {
@@ -113,7 +128,9 @@ std::string compatibility_group_of(const VarKey& key, const VarInfo& info) {
         const std::string value_shape = info.type
             ? "type:" + info.type->to_string()
             : "size:" + std::to_string(info.size_bytes);
-        return "aarch64_x0:nonparam:" + key.name + ":" + value_shape;
+        const std::string provenance = info.memory_load ? "load" : "value";
+        return "aarch64_x0:nonparam:" + key.name + ":" + provenance
+            + ":" + value_shape;
     }
     if (info.aliased) {
         return "alias:" + key.name + "#" + std::to_string(key.version);
@@ -289,6 +306,17 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
             return;
         }
         VarKey key = key_of(var);
+        const auto inferred_stack_offset = !var->is_parameter()
+            ? inferred_stack_argument_offset(var->name()) : std::nullopt;
+        if (inferred_stack_offset.has_value()) {
+            // Width propagation can create fresh occurrences without the
+            // original stack metadata. The lowered name is still a stable
+            // frame coordinate; restore the storage role before coloring so
+            // version-0 loads and versioned stores cannot split apart.
+            var->set_kind(VariableKind::StackArgument);
+            var->set_stack_offset(*inferred_stack_offset);
+            var->set_aliased(true);
+        }
         const bool x0_nonparam_role = is_aarch64_x0_family(key.name)
             && !is_aarch64_x0_parameter_role(key);
         auto& info = var_info[key];
@@ -347,6 +375,18 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
                 record_var(v);
             }
 
+            if (auto* assignment = dyn_cast<Assignment>(inst)) {
+                auto* operation = dyn_cast<Operation>(assignment->value());
+                const bool memory_load = operation
+                    && operation->type() == OperationType::deref;
+                if (memory_load) {
+                    if (auto* destination = dyn_cast<Variable>(assignment->destination())) {
+                        auto info = var_info.find(key_of(destination));
+                        if (info != var_info.end()) info->second.memory_load = true;
+                    }
+                }
+            }
+
             for (const VarKey& rk : req_keys) {
                 if (!defs.contains(rk)) {
                     uses.insert(rk);
@@ -359,6 +399,85 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
 
         uses_block[block] = std::move(uses);
         defs_block[block] = std::move(defs);
+    }
+
+    // Phi elimination introduces edge copies immediately before this pass.
+    // Infer pointer compatibility from those copy definitions as well as from
+    // variable metadata. Late address resolution can discover that an SSA
+    // value is a string/global pointer after earlier integer register types
+    // were assigned; grouping solely by the stale register type would then
+    // coalesce the phi target with unrelated integer call results.
+    bool pointer_roles_changed = true;
+    while (pointer_roles_changed) {
+        pointer_roles_changed = false;
+        for (BasicBlock* block : ordered_blocks) {
+            for (Instruction* inst : block->instructions()) {
+                auto* assignment = dyn_cast<Assignment>(inst);
+                auto* destination = assignment
+                    ? dyn_cast<Variable>(assignment->destination()) : nullptr;
+                if (!assignment || !destination || isa<GlobalVariable>(destination)) {
+                    continue;
+                }
+
+                TypePtr pointer_type;
+                if (assignment->value() && assignment->value()->ir_type()
+                    && assignment->value()->ir_type()->type_kind() == TypeKind::Pointer) {
+                    pointer_type = assignment->value()->ir_type();
+                } else if (auto* source = dyn_cast<Variable>(assignment->value())) {
+                    auto source_info = var_info.find(key_of(source));
+                    if (source_info != var_info.end() && source_info->second.type
+                        && source_info->second.type->type_kind() == TypeKind::Pointer) {
+                        pointer_type = source_info->second.type;
+                    }
+                }
+
+                if (!pointer_type) continue;
+                auto destination_info = var_info.find(key_of(destination));
+                if (destination_info == var_info.end()) continue;
+                if (!destination_info->second.type
+                    || destination_info->second.type->type_kind() != TypeKind::Pointer) {
+                    destination_info->second.type = pointer_type;
+                    pointer_roles_changed = true;
+                }
+            }
+        }
+    }
+
+    // Recover per-version floating stack lifetimes before coloring. Physical
+    // stack variables are initially bit containers and therefore commonly
+    // retain an unsigned integer type even when one SSA definition stores a
+    // floating expression. Keeping the inference keyed by (name, version)
+    // prevents that lifetime from retyping later integer reuse of the slot.
+    for (BasicBlock* block : ordered_blocks) {
+        for (Instruction* inst : block->instructions()) {
+            auto* assignment = dyn_cast<Assignment>(inst);
+            auto* destination = assignment
+                ? dyn_cast<Variable>(assignment->destination()) : nullptr;
+            if (!destination || !assignment->value()
+                || (destination->kind() != VariableKind::StackLocal
+                    && destination->kind() != VariableKind::StackArgument)) {
+                continue;
+            }
+
+            TypePtr floating_type;
+            if (assignment->value()->ir_type()
+                && assignment->value()->ir_type()->type_kind() == TypeKind::Float) {
+                floating_type = assignment->value()->ir_type();
+            } else if (auto* bitcast = dyn_cast<Operation>(assignment->value());
+                bitcast && bitcast->type() == OperationType::bitcast
+                && bitcast->operands().size() == 1
+                && bitcast->operands()[0]
+                && bitcast->operands()[0]->ir_type()
+                && bitcast->operands()[0]->ir_type()->type_kind() == TypeKind::Float) {
+                floating_type = bitcast->operands()[0]->ir_type();
+            }
+            if (!floating_type
+                || floating_type->size_bytes() != destination->size_bytes) {
+                continue;
+            }
+            auto info = var_info.find(key_of(destination));
+            if (info != var_info.end()) info->second.type = floating_type;
+        }
     }
 
     bool changed = true;
@@ -546,9 +665,11 @@ void MinimalVariableRenamer::rename(DecompilerArena& arena, ControlFlowGraph& cf
         std::stable_sort(members.begin(), members.end(), key_less);
 
         const VarInfo& info = var_info[members.front()];
-        if (info.aliased) {
-            continue;
-        }
+        // Aliased SSA values still need distinct canonical objects here.
+        // Their compatibility group includes the exact storage version, so
+        // this does not merge memory states; it prevents all versions from
+        // falling through as one raw stack name and being declared with an
+        // unrelated lifetime's type later.
 
         // Scan all members for the best provenance metadata.
         // Priority: Parameter > StackLocal/StackArgument > Register.

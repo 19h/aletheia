@@ -35,6 +35,10 @@ private:
     /// Current function address (for SP delta queries).
     ida::Address current_function_ea_ = ida::BadAddress;
 
+    /// Task supplying the run-scoped cross-function signature registry.
+    /// Valid for the populate/lift pair owned by a frontend instance.
+    class DecompilerTask* current_task_ = nullptr;
+
     /// Parameter register map (populated during populate_task_signature).
     /// Maps lowercase register name -> parameter index.
     std::unordered_map<std::string, int> param_register_map_;

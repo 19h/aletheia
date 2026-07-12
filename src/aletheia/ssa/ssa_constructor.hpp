@@ -19,10 +19,11 @@ public:
 private:
     void insert_phi_nodes(DecompilerArena& arena, ControlFlowGraph& cfg, const DominatorTree& dom_tree);
     void rename_variables(DecompilerArena& arena, ControlFlowGraph& cfg, const DominatorTree& dom_tree);
+    void reconcile_phi_metadata(ControlFlowGraph& cfg);
 
     /// Maps variable name -> list of blocks that contain a definition for it.
     std::unordered_map<std::string, std::vector<BasicBlock*>> var_defs_;
-    
+
     /// Maps block -> phi instructions placed at that block.
     std::unordered_map<BasicBlock*, std::vector<Phi*>> phi_nodes_;
     

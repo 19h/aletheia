@@ -13,6 +13,9 @@ namespace aletheia {
 
 namespace {
 
+constexpr std::size_t kMaxConditionAwareAstDepth = 256;
+constexpr std::size_t kMaxConditionAwareAstExpansions = 1'000'000;
+
 Expression* extract_cond_expr(AstNode* cond_node) {
     if (auto* expr_ast = ast_dyn_cast<ExprAstNode>(cond_node)) {
         return expr_ast->expr();
@@ -40,78 +43,6 @@ std::string expr_fingerprint(Expression* expr) {
         return out;
     }
     return "E:unknown";
-}
-
-bool ast_contains_node(AstNode* parent, AstNode* target) {
-    if (!parent || !target) {
-        return false;
-    }
-    if (parent == target) {
-        return true;
-    }
-    if (auto* seq = ast_dyn_cast<SeqNode>(parent)) {
-        for (AstNode* child : seq->nodes()) {
-            if (ast_contains_node(child, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (auto* if_node = ast_dyn_cast<IfNode>(parent)) {
-        return ast_contains_node(if_node->true_branch(), target)
-            || ast_contains_node(if_node->false_branch(), target);
-    }
-    if (auto* loop = ast_dyn_cast<LoopNode>(parent)) {
-        return ast_contains_node(loop->body(), target);
-    }
-    if (auto* sw = ast_dyn_cast<SwitchNode>(parent)) {
-        for (CaseNode* c : sw->cases()) {
-            if (ast_contains_node(c, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (auto* c = ast_dyn_cast<CaseNode>(parent)) {
-        return ast_contains_node(c->body(), target);
-    }
-    return false;
-}
-
-bool ast_contains_original_block(AstNode* node, BasicBlock* target) {
-    if (!node || !target) {
-        return false;
-    }
-    if (auto* code = ast_dyn_cast<CodeNode>(node)) {
-        return code->block() == target;
-    }
-    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-        for (AstNode* child : seq->nodes()) {
-            if (ast_contains_original_block(child, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        return ast_contains_original_block(if_node->true_branch(), target)
-            || ast_contains_original_block(if_node->false_branch(), target);
-    }
-    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        return ast_contains_original_block(loop->body(), target);
-    }
-    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-        for (CaseNode* c : sw->cases()) {
-            if (ast_contains_original_block(c, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (auto* c = ast_dyn_cast<CaseNode>(node)) {
-        return ast_contains_original_block(c->body(), target);
-    }
-    return false;
 }
 
 int ast_node_transition_match_score(AstNode* node, TransitionBlock* tb) {
@@ -149,83 +80,13 @@ std::uint64_t transition_block_order_key(TransitionBlock* tb) {
         return std::numeric_limits<std::uint64_t>::max();
     }
 
-    auto min_original_block_id = [&](AstNode* node, auto& self) -> std::optional<std::uint64_t> {
-        if (!node) {
-            return std::nullopt;
-        }
-        if (BasicBlock* bb = node->get_original_block()) {
-            return static_cast<std::uint64_t>(bb->id());
-        }
-
-        std::optional<std::uint64_t> best;
-        auto take_best = [&](AstNode* child) {
-            auto child_id = self(child, self);
-            if (child_id.has_value() && (!best.has_value() || child_id.value() < best.value())) {
-                best = child_id;
-            }
-        };
-
-        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-            for (AstNode* child : seq->nodes()) {
-                take_best(child);
-            }
-        } else if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-            take_best(if_node->true_branch());
-            take_best(if_node->false_branch());
-        } else if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-            take_best(loop->body());
-        } else if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-            for (CaseNode* case_node : sw->cases()) {
-                take_best(case_node->body());
-            }
-        } else if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-            take_best(case_node->body());
-        }
-
-        return best;
-    };
-
-    if (auto min_id = min_original_block_id(tb->ast_node(), min_original_block_id); min_id.has_value()) {
-        return min_id.value();
+    std::vector<std::uint64_t> ids;
+    if (collect_ast_original_block_ids(tb->ast_node(), ids) && !ids.empty()) {
+        return *std::min_element(ids.begin(), ids.end());
     }
 
     const auto kind_bias = static_cast<std::uint64_t>(tb->ast_node()->ast_kind());
     return std::numeric_limits<std::uint64_t>::max() - kind_bias;
-}
-
-void collect_original_block_ids(AstNode* node, std::vector<std::uint64_t>& ids) {
-    if (!node) {
-        return;
-    }
-
-    if (BasicBlock* bb = node->get_original_block()) {
-        ids.push_back(static_cast<std::uint64_t>(bb->id()));
-    }
-
-    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-        for (AstNode* child : seq->nodes()) {
-            collect_original_block_ids(child, ids);
-        }
-        return;
-    }
-    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        collect_original_block_ids(if_node->true_branch(), ids);
-        collect_original_block_ids(if_node->false_branch(), ids);
-        return;
-    }
-    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        collect_original_block_ids(loop->body(), ids);
-        return;
-    }
-    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-        for (CaseNode* case_node : sw->cases()) {
-            collect_original_block_ids(case_node->body(), ids);
-        }
-        return;
-    }
-    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-        collect_original_block_ids(case_node->body(), ids);
-    }
 }
 
 std::string transition_block_signature(TransitionBlock* tb) {
@@ -234,7 +95,7 @@ std::string transition_block_signature(TransitionBlock* tb) {
     }
 
     std::vector<std::uint64_t> ids;
-    collect_original_block_ids(tb->ast_node(), ids);
+    collect_ast_original_block_ids(tb->ast_node(), ids);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
@@ -415,7 +276,9 @@ public:
                 if (!selector) {
                     selector = curr_selector;
                     selector_fp = curr_selector_fp;
-                } else if (selector_fp != curr_selector_fp) {
+                } else if (selector_fp != curr_selector_fp
+                           || !expressions_structurally_equal(
+                               selector, curr_selector)) {
                     valid_chain = false;
                     break;
                 }
@@ -482,7 +345,10 @@ public:
                     continue;
                 }
 
-                if (nested_fp != switch_fp || switch_has_case_value(sw, nested_value)) {
+                if (nested_fp != switch_fp
+                    || !expressions_structurally_equal(
+                        switch_expr, nested_selector)
+                    || switch_has_case_value(sw, nested_value)) {
                     continue;
                 }
 
@@ -533,7 +399,12 @@ public:
             }
 
             Expression* inner_selector = extract_cond_expr(inner_switch->cond());
-            if (!inner_selector || expr_fingerprint(inner_selector) != selector_fp) continue;
+            if (!inner_selector
+                || expr_fingerprint(inner_selector) != selector_fp
+                || !expressions_structurally_equal(
+                    inner_selector, selector)) {
+                continue;
+            }
 
             auto* merged = arena.create<SwitchNode>(arena.create<ExprAstNode>(selector));
             merged->add_case(arena.create<CaseNode>(case_value, wrapper_if->true_branch()));
@@ -593,7 +464,8 @@ public:
                 if (!cond_expr) break;
                 
                 std::vector<std::uint64_t> values;
-                if (extract_multiple_cases(cond_expr, switch_fp, values)) {
+                if (extract_multiple_cases(
+                        cond_expr, switch_expr, switch_fp, values)) {
                     if (!values.empty()) {
                         for (std::uint64_t v : values) {
                             CaseNode* c = arena.create<CaseNode>(v, if_node->true_branch());
@@ -611,13 +483,18 @@ public:
     }
 
 private:
-    static bool extract_multiple_cases(Expression* expr, const std::string& switch_fp, std::vector<std::uint64_t>& values) {
+    static bool extract_multiple_cases(
+        Expression* expr,
+        const Expression* switch_expr,
+        const std::string& switch_fp,
+        std::vector<std::uint64_t>& values) {
         if (!expr) return false;
         if (auto* op = dyn_cast<Operation>(expr)) {
             if (op->type() == OperationType::logical_or) {
                 bool ok = true;
                 for (Expression* child : op->operands()) {
-                    if (!extract_multiple_cases(child, switch_fp, values)) {
+                    if (!extract_multiple_cases(
+                            child, switch_expr, switch_fp, values)) {
                         ok = false;
                         break;
                     }
@@ -627,12 +504,15 @@ private:
                 if (op->operands().size() == 2) {
                     Expression* lhs = op->operands()[0];
                     Expression* rhs = op->operands()[1];
-                    if (expr_fingerprint(lhs) == switch_fp) {
+                    if (expr_fingerprint(lhs) == switch_fp
+                        && expressions_structurally_equal(lhs, switch_expr)) {
                         if (auto* c = dyn_cast<Constant>(rhs)) {
                             values.push_back(c->value());
                             return true;
                         }
-                    } else if (expr_fingerprint(rhs) == switch_fp) {
+                    } else if (expr_fingerprint(rhs) == switch_fp
+                               && expressions_structurally_equal(
+                                   rhs, switch_expr)) {
                         if (auto* c = dyn_cast<Constant>(lhs)) {
                             values.push_back(c->value());
                             return true;
@@ -688,7 +568,11 @@ public:
                 if (!decode_switch_case_condition(extract_cond_expr(if_node->cond()), selector, selector_fp, value)) {
                     break;
                 }
-                if (selector_fp != switch_fp) break;
+                if (selector_fp != switch_fp
+                    || !expressions_structurally_equal(
+                        selector, switch_expr)) {
+                    break;
+                }
 
                 if (!switch_has_case_value(sw, value)) {
                     sw->add_case(arena.create<CaseNode>(value, if_node->true_branch()));
@@ -1071,8 +955,8 @@ bool are_negated_conditions(DecompilerArena& arena, Expression* lhs, Expression*
     }
     Expression* negated_lhs = negate_condition_expr(arena, lhs);
     Expression* negated_rhs = negate_condition_expr(arena, rhs);
-    return expr_fingerprint(negated_lhs) == expr_fingerprint(rhs)
-        || expr_fingerprint(lhs) == expr_fingerprint(negated_rhs);
+    return expressions_structurally_equal(negated_lhs, rhs)
+        || expressions_structurally_equal(lhs, negated_rhs);
 }
 
 std::int64_t sign_extend_bits(std::uint64_t value, std::size_t bit_width) {
@@ -1190,6 +1074,7 @@ std::optional<std::uint64_t> evaluate_constant_expression(
         case OperationType::bit_not:
         case OperationType::logical_not:
         case OperationType::cast:
+        case OperationType::bitcast:
         case OperationType::low: {
             auto value = eval_operand(0);
             if (!value) {
@@ -1200,6 +1085,7 @@ std::optional<std::uint64_t> evaluate_constant_expression(
                 case OperationType::bit_not: return truncate_to_width(~(*value), bit_width);
                 case OperationType::logical_not: return *value == 0 ? 1 : 0;
                 case OperationType::cast:
+                case OperationType::bitcast:
                 case OperationType::low: return truncate_to_width(*value, bit_width);
                 default: break;
             }
@@ -1428,7 +1314,8 @@ void rewrite_early_return_guarded_do_while_to_while(DecompilerArena& arena, SeqN
         if (!guard_return || !trailing_return) {
             continue;
         }
-        if (expr_fingerprint(guard_return) != expr_fingerprint(trailing_return)) {
+        if (!expressions_structurally_equal(
+                guard_return, trailing_return)) {
             continue;
         }
 
@@ -1503,12 +1390,21 @@ void rewrite_tail_driven_endless_loops(DecompilerArena& arena, SeqNode* seq) {
     }
 }
 
-AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
+AstNode* rewrite_guarded_do_while(
+    DecompilerArena& arena,
+    AstNode* node,
+    std::size_t depth,
+    std::size_t& expansions) {
     if (!node) return nullptr;
+    if (depth > kMaxConditionAwareAstDepth
+        || ++expansions > kMaxConditionAwareAstExpansions) {
+        return node;
+    }
 
     if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
         for (AstNode*& child : seq->mutable_nodes()) {
-            child = rewrite_guarded_do_while(arena, child);
+            child = rewrite_guarded_do_while(
+                arena, child, depth + 1, expansions);
         }
         rewrite_early_return_guarded_do_while_to_while(arena, seq);
         rewrite_tail_driven_endless_loops(arena, seq);
@@ -1519,10 +1415,12 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
 
     if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
         if (if_node->true_branch()) {
-            if_node->set_true_branch(rewrite_guarded_do_while(arena, if_node->true_branch()));
+            if_node->set_true_branch(rewrite_guarded_do_while(
+                arena, if_node->true_branch(), depth + 1, expansions));
         }
         if (if_node->false_branch()) {
-            if_node->set_false_branch(rewrite_guarded_do_while(arena, if_node->false_branch()));
+            if_node->set_false_branch(rewrite_guarded_do_while(
+                arena, if_node->false_branch(), depth + 1, expansions));
         }
 
         // Guarded do-while pattern:
@@ -1531,7 +1429,8 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
             auto* dowhile = ast_dyn_cast<DoWhileLoopNode>(if_node->true_branch());
             Expression* guard_cond = if_node->condition_expr();
             if (dowhile != nullptr && guard_cond != nullptr && dowhile->condition() != nullptr) {
-                if (expr_fingerprint(guard_cond) == expr_fingerprint(dowhile->condition())) {
+                if (expressions_structurally_equal(
+                        guard_cond, dowhile->condition())) {
                     return arena.create<WhileLoopNode>(dowhile->body(), dowhile->condition());
                 }
             }
@@ -1540,7 +1439,8 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
             if (true_seq && true_seq->size() >= 1 && guard_cond != nullptr) {
                 auto* seq_dowhile = ast_dyn_cast<DoWhileLoopNode>(true_seq->first());
                 if (seq_dowhile != nullptr && seq_dowhile->condition() != nullptr
-                    && expr_fingerprint(guard_cond) == expr_fingerprint(seq_dowhile->condition())) {
+                    && expressions_structurally_equal(
+                        guard_cond, seq_dowhile->condition())) {
                     auto* replacement = arena.create<SeqNode>();
                     replacement->add_node(arena.create<WhileLoopNode>(seq_dowhile->body(), seq_dowhile->condition()));
                     for (std::size_t i = 1; i < true_seq->nodes().size(); ++i) {
@@ -1556,20 +1456,23 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
 
     if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
         if (loop->body()) {
-            loop->set_body(rewrite_guarded_do_while(arena, loop->body()));
+            loop->set_body(rewrite_guarded_do_while(
+                arena, loop->body(), depth + 1, expansions));
         }
         return loop;
     }
 
     if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
         for (CaseNode* c : sw->mutable_cases()) {
-            c->set_body(rewrite_guarded_do_while(arena, c->body()));
+            c->set_body(rewrite_guarded_do_while(
+                arena, c->body(), depth + 1, expansions));
         }
         return sw;
     }
 
     if (auto* c = ast_dyn_cast<CaseNode>(node)) {
-        c->set_body(rewrite_guarded_do_while(arena, c->body()));
+        c->set_body(rewrite_guarded_do_while(
+            arena, c->body(), depth + 1, expansions));
         return c;
     }
 
@@ -1579,15 +1482,22 @@ AstNode* rewrite_guarded_do_while(DecompilerArena& arena, AstNode* node) {
 AstNode* refine_condition_aware_recursive(
     DecompilerArena& arena,
     AstNode* node,
-    const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
+    const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions,
+    std::size_t depth,
+    std::size_t& expansions
 ) {
     if (!node) {
         return nullptr;
     }
+    if (depth > kMaxConditionAwareAstDepth
+        || ++expansions > kMaxConditionAwareAstExpansions) {
+        return node;
+    }
 
     if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
         for (AstNode*& child : seq->mutable_nodes()) {
-            child = refine_condition_aware_recursive(arena, child, reaching_conditions);
+            child = refine_condition_aware_recursive(
+                arena, child, reaching_conditions, depth + 1, expansions);
         }
 
         InitialSwitchNodeConstructor::run(arena, seq, reaching_conditions);
@@ -1602,35 +1512,45 @@ AstNode* refine_condition_aware_recursive(
             }
         }
 
-        AstNode* rewritten = rewrite_guarded_do_while(arena, seq);
+        AstNode* rewritten = rewrite_guarded_do_while(
+            arena, seq, depth, expansions);
         if (rewritten != node) {
-            return refine_condition_aware_recursive(arena, rewritten, reaching_conditions);
+            return refine_condition_aware_recursive(
+                arena, rewritten, reaching_conditions, depth, expansions);
         }
         return rewritten;
     }
 
     if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        if_node->set_cond(refine_condition_aware_recursive(arena, if_node->cond(), reaching_conditions));
-        if_node->set_true_branch(refine_condition_aware_recursive(arena, if_node->true_branch(), reaching_conditions));
-        if_node->set_false_branch(refine_condition_aware_recursive(arena, if_node->false_branch(), reaching_conditions));
+        if_node->set_cond(refine_condition_aware_recursive(
+            arena, if_node->cond(), reaching_conditions, depth + 1, expansions));
+        if_node->set_true_branch(refine_condition_aware_recursive(
+            arena, if_node->true_branch(), reaching_conditions,
+            depth + 1, expansions));
+        if_node->set_false_branch(refine_condition_aware_recursive(
+            arena, if_node->false_branch(), reaching_conditions,
+            depth + 1, expansions));
         return if_node;
     }
 
     if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        loop->set_body(refine_condition_aware_recursive(arena, loop->body(), reaching_conditions));
+        loop->set_body(refine_condition_aware_recursive(
+            arena, loop->body(), reaching_conditions, depth + 1, expansions));
         return loop;
     }
 
     if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
         for (CaseNode* c : sw->mutable_cases()) {
-            c->set_body(refine_condition_aware_recursive(arena, c->body(), reaching_conditions));
+            c->set_body(refine_condition_aware_recursive(
+                arena, c->body(), reaching_conditions, depth + 1, expansions));
         }
         sw->mutable_cases() = CaseDependencyGraph::order_cases(sw->cases());
         return sw;
     }
 
     if (auto* c = ast_dyn_cast<CaseNode>(node)) {
-        c->set_body(refine_condition_aware_recursive(arena, c->body(), reaching_conditions));
+        c->set_body(refine_condition_aware_recursive(
+            arena, c->body(), reaching_conditions, depth + 1, expansions));
         return c;
     }
 
@@ -1646,7 +1566,12 @@ AstNode* ConditionAwareRefinement::refine(
     const std::unordered_map<TransitionBlock*, logos::LogicCondition>& reaching_conditions
 ) {
     (void)ctx;
-    return refine_condition_aware_recursive(arena, root, reaching_conditions);
+    if (!ast_has_unique_code_node_ownership(root)) {
+        return root;
+    }
+    std::size_t expansions = 0;
+    return refine_condition_aware_recursive(
+        arena, root, reaching_conditions, 0, expansions);
 }
 
 } // namespace aletheia

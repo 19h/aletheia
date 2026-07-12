@@ -1,6 +1,9 @@
 #include "instruction_length_handler.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace aletheia {
@@ -20,26 +23,55 @@ public:
     }
 
 private:
+    static constexpr std::size_t kMaxTraversalExpansions = 1'000'000;
+
     static std::size_t expression_complexity(Expression* expr) {
         if (!expr) return 0;
-        if (isa<Constant>(expr) || isa<Variable>(expr)) {
-            return 1;
-        }
-        if (auto* op = dyn_cast<Operation>(expr)) {
-            std::size_t total = 0;
-            for (Expression* child : op->operands()) {
-                total += expression_complexity(child);
+        struct WorkItem {
+            Expression* expression = nullptr;
+            bool exiting = false;
+        };
+        std::vector<WorkItem> work{{expr, false}};
+        std::unordered_set<Expression*> active;
+        std::size_t total = 0;
+        std::size_t expansions = 0;
+        while (!work.empty()) {
+            const WorkItem item = work.back();
+            work.pop_back();
+            Expression* current = item.expression;
+            if (!current) continue;
+            if (item.exiting) {
+                active.erase(current);
+                continue;
             }
-            return total;
-        }
-        if (auto* list = dyn_cast<ListOperation>(expr)) {
-            std::size_t total = 0;
-            for (Expression* child : list->operands()) {
-                total += expression_complexity(child);
+            if (++expansions > kMaxTraversalExpansions) {
+                return std::numeric_limits<std::size_t>::max();
             }
-            return total;
+            std::span<Expression* const> children;
+            if (auto* op = dyn_cast<Operation>(current)) {
+                children = {op->operands().data(), op->operands().size()};
+            } else if (auto* list = dyn_cast<ListOperation>(current)) {
+                children = {
+                    list->operands().data(), list->operands().size()};
+            }
+            if (children.empty()
+                && !isa<Operation>(current)
+                && !isa<ListOperation>(current)) {
+                if (total == std::numeric_limits<std::size_t>::max()) {
+                    return total;
+                }
+                ++total;
+                continue;
+            }
+            if (!active.insert(current).second) {
+                return std::numeric_limits<std::size_t>::max();
+            }
+            work.push_back({current, true});
+            for (auto it = children.rbegin(); it != children.rend(); ++it) {
+                work.push_back({*it, false});
+            }
         }
-        return 1;
+        return total;
     }
 
     static bool is_simple(Expression* expr) {
@@ -127,29 +159,30 @@ private:
         Expression* target,
         std::size_t target_bound,
         std::vector<Instruction*>& out) {
-        if (!owner || !target) return;
-        if (expression_complexity(target) <= target_bound) return;
-
-        if (auto* call = dyn_cast<Call>(target)) {
-            auto& mutable_ops = call->mutable_operands();
-            simplify_operand_list(owner, mutable_ops, target_bound, out);
-            return;
-        }
-
-        if (auto* list = dyn_cast<ListOperation>(target)) {
-            auto& mutable_ops = list->mutable_operands();
-            simplify_operand_list(owner, mutable_ops, target_bound, out);
-            return;
-        }
-
-        if (auto* op = dyn_cast<Operation>(target)) {
+        if (!owner) return;
+        std::unordered_set<Expression*> visited;
+        std::size_t expansions = 0;
+        while (target && visited.insert(target).second
+               && ++expansions <= kMaxTraversalExpansions) {
+            if (expression_complexity(target) <= target_bound) return;
+            if (auto* call = dyn_cast<Call>(target)) {
+                auto& mutable_ops = call->mutable_operands();
+                simplify_operand_list(owner, mutable_ops, target_bound, out);
+                return;
+            }
+            if (auto* list = dyn_cast<ListOperation>(target)) {
+                auto& mutable_ops = list->mutable_operands();
+                simplify_operand_list(owner, mutable_ops, target_bound, out);
+                return;
+            }
+            auto* op = dyn_cast<Operation>(target);
+            if (!op) return;
             if (op->operands().size() == 2) {
                 simplify_binary_target(owner, op, target_bound, out);
                 return;
             }
-            if (op->operands().size() == 1) {
-                simplify_target(owner, op->operands()[0], target_bound, out);
-            }
+            if (op->operands().size() != 1) return;
+            target = op->operands()[0];
         }
     }
 
@@ -209,41 +242,39 @@ private:
 
     void visit_node(AstNode* node) {
         if (!node) return;
-
-        if (auto* code = ast_dyn_cast<CodeNode>(node)) {
-            process_block(code->block());
-            return;
-        }
-        if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-            for (AstNode* child : seq->nodes()) {
-                visit_node(child);
+        std::unordered_set<AstNode*> visited;
+        std::vector<AstNode*> work{node};
+        std::size_t expansions = 0;
+        while (!work.empty()) {
+            AstNode* current = work.back();
+            work.pop_back();
+            if (!current || !visited.insert(current).second) continue;
+            if (++expansions > kMaxTraversalExpansions) return;
+            if (auto* code = ast_dyn_cast<CodeNode>(current)) {
+                process_block(code->block());
+            } else if (auto* seq = ast_dyn_cast<SeqNode>(current)) {
+                for (auto it = seq->nodes().rbegin();
+                     it != seq->nodes().rend(); ++it) {
+                    work.push_back(*it);
+                }
+            } else if (auto* if_node = ast_dyn_cast<IfNode>(current)) {
+                work.push_back(if_node->false_branch());
+                work.push_back(if_node->true_branch());
+            } else if (auto* for_loop = ast_dyn_cast<ForLoopNode>(current)) {
+                std::vector<Instruction*> sink;
+                simplify_instruction(for_loop->declaration(), sink);
+                simplify_instruction(for_loop->modification(), sink);
+                work.push_back(for_loop->body());
+            } else if (auto* loop = ast_dyn_cast<LoopNode>(current)) {
+                work.push_back(loop->body());
+            } else if (auto* sw = ast_dyn_cast<SwitchNode>(current)) {
+                for (auto it = sw->cases().rbegin();
+                     it != sw->cases().rend(); ++it) {
+                    work.push_back(*it);
+                }
+            } else if (auto* case_node = ast_dyn_cast<CaseNode>(current)) {
+                work.push_back(case_node->body());
             }
-            return;
-        }
-        if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-            visit_node(if_node->true_branch());
-            visit_node(if_node->false_branch());
-            return;
-        }
-        if (auto* for_loop = ast_dyn_cast<ForLoopNode>(node)) {
-            std::vector<Instruction*> sink;
-            simplify_instruction(for_loop->declaration(), sink);
-            simplify_instruction(for_loop->modification(), sink);
-            visit_node(for_loop->body());
-            return;
-        }
-        if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-            visit_node(loop->body());
-            return;
-        }
-        if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-            for (CaseNode* case_node : sw->cases()) {
-                visit_node(case_node);
-            }
-            return;
-        }
-        if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-            visit_node(case_node->body());
         }
     }
 

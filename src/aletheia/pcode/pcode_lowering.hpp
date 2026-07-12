@@ -59,6 +59,11 @@ struct PcodeFunctionInfo {
     std::vector<TypePtr> parameter_types;
     TypePtr return_type;
     bool prototype_known = false;
+    bool variadic = false;
+    std::size_t abi_indirect_result_size = 0;
+    std::size_t abi_hfa_result_element_size = 0;
+    std::size_t abi_hfa_result_count = 0;
+    std::vector<AbiParameterLocation> abi_parameter_locations;
 };
 
 struct PcodeSignatureContext {
@@ -66,12 +71,23 @@ struct PcodeSignatureContext {
     std::size_t parameter_count_hint = 0;
     bool prefers_w_arguments = false;
     bool prefers_w_return = false;
+    std::size_t abi_indirect_result_size = 0;
+    std::size_t abi_hfa_result_element_size = 0;
+    std::size_t abi_hfa_result_count = 0;
 };
 
 struct PcodeArchitectureContext {
     std::string arch_name;
     std::size_t pointer_size = 8;
     bool big_endian = false;
+    /// Darwin's AArch64 ABI places the unnamed portion of a variadic call on
+    /// the caller stack even while fixed parameters remain register-passed.
+    bool variadic_arguments_on_stack = false;
+    std::vector<std::string> gp_argument_registers = {
+        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"};
+    std::vector<std::string> integer_return_registers = {"x0", "x1"};
+    std::string stack_pointer_register = "sp";
+    std::string frame_pointer_register = "x29";
     std::string register_space_name = "register";
     std::string const_space_name = "const";
     std::string unique_space_name = "unique";
@@ -92,8 +108,47 @@ struct PcodeArchitectureContext {
                             std::size_t)> stack_variable_resolver;
 };
 
+struct PcodeSignatureRefinement {
+    bool signature_inferred = false;
+    std::size_t resolved_self_calls = 0;
+};
+
+/// Infer an untyped function signature from parameter and return evidence in
+/// its lowered CFG, then apply it to direct recursive calls. Refinement is
+/// deliberately all-or-nothing: every self-call must agree with the inferred
+/// arity and ABI return storage or the original fallback state is retained.
+PcodeSignatureRefinement refine_pcode_function_signature(
+    DecompilerTask& task,
+    ControlFlowGraph& cfg,
+    std::size_t abi_indirect_result_size = 0,
+    std::size_t abi_hfa_result_element_size = 0,
+    std::size_t abi_hfa_result_count = 0,
+    const PcodeArchitectureContext* architecture = nullptr);
+
 class PcodeLowerer {
 public:
+    struct StackArgumentEvidence {
+        std::int64_t offset = 0;
+        std::size_t width = 0;
+        Expression* storage = nullptr;
+        Variable* stack_slot = nullptr;
+        ida::Address instruction_ea = 0;
+    };
+
+    struct StackTypeEvidence {
+        PcodeStackBase base = PcodeStackBase::StackPointer;
+        std::int64_t offset = 0;
+        std::size_t width = 0;
+        TypePtr type;
+    };
+
+    struct CallArgumentEvidence {
+        std::array<bool, 8> gp_register_writes{};
+        std::array<bool, 8> fp_register_writes{};
+        std::vector<StackArgumentEvidence> stack_writes;
+        std::vector<StackTypeEvidence> stack_types;
+    };
+
     struct Options {
         ida::Address function_address;
         TypePtr function_type;
@@ -108,8 +163,11 @@ public:
     ida::Result<std::vector<Instruction*>> lower_instruction(const RawPcodeInstruction& instruction);
 
     /// Reset call-site write evidence at an architectural basic-block
-    /// boundary. Unknown-prototype inference never crosses this boundary.
-    void begin_basic_block();
+    /// boundary unless IDA split an immediately preceding fallthrough before
+    /// the call instruction. Join-aware merging remains a lifter concern.
+    void begin_basic_block(bool preserve_linear_fallthrough = false);
+    void begin_basic_block(const std::vector<CallArgumentEvidence>& predecessor_evidence);
+    [[nodiscard]] CallArgumentEvidence call_argument_evidence() const;
 
 private:
     struct LocalDefinition {
@@ -130,10 +188,35 @@ private:
         std::int64_t offset = 0;
     };
 
+    struct RegisterSemantic {
+        std::string name;
+        std::string canonical_register_name;
+        std::size_t size_bytes = 0;
+        TypePtr type;
+        std::size_t bit_carried_width = 0;
+        TypePtr bit_carried_type;
+        std::optional<StackAddress> stack_address;
+    };
+
+    struct IndirectResultRegion {
+        StackAddress address;
+        std::size_t size_bytes = 0;
+        Variable* storage = nullptr;
+    };
+
+    struct StackStoredType {
+        StackAddress address;
+        std::size_t width = 0;
+        TypePtr type;
+    };
+
     Expression* lower_varnode_read(
         const RawPcodeVarnode& varnode,
         const LocalDefinitionMap& local_defs);
-    WriteTarget lower_output_write(const RawPcodeVarnode& output, Expression* value);
+    WriteTarget lower_output_write(const RawPcodeVarnode& output,
+                                   Expression* value,
+                                   const LocalDefinitionMap& local_defs,
+                                   std::optional<StackAddress> stack_address);
     Expression* lower_call_target(const RawPcodeVarnode& target,
                                   const LocalDefinitionMap& local_defs);
     Expression* lower_pointer_expression(
@@ -142,13 +225,25 @@ private:
     Expression* maybe_stack_or_memory_read(Expression* address_expr,
                                            const LocalDefinitionMap& local_defs,
                                            ida::Address instruction_ea,
-                                           std::size_t width);
+                                           std::size_t width,
+                                           bool bind_stack_parameter = true);
     Expression* make_cast(Expression* expr, std::size_t size, bool is_signed = false);
     Expression* make_float_cast(Expression* expr, std::size_t size);
     Expression* make_float_operand(Expression* expr, std::size_t size);
     Expression* make_abi_argument(std::size_t index, const TypePtr& type);
     Expression* make_abi_return_value(const TypePtr& type);
     Variable* make_abi_return_storage(const TypePtr& type);
+    Expression* make_indirect_result_argument(
+        std::size_t result_size,
+        ida::Address instruction_ea);
+    Expression* make_hfa_result_argument(
+        std::size_t element_size,
+        std::size_t element_count,
+        ida::Address instruction_ea,
+        Variable** storage_out);
+    Expression* access_indirect_result_region(
+        const StackAddress& address,
+        std::size_t width);
     Condition* make_nonzero_condition(Expression* expr);
     std::string unique_key_for(const RawPcodeVarnode& varnode) const;
     std::string unique_name_for(const RawPcodeVarnode& varnode, ida::Address ea, std::uint32_t ordinal) const;
@@ -160,7 +255,9 @@ private:
     void record_fallback(const RawPcodeOp& op, const std::string& message);
     void observe_abi_register_write(const RawPcodeVarnode& output);
     std::size_t inferred_gp_argument_count() const;
+    std::size_t inferred_fp_argument_count() const;
     void reset_call_argument_evidence(bool preserve_return_register);
+    void invalidate_call_clobbered_register_semantics();
 
     DecompilerArena& arena_;
     DecompilerTask& task_;
@@ -169,7 +266,13 @@ private:
     Options options_;
     ida::Address current_instruction_ea_ = 0;
     std::uint32_t current_op_ordinal_ = 0;
+    bool suppress_current_parameter_inference_ = false;
     std::array<bool, 8> gp_argument_write_evidence_{};
+    std::array<bool, 8> fp_argument_write_evidence_{};
+    std::vector<StackArgumentEvidence> stack_argument_write_evidence_;
+    std::unordered_map<std::string, RegisterSemantic> register_semantics_;
+    std::vector<IndirectResultRegion> indirect_result_regions_;
+    std::vector<StackStoredType> stack_stored_types_;
 };
 
 } // namespace aletheia

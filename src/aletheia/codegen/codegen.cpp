@@ -5,7 +5,9 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 
 namespace aletheia {
@@ -417,6 +419,8 @@ const char* comparison_symbol(OperationType type) {
     }
 }
 
+std::string format_float_bit_pattern(const Constant* constant, std::size_t width_bytes);
+
 std::string render_comparison_expression(
     CExpressionGenerator& gen,
     OperationType op_type,
@@ -428,8 +432,19 @@ std::string render_comparison_expression(
     }
 
     const int parent_prec = precedence_for_operation(op_type);
+    const bool floating_comparison =
+        gen.has_declared_type_kind(lhs, TypeKind::Float)
+        || gen.has_declared_type_kind(rhs, TypeKind::Float);
     auto render_operand = [&](Expression* operand, bool is_rhs) {
-        std::string rendered = gen.generate(operand);
+        std::string rendered;
+        if (floating_comparison) {
+            if (auto* constant = dyn_cast<Constant>(operand)) {
+                rendered = format_float_bit_pattern(constant, operand->size_bytes);
+            }
+        }
+        if (rendered.empty()) {
+            rendered = gen.generate(operand);
+        }
         const int child_prec = precedence_for_expression(operand);
         const bool needs_brackets =
             (child_prec < parent_prec) ||
@@ -614,11 +629,14 @@ int precedence_for_operation(OperationType type) {
         case OperationType::deref:
         case OperationType::address_of:
         case OperationType::cast:
+        case OperationType::bitcast:
         case OperationType::pointer:
         case OperationType::low:
             return 140;
 
         case OperationType::power:
+        case OperationType::popcount:
+        case OperationType::lzcount:
             return 135;
 
         case OperationType::mul:
@@ -819,71 +837,613 @@ std::string lowercase_copy(const std::string& text) {
     return out;
 }
 
-struct ParameterDisplayInfo {
-    std::unordered_map<std::string, std::string> expr_name_map;
-    std::unordered_map<int, std::string> index_to_name;
-    std::unordered_map<std::string, TypePtr> declared_type_by_name;
-};
-
-ParameterDisplayInfo build_parameter_display_info(const DecompilerTask& task) {
+ParameterDisplayInfo build_parameter_display_info_impl(
+    const DecompilerTask& task) {
     ParameterDisplayInfo info;
 
-    std::optional<int> max_declared_param_index;
+    const FunctionTypeDef* function = nullptr;
+    std::optional<std::size_t> declared_parameter_count;
     if (task.function_type()) {
-        if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
-            if (!func_type->parameters().empty()) {
-                max_declared_param_index = static_cast<int>(func_type->parameters().size()) - 1;
-            } else {
-                max_declared_param_index = -1;
-            }
+        function = type_dyn_cast<FunctionTypeDef>(task.function_type().get());
+        if (function) {
+            declared_parameter_count = function->parameters().size();
         }
     }
 
     auto include_param_index = [&](int index) {
-        if (!max_declared_param_index.has_value()) {
-            return true;
-        }
-        return index >= 0 && index <= *max_declared_param_index;
+        return index >= 0
+            && (!declared_parameter_count.has_value()
+                || static_cast<std::size_t>(index)
+                    < *declared_parameter_count);
     };
 
     for (const auto& [reg, param] : task.parameter_registers()) {
+        (void)reg;
         if (!include_param_index(param.index)) {
             continue;
         }
         auto it = info.index_to_name.find(param.index);
-        if (it == info.index_to_name.end() || param.name.size() > it->second.size()) {
+        const bool better = it == info.index_to_name.end()
+            || param.name.size() > it->second.size()
+            || (param.name.size() == it->second.size()
+                && param.name < it->second);
+        if (better) {
             info.index_to_name[param.index] = param.name;
         }
     }
 
-    for (const auto& [reg, param] : task.parameter_registers()) {
-        if (!include_param_index(param.index)) {
-            continue;
-        }
-        std::string chosen = param.name;
-        auto best_it = info.index_to_name.find(param.index);
-        if (best_it != info.index_to_name.end() && !best_it->second.empty()) {
-            chosen = best_it->second;
-        }
-        info.expr_name_map[lowercase_copy(reg)] = chosen;
-    }
-
-    for (const auto& [idx, name] : info.index_to_name) {
-        info.expr_name_map["arg_" + std::to_string(idx)] = name;
-    }
-
-    if (task.function_type()) {
-        if (auto* function = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
-            for (std::size_t index = 0; index < function->parameters().size(); ++index) {
-                auto name_it = info.index_to_name.find(static_cast<int>(index));
-                const std::string display_name = name_it != info.index_to_name.end()
-                    && !name_it->second.empty()
-                    ? name_it->second : "a" + std::to_string(index + 1);
-                info.declared_type_by_name[display_name] = function->parameters()[index];
+    if (declared_parameter_count.has_value()) {
+        for (std::size_t index = 0;
+             index < *declared_parameter_count;
+             ++index) {
+            auto [it, inserted] = info.index_to_name.try_emplace(
+                static_cast<int>(index),
+                "a" + std::to_string(index + 1));
+            if (!inserted && it->second.empty()) {
+                it->second = "a" + std::to_string(index + 1);
             }
         }
     }
 
+    std::vector<int> ordered_indices;
+    ordered_indices.reserve(info.index_to_name.size());
+    for (const auto& [index, _] : info.index_to_name) {
+        ordered_indices.push_back(index);
+    }
+    std::sort(ordered_indices.begin(), ordered_indices.end());
+    CIdentifierAllocator parameter_allocator;
+    for (int index : ordered_indices) {
+        std::string base = info.index_to_name[index];
+        if (base.empty()) base = "a" + std::to_string(index + 1);
+        info.index_to_name[index] =
+            parameter_allocator.allocate(
+                normalize_distinct_c_identifier(base, "arg"), "arg");
+    }
+
+    for (const auto& [reg, param] : task.parameter_registers()) {
+        if (!include_param_index(param.index)) continue;
+        info.expr_name_map[lowercase_copy(reg)] =
+            info.index_to_name.at(param.index);
+    }
+
+    for (int index : ordered_indices) {
+        const std::string& name = info.index_to_name.at(index);
+        info.expr_name_map["arg_" + std::to_string(index)] = name;
+        if (function && static_cast<std::size_t>(index)
+                < function->parameters().size()) {
+            info.declared_type_by_name[name] =
+                function->parameters()[static_cast<std::size_t>(index)];
+        }
+    }
+
+    return info;
+}
+
+std::string raw_local_identifier(const Variable* variable) {
+    if (!variable) return {};
+    std::string raw = variable->name();
+    if (variable->ssa_version() > 0) {
+        raw += "_" + std::to_string(variable->ssa_version());
+    }
+    return raw;
+}
+
+std::vector<const Expression*> codegen_instruction_expression_roots(
+    const Instruction* instruction) {
+    std::vector<const Expression*> roots;
+    if (!instruction) return roots;
+    if (const auto* assignment = dyn_cast<Assignment>(instruction)) {
+        roots.push_back(assignment->destination());
+        roots.push_back(assignment->value());
+        if (const auto* phi = dyn_cast<Phi>(instruction)) {
+            for (const auto& [_, expression] : phi->origin_block()) {
+                roots.push_back(expression);
+            }
+        }
+    } else if (const auto* relation = dyn_cast<Relation>(instruction)) {
+        roots.push_back(relation->destination());
+        roots.push_back(relation->value());
+    } else if (const auto* branch = dyn_cast<Branch>(instruction)) {
+        roots.push_back(branch->condition());
+    } else if (const auto* indirect = dyn_cast<IndirectBranch>(instruction)) {
+        roots.push_back(indirect->expression());
+    } else if (const auto* return_instruction = dyn_cast<Return>(instruction)) {
+        roots.insert(
+            roots.end(),
+            return_instruction->values().begin(),
+            return_instruction->values().end());
+    }
+    return roots;
+}
+
+CIdentifierDisplayInfo build_c_identifier_display_info_impl(
+    const DecompilerTask& task) {
+    CIdentifierDisplayInfo info;
+    info.parameters = build_parameter_display_info_impl(task);
+
+    const std::string raw_function_name = task.function_name().empty()
+        ? "sub_" + std::to_string(task.function_address())
+        : task.function_name();
+    CIdentifierAllocator file_allocator;
+    info.function_name = file_allocator.allocate(
+        normalize_distinct_c_identifier(raw_function_name, "symbol"),
+        "symbol");
+
+    std::unordered_set<const Variable*> variables;
+    std::vector<TypePtr> expression_types;
+    std::vector<TypePtr> rendered_expression_types;
+    const auto collect_expression_types = [&](const Expression* root) {
+        if (!root) return;
+        std::unordered_set<const Expression*> visited;
+        std::vector<const Expression*> work{root};
+        while (!work.empty()) {
+            const Expression* expression = work.back();
+            work.pop_back();
+            if (!expression || !visited.insert(expression).second) continue;
+            if (expression->ir_type()) {
+                expression_types.push_back(expression->ir_type());
+                if (const auto* operation = dyn_cast<Operation>(expression);
+                    operation
+                    && (isa<Call>(operation)
+                        || operation->type() == OperationType::cast
+                        || operation->type() == OperationType::bitcast
+                        || operation->type() == OperationType::deref)) {
+                    rendered_expression_types.push_back(expression->ir_type());
+                }
+            }
+            auto children = expression_graph_children(expression);
+            work.insert(work.end(), children.begin(), children.end());
+        }
+    };
+    const auto collect_instruction_types = [&](const Instruction* instruction) {
+        for (const Expression* root :
+             codegen_instruction_expression_roots(instruction)) {
+            collect_expression_types(root);
+        }
+    };
+    if (task.cfg()) {
+        for (const BasicBlock* block : task.cfg()->blocks()) {
+            if (!block) continue;
+            for (const Instruction* instruction : block->instructions()) {
+                if (!instruction) continue;
+                std::unordered_set<Variable*> definitions;
+                instruction->collect_definitions(definitions);
+                variables.insert(definitions.begin(), definitions.end());
+                std::unordered_set<Variable*> requirements;
+                instruction->collect_requirements(requirements);
+                variables.insert(requirements.begin(), requirements.end());
+                collect_instruction_types(instruction);
+            }
+        }
+    }
+    if (task.ast() && task.ast()->root()) {
+        VariableCollector collector;
+        collector.traverse(task.ast()->root());
+        variables.insert(
+            collector.variables().begin(), collector.variables().end());
+
+        std::unordered_set<const AstNode*> visited_ast;
+        std::vector<const AstNode*> ast_work{task.ast()->root()};
+        while (!ast_work.empty()) {
+            const AstNode* node = ast_work.back();
+            ast_work.pop_back();
+            if (!node || !visited_ast.insert(node).second) continue;
+            if (const auto* expression = ast_dyn_cast<ExprAstNode>(node)) {
+                collect_expression_types(expression->expr());
+            }
+            if (const auto* loop = ast_dyn_cast<LoopNode>(node)) {
+                collect_expression_types(loop->condition());
+                if (const auto* for_loop = ast_dyn_cast<ForLoopNode>(node)) {
+                    collect_instruction_types(for_loop->declaration());
+                    collect_instruction_types(for_loop->modification());
+                }
+            }
+            if (const auto* code = ast_dyn_cast<CodeNode>(node);
+                code && code->block()) {
+                for (const Instruction* instruction :
+                     code->block()->instructions()) {
+                    collect_instruction_types(instruction);
+                }
+            }
+            auto children = pipeline_detail::ast_children(node);
+            ast_work.insert(
+                ast_work.end(), children.begin(), children.end());
+        }
+    }
+
+    std::vector<std::string> globals;
+    std::vector<std::string> locals;
+    std::vector<TypePtr> type_work;
+    std::vector<TypePtr> required_type_roots;
+    if (task.function_type()) {
+        type_work.push_back(task.function_type());
+        required_type_roots.push_back(task.function_type());
+    }
+    type_work.insert(
+        type_work.end(), expression_types.begin(), expression_types.end());
+    required_type_roots.insert(
+        required_type_roots.end(),
+        rendered_expression_types.begin(),
+        rendered_expression_types.end());
+    for (const Variable* variable : variables) {
+        if (!variable) continue;
+        if (variable->ir_type()) {
+            type_work.push_back(variable->ir_type());
+            required_type_roots.push_back(variable->ir_type());
+        }
+        if (isa<GlobalVariable>(variable)) {
+            if (!is_c_quoted_literal(variable->name())) {
+                globals.push_back(variable->name());
+            }
+        } else if (!variable->is_parameter()) {
+            locals.push_back(raw_local_identifier(variable));
+        }
+    }
+    std::sort(globals.begin(), globals.end());
+    globals.erase(std::unique(globals.begin(), globals.end()), globals.end());
+    std::sort(locals.begin(), locals.end());
+    locals.erase(std::unique(locals.begin(), locals.end()), locals.end());
+
+    for (const std::string& raw : globals) {
+        if (raw == raw_function_name) {
+            info.global_names[raw] = info.function_name;
+        } else if (raw.starts_with("__pcode_")
+                   || raw.starts_with("__aletheia_")) {
+            const std::string intrinsic = normalize_c_identifier(raw, "global");
+            info.global_names[raw] = intrinsic;
+            file_allocator.reserve(intrinsic);
+        } else {
+            info.global_names[raw] = file_allocator.allocate(
+                normalize_distinct_c_identifier(raw, "symbol"), "symbol");
+        }
+    }
+
+    CIdentifierAllocator local_allocator;
+    local_allocator.reserve(info.function_name);
+    for (const auto& [_, name] : info.global_names) {
+        local_allocator.reserve(name);
+    }
+    for (const auto& [_, name] : info.parameters.index_to_name) {
+        local_allocator.reserve(name);
+    }
+    for (const std::string& raw : locals) {
+        info.local_names[raw] = local_allocator.allocate(
+            normalize_distinct_c_identifier(raw, "var"), "var");
+    }
+
+    const std::vector<TypePtr> layout_roots = type_work;
+    std::unordered_set<const Type*> visited_types;
+    std::set<std::string> custom_type_declarations;
+    std::map<std::string, std::vector<const ComplexType*>> complex_types;
+    const auto has_unmodeled_aggregate_abi = [](TypePtr type) {
+        while (type) {
+            if (type->type_kind() == TypeKind::Struct
+                || type->type_kind() == TypeKind::Union) {
+                return true;
+            }
+            if (const auto* custom = type_dyn_cast<CustomType>(type.get())) {
+                return split_tagged_c_type(custom->text()).has_value();
+            }
+            if (const auto* array = type_dyn_cast<ArrayType>(type.get())) {
+                type = array->element();
+                continue;
+            }
+            return false;
+        }
+        return false;
+    };
+    const auto mark_unsupported_portable_type = [
+        &custom_type_declarations,
+        &info](std::string reason) {
+        custom_type_declarations.insert(
+            "/* ALETHEIA_UNSUPPORTED_PORTABLE_TYPE: "
+            + std::move(reason) + " */");
+        info.unresolved_type_semantics = true;
+    };
+    while (!type_work.empty()) {
+        TypePtr type = std::move(type_work.back());
+        type_work.pop_back();
+        if (!type || !visited_types.insert(type.get()).second) continue;
+        if (const auto* custom = type_dyn_cast<CustomType>(type.get())) {
+            if (auto alias = portable_custom_type_alias(*custom)) {
+                custom_type_declarations.insert(*alias);
+                if (alias->find(
+                        "ALETHEIA_UNSUPPORTED_CUSTOM_TYPE_WIDTH_")
+                    != std::string::npos) {
+                    info.unresolved_type_semantics = true;
+                }
+            }
+        } else if (const auto* pointer = type_dyn_cast<Pointer>(type.get())) {
+            type_work.push_back(pointer->pointee());
+        } else if (const auto* array = type_dyn_cast<ArrayType>(type.get())) {
+            type_work.push_back(array->element());
+        } else if (const auto* function =
+                       type_dyn_cast<FunctionTypeDef>(type.get())) {
+            const bool unresolved_abi =
+                has_unmodeled_aggregate_abi(function->return_type())
+                || std::any_of(
+                    function->parameters().begin(),
+                    function->parameters().end(),
+                    has_unmodeled_aggregate_abi);
+            if (unresolved_abi) {
+                custom_type_declarations.insert(
+                    "/* ALETHEIA_UNSUPPORTED_COMPLEX_TYPE_LAYOUT: "
+                    "aggregate function ABI requires alignment and "
+                    "classification metadata */");
+                info.unresolved_type_semantics = true;
+            }
+            type_work.push_back(function->return_type());
+            type_work.insert(
+                type_work.end(),
+                function->parameters().begin(),
+                function->parameters().end());
+        } else if (const auto* structure = type_dyn_cast<Struct>(type.get())) {
+            complex_types[portable_complex_type_name(*structure)].push_back(
+                structure);
+            for (const auto& [_, member] : structure->members()) {
+                if (member.type) type_work.push_back(member.type);
+            }
+        } else if (const auto* union_type = type_dyn_cast<Union>(type.get())) {
+            complex_types[portable_complex_type_name(*union_type)].push_back(
+                union_type);
+            for (const auto& member : union_type->members()) {
+                if (member.type) type_work.push_back(member.type);
+            }
+        } else if (const auto* enumeration = type_dyn_cast<Enum>(type.get())) {
+            complex_types[portable_complex_type_name(*enumeration)].push_back(
+                enumeration);
+            for (const auto& [_, member] : enumeration->members()) {
+                if (member.type) type_work.push_back(member.type);
+            }
+        }
+    }
+
+    std::vector<TypePtr> required_type_work = required_type_roots;
+    std::unordered_set<const Type*> visited_required_types;
+    while (!required_type_work.empty()) {
+        TypePtr type = std::move(required_type_work.back());
+        required_type_work.pop_back();
+        if (!type || !visited_required_types.insert(type.get()).second) continue;
+        if (const auto* integer = type_dyn_cast<Integer>(type.get())) {
+            if (portable_integer_storage(
+                    integer->size(), integer->is_signed())) {
+                const std::string guard = "ALETHEIA_INTEGER_WIDTH_"
+                    + std::to_string(integer->size());
+                custom_type_declarations.insert(
+                    "#ifndef " + guard + "\n#define " + guard
+                    + " 1\n_Static_assert(sizeof("
+                    + render_portable_c_type(type) + ") == "
+                    + std::to_string(integer->size() / 8)
+                    + ", \"Aletheia integer type width mismatch\");\n#endif");
+            }
+        } else if (const auto* floating = type_dyn_cast<Float>(type.get())) {
+            switch (floating->size()) {
+                case 16: case 32: case 64: case 80: case 128: {
+                    const std::string rendered = render_portable_c_type(type);
+                    const std::string guard = "ALETHEIA_FLOAT_WIDTH_"
+                        + std::to_string(floating->size());
+                    custom_type_declarations.insert(
+                        "#ifndef " + guard + "\n#define " + guard
+                        + " 1\n_Static_assert(sizeof(" + rendered + ") == "
+                        + std::to_string(floating->size() / 8)
+                        + ", \"Aletheia floating type width mismatch\");\n#endif");
+                    break;
+                }
+                default:
+                    break;
+            }
+        } else if (const auto* pointer = type_dyn_cast<Pointer>(type.get())) {
+            if (pointer->size() != 64) {
+                mark_unsupported_portable_type(
+                    "pointer width " + std::to_string(pointer->size())
+                    + " bits does not match LP64");
+            }
+            required_type_work.push_back(pointer->pointee());
+        } else if (const auto* array = type_dyn_cast<ArrayType>(type.get())) {
+            if (array->count() == 0) {
+                mark_unsupported_portable_type("zero-length array");
+            }
+            required_type_work.push_back(array->element());
+        } else if (const auto* function =
+                       type_dyn_cast<FunctionTypeDef>(type.get())) {
+            required_type_work.push_back(function->return_type());
+            required_type_work.insert(
+                required_type_work.end(),
+                function->parameters().begin(),
+                function->parameters().end());
+        } else if (const auto* structure = type_dyn_cast<Struct>(type.get())) {
+            for (const auto& [_, member] : structure->members()) {
+                required_type_work.push_back(member.type);
+            }
+        } else if (const auto* union_type = type_dyn_cast<Union>(type.get())) {
+            for (const auto& member : union_type->members()) {
+                required_type_work.push_back(member.type);
+            }
+        }
+    }
+
+    std::vector<std::pair<TypePtr, bool>> layout_work;
+    layout_work.reserve(layout_roots.size());
+    for (const TypePtr& root : layout_roots) {
+        layout_work.emplace_back(root, true);
+    }
+    std::unordered_set<const Type*> visited_complete_types;
+    std::unordered_set<const Type*> visited_incomplete_types;
+    while (!layout_work.empty()) {
+        auto [type, requires_complete_type] =
+            std::move(layout_work.back());
+        layout_work.pop_back();
+        if (!type) continue;
+        auto& visited = requires_complete_type
+            ? visited_complete_types : visited_incomplete_types;
+        if (!visited.insert(type.get()).second) continue;
+        if (const auto* pointer = type_dyn_cast<Pointer>(type.get())) {
+            layout_work.emplace_back(pointer->pointee(), false);
+        } else if (const auto* array = type_dyn_cast<ArrayType>(type.get())) {
+            layout_work.emplace_back(array->element(), requires_complete_type);
+        } else if (const auto* function =
+                       type_dyn_cast<FunctionTypeDef>(type.get())) {
+            layout_work.emplace_back(function->return_type(), true);
+            for (const TypePtr& parameter : function->parameters()) {
+                layout_work.emplace_back(parameter, true);
+            }
+        } else if (const auto* custom = type_dyn_cast<CustomType>(type.get())) {
+            if (requires_complete_type
+                && split_tagged_c_type(custom->text())) {
+                custom_type_declarations.insert(
+                    "/* ALETHEIA_UNSUPPORTED_COMPLEX_TYPE_LAYOUT: "
+                    "tagged custom type requires an unavailable definition */");
+                info.unresolved_type_semantics = true;
+            }
+        } else if (const auto* structure = type_dyn_cast<Struct>(type.get())) {
+            for (const auto& [_, member] : structure->members()) {
+                layout_work.emplace_back(member.type, true);
+            }
+        } else if (const auto* union_type = type_dyn_cast<Union>(type.get())) {
+            for (const auto& member : union_type->members()) {
+                layout_work.emplace_back(member.type, true);
+            }
+        }
+    }
+
+    info.type_declarations.assign(
+        custom_type_declarations.begin(), custom_type_declarations.end());
+
+    struct ComplexDefinition {
+        const ComplexType* type = nullptr;
+        PortableComplexDeclaration declaration;
+    };
+    std::map<std::string, ComplexDefinition> definitions;
+    for (const auto& [name, candidates] : complex_types) {
+        std::vector<ComplexDefinition> rendered;
+        rendered.reserve(candidates.size());
+        for (const ComplexType* candidate : candidates) {
+            rendered.push_back({
+                candidate,
+                portable_complex_type_declaration(*candidate),
+            });
+        }
+        std::sort(
+            rendered.begin(), rendered.end(),
+            [](const ComplexDefinition& lhs, const ComplexDefinition& rhs) {
+                if (lhs.declaration.text != rhs.declaration.text) {
+                    return lhs.declaration.text < rhs.declaration.text;
+                }
+                return lhs.declaration.unresolved
+                    < rhs.declaration.unresolved;
+            });
+        const bool conflicting = std::any_of(
+            rendered.begin() + 1, rendered.end(),
+            [&](const ComplexDefinition& candidate) {
+                return candidate.declaration.text
+                    != rendered.front().declaration.text
+                    || candidate.declaration.unresolved
+                        != rendered.front().declaration.unresolved;
+            });
+        if (conflicting) {
+            definitions[name] = {
+                rendered.front().type,
+                {"/* ALETHEIA_UNSUPPORTED_COMPLEX_TYPE_LAYOUT: "
+                     + name + ": conflicting definitions */",
+                 true},
+            };
+        } else {
+            definitions[name] = std::move(rendered.front());
+        }
+    }
+
+    for (const auto& [name, definition] : definitions) {
+        if (definition.type->type_kind() == TypeKind::Struct
+            || definition.type->type_kind() == TypeKind::Union) {
+            info.type_declarations.push_back(name + ";");
+        }
+    }
+
+    std::map<std::string, std::set<std::string>> dependencies;
+    for (const auto& [name, _] : definitions) dependencies[name];
+    const auto collect_complete_dependency = [&dependencies](
+        const std::string& owner,
+        const TypePtr& root) {
+        TypePtr type = root;
+        while (type) {
+            if (const auto* pointer = type_dyn_cast<Pointer>(type.get())) {
+                (void)pointer;
+                return;
+            }
+            if (const auto* array = type_dyn_cast<ArrayType>(type.get())) {
+                type = array->element();
+                continue;
+            }
+            if (const auto* complex = type_dyn_cast<ComplexType>(type.get())) {
+                dependencies[owner].insert(portable_complex_type_name(*complex));
+            }
+            return;
+        }
+    };
+    for (const auto& [name, definition] : definitions) {
+        if (const auto* structure = type_dyn_cast<Struct>(definition.type)) {
+            for (const auto& [_, member] : structure->members()) {
+                collect_complete_dependency(name, member.type);
+            }
+        } else if (const auto* union_type =
+                       type_dyn_cast<Union>(definition.type)) {
+            for (const auto& member : union_type->members()) {
+                collect_complete_dependency(name, member.type);
+            }
+        }
+    }
+
+    std::set<std::string> remaining;
+    for (const auto& [name, _] : definitions) remaining.insert(name);
+    std::set<std::string> invalid;
+    while (!remaining.empty()) {
+        bool progressed = false;
+        for (auto it = remaining.begin(); it != remaining.end();) {
+            const std::string name = *it;
+            const bool waiting = std::any_of(
+                dependencies[name].begin(), dependencies[name].end(),
+                [&](const std::string& dependency) {
+                    return remaining.contains(dependency);
+                });
+            if (waiting) {
+                ++it;
+                continue;
+            }
+
+            ComplexDefinition& definition = definitions.at(name);
+            const bool invalid_dependency = std::any_of(
+                dependencies[name].begin(), dependencies[name].end(),
+                [&](const std::string& dependency) {
+                    return invalid.contains(dependency)
+                        || !definitions.contains(dependency);
+                });
+            if (invalid_dependency) {
+                info.type_declarations.push_back(
+                    "/* ALETHEIA_UNSUPPORTED_COMPLEX_TYPE_LAYOUT: "
+                    + name + ": incomplete by-value dependency */");
+                invalid.insert(name);
+                info.unresolved_type_semantics = true;
+            } else {
+                info.type_declarations.push_back(definition.declaration.text);
+                if (definition.declaration.unresolved) {
+                    invalid.insert(name);
+                    info.unresolved_type_semantics = true;
+                }
+            }
+            it = remaining.erase(it);
+            progressed = true;
+        }
+        if (!progressed) {
+            for (const std::string& name : remaining) {
+                info.type_declarations.push_back(
+                    "/* ALETHEIA_UNSUPPORTED_COMPLEX_TYPE_LAYOUT: "
+                    + name + ": recursive by-value dependency */");
+                invalid.insert(name);
+            }
+            info.unresolved_type_semantics = true;
+            break;
+        }
+    }
     return info;
 }
 
@@ -1027,7 +1587,8 @@ std::string portable_explicit_cast(
         || destination_type->type_kind() == TypeKind::Union) {
         return expression;
     }
-    const std::string destination_name = destination_type->to_string();
+    const std::string destination_name =
+        render_portable_c_type(destination_type);
     const bool destination_pointer = destination_type->type_kind() == TypeKind::Pointer;
     if (destination_pointer) {
         return "(" + destination_name + ")(uintptr_t)(" + expression + ")";
@@ -1037,26 +1598,102 @@ std::string portable_explicit_cast(
 
 } // namespace
 
+ParameterDisplayInfo build_parameter_display_info(
+    const DecompilerTask& task) {
+    return build_parameter_display_info_impl(task);
+}
+
+CIdentifierDisplayInfo build_c_identifier_display_info(
+    const DecompilerTask& task) {
+    return build_c_identifier_display_info_impl(task);
+}
+
 std::string CExpressionGenerator::generate(DataflowObject* obj) {
+    const bool root_generation = active_nodes_.empty();
+    if (root_generation) {
+        expression_cycle_detected_ = false;
+        expression_depth_limit_detected_ = false;
+        expression_expansion_limit_detected_ = false;
+        generation_depth_ = 0;
+        generation_expansions_ = 0;
+    }
+
     if (!obj) {
         if (options_.portable_c) unresolved_semantics_ = true;
         return options_.portable_c ? "__aletheia_undefined_u64()" : "";
     }
 
+    if (++generation_expansions_
+        > pipeline_detail::kMaxCodegenGraphExpansions) {
+        expression_expansion_limit_detected_ = true;
+        if (options_.portable_c) unresolved_semantics_ = true;
+        return "__aletheia_expr_expansion_limit";
+    }
+
     if (!active_nodes_.insert(obj).second) {
+        expression_cycle_detected_ = true;
         if (options_.portable_c) unresolved_semantics_ = true;
         return "__aletheia_expr_cycle";
     }
 
+    if (generation_depth_
+        >= pipeline_detail::kMaxCodegenExpressionDepth) {
+        active_nodes_.erase(obj);
+        expression_depth_limit_detected_ = true;
+        if (options_.portable_c) unresolved_semantics_ = true;
+        return "__aletheia_expr_depth_limit";
+    }
+
+    ++generation_depth_;
     result_.clear();
     obj->accept(*this);
+    --generation_depth_;
     std::string rendered = result_;
+    if (expression_cycle_detected_) {
+        rendered = "__aletheia_expr_cycle";
+    } else if (expression_depth_limit_detected_) {
+        rendered = "__aletheia_expr_depth_limit";
+    } else if (expression_expansion_limit_detected_) {
+        rendered = "__aletheia_expr_expansion_limit";
+    }
     if (options_.portable_c && rendered.empty()) {
         unresolved_semantics_ = true;
         rendered = "__aletheia_undefined_u64()";
     }
     active_nodes_.erase(obj);
     return rendered;
+}
+
+bool CExpressionGenerator::has_declared_type_kind(
+    Expression* expression,
+    TypeKind kind) const {
+    if (!expression) return false;
+    if (expression->ir_type() && expression->ir_type()->type_kind() == kind) {
+        return true;
+    }
+    if (auto* operation = dyn_cast<Operation>(expression);
+        operation && operation->type() == OperationType::cast
+        && operation->operands().size() == 1) {
+        return has_declared_type_kind(operation->operands()[0], kind);
+    }
+    const auto* variable = dyn_cast<Variable>(expression);
+    if (!variable) return false;
+    std::string name = variable->name();
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (auto display = param_display_names_.find(lower_name);
+        display != param_display_names_.end()) {
+        name = display->second;
+    }
+    if (auto parameter = param_declared_types_.find(name);
+        parameter != param_declared_types_.end()
+        && parameter->second && parameter->second->type_kind() == kind) {
+        return true;
+    }
+    auto local = local_declared_types_.find(name);
+    return local != local_declared_types_.end()
+        && local->second && local->second->type_kind() == kind;
 }
 
 void CExpressionGenerator::visit(Constant* c) {
@@ -1118,6 +1755,17 @@ void CExpressionGenerator::visit(Variable* v) {
         return;
     }
 
+    // Resolve semantic parameter identity before textual storage aliases.
+    // Out-of-SSA renaming may replace x0/arg_0 with var_N while preserving
+    // VariableKind::Parameter and parameter_index.
+    if (v->is_parameter() && v->parameter_index() >= 0) {
+        if (auto it = param_index_display_names_.find(v->parameter_index());
+            it != param_index_display_names_.end() && !it->second.empty()) {
+            result_ = normalize_c_identifier(it->second, "arg");
+            return;
+        }
+    }
+
     // Check if this variable is a parameter register with a display name.
     if (v->is_parameter() || !param_display_names_.empty()) {
         // Normalize to lowercase for lookup.
@@ -1126,28 +1774,53 @@ void CExpressionGenerator::visit(Variable* v) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
         auto it = param_display_names_.find(lower_name);
-        if (it != param_display_names_.end()) {
+        const bool ordinal_parameter_name = lower_name.starts_with("arg_");
+        if (it != param_display_names_.end()
+            && (!ordinal_parameter_name || v->is_parameter())) {
             // Use the display name, but still append SSA suffix if present.
             if (v->ssa_version() > 0) {
-                result_ = it->second + "_" + std::to_string(v->ssa_version());
+                result_ = normalize_c_identifier(
+                    it->second + "_" + std::to_string(v->ssa_version()),
+                    "arg");
             } else {
-                result_ = it->second;
+                result_ = normalize_c_identifier(it->second, "arg");
             }
             return;
         }
     }
 
+    std::string raw_name = base_name;
     if (v->ssa_version() > 0) {
-        result_ = base_name + "_" + std::to_string(v->ssa_version());
+        raw_name += "_" + std::to_string(v->ssa_version());
+    }
+    if (auto it = local_identifier_names_.find(raw_name);
+        it != local_identifier_names_.end()) {
+        result_ = it->second;
     } else {
-        result_ = base_name;
+        result_ = normalize_distinct_c_identifier(raw_name, "var");
     }
 }
 
 void CExpressionGenerator::visit(GlobalVariable* v) {
     // Global names are rendered without SSA suffixes for stable declarations.
-    result_ = options_.portable_c && v->name().empty()
-        ? "__aletheia_undefined_u64()" : v->name();
+    if (is_c_quoted_literal(v->name())) {
+        result_ = v->name();
+        return;
+    }
+    std::string identifier;
+    if (auto it = global_identifier_names_.find(v->name());
+        it != global_identifier_names_.end()) {
+        identifier = it->second;
+    } else {
+        identifier = normalize_distinct_c_identifier(v->name(), "symbol");
+    }
+    if (options_.portable_c && v->name().empty()) {
+        result_ = "__aletheia_undefined_u64()";
+    } else if (options_.portable_c && v->represents_address()) {
+        result_ = "((uintptr_t)" + identifier + ")";
+    } else {
+        result_ = identifier;
+    }
 }
 
 void CExpressionGenerator::visit(Operation* o) {
@@ -1160,8 +1833,43 @@ void CExpressionGenerator::visit(Operation* o) {
         return;
     }
 
+    if ((type == OperationType::popcount || type == OperationType::lzcount)
+        && ops.size() == 2) {
+        const char* helper = type == OperationType::popcount
+            ? "__pcode_popcount" : "__pcode_lzcount";
+        result_ = std::string(helper) + "((uint64_t)(" + generate(ops[0])
+            + "), (unsigned)(" + generate(ops[1]) + "))";
+        return;
+    }
+
     // --- Binary infix operators ---
     if (ops.size() == 2) {
+        if (options_.portable_c
+            && (type == OperationType::add || type == OperationType::sub)) {
+            const auto is_pointer = [&](Expression* expression) {
+                if (expression && expression->ir_type()
+                    && expression->ir_type()->type_kind() == TypeKind::Pointer) {
+                    return true;
+                }
+                auto* variable = dyn_cast<Variable>(expression);
+                if (!variable) return false;
+                const std::string rendered_name = generate(variable);
+                const auto parameter = param_declared_types_.find(rendered_name);
+                if (parameter != param_declared_types_.end() && parameter->second
+                    && parameter->second->type_kind() == TypeKind::Pointer) {
+                    return true;
+                }
+                const auto local = local_declared_types_.find(rendered_name);
+                return local != local_declared_types_.end() && local->second
+                    && local->second->type_kind() == TypeKind::Pointer;
+            };
+            if (is_pointer(ops[0]) || is_pointer(ops[1])) {
+                const char* symbol = type == OperationType::add ? " + " : " - ";
+                result_ = "((uintptr_t)(" + generate(ops[0]) + ")" + symbol
+                    + "(uintptr_t)(" + generate(ops[1]) + "))";
+                return;
+            }
+        }
         const char* infix = nullptr;
         switch (type) {
             // Arithmetic (signed)
@@ -1213,9 +1921,12 @@ void CExpressionGenerator::visit(Operation* o) {
                 || type == OperationType::sub_float
                 || type == OperationType::mul_float
                 || type == OperationType::div_float;
+            const bool floating_comparison = is_comparison_operation(type)
+                && (has_declared_type_kind(ops[0], TypeKind::Float)
+                    || has_declared_type_kind(ops[1], TypeKind::Float));
             auto render_operand = [&](Expression* operand, bool is_rhs) {
                 std::string rendered;
-                if (floating_arithmetic) {
+                if (floating_arithmetic || floating_comparison) {
                     if (auto* constant = dyn_cast<Constant>(operand)) {
                         rendered = format_float_bit_pattern(constant, operand->size_bytes);
                     }
@@ -1252,11 +1963,22 @@ void CExpressionGenerator::visit(Operation* o) {
                 return;
             case OperationType::deref:
                 if (auto* g = dyn_cast<GlobalVariable>(ops[0])) {
-                    result_ = generate(g);
+                    if (options_.portable_c && g->represents_address()) {
+                        std::string value_type = "uint8_t";
+                        if (o->ir_type() && o->ir_type()->to_string() != "unknown type") {
+                            value_type = render_portable_c_type(o->ir_type());
+                        } else if (o->size_bytes > 0) {
+                            value_type = "uint" + std::to_string(o->size_bytes * 8) + "_t";
+                        }
+                        result_ = "(*((" + value_type + " *)(uintptr_t)("
+                            + generate(g) + ")))";
+                    } else {
+                        result_ = generate(g);
+                    }
                 } else if (options_.portable_c) {
                     std::string value_type = "uint8_t";
                     if (o->ir_type() && o->ir_type()->to_string() != "unknown type") {
-                        value_type = o->ir_type()->to_string();
+                        value_type = render_portable_c_type(o->ir_type());
                     } else if (o->size_bytes > 0) {
                         value_type = "uint" + std::to_string(o->size_bytes * 8) + "_t";
                     }
@@ -1326,10 +2048,61 @@ void CExpressionGenerator::visit(Operation* o) {
             case OperationType::cast:
                 // cast with 1 operand: type info should come from the Operation's ir_type
                 if (o->ir_type()) {
-                    result_ = "(" + o->ir_type()->to_string() + ")" + generate(ops[0]);
+                    std::string cast_type = render_codegen_type(
+                        o->ir_type(), options_.portable_c);
+                    if (options_.portable_c) {
+                        if (const auto* integer = type_dyn_cast<Integer>(o->ir_type().get());
+                            integer && integer->size() != 8 && integer->size() != 16
+                            && integer->size() != 32 && integer->size() != 64
+                            && integer->size() <= 128) {
+                            cast_type = integer->is_signed() ? "int128_t" : "uint128_t";
+                        }
+                    }
+                    result_ = "(" + cast_type + ")(" + generate(ops[0]) + ")";
                 } else {
-                    result_ = "(cast)" + generate(ops[0]);
+                    result_ = "(cast)(" + generate(ops[0]) + ")";
                 }
+                return;
+            case OperationType::bitcast:
+                if (ops.size() != 1 || !o->ir_type()) {
+                    result_ = "__aletheia_invalid_bitcast()";
+                    return;
+                }
+                if (o->ir_type()->type_kind() == TypeKind::Float
+                    && o->ir_type()->size_bytes() == ops[0]->size_bytes
+                    && has_declared_type_kind(ops[0], TypeKind::Float)) {
+                    result_ = generate(ops[0]);
+                    return;
+                }
+                if (o->ir_type()->type_kind() == TypeKind::Float
+                    && o->ir_type()->size_bytes() == 4) {
+                    result_ = "((union { uint32_t u; float f; }){ .u = "
+                        "(uint32_t)(" + generate(ops[0]) + ") }).f";
+                    return;
+                }
+                if (o->ir_type()->type_kind() == TypeKind::Float
+                    && o->ir_type()->size_bytes() == 8) {
+                    result_ = "((union { uint64_t u; double f; }){ .u = "
+                        "(uint64_t)(" + generate(ops[0]) + ") }).f";
+                    return;
+                }
+                if (o->ir_type()->type_kind() == TypeKind::Integer
+                    && o->ir_type()->size_bytes() == 4
+                    && has_declared_type_kind(ops[0], TypeKind::Float)) {
+                    result_ = "((union { float f; uint32_t u; }){ .f = "
+                        "(float)(" + generate(ops[0]) + ") }).u";
+                    return;
+                }
+                if (o->ir_type()->type_kind() == TypeKind::Integer
+                    && o->ir_type()->size_bytes() == 8
+                    && has_declared_type_kind(ops[0], TypeKind::Float)) {
+                    result_ = "((union { double f; uint64_t u; }){ .f = "
+                        "(double)(" + generate(ops[0]) + ") }).u";
+                    return;
+                }
+                result_ = "(" + render_codegen_type(
+                    o->ir_type(), options_.portable_c) + ")(" +
+                    generate(ops[0]) + ")";
                 return;
             case OperationType::pointer:
                 result_ = "&" + generate(ops[0]);
@@ -1346,13 +2119,33 @@ void CExpressionGenerator::visit(Operation* o) {
 
     // --- Member access: a.b or a->b ---
     if (type == OperationType::member_access && ops.size() == 2) {
-        result_ = generate(ops[0]) + "." + generate(ops[1]);
+        std::string member;
+        if (const auto* variable = dyn_cast<Variable>(ops[1])) {
+            member = normalize_distinct_c_identifier(
+                variable->name(), "member");
+        } else if (const auto* constant = dyn_cast<Constant>(ops[1])) {
+            member = "field_" + std::to_string(constant->value());
+        } else {
+            member = normalize_distinct_c_identifier(
+                generate(ops[1]), "member");
+        }
+        result_ = generate(ops[0]) + "." + member;
         return;
     }
 
     // --- Field access by offset ---
     if (type == OperationType::field && ops.size() == 2) {
-        result_ = generate(ops[0]) + "." + generate(ops[1]);
+        std::string member;
+        if (const auto* variable = dyn_cast<Variable>(ops[1])) {
+            member = normalize_distinct_c_identifier(
+                variable->name(), "member");
+        } else if (const auto* constant = dyn_cast<Constant>(ops[1])) {
+            member = "field_" + std::to_string(constant->value());
+        } else {
+            member = normalize_distinct_c_identifier(
+                generate(ops[1]), "member");
+        }
+        result_ = generate(ops[0]) + "." + member;
         return;
     }
 
@@ -1428,7 +2221,19 @@ void CExpressionGenerator::visit(ListOperation* o) {
 }
 
 void CExpressionGenerator::visit(Call* c) {
-    std::string func = generate(c->target());
+    auto* global_target = dyn_cast<GlobalVariable>(c->target());
+    std::string func;
+    if (global_target) {
+        if (auto it = global_identifier_names_.find(global_target->name());
+            it != global_identifier_names_.end()) {
+            func = it->second;
+        } else {
+            func = normalize_distinct_c_identifier(
+                global_target->name(), "symbol");
+        }
+    } else {
+        func = generate(c->target());
+    }
     if (options_.portable_c && func.starts_with("__pcode_userop_")) {
         unresolved_semantics_ = true;
     }
@@ -1441,23 +2246,86 @@ void CExpressionGenerator::visit(Call* c) {
         if (arg.empty()) {
             arg = "a" + std::to_string(i + 1);
         }
+        if (options_.portable_c && func.starts_with("__pcode_float_")) {
+            if (auto* constant = dyn_cast<Constant>(c->arg(i))) {
+                if (std::string floating_bits = format_float_bit_pattern(
+                        constant, constant->size_bytes);
+                    !floating_bits.empty()) {
+                    arg = std::move(floating_bits);
+                }
+            } else if (!has_declared_type_kind(c->arg(i), TypeKind::Float)) {
+                if (c->arg(i)->size_bytes == 4) {
+                    arg = "((union { uint32_t u; float f; }){ .u = (uint32_t)("
+                        + arg + ") }).f";
+                } else if (c->arg(i)->size_bytes == 8) {
+                    arg = "((union { uint64_t u; double f; }){ .u = (uint64_t)("
+                        + arg + ") }).f";
+                }
+            }
+        }
         if (options_.portable_c && function_type
             && i < function_type->parameters().size()) {
-            arg = portable_explicit_cast(
-                std::move(arg),
-                function_type->parameters()[i]);
+            const TypePtr& parameter_type = function_type->parameters()[i];
+            std::string floating_bits;
+            if (parameter_type
+                && parameter_type->type_kind() == TypeKind::Float) {
+                if (auto* constant = dyn_cast<Constant>(c->arg(i))) {
+                    floating_bits = format_float_bit_pattern(
+                        constant, parameter_type->size_bytes());
+                }
+                if (floating_bits.empty()
+                    && !has_declared_type_kind(c->arg(i), TypeKind::Float)
+                    && c->arg(i)->size_bytes == parameter_type->size_bytes()) {
+                    if (parameter_type->size_bytes() == 4) {
+                        floating_bits =
+                            "((union { uint32_t u; float f; }){ .u = (uint32_t)("
+                            + arg + ") }).f";
+                    } else if (parameter_type->size_bytes() == 8) {
+                        floating_bits =
+                            "((union { uint64_t u; double f; }){ .u = (uint64_t)("
+                            + arg + ") }).f";
+                    }
+                }
+            }
+            arg = !floating_bits.empty()
+                ? std::move(floating_bits)
+                : portable_explicit_cast(std::move(arg), parameter_type);
         }
         args += arg;
     }
-    if (options_.portable_c
+    if (options_.portable_c && isa<GlobalVariable>(c->target())) {
+        // A resolved symbol already has a translation-unit declaration.  A
+        // call through an invented `uintptr_t (*)()` type is incompatible
+        // with a defined function type and therefore invokes undefined
+        // behaviour under C11 6.5.2.2.  Preserve the direct-call ABI and let
+        // the declaration provide the return and parameter convention.
+        result_ = func + "(" + args + ")";
+    } else if (options_.portable_c
         && !func.starts_with("__pcode_")
         && !func.starts_with("__aletheia_")) {
         std::string return_type = "uintptr_t";
         if (function_type && function_type->return_type()
             && function_type->return_type()->to_string() != "unknown type") {
-            return_type = function_type->return_type()->to_string();
+            return_type = render_portable_c_type(
+                function_type->return_type());
         }
-        result_ = "((" + return_type + " (*)())(uintptr_t)(" + func + "))(" + args + ")";
+        std::string parameter_types;
+        if (function_type) {
+            for (std::size_t index = 0; index < function_type->parameters().size(); ++index) {
+                if (index > 0) parameter_types += ", ";
+                const TypePtr& parameter = function_type->parameters()[index];
+                parameter_types += parameter
+                    && parameter->to_string() != "unknown type"
+                    ? render_portable_c_type(parameter) : "uintptr_t";
+            }
+            if (function_type->variadic() && !function_type->parameters().empty()) {
+                parameter_types += ", ...";
+            } else if (function_type->parameters().empty()) {
+                parameter_types = "void";
+            }
+        }
+        result_ = "((" + return_type + " (*)(" + parameter_types
+            + "))(uintptr_t)(" + func + "))(" + args + ")";
     } else {
         result_ = func + "(" + args + ")";
     }
@@ -1469,35 +2337,7 @@ void CExpressionGenerator::visit(Condition* c) {
         return;
     }
 
-    std::string op_str = " == ";
-    switch (c->type()) {
-        case OperationType::eq:    op_str = " == "; break;
-        case OperationType::neq:   op_str = " != "; break;
-        case OperationType::lt:
-        case OperationType::lt_us: op_str = " < "; break;
-        case OperationType::le:
-        case OperationType::le_us: op_str = " <= "; break;
-        case OperationType::gt:
-        case OperationType::gt_us: op_str = " > "; break;
-        case OperationType::ge:
-        case OperationType::ge_us: op_str = " >= "; break;
-        default: op_str = " ?? "; break;
-    }
-
-    const int parent_prec = precedence_for_operation(c->type());
-    auto render_operand = [&](Expression* operand, bool is_rhs) {
-        std::string rendered = generate(operand);
-        const int child_prec = precedence_for_expression(operand);
-        const bool needs_brackets =
-            (child_prec < parent_prec) ||
-            (is_rhs && child_prec == parent_prec && needs_parentheses_for_equal_precedence_rhs(c->type()));
-        if (needs_brackets) {
-            return "(" + rendered + ")";
-        }
-        return rendered;
-    };
-
-    result_ = render_operand(c->lhs(), false) + op_str + render_operand(c->rhs(), true);
+    result_ = render_comparison_expression(*this, c->type(), c->lhs(), c->rhs());
 }
 
 void CExpressionGenerator::visit_assignment(Assignment* i) {
@@ -1505,6 +2345,29 @@ void CExpressionGenerator::visit_assignment(Assignment* i) {
         result_ = generate(i->value());
         return;
     }
+    const auto render_destination = [&]() {
+        Expression* candidate = i->destination();
+        while (auto* cast = dyn_cast<Operation>(candidate)) {
+            if (cast->type() != OperationType::cast || cast->operands().size() != 1) {
+                break;
+            }
+            candidate = cast->operands()[0];
+        }
+        if (auto* global = dyn_cast<GlobalVariable>(candidate);
+            options_.portable_c && global && global->represents_address()) {
+            Expression* value = i->value();
+            std::string value_type = "uint8_t";
+            if (value && value->ir_type()
+                && value->ir_type()->to_string() != "unknown type") {
+                value_type = value->ir_type()->to_string();
+            } else if (value && value->size_bytes > 0) {
+                value_type = "uint" + std::to_string(value->size_bytes * 8) + "_t";
+            }
+            return "(*((" + value_type + " *)(uintptr_t)((uintptr_t)"
+                + global->name() + ")))";
+        }
+        return generate(i->destination());
+    };
     if (auto* rhs_op = dyn_cast<Operation>(i->value());
         rhs_op != nullptr && rhs_op->operands().size() == 2) {
         const OperationType op_type = rhs_op->type();
@@ -1527,17 +2390,17 @@ void CExpressionGenerator::visit_assignment(Assignment* i) {
                     const bool is_increment =
                         (op_type == OperationType::add && unit_sign > 0) ||
                         (op_type == OperationType::sub && unit_sign < 0);
-                    result_ = generate(i->destination()) + (is_increment ? "++" : "--");
+                    result_ = render_destination() + (is_increment ? "++" : "--");
                     return;
                 }
 
-                result_ = generate(i->destination()) + " " + op_symbol + "= " + generate(target_operand);
+                result_ = render_destination() + " " + op_symbol + "= " + generate(target_operand);
                 return;
             }
         }
     }
 
-    std::string lhs = generate(i->destination());
+    std::string lhs = render_destination();
     std::string rhs = generate(i->value());
     if (rhs.empty()) {
         rhs = "0x0";
@@ -1609,15 +2472,41 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
     emitted_blocks_.clear();
     expr_gen_.reset_diagnostics();
 
+    if (auto validation_error = validate_task_for_codegen(task)) {
+        expr_gen_.mark_unresolved_semantics();
+        lines_.push_back(
+            "/* Aletheia code generation rejected invalid IR: "
+            + *validation_error + " */");
+        return lines_;
+    }
+
     // Set up parameter display name mapping for the expression generator.
     // Include both raw register names AND post-rename "arg_N" names so that
     // variables renamed by VariableNameGeneration still resolve to the
     // prototype parameter name (e.g., "arg_0" → "cmd").
-    const ParameterDisplayInfo param_display = build_parameter_display_info(task);
+    const CIdentifierDisplayInfo identifier_display =
+        build_c_identifier_display_info(task);
+    const ParameterDisplayInfo& param_display =
+        identifier_display.parameters;
     expr_gen_.set_parameter_names(param_display.expr_name_map);
+    expr_gen_.set_parameter_index_names(param_display.index_to_name);
     expr_gen_.set_parameter_types(param_display.declared_type_by_name);
+    expr_gen_.set_local_identifier_names(identifier_display.local_names);
+    expr_gen_.set_global_identifier_names(identifier_display.global_names);
+    if (identifier_display.unresolved_type_semantics) {
+        expr_gen_.mark_unresolved_semantics();
+    }
 
-    auto global_decls = GlobalDeclarationGenerator::generate(task);
+    if (options_.portable_c && !identifier_display.type_declarations.empty()) {
+        lines_.insert(
+            lines_.end(),
+            identifier_display.type_declarations.begin(),
+            identifier_display.type_declarations.end());
+        lines_.push_back("");
+    }
+
+    auto global_decls = GlobalDeclarationGenerator::generate(
+        task, &identifier_display.global_names, options_.portable_c);
     for (const auto& decl : global_decls) {
         lines_.push_back(decl);
     }
@@ -1625,15 +2514,17 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
         lines_.push_back("");
     }
 
-    std::string name = task.function_name().empty() ? "sub_" + std::to_string(task.function_address()) : task.function_name();
+    const std::string& name = identifier_display.function_name;
 
     // Generate function signature (with void->non-void reconciliation when needed)
     std::string return_type = "void";
     if (task.function_type()) {
         if (auto* func_type = type_dyn_cast<FunctionTypeDef>(task.function_type().get())) {
-            return_type = func_type->return_type()->to_string();
+            return_type = render_codegen_type(
+                func_type->return_type(), options_.portable_c);
         } else {
-            return_type = task.function_type()->to_string();
+            return_type = render_codegen_type(
+                task.function_type(), options_.portable_c);
         }
     }
 
@@ -1657,8 +2548,12 @@ std::vector<std::string> CodeVisitor::generate_code(DecompilerTask& task) {
                 std::string pname = (it != param_display.index_to_name.end() && !it->second.empty())
                     ? it->second
                     : "a" + std::to_string(i + 1);
-                sig += params[i]->to_string() + " " + pname;
+                sig += render_codegen_declaration(
+                    params[i], pname, options_.portable_c);
                 emitted_parameter_names.insert(pname);
+            }
+            if (func_type->variadic() && !params.empty()) {
+                sig += ", ...";
             }
             params_emitted = true;
         }
@@ -1748,6 +2643,14 @@ std::vector<std::string> CodeVisitor::generate_code(AbstractSyntaxForest* forest
     cfg_fallback_mode_ = false;
     emitted_blocks_.clear();
     expr_gen_.reset_diagnostics();
+
+    if (auto validation_error = validate_ast_for_codegen(forest)) {
+        expr_gen_.mark_unresolved_semantics();
+        lines_.push_back(
+            "/* Aletheia code generation rejected invalid IR: "
+            + *validation_error + " */");
+        return lines_;
+    }
 
     if (forest && forest->root()) {
         cfg_fallback_mode_ = is_cfg_fallback_root(forest->root());

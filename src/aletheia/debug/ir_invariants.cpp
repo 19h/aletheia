@@ -55,16 +55,108 @@ void insert_definition_with_aliases(std::unordered_set<std::string>& defined, co
     defined.insert(alias_key);
 }
 
+std::string expression_label(const Expression* expression) {
+    if (!expression) return "null";
+    switch (expression->node_kind()) {
+    case NodeKind::Constant:
+        return std::format(
+            "constant(0x{:x})",
+            static_cast<const Constant*>(expression)->value());
+    case NodeKind::Variable:
+        return std::format(
+            "variable({}_{})",
+            static_cast<const Variable*>(expression)->name(),
+            static_cast<const Variable*>(expression)->ssa_version());
+    case NodeKind::GlobalVariable:
+        return std::format(
+            "global({})",
+            static_cast<const GlobalVariable*>(expression)->name());
+    case NodeKind::ListOperation:
+        return "list";
+    case NodeKind::Operation:
+    case NodeKind::Call:
+    case NodeKind::Condition:
+        return std::format(
+            "operation({})",
+            static_cast<int>(
+                static_cast<const Operation*>(expression)->type()));
+    default:
+        return std::format(
+            "expression-kind({})",
+            static_cast<int>(expression->node_kind()));
+    }
+}
+
+struct NamedExpressionRoot {
+    std::string name;
+    const Expression* expression = nullptr;
+};
+
+std::vector<NamedExpressionRoot> instruction_expression_roots(
+    const Instruction* instruction) {
+    std::vector<NamedExpressionRoot> roots;
+    if (!instruction) return roots;
+
+    if (const auto* assignment = dyn_cast<Assignment>(instruction)) {
+        roots.push_back({"destination", assignment->destination()});
+        roots.push_back({"value", assignment->value()});
+        if (const auto* phi = dyn_cast<Phi>(instruction)) {
+            for (const auto& [origin, expression] : phi->origin_block()) {
+                roots.push_back({
+                    origin
+                        ? std::format("phi-origin-bb_{}", origin->id())
+                        : "phi-origin-null",
+                    expression,
+                });
+            }
+        }
+    } else if (const auto* relation = dyn_cast<Relation>(instruction)) {
+        roots.push_back({"destination", relation->destination()});
+        roots.push_back({"value", relation->value()});
+    } else if (const auto* branch = dyn_cast<Branch>(instruction)) {
+        roots.push_back({"condition", branch->condition()});
+    } else if (const auto* indirect =
+                   dyn_cast<IndirectBranch>(instruction)) {
+        roots.push_back({"target", indirect->expression()});
+    } else if (const auto* return_instruction =
+                   dyn_cast<Return>(instruction)) {
+        for (std::size_t index = 0;
+             index < return_instruction->values().size();
+             ++index) {
+            roots.push_back({
+                std::format("return-value[{}]", index),
+                return_instruction->values()[index],
+            });
+        }
+    }
+    return roots;
+}
+
 } // namespace
 
 std::vector<InvariantViolation> IrInvariantChecker::check_all(
-    const ControlFlowGraph* cfg, PipelinePhase phase) const {
+    const ControlFlowGraph* cfg,
+    PipelinePhase phase,
+    std::optional<std::size_t> declared_parameter_count) const {
 
     std::vector<InvariantViolation> all;
 
     // CFG consistency: always
     auto cfg_v = check_cfg_consistency(cfg);
     all.insert(all.end(), cfg_v.begin(), cfg_v.end());
+
+    // Expression cycles can make requirement collection, cloning, and code
+    // generation recurse indefinitely. Detect them before invoking any other
+    // expression walker and return the safe diagnostics immediately.
+    auto expression_v = check_expression_acyclicity(cfg);
+    all.insert(all.end(), expression_v.begin(), expression_v.end());
+    if (!expression_v.empty()) {
+        return all;
+    }
+
+    auto parameter_v = check_parameter_metadata(
+        cfg, declared_parameter_count);
+    all.insert(all.end(), parameter_v.begin(), parameter_v.end());
 
     // SSA consistency: only during SSA phase
     if (phase == PipelinePhase::SSA) {
@@ -90,6 +182,55 @@ std::vector<InvariantViolation> IrInvariantChecker::check_all(
     }
 
     return all;
+}
+
+std::vector<InvariantViolation> IrInvariantChecker::check_parameter_metadata(
+    const ControlFlowGraph* cfg,
+    std::optional<std::size_t> declared_parameter_count) const {
+    std::vector<InvariantViolation> violations;
+    if (!cfg) return violations;
+
+    std::unordered_set<const Variable*> reported;
+    for (const BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        const auto& instructions = block->instructions();
+        for (std::size_t instruction_index = 0;
+             instruction_index < instructions.size();
+             ++instruction_index) {
+            const Instruction* instruction = instructions[instruction_index];
+            for (const NamedExpressionRoot& root :
+                 instruction_expression_roots(instruction)) {
+                for (const Variable* variable :
+                     expression_graph_variables(root.expression)) {
+                    if (!variable || isa<GlobalVariable>(variable)
+                        || reported.contains(variable)) {
+                        continue;
+                    }
+                    auto error = variable_parameter_metadata_error(
+                        variable, declared_parameter_count);
+                    if (!error) continue;
+                    reported.insert(variable);
+                    violations.push_back({
+                        "parameter_metadata",
+                        std::format(
+                            "bb_{} instruction[{}] root '{}' variable {}_{}: {}",
+                            block->id(),
+                            instruction_index,
+                            root.name,
+                            variable->name(),
+                            variable->ssa_version(),
+                            *error),
+                        std::format(
+                            "kind={} parameter_index={} address=0x{:x}",
+                            static_cast<int>(variable->kind()),
+                            variable->parameter_index(),
+                            instruction ? instruction->address() : 0),
+                    });
+                }
+            }
+        }
+    }
+    return violations;
 }
 
 std::vector<InvariantViolation> IrInvariantChecker::check_cfg_consistency(
@@ -169,6 +310,56 @@ std::vector<InvariantViolation> IrInvariantChecker::check_cfg_consistency(
         }
     }
 
+    return violations;
+}
+
+std::vector<InvariantViolation>
+IrInvariantChecker::check_expression_acyclicity(
+    const ControlFlowGraph* cfg) const {
+    std::vector<InvariantViolation> violations;
+    if (!cfg) return violations;
+
+    for (const BasicBlock* block : cfg->blocks()) {
+        if (!block) continue;
+        const auto& instructions = block->instructions();
+        for (std::size_t instruction_index = 0;
+             instruction_index < instructions.size();
+             ++instruction_index) {
+            const Instruction* instruction =
+                instructions[instruction_index];
+            for (const NamedExpressionRoot& root :
+                 instruction_expression_roots(instruction)) {
+                const std::vector<const Expression*> trace =
+                    expression_graph_cycle_trace(root.expression);
+                if (trace.empty()) {
+                    continue;
+                }
+
+                std::string path;
+                for (std::size_t index = 0;
+                     index < trace.size();
+                     ++index) {
+                    if (index > 0) path += " -> ";
+                    path += expression_label(trace[index]);
+                }
+                violations.push_back({
+                    "expression_cycle",
+                    std::format(
+                        "bb_{} instruction[{}] root '{}' contains cycle: {}",
+                        block->id(),
+                        instruction_index,
+                        root.name,
+                        path),
+                    std::format(
+                        "instruction-kind={} address=0x{:x}",
+                        instruction
+                            ? static_cast<int>(instruction->node_kind())
+                            : -1,
+                        instruction ? instruction->address() : 0),
+                });
+            }
+        }
+    }
     return violations;
 }
 

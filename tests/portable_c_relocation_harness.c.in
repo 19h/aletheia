@@ -1,0 +1,7 @@
+#define _main decompiled_main
+#include "@GENERATED_C@"
+#undef _main
+
+int main(int argc, char **argv, char **envp) {
+    return decompiled_main(argc, argv, envp);
+}

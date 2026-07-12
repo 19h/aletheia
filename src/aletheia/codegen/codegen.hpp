@@ -1,4 +1,6 @@
 #pragma once
+#include "c_identifier.hpp"
+#include "c_type.hpp"
 #include "../structuring/ast.hpp"
 #include "../structures/dataflow.hpp"
 #include "../pipeline/pipeline.hpp"
@@ -16,6 +18,27 @@ struct CCodegenOptions {
     bool portable_c = false;
 };
 
+struct ParameterDisplayInfo {
+    std::unordered_map<std::string, std::string> expr_name_map;
+    std::unordered_map<int, std::string> index_to_name;
+    std::unordered_map<std::string, TypePtr> declared_type_by_name;
+};
+
+ParameterDisplayInfo build_parameter_display_info(
+    const DecompilerTask& task);
+
+struct CIdentifierDisplayInfo {
+    std::string function_name;
+    ParameterDisplayInfo parameters;
+    std::unordered_map<std::string, std::string> local_names;
+    std::unordered_map<std::string, std::string> global_names;
+    std::vector<std::string> type_declarations;
+    bool unresolved_type_semantics = false;
+};
+
+CIdentifierDisplayInfo build_c_identifier_display_info(
+    const DecompilerTask& task);
+
 class CExpressionGenerator : public DataflowObjectVisitorInterface {
 public:
     explicit CExpressionGenerator(CCodegenOptions options = {})
@@ -23,6 +46,7 @@ public:
 
     std::string generate(DataflowObject* obj);
     void reset_diagnostics() { unresolved_semantics_ = false; }
+    void mark_unresolved_semantics() { unresolved_semantics_ = true; }
     bool has_unresolved_semantics() const { return unresolved_semantics_; }
 
     /// Set the parameter register -> display name mapping for parameter rendering.
@@ -30,12 +54,24 @@ public:
     void set_parameter_names(const std::unordered_map<std::string, std::string>& map) {
         param_display_names_ = map;
     }
+    void set_parameter_index_names(const std::unordered_map<int, std::string>& map) {
+        param_index_display_names_ = map;
+    }
     void set_parameter_types(const std::unordered_map<std::string, TypePtr>& map) {
         param_declared_types_ = map;
+    }
+    void set_local_identifier_names(
+        const std::unordered_map<std::string, std::string>& map) {
+        local_identifier_names_ = map;
+    }
+    void set_global_identifier_names(
+        const std::unordered_map<std::string, std::string>& map) {
+        global_identifier_names_ = map;
     }
     void set_local_declared_type(std::string name, TypePtr type) {
         local_declared_types_[std::move(name)] = std::move(type);
     }
+    bool has_declared_type_kind(Expression* expression, TypeKind kind) const;
 
     // Expression visitors
     void visit(Constant* c) override;
@@ -60,10 +96,20 @@ private:
     std::unordered_set<const DataflowObject*> active_nodes_;
     /// Maps lowercase register name -> display name for parameter rendering.
     std::unordered_map<std::string, std::string> param_display_names_;
+    /// Maps semantic ABI parameter index -> source-level display name. This is
+    /// authoritative after out-of-SSA renaming changes the storage name.
+    std::unordered_map<int, std::string> param_index_display_names_;
     std::unordered_map<std::string, TypePtr> param_declared_types_;
     std::unordered_map<std::string, TypePtr> local_declared_types_;
+    std::unordered_map<std::string, std::string> local_identifier_names_;
+    std::unordered_map<std::string, std::string> global_identifier_names_;
     CCodegenOptions options_;
     bool unresolved_semantics_ = false;
+    bool expression_cycle_detected_ = false;
+    bool expression_depth_limit_detected_ = false;
+    bool expression_expansion_limit_detected_ = false;
+    std::size_t generation_depth_ = 0;
+    std::size_t generation_expansions_ = 0;
 };
 
 class CodeVisitor {

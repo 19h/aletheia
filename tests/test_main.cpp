@@ -9,6 +9,7 @@
 #include "../src/aletheia/structures/cfg.hpp"
 #include "../src/aletheia/structures/dataflow.hpp"
 #include "../src/aletheia/structures/types.hpp"
+#include "../src/aletheia/codegen/codegen.hpp"
 #include "../src/aletheia/structuring/ast.hpp"
 #include "../src/aletheia/structuring/condition_handler.hpp"
 #include "../src/aletheia/structuring/loop_structurer.hpp"
@@ -19,6 +20,7 @@
 #include "../src/aletheia/structuring/instruction_length_handler.hpp"
 #include "../src/aletheia/structuring/variable_name_generation.hpp"
 #include "../src/aletheia/structuring/loop_name_generator.hpp"
+#include "../src/aletheia/frontend/shared_support.hpp"
 #include "../src/aletheia/ssa/dominators.hpp"
 #include "../src/aletheia/ssa/ssa_constructor.hpp"
 #include "../src/aletheia/ssa/ssa_destructor.hpp"
@@ -76,6 +78,60 @@ private:
     std::vector<std::string> deps_;
     bool* executed_ = nullptr;
     bool throw_error_ = false;
+};
+
+class CycleProducingStage final : public PipelineStage {
+public:
+    const char* name() const override { return "CycleProducingStage"; }
+
+    void execute(DecompilerTask& task) override {
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(900);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+
+        auto* cycle = task.arena().create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{
+                task.arena().create<Constant>(0, 1)},
+            1);
+        cycle->mutable_operands()[0] = cycle;
+        block->add_instruction(task.arena().create<Assignment>(
+            task.arena().create<Variable>("cycle", 1),
+            cycle));
+        task.set_cfg(std::move(cfg));
+    }
+};
+
+class AstCycleProducingStage final : public PipelineStage {
+public:
+    const char* name() const override {
+        return "AstCycleProducingStage";
+    }
+
+    void execute(DecompilerTask& task) override {
+        auto forest = std::make_unique<AbstractSyntaxForest>();
+        auto* sequence = task.arena().create<SeqNode>();
+        sequence->add_node(sequence);
+        forest->set_root(sequence);
+        task.set_ast(std::move(forest));
+    }
+};
+
+class ParameterMetadataCorruptingStage final : public PipelineStage {
+public:
+    const char* name() const override {
+        return "ParameterMetadataCorruptingStage";
+    }
+
+    void execute(DecompilerTask& task) override {
+        if (!task.cfg() || !task.cfg()->entry_block()) return;
+        auto* invalid = task.arena().create<Variable>("corrupt", 8);
+        invalid->set_parameter_index(0);
+        task.cfg()->entry_block()->add_instruction(
+            task.arena().create<Return>(
+                std::vector<Expression*>{invalid}));
+    }
 };
 
 void test_arena() {
@@ -185,6 +241,233 @@ void test_pipeline_stage_tracking() {
         ASSERT_EQ(task.stage_records().size(), 2);
         ASSERT_EQ(task.stage_records()[0].status, StageExecutionStatus::Success);
         ASSERT_EQ(task.stage_records()[1].status, StageExecutionStatus::Failed);
+    }
+
+    {
+        DecompilerTask task(0x1130);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(901);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        auto* cycle = task.arena().create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{
+                task.arena().create<Constant>(0, 1)},
+            1);
+        cycle->mutable_operands()[0] = cycle;
+        std::unordered_set<Variable*> cyclic_requirements;
+        cycle->collect_requirements(cyclic_requirements);
+        ASSERT_TRUE(cyclic_requirements.empty());
+        block->add_instruction(task.arena().create<Return>(
+            std::vector<Expression*>{cycle}));
+        task.set_cfg(std::move(cfg));
+
+        bool executed = false;
+        DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "MustNotRun",
+            std::vector<std::string>{},
+            &executed));
+        pipeline.run(task);
+
+        ASSERT_TRUE(!executed);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(task.failure_stage(), std::string("PipelineInput"));
+        ASSERT_TRUE(
+            task.failure_message().find("expression cycle")
+            != std::string::npos);
+        ASSERT_EQ(task.stage_records().size(), 1U);
+        ASSERT_EQ(
+            task.stage_records()[0].status,
+            StageExecutionStatus::Failed);
+    }
+
+    {
+        DecompilerTask task(0x1140);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(902);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        task.set_cfg(std::move(cfg));
+
+        bool next_executed = false;
+        DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<CycleProducingStage>());
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "MustNotRunAfterCycle",
+            std::vector<std::string>{},
+            &next_executed));
+        pipeline.run(task);
+
+        ASSERT_TRUE(!next_executed);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(
+            task.failure_stage(),
+            std::string("CycleProducingStage"));
+        ASSERT_TRUE(
+            task.failure_message().find(
+                "stage produced cyclic expression IR")
+            != std::string::npos);
+        ASSERT_EQ(task.stage_records().size(), 1U);
+        ASSERT_EQ(
+            task.stage_records()[0].status,
+            StageExecutionStatus::Failed);
+    }
+
+    {
+        DecompilerTask task(0x1150);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(903);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        task.set_cfg(std::move(cfg));
+
+        auto forest = std::make_unique<AbstractSyntaxForest>();
+        auto* expression_cycle = task.arena().create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{
+                task.arena().create<Constant>(0, 1)},
+            1);
+        expression_cycle->mutable_operands()[0] = expression_cycle;
+        forest->set_root(
+            task.arena().create<ExprAstNode>(expression_cycle));
+        task.set_ast(std::move(forest));
+
+        bool executed = false;
+        DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "MustNotRunWithAstExpressionCycle",
+            std::vector<std::string>{},
+            &executed));
+        pipeline.run(task);
+
+        ASSERT_TRUE(!executed);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(task.failure_stage(), std::string("PipelineInput"));
+        ASSERT_TRUE(
+            task.failure_message().find("AST")
+            != std::string::npos);
+        ASSERT_TRUE(
+            task.failure_message().find("expression cycle")
+            != std::string::npos);
+    }
+
+    {
+        DecompilerTask task(0x1160);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(904);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        task.set_cfg(std::move(cfg));
+
+        bool next_executed = false;
+        DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<AstCycleProducingStage>());
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "MustNotRunAfterAstCycle",
+            std::vector<std::string>{},
+            &next_executed));
+        pipeline.run(task);
+
+        ASSERT_TRUE(!next_executed);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(
+            task.failure_stage(),
+            std::string("AstCycleProducingStage"));
+        ASSERT_TRUE(
+            task.failure_message().find("AST structural cycle")
+            != std::string::npos);
+    }
+
+    {
+        DecompilerTask task(0x1170);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(905);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        task.set_cfg(std::move(cfg));
+
+        auto forest = std::make_unique<AbstractSyntaxForest>();
+        auto* sequence = task.arena().create<SeqNode>();
+        auto* shared = task.arena().create<BreakNode>();
+        sequence->add_node(shared);
+        sequence->add_node(shared);
+        forest->set_root(sequence);
+        task.set_ast(std::move(forest));
+
+        bool executed = false;
+        DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "SharedAstDag",
+            std::vector<std::string>{},
+            &executed));
+        pipeline.run(task);
+
+        ASSERT_TRUE(executed);
+        ASSERT_TRUE(!task.failed());
+        ASSERT_EQ(task.stage_records().size(), 1U);
+        ASSERT_EQ(
+            task.stage_records()[0].status,
+            StageExecutionStatus::Success);
+    }
+
+
+    {
+        DecompilerTask task(0x1180);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(906);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        auto* invalid = task.arena().create<Variable>("invalid_input", 8);
+        invalid->set_kind(VariableKind::Parameter);
+        block->add_instruction(task.arena().create<Return>(
+            std::vector<Expression*>{invalid}));
+        task.set_cfg(std::move(cfg));
+
+        bool executed = false;
+        DecompilerPipeline pipeline;
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "MustNotRunWithInvalidParameterMetadata",
+            std::vector<std::string>{},
+            &executed));
+        pipeline.run(task);
+
+        ASSERT_TRUE(!executed);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(task.failure_stage(), std::string("PipelineInput"));
+        ASSERT_TRUE(task.failure_message().find("invalid parameter metadata")
+            != std::string::npos);
+        ASSERT_TRUE(task.failure_message().find("no non-negative parameter index")
+            != std::string::npos);
+    }
+
+    {
+        DecompilerTask task(0x1190);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(907);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        task.set_cfg(std::move(cfg));
+
+        bool next_executed = false;
+        DecompilerPipeline pipeline;
+        pipeline.add_stage(
+            std::make_unique<ParameterMetadataCorruptingStage>());
+        pipeline.add_stage(std::make_unique<PipelineTestStage>(
+            "MustNotRunAfterParameterMetadataCorruption",
+            std::vector<std::string>{},
+            &next_executed));
+        pipeline.run(task);
+
+        ASSERT_TRUE(!next_executed);
+        ASSERT_TRUE(task.failed());
+        ASSERT_EQ(task.failure_stage(),
+            std::string("ParameterMetadataCorruptingStage"));
+        ASSERT_TRUE(task.failure_message().find(
+            "stage produced invalid parameter metadata")
+            != std::string::npos);
+        ASSERT_TRUE(task.failure_message().find("non-parameter variable")
+            != std::string::npos);
     }
 
     std::cout << "[+] test_pipeline_stage_tracking passed.\n";
@@ -435,6 +718,23 @@ void test_instruction_hierarchy() {
     // Test Condition negate
     ASSERT_EQ(Condition::negate_comparison(OperationType::eq), OperationType::neq);
     ASSERT_EQ(Condition::negate_comparison(OperationType::lt), OperationType::ge);
+
+    // Requirement collection and substitution must remain stack-safe and
+    // cycle-safe even on malformed expression graphs.
+    auto* cycle_old = arena.create<Variable>("cycle_old", 4);
+    auto* cycle_new = arena.create<Variable>("cycle_new", 4);
+    auto* cyclic = arena.create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{cycle_old, nullptr},
+        4);
+    cyclic->mutable_operands()[1] = cyclic;
+    cyclic->substitute(cycle_old, cycle_new);
+    ASSERT_EQ(cyclic->operands()[0], cycle_new);
+    ASSERT_EQ(cyclic->operands()[1], cyclic);
+    std::unordered_set<Variable*> cyclic_reqs;
+    cyclic->collect_requirements(cyclic_reqs);
+    ASSERT_EQ(cyclic_reqs.size(), 1U);
+    ASSERT_TRUE(cyclic_reqs.contains(cycle_new));
     
     std::cout << "[+] test_instruction_hierarchy passed.\n";
 }
@@ -650,6 +950,384 @@ void test_type_system() {
     
     auto parsed_void = parser.parse("void");
     ASSERT_EQ(parsed_void->to_string(), "void");
+
+    auto hostile = std::make_shared<const CustomType>("9 bad-type", 32);
+    const std::string hostile_name = render_portable_c_type(hostile);
+    ASSERT_TRUE(is_valid_c_identifier(hostile_name));
+    auto hostile_alias = portable_custom_type_alias(*hostile);
+    ASSERT_TRUE(hostile_alias.has_value());
+    ASSERT_TRUE(hostile_alias->find("typedef uint32_t " + hostile_name)
+        != std::string::npos);
+
+    auto array_of_pointers = std::make_shared<const ArrayType>(ptr_int, 3);
+    ASSERT_EQ(
+        render_portable_c_declaration(array_of_pointers, "items"),
+        std::string("int * items[3]"));
+    auto pointer_to_array = std::make_shared<const Pointer>(
+        std::make_shared<const ArrayType>(i32, 3));
+    ASSERT_EQ(
+        render_portable_c_declaration(pointer_to_array, "matrix"),
+        std::string("int (*matrix)[3]"));
+
+    auto tagged = std::make_shared<const CustomType>("struct 9-bad tag", 64);
+    ASSERT_TRUE(render_portable_c_type(tagged).starts_with("struct "));
+    ASSERT_TRUE(is_valid_c_identifier(
+        render_portable_c_type(tagged).substr(7)));
+
+    DecompilerTask incomplete_tag_task(0x4102);
+    auto incomplete_tag_forest = std::make_unique<AbstractSyntaxForest>();
+    auto* incomplete_tag_value = incomplete_tag_task.arena().create<Variable>(
+        "incomplete", 8);
+    incomplete_tag_value->set_ir_type(tagged);
+    incomplete_tag_forest->set_root(
+        incomplete_tag_task.arena().create<ExprAstNode>(incomplete_tag_value));
+    incomplete_tag_task.set_ast(std::move(incomplete_tag_forest));
+    ASSERT_TRUE(build_c_identifier_display_info(incomplete_tag_task)
+        .unresolved_type_semantics);
+
+    DecompilerTask incomplete_tag_pointer_task(0x4104);
+    auto incomplete_tag_pointer_forest =
+        std::make_unique<AbstractSyntaxForest>();
+    auto* incomplete_tag_pointer_value =
+        incomplete_tag_pointer_task.arena().create<Variable>("opaque", 8);
+    incomplete_tag_pointer_value->set_ir_type(
+        std::make_shared<const Pointer>(tagged));
+    incomplete_tag_pointer_forest->set_root(
+        incomplete_tag_pointer_task.arena().create<ExprAstNode>(
+            incomplete_tag_pointer_value));
+    incomplete_tag_pointer_task.set_ast(
+        std::move(incomplete_tag_pointer_forest));
+    ASSERT_TRUE(!build_c_identifier_display_info(incomplete_tag_pointer_task)
+        .unresolved_type_semantics);
+
+    auto unsupported = std::make_shared<const CustomType>("odd_width", 24);
+    auto unsupported_alias = portable_custom_type_alias(*unsupported);
+    ASSERT_TRUE(unsupported_alias.has_value());
+    ASSERT_TRUE(unsupported_alias->find(
+        "ALETHEIA_UNSUPPORTED_CUSTOM_TYPE_WIDTH_24")
+        != std::string::npos);
+
+    const TypePtr packed_record = std::make_shared<const Struct>(
+        "9 hostile record",
+        64,
+        std::unordered_map<std::size_t, ComplexTypeMember>{
+            {0, {"switch", 0, Integer::int32_t(), std::nullopt}},
+            {6, {"a-b", 6, Integer::uint16_t(), std::nullopt}},
+        });
+    const auto packed_record_declaration =
+        portable_complex_type_declaration(
+            *type_dyn_cast<Struct>(packed_record.get()));
+    ASSERT_TRUE(!packed_record_declaration.unresolved);
+    ASSERT_TRUE(packed_record_declaration.text.find(
+        "__aletheia_padding_4[2]") != std::string::npos);
+    ASSERT_TRUE(packed_record_declaration.text.find(
+        normalize_distinct_c_identifier("switch", "member"))
+        != std::string::npos);
+    ASSERT_TRUE(packed_record_declaration.text.find(
+        normalize_distinct_c_identifier("a-b", "member"))
+        != std::string::npos);
+    ASSERT_TRUE(packed_record_declaration.text.find(
+        "__attribute__((packed))") != std::string::npos);
+    ASSERT_TRUE(packed_record_declaration.text.find(
+        "_Static_assert(sizeof(") != std::string::npos);
+
+    const TypePtr overlapping_record = std::make_shared<const Struct>(
+        "overlap",
+        64,
+        std::unordered_map<std::size_t, ComplexTypeMember>{
+            {0, {"first", 0, Integer::int32_t(), std::nullopt}},
+            {2, {"second", 2, Integer::int32_t(), std::nullopt}},
+        });
+    const auto overlap_declaration = portable_complex_type_declaration(
+        *type_dyn_cast<Struct>(overlapping_record.get()));
+    ASSERT_TRUE(overlap_declaration.unresolved);
+    ASSERT_TRUE(overlap_declaration.text.find(
+        "ALETHEIA_UNSUPPORTED_COMPLEX_TYPE_LAYOUT")
+        != std::string::npos);
+
+    const TypePtr storage_union = std::make_shared<const Union>(
+        "choice",
+        64,
+        std::vector<ComplexTypeMember>{
+            {"word", 0, Integer::int32_t(), std::nullopt},
+            {"wide", 0, Integer::int64_t(), std::nullopt},
+        });
+    const auto union_declaration = portable_complex_type_declaration(
+        *type_dyn_cast<Union>(storage_union.get()));
+    ASSERT_TRUE(!union_declaration.unresolved);
+    ASSERT_TRUE(union_declaration.text.find("__aletheia_storage[8]")
+        != std::string::npos);
+    ASSERT_TRUE(union_declaration.text.find("_Static_assert(sizeof(")
+        != std::string::npos);
+
+    const TypePtr invalid_union = std::make_shared<const Union>(
+        "invalid choice",
+        64,
+        std::vector<ComplexTypeMember>{
+            {"shifted", 1, Integer::int32_t(), std::nullopt},
+        });
+    ASSERT_TRUE(portable_complex_type_declaration(
+        *type_dyn_cast<Union>(invalid_union.get())).unresolved);
+
+    const TypePtr status_enum = std::make_shared<const Enum>(
+        "status code",
+        32,
+        std::unordered_map<std::int64_t, ComplexTypeMember>{
+            {-1, {"not-ready", 0, nullptr, -1}},
+            {7, {"switch", 0, nullptr, 7}},
+        });
+    const auto enum_declaration = portable_complex_type_declaration(
+        *type_dyn_cast<Enum>(status_enum.get()));
+    ASSERT_TRUE(!enum_declaration.unresolved);
+    ASSERT_TRUE(enum_declaration.text.find("typedef int32_t ")
+        != std::string::npos);
+    ASSERT_TRUE(enum_declaration.text.find("((" +
+        render_portable_c_type(status_enum) + ")(-1))")
+        != std::string::npos);
+
+    const TypePtr nested_record = std::make_shared<const Struct>(
+        "nested",
+        64,
+        std::unordered_map<std::size_t, ComplexTypeMember>{
+            {0, {"payload", 0, packed_record, std::nullopt}},
+        });
+    DecompilerTask aggregate_type_task(0x4108);
+    auto aggregate_type_forest = std::make_unique<AbstractSyntaxForest>();
+    auto* aggregate_expression = aggregate_type_task.arena().create<Variable>(
+        "aggregate", 8);
+    aggregate_expression->set_ir_type(nested_record);
+    aggregate_type_forest->set_root(
+        aggregate_type_task.arena().create<ExprAstNode>(aggregate_expression));
+    aggregate_type_task.set_ast(std::move(aggregate_type_forest));
+    const CIdentifierDisplayInfo aggregate_type_info =
+        build_c_identifier_display_info(aggregate_type_task);
+    ASSERT_TRUE(!aggregate_type_info.unresolved_type_semantics);
+    const auto declaration_index = [&](const std::string& needle) {
+        for (std::size_t index = 0;
+             index < aggregate_type_info.type_declarations.size();
+             ++index) {
+            if (aggregate_type_info.type_declarations[index].find(needle)
+                != std::string::npos) {
+                return index;
+            }
+        }
+        return aggregate_type_info.type_declarations.size();
+    };
+    const std::size_t child_definition = declaration_index(
+        portable_complex_type_name(
+            *type_dyn_cast<Struct>(packed_record.get())) + " {");
+    const std::size_t parent_definition = declaration_index(
+        portable_complex_type_name(
+            *type_dyn_cast<Struct>(nested_record.get())) + " {");
+    ASSERT_TRUE(child_definition < parent_definition);
+
+    const TypePtr custom_member_record = std::make_shared<const Struct>(
+        "custom payload",
+        32,
+        std::unordered_map<std::size_t, ComplexTypeMember>{
+            {0, {"value", 0, hostile, std::nullopt}},
+        });
+    DecompilerTask custom_member_task(0x410a);
+    auto custom_member_forest = std::make_unique<AbstractSyntaxForest>();
+    auto* custom_member_expression =
+        custom_member_task.arena().create<Variable>("custom_record", 4);
+    custom_member_expression->set_ir_type(custom_member_record);
+    custom_member_forest->set_root(
+        custom_member_task.arena().create<ExprAstNode>(
+            custom_member_expression));
+    custom_member_task.set_ast(std::move(custom_member_forest));
+    const CIdentifierDisplayInfo custom_member_info =
+        build_c_identifier_display_info(custom_member_task);
+    const auto custom_declaration_index = [&](const std::string& needle) {
+        for (std::size_t index = 0;
+             index < custom_member_info.type_declarations.size();
+             ++index) {
+            if (custom_member_info.type_declarations[index].find(needle)
+                != std::string::npos) {
+                return index;
+            }
+        }
+        return custom_member_info.type_declarations.size();
+    };
+    ASSERT_TRUE(custom_declaration_index("typedef uint32_t " + hostile_name)
+        < custom_declaration_index(
+            portable_complex_type_name(
+                *type_dyn_cast<Struct>(custom_member_record.get())) + " {"));
+
+    DecompilerTask invalid_aggregate_task(0x410c);
+    auto invalid_aggregate_forest = std::make_unique<AbstractSyntaxForest>();
+    auto* invalid_aggregate_expression =
+        invalid_aggregate_task.arena().create<Variable>("overlap", 8);
+    invalid_aggregate_expression->set_ir_type(overlapping_record);
+    invalid_aggregate_forest->set_root(
+        invalid_aggregate_task.arena().create<ExprAstNode>(
+            invalid_aggregate_expression));
+    invalid_aggregate_task.set_ast(std::move(invalid_aggregate_forest));
+    ASSERT_TRUE(build_c_identifier_display_info(invalid_aggregate_task)
+        .unresolved_type_semantics);
+
+    const TypePtr conflicting_record_a = std::make_shared<const Struct>(
+        "conflicting",
+        32,
+        std::unordered_map<std::size_t, ComplexTypeMember>{
+            {0, {"alpha", 0, Integer::int32_t(), std::nullopt}},
+        });
+    const TypePtr conflicting_record_b = std::make_shared<const Struct>(
+        "conflicting",
+        32,
+        std::unordered_map<std::size_t, ComplexTypeMember>{
+            {0, {"beta", 0, Integer::int32_t(), std::nullopt}},
+        });
+    DecompilerTask conflicting_type_task(0x410d);
+    auto conflicting_type_forest = std::make_unique<AbstractSyntaxForest>();
+    auto* conflicting_lhs =
+        conflicting_type_task.arena().create<Variable>("lhs", 4);
+    conflicting_lhs->set_ir_type(conflicting_record_a);
+    auto* conflicting_rhs =
+        conflicting_type_task.arena().create<Variable>("rhs", 4);
+    conflicting_rhs->set_ir_type(conflicting_record_b);
+    conflicting_type_forest->set_root(
+        conflicting_type_task.arena().create<ExprAstNode>(
+            conflicting_type_task.arena().create<Operation>(
+                OperationType::add,
+                std::vector<Expression*>{conflicting_lhs, conflicting_rhs},
+                4)));
+    conflicting_type_task.set_ast(std::move(conflicting_type_forest));
+    const CIdentifierDisplayInfo conflicting_type_info =
+        build_c_identifier_display_info(conflicting_type_task);
+    ASSERT_TRUE(conflicting_type_info.unresolved_type_semantics);
+    ASSERT_TRUE(std::any_of(
+        conflicting_type_info.type_declarations.begin(),
+        conflicting_type_info.type_declarations.end(),
+        [](const std::string& declaration) {
+            return declaration.find("conflicting definitions")
+                != std::string::npos;
+        }));
+
+    DecompilerTask aggregate_abi_task(0x410e);
+    aggregate_abi_task.set_function_type(
+        std::make_shared<const FunctionTypeDef>(
+            Integer::int32_t(), std::vector<TypePtr>{packed_record}));
+    const CIdentifierDisplayInfo aggregate_abi_info =
+        build_c_identifier_display_info(aggregate_abi_task);
+    ASSERT_TRUE(aggregate_abi_info.unresolved_type_semantics);
+    ASSERT_TRUE(std::any_of(
+        aggregate_abi_info.type_declarations.begin(),
+        aggregate_abi_info.type_declarations.end(),
+        [](const std::string& declaration) {
+            return declaration.find("aggregate function ABI")
+                != std::string::npos;
+        }));
+
+    DecompilerTask ast_type_task(0x4100);
+    auto ast_type_forest = std::make_unique<AbstractSyntaxForest>();
+    auto* ast_only_expression = ast_type_task.arena().create<Operation>(
+        OperationType::cast,
+        std::vector<Expression*>{
+            ast_type_task.arena().create<Constant>(7, 4)},
+        4);
+    ast_only_expression->set_ir_type(hostile);
+    ast_type_forest->set_root(
+        ast_type_task.arena().create<ExprAstNode>(ast_only_expression));
+    ast_type_task.set_ast(std::move(ast_type_forest));
+    const CIdentifierDisplayInfo ast_type_info =
+        build_c_identifier_display_info(ast_type_task);
+    ASSERT_TRUE(std::any_of(
+        ast_type_info.type_declarations.begin(),
+        ast_type_info.type_declarations.end(),
+        [&](const std::string& declaration) {
+            return declaration.find(hostile_name) != std::string::npos;
+        }));
+
+    DecompilerTask unsupported_task(0x4110);
+    auto unsupported_forest = std::make_unique<AbstractSyntaxForest>();
+    auto* unsupported_expression = unsupported_task.arena().create<Operation>(
+        OperationType::cast,
+        std::vector<Expression*>{
+            unsupported_task.arena().create<Constant>(1, 3)},
+        3);
+    unsupported_expression->set_ir_type(unsupported);
+    unsupported_forest->set_root(
+        unsupported_task.arena().create<ExprAstNode>(unsupported_expression));
+    unsupported_task.set_ast(std::move(unsupported_forest));
+    CodeVisitor unsupported_visitor({.portable_c = true});
+    const auto unsupported_lines =
+        unsupported_visitor.generate_code(unsupported_task);
+    ASSERT_TRUE(unsupported_visitor.has_unresolved_semantics());
+    ASSERT_TRUE(std::any_of(
+        unsupported_lines.begin(), unsupported_lines.end(),
+        [](const std::string& line) {
+            return line.find("ALETHEIA_UNSUPPORTED_CUSTOM_TYPE_WIDTH_24")
+                != std::string::npos;
+        }));
+
+    const TypePtr unsupported_integer =
+        std::make_shared<const Integer>(24, true);
+    const TypePtr unsupported_float = std::make_shared<const Float>(8);
+    const TypePtr unsupported_pointer =
+        std::make_shared<const Pointer>(Integer::int32_t(), 32);
+    DecompilerTask unsupported_portable_type_task(0x4118);
+    auto unsupported_portable_type_forest =
+        std::make_unique<AbstractSyntaxForest>();
+    auto* unsupported_integer_value =
+        unsupported_portable_type_task.arena().create<Variable>("i24", 3);
+    unsupported_integer_value->set_ir_type(unsupported_integer);
+    auto* unsupported_float_value =
+        unsupported_portable_type_task.arena().create<Variable>("f8", 1);
+    unsupported_float_value->set_ir_type(unsupported_float);
+    auto* unsupported_pointer_value =
+        unsupported_portable_type_task.arena().create<Variable>("p32", 4);
+    unsupported_pointer_value->set_ir_type(unsupported_pointer);
+    unsupported_portable_type_forest->set_root(
+        unsupported_portable_type_task.arena().create<ExprAstNode>(
+            unsupported_portable_type_task.arena().create<Operation>(
+                OperationType::add,
+                std::vector<Expression*>{
+                    unsupported_integer_value,
+                    unsupported_float_value,
+                    unsupported_pointer_value,
+                },
+                4)));
+    unsupported_portable_type_task.set_ast(
+        std::move(unsupported_portable_type_forest));
+    const CIdentifierDisplayInfo unsupported_portable_types =
+        build_c_identifier_display_info(unsupported_portable_type_task);
+    ASSERT_TRUE(unsupported_portable_types.unresolved_type_semantics);
+    ASSERT_TRUE(std::count_if(
+        unsupported_portable_types.type_declarations.begin(),
+        unsupported_portable_types.type_declarations.end(),
+        [](const std::string& declaration) {
+            return declaration.find("ALETHEIA_UNSUPPORTED_PORTABLE_TYPE")
+                != std::string::npos;
+        }) == 1);
+    ASSERT_TRUE(render_portable_c_type(unsupported_integer).find(
+        "ALETHEIA_UNSUPPORTED_PORTABLE_TYPE_INTEGER_WIDTH_24")
+        != std::string::npos);
+    ASSERT_TRUE(render_portable_c_type(unsupported_float).find(
+        "ALETHEIA_UNSUPPORTED_PORTABLE_TYPE_FLOAT_WIDTH_8")
+        != std::string::npos);
+
+    DecompilerTask float_contract_task(0x411c);
+    float_contract_task.set_function_type(
+        std::make_shared<const FunctionTypeDef>(
+            Float::float64(), std::vector<TypePtr>{Float::float32()}));
+    const CIdentifierDisplayInfo float_contract =
+        build_c_identifier_display_info(float_contract_task);
+    ASSERT_TRUE(!float_contract.unresolved_type_semantics);
+    ASSERT_TRUE(std::any_of(
+        float_contract.type_declarations.begin(),
+        float_contract.type_declarations.end(),
+        [](const std::string& declaration) {
+            return declaration.find("ALETHEIA_FLOAT_WIDTH_32")
+                != std::string::npos;
+        }));
+    ASSERT_TRUE(std::any_of(
+        float_contract.type_declarations.begin(),
+        float_contract.type_declarations.end(),
+        [](const std::string& declaration) {
+            return declaration.find("ALETHEIA_FLOAT_WIDTH_64")
+                != std::string::npos;
+        }));
     
     // Verify IR nodes can hold types
     DecompilerArena arena;
@@ -1186,6 +1864,134 @@ void test_minimal_variable_renamer() {
     std::cout << "[+] test_minimal_variable_renamer passed.\n";
 }
 
+void test_minimal_variable_renamer_separates_x0_pointer_and_integer_roles() {
+    DecompilerTask task(0x6010);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(301);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* pointer_value = task.arena().create<Variable>("x0", 8);
+    pointer_value->set_ssa_version(1);
+    // Model stale register typing: the pointer role is only exposed by the
+    // resolved global on the assignment RHS.
+    pointer_value->set_ir_type(Integer::uint64_t());
+    auto* integer_value = task.arena().create<Variable>("x0", 8);
+    integer_value->set_ssa_version(2);
+    integer_value->set_ir_type(Integer::int64_t());
+
+    auto* pointer_source = task.arena().create<GlobalVariable>("text", 8);
+    pointer_source->set_ir_type(std::make_shared<Pointer>(Integer::uint8_t()));
+    bb->add_instruction(task.arena().create<Assignment>(pointer_value, pointer_source));
+    bb->add_instruction(task.arena().create<Assignment>(
+        integer_value, task.arena().create<Constant>(7, 8)));
+    bb->add_instruction(task.arena().create<Return>(
+        std::vector<Expression*>{integer_value}));
+
+    MinimalVariableRenamer::rename(task.arena(), *task.cfg());
+
+    auto* pointer_assignment = dynamic_cast<Assignment*>(bb->instructions()[0]);
+    auto* integer_assignment = dynamic_cast<Assignment*>(bb->instructions()[1]);
+    auto* pointer_destination = pointer_assignment
+        ? dynamic_cast<Variable*>(pointer_assignment->destination()) : nullptr;
+    auto* integer_destination = integer_assignment
+        ? dynamic_cast<Variable*>(integer_assignment->destination()) : nullptr;
+    ASSERT_TRUE(pointer_destination != nullptr);
+    ASSERT_TRUE(integer_destination != nullptr);
+    ASSERT_TRUE(pointer_destination->name() != integer_destination->name());
+    ASSERT_TRUE(pointer_destination->ir_type() != nullptr);
+    ASSERT_TRUE(pointer_destination->ir_type()->type_kind() == TypeKind::Pointer);
+    ASSERT_TRUE(integer_destination->ir_type() != nullptr);
+    ASSERT_TRUE(integer_destination->ir_type()->type_kind() == TypeKind::Integer);
+
+    // A folded call argument can remove the only pointer-typed occurrence of
+    // a later x0 load. Definition provenance must still keep that value apart
+    // from an integer call result.
+    DecompilerTask provenance_task(0x6011);
+    auto provenance_cfg = std::make_unique<ControlFlowGraph>();
+    auto* provenance_bb = provenance_task.arena().create<BasicBlock>(303);
+    provenance_cfg->set_entry_block(provenance_bb);
+    provenance_cfg->add_block(provenance_bb);
+    provenance_task.set_cfg(std::move(provenance_cfg));
+
+    auto* call_destination = provenance_task.arena().create<Variable>("x0", 8);
+    call_destination->set_ssa_version(1);
+    call_destination->set_ir_type(Integer::int32_t());
+    auto* load_destination = provenance_task.arena().create<Variable>("x0", 8);
+    load_destination->set_ssa_version(2);
+    load_destination->set_ir_type(Integer::uint64_t());
+    auto* load_address = provenance_task.arena().create<Variable>("x20", 8);
+    load_address->set_ssa_version(1);
+    load_address->set_ir_type(std::make_shared<Pointer>(Integer::uint64_t()));
+
+    provenance_bb->add_instruction(provenance_task.arena().create<Assignment>(
+        call_destination,
+        provenance_task.arena().create<Call>(
+            provenance_task.arena().create<GlobalVariable>("callee", 8),
+            std::vector<Expression*>{},
+            4)));
+    provenance_bb->add_instruction(provenance_task.arena().create<Assignment>(
+        load_destination,
+        provenance_task.arena().create<Operation>(
+            OperationType::deref,
+            std::vector<Expression*>{load_address},
+            8)));
+    provenance_bb->add_instruction(provenance_task.arena().create<Return>(
+        std::vector<Expression*>{load_destination}));
+
+    MinimalVariableRenamer::rename(
+        provenance_task.arena(), *provenance_task.cfg());
+    auto* renamed_call = dyn_cast<Variable>(
+        dyn_cast<Assignment>(provenance_bb->instructions()[0])->destination());
+    auto* renamed_load = dyn_cast<Variable>(
+        dyn_cast<Assignment>(provenance_bb->instructions()[1])->destination());
+    ASSERT_TRUE(renamed_call != nullptr);
+    ASSERT_TRUE(renamed_load != nullptr);
+    ASSERT_TRUE(renamed_call->name() != renamed_load->name());
+
+    std::cout << "[+] test_minimal_variable_renamer_separates_x0_pointer_and_integer_roles passed.\n";
+}
+
+void test_cfg_variable_naming_unifies_inconsistent_stack_metadata() {
+    DecompilerTask task(0x6020);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(302);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* defined = task.arena().create<Variable>("arg_8", 8);
+    defined->set_ssa_version(1);
+    defined->set_kind(VariableKind::StackArgument);
+    defined->set_stack_offset(8);
+    auto* copied_source = task.arena().create<Variable>("arg_8", 8);
+    copied_source->set_ssa_version(1);
+    auto* copied_destination = task.arena().create<Variable>("arg_8", 8);
+    copied_destination->set_ssa_version(3);
+    auto* later_use = task.arena().create<Variable>("arg_8", 8);
+    later_use->set_ssa_version(3);
+
+    auto* definition = task.arena().create<Assignment>(
+        defined, task.arena().create<Constant>(92, 8));
+    auto* copy = task.arena().create<Assignment>(copied_destination, copied_source);
+    auto* ret = task.arena().create<Return>(std::vector<Expression*>{later_use});
+    bb->add_instruction(definition);
+    bb->add_instruction(copy);
+    bb->add_instruction(ret);
+
+    auto* forest = task.arena().create<AbstractSyntaxForest>();
+    forest->set_root(task.arena().create<CodeNode>(bb));
+    VariableNameGeneration::apply_default(forest);
+
+    ASSERT_EQ(defined->name(), copied_source->name());
+    ASSERT_EQ(copied_destination->name(), later_use->name());
+
+    std::cout << "[+] test_cfg_variable_naming_unifies_inconsistent_stack_metadata passed.\n";
+}
+
 void test_graph_expression_folding_rewrites_store_address() {
     DecompilerTask task(0x6050);
 
@@ -1427,6 +2233,40 @@ void test_out_of_ssa_mode_config() {
     auto [sreedhar_name, sreedhar_version] = run_mode(OutOfSsaMode::Sreedhar);
     ASSERT_EQ(sreedhar_name, "x");
     ASSERT_EQ(sreedhar_version, 1);
+
+    const auto preserves_parameter_metadata = [](OutOfSsaMode mode) {
+        DecompilerTask task(0x6210);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* bb = task.arena().create<BasicBlock>(33);
+        cfg->set_entry_block(bb);
+        cfg->add_block(bb);
+        task.set_cfg(std::move(cfg));
+        task.set_out_of_ssa_mode(mode);
+
+        auto* parameter = task.arena().create<Variable>("incoming", 4);
+        parameter->set_kind(VariableKind::Parameter);
+        parameter->set_parameter_index(2);
+        parameter->set_ir_type(Integer::int32_t());
+        bb->add_instruction(task.arena().create<Return>(
+            std::vector<Expression*>{parameter}));
+
+        SsaDestructor stage;
+        stage.execute(task);
+
+        auto* returned = dyn_cast<Variable>(
+            dyn_cast<Return>(bb->instructions().back())->values()[0]);
+        ASSERT_TRUE(returned != nullptr);
+        ASSERT_TRUE(returned->is_parameter());
+        ASSERT_EQ(returned->parameter_index(), 2);
+        ASSERT_TRUE(returned->ir_type() != nullptr);
+        ASSERT_TRUE(*returned->ir_type() == *Integer::int32_t());
+    };
+
+    preserves_parameter_metadata(OutOfSsaMode::LiftMinimal);
+    preserves_parameter_metadata(OutOfSsaMode::Simple);
+    preserves_parameter_metadata(OutOfSsaMode::Conditional);
+    preserves_parameter_metadata(OutOfSsaMode::Minimization);
+    preserves_parameter_metadata(OutOfSsaMode::Sreedhar);
 
     auto parsed_default = SsaDestructor::parse_mode("lift_minimal");
     ASSERT_TRUE(parsed_default.has_value());
@@ -1788,7 +2628,154 @@ void test_codegen_constant_formatting() {
     ASSERT_TRUE(float_product_text.find("union { uint64_t u; double f; }") != std::string::npos);
     ASSERT_TRUE(float_product_text.find("0x3e112e0be826d695ULL") != std::string::npos);
 
+    auto* wide_cast = arena.create<aletheia::Operation>(
+        aletheia::OperationType::cast,
+        std::vector<aletheia::Expression*>{arena.create<aletheia::Constant>(1, 8)},
+        9);
+    wide_cast->set_ir_type(std::make_shared<aletheia::Integer>(72, false));
+    aletheia::CExpressionGenerator portable({.portable_c = true});
+    ASSERT_TRUE(portable.generate(wide_cast).starts_with("(uint128_t)("));
+
+    auto* declared_float = arena.create<aletheia::Variable>("tmp_0", 8);
+    declared_float->set_ir_type(aletheia::Integer::uint64_t());
+    auto* expected_float = arena.create<aletheia::Constant>(0x4071d00000000000ULL, 8);
+    expected_float->set_ir_type(aletheia::Integer::uint64_t());
+    auto* float_equality = arena.create<aletheia::Condition>(
+        aletheia::OperationType::eq, declared_float, expected_float, 1);
+    portable.set_local_declared_type("tmp_0", aletheia::Float::float64());
+    const std::string float_equality_text = portable.generate(float_equality);
+    ASSERT_TRUE(float_equality_text.find("union { uint64_t u; double f; }")
+        != std::string::npos);
+    ASSERT_TRUE(float_equality_text.find("0x4071d00000000000ULL")
+        != std::string::npos);
+
     std::cout << "[+] test_codegen_constant_formatting passed.\n";
+}
+
+void test_codegen_parameter_display_respects_storage_kind() {
+    const std::string safe_comment =
+        aletheia::frontend::sanitize_c_block_comment_text(
+            "marker /* nested */\nnext\tfield\x01");
+    ASSERT_TRUE(safe_comment.find("/*") == std::string::npos);
+    ASSERT_TRUE(safe_comment.find("*/") == std::string::npos);
+    ASSERT_EQ(
+        safe_comment,
+        std::string("marker / * nested * / next field?"));
+    ASSERT_TRUE(is_c_quoted_literal("\"value=%d\\n\""));
+    ASSERT_TRUE(is_c_quoted_literal("u8\"text\""));
+    ASSERT_TRUE(is_c_quoted_literal("L'x'"));
+    ASSERT_TRUE(!is_c_quoted_literal("global_name"));
+    ASSERT_TRUE(is_c_keyword("switch"));
+    ASSERT_TRUE(is_c_keyword("_Alignas"));
+    ASSERT_TRUE(is_c_keyword("typeof"));
+    ASSERT_TRUE(!is_valid_c_identifier("switch"));
+    ASSERT_TRUE(!is_valid_c_identifier("9value"));
+    ASSERT_TRUE(!is_valid_c_identifier("user-name"));
+    ASSERT_TRUE(is_valid_c_identifier("user_name"));
+    ASSERT_TRUE(is_valid_c_identifier(
+        normalize_c_identifier("switch", "arg")));
+    ASSERT_TRUE(is_valid_c_identifier(
+        normalize_distinct_c_identifier("9-user name", "arg")));
+    ASSERT_TRUE(
+        normalize_distinct_c_identifier("a-b", "var")
+        != normalize_distinct_c_identifier("a_b", "var"));
+    ASSERT_TRUE(
+        normalize_distinct_c_identifier("aletheia_encoded_612d62", "var")
+        != "aletheia_encoded_612d62");
+    ASSERT_EQ(
+        normalize_distinct_c_identifier("a-b", "var"),
+        normalize_distinct_c_identifier("a-b", "var"));
+
+    CIdentifierAllocator allocator;
+    ASSERT_EQ(allocator.allocate("value"), std::string("value"));
+    ASSERT_EQ(allocator.allocate("value"), std::string("value_2"));
+    ASSERT_EQ(allocator.allocate("uint64_t"), std::string("uint64_t_2"));
+
+    DecompilerArena arena;
+    CExpressionGenerator generator;
+    generator.set_parameter_names({{"arg_0", "a1"}});
+    generator.set_parameter_index_names({{0, "a1"}});
+
+    auto* parameter = arena.create<Variable>("arg_0", 8);
+    parameter->set_kind(VariableKind::Parameter);
+    parameter->set_parameter_index(0);
+    ASSERT_EQ(generator.generate(parameter), std::string("a1"));
+
+    auto* local = arena.create<Variable>("arg_0", 8);
+    local->set_kind(VariableKind::StackLocal);
+    local->set_stack_offset(0);
+    ASSERT_EQ(generator.generate(local), std::string("arg_0"));
+
+    auto* unclassified = arena.create<Variable>("arg_0", 8);
+    ASSERT_EQ(generator.generate(unclassified), std::string("arg_0"));
+
+    auto* renamed_parameter = arena.create<Variable>("var_37", 8);
+    renamed_parameter->set_kind(VariableKind::Parameter);
+    renamed_parameter->set_parameter_index(0);
+    ASSERT_EQ(generator.generate(renamed_parameter), std::string("a1"));
+
+    auto* aggregate = arena.create<Variable>("record", 8);
+    auto* hostile_member = arena.create<Variable>("switch", 4);
+    auto* member_access = arena.create<Operation>(
+        OperationType::member_access,
+        std::vector<Expression*>{aggregate, hostile_member},
+        4);
+    std::unordered_set<Variable*> member_requirements;
+    member_access->collect_requirements(member_requirements);
+    ASSERT_TRUE(member_requirements.contains(aggregate));
+    ASSERT_TRUE(!member_requirements.contains(hostile_member));
+    const std::string member_text = generator.generate(member_access);
+    ASSERT_TRUE(member_text.starts_with("record."));
+    ASSERT_TRUE(is_valid_c_identifier(
+        member_text.substr(member_text.find('.') + 1)));
+    ASSERT_TRUE(member_text.find(".switch") == std::string::npos);
+
+    DecompilerTask display_task(0x4120);
+    display_task.set_function_type(std::make_shared<const FunctionTypeDef>(
+        Integer::int32_t(),
+        std::vector<TypePtr>{Integer::int32_t(), Integer::int64_t()}));
+    display_task.set_parameter_register("x0", {
+        .name = "bravo", .index = 0, .type = Integer::int32_t()});
+    display_task.set_parameter_register("w0", {
+        .name = "alpha", .index = 0, .type = Integer::int32_t()});
+    display_task.set_parameter_register("x1", {
+        .name = "alpha", .index = 1, .type = Integer::int64_t()});
+    const ParameterDisplayInfo display =
+        build_parameter_display_info(display_task);
+    ASSERT_EQ(display.index_to_name.at(0), std::string("alpha"));
+    ASSERT_EQ(display.index_to_name.at(1), std::string("alpha_2"));
+    ASSERT_EQ(display.expr_name_map.at("x0"), std::string("alpha"));
+    ASSERT_EQ(display.expr_name_map.at("w0"), std::string("alpha"));
+    ASSERT_EQ(display.expr_name_map.at("x1"), std::string("alpha_2"));
+
+    DecompilerTask callee_task(0x4130);
+    callee_task.set_function_name("callee-name");
+    const CIdentifierDisplayInfo callee_identifiers =
+        build_c_identifier_display_info(callee_task);
+    ASSERT_TRUE(is_valid_c_identifier(callee_identifiers.function_name));
+
+    DecompilerTask caller_task(0x4140);
+    caller_task.set_function_name("switch");
+    auto caller_cfg = std::make_unique<ControlFlowGraph>();
+    auto* caller_block = caller_task.arena().create<BasicBlock>(180);
+    caller_cfg->set_entry_block(caller_block);
+    caller_cfg->add_block(caller_block);
+    auto* callee_symbol = caller_task.arena().create<GlobalVariable>(
+        "callee-name", 8);
+    caller_block->add_instruction(caller_task.arena().create<Return>(
+        std::vector<Expression*>{
+            caller_task.arena().create<Call>(
+                callee_symbol, std::vector<Expression*>{}, 4)}));
+    caller_task.set_cfg(std::move(caller_cfg));
+    const CIdentifierDisplayInfo caller_identifiers =
+        build_c_identifier_display_info(caller_task);
+    ASSERT_TRUE(is_valid_c_identifier(caller_identifiers.function_name));
+    ASSERT_TRUE(caller_identifiers.function_name != "switch");
+    ASSERT_EQ(
+        caller_identifiers.global_names.at("callee-name"),
+        callee_identifiers.function_name);
+
+    std::cout << "[+] test_codegen_parameter_display_respects_storage_kind passed.\n";
 }
 
 void test_codegen_unknown_operation_placeholder() {
@@ -1847,6 +2834,111 @@ void test_codegen_scalar_list_is_explicitly_unresolved() {
     ASSERT_TRUE(portable.has_unresolved_semantics());
 
     std::cout << "[+] test_codegen_scalar_list_is_explicitly_unresolved passed.\n";
+}
+
+void test_portable_codegen_resolved_call_uses_declared_symbol_abi() {
+    aletheia::DecompilerArena arena;
+    auto* target = arena.create<aletheia::GlobalVariable>(
+        "resolved_callee",
+        8,
+        arena.create<aletheia::Constant>(0x1000, 8),
+        false);
+    auto* argument = arena.create<aletheia::Constant>(7, 4);
+    argument->set_ir_type(aletheia::Integer::uint32_t());
+    auto* call = arena.create<aletheia::Call>(
+        target,
+        std::vector<aletheia::Expression*>{argument},
+        4);
+    call->set_ir_type(std::make_shared<aletheia::FunctionTypeDef>(
+        aletheia::Integer::uint32_t(),
+        std::vector<aletheia::TypePtr>{aletheia::Integer::uint32_t()}));
+
+    aletheia::CExpressionGenerator portable({.portable_c = true});
+    const std::string text = portable.generate(call);
+    ASSERT_TRUE(text.starts_with("resolved_callee("));
+    ASSERT_TRUE(text.find("(*)()") == std::string::npos);
+    ASSERT_TRUE(text.find("uintptr_t") == std::string::npos);
+
+    auto* indirect_target = arena.create<aletheia::Variable>("callback", 8);
+    indirect_target->set_ir_type(std::make_shared<aletheia::Pointer>(
+        std::make_shared<aletheia::FunctionTypeDef>(
+            aletheia::Integer::uint32_t(),
+            std::vector<aletheia::TypePtr>{aletheia::Integer::uint32_t()}),
+        64));
+    auto* indirect_call = arena.create<aletheia::Call>(
+        indirect_target,
+        std::vector<aletheia::Expression*>{argument},
+        4);
+    indirect_call->set_ir_type(std::make_shared<aletheia::FunctionTypeDef>(
+        aletheia::Integer::uint32_t(),
+        std::vector<aletheia::TypePtr>{aletheia::Integer::uint32_t()}));
+    const std::string indirect_text = portable.generate(indirect_call);
+    ASSERT_TRUE(indirect_text.find("unsigned int (*)(unsigned int)") != std::string::npos);
+    ASSERT_TRUE(indirect_text.find("(*)()") == std::string::npos);
+
+    std::cout << "[+] test_portable_codegen_resolved_call_uses_declared_symbol_abi passed.\n";
+}
+
+void test_portable_codegen_distinguishes_global_address_and_lvalue() {
+    aletheia::DecompilerArena arena;
+    auto* global = arena.create<aletheia::GlobalVariable>(
+        "global_counter",
+        8,
+        arena.create<aletheia::Constant>(0x1000, 8),
+        false);
+    global->set_represents_address(true);
+
+    aletheia::CExpressionGenerator portable({.portable_c = true});
+    ASSERT_EQ(portable.generate(global), "((uintptr_t)global_counter)");
+
+    auto* load = arena.create<aletheia::Operation>(
+        aletheia::OperationType::deref,
+        std::vector<aletheia::Expression*>{global},
+        4);
+    const std::string load_text = portable.generate(load);
+    ASSERT_TRUE(load_text.find("(uint32_t *)(uintptr_t)") != std::string::npos);
+    ASSERT_TRUE(load_text.find("global_counter") != std::string::npos);
+
+    auto* assignment = arena.create<aletheia::Assignment>(
+        global,
+        arena.create<aletheia::Constant>(7, 4));
+    ASSERT_TRUE(portable.generate(assignment).find("global_counter") != std::string::npos);
+
+    auto* cast_lvalue = arena.create<aletheia::Operation>(
+        aletheia::OperationType::cast,
+        std::vector<aletheia::Expression*>{global},
+        4);
+    cast_lvalue->set_ir_type(aletheia::Integer::uint32_t());
+    auto* cast_assignment = arena.create<aletheia::Assignment>(
+        cast_lvalue,
+        arena.create<aletheia::Constant>(9, 4));
+    ASSERT_TRUE(portable.generate(cast_assignment).find("global_counter") != std::string::npos);
+
+    auto* address_add = arena.create<aletheia::Operation>(
+        aletheia::OperationType::add,
+        std::vector<aletheia::Expression*>{
+            global,
+            arena.create<aletheia::Constant>(3, 8)},
+        8);
+    const std::string address_text = portable.generate(address_add);
+    ASSERT_TRUE(address_text.find("global_counter") != std::string::npos);
+    ASSERT_TRUE(address_text.find(" + 3") != std::string::npos);
+
+    auto* pointer = arena.create<aletheia::Variable>("argv", 8);
+    pointer->set_ir_type(std::make_shared<aletheia::Pointer>(
+        std::make_shared<aletheia::Pointer>(aletheia::Integer::char_type())));
+    auto* byte_add = arena.create<aletheia::Operation>(
+        aletheia::OperationType::add,
+        std::vector<aletheia::Expression*>{
+            pointer,
+            arena.create<aletheia::Constant>(8, 8)},
+        8);
+    byte_add->set_ir_type(pointer->ir_type());
+    const std::string byte_add_text = portable.generate(byte_add);
+    ASSERT_TRUE(byte_add_text.find("(uintptr_t)(argv)") != std::string::npos);
+    ASSERT_TRUE(byte_add_text.find("argv + 8") == std::string::npos);
+
+    std::cout << "[+] test_portable_codegen_distinguishes_global_address_and_lvalue passed.\n";
 }
 
 void test_codegen_fallback_branch_marker() {
@@ -2047,6 +3139,8 @@ void test_codegen_parameter_signature_body_name_coherence() {
 
     auto* cmd_reg = task.arena().create<Variable>("rdi", 8);
     auto* argc_var = task.arena().create<Variable>("arg_1", 4);
+    argc_var->set_kind(VariableKind::Parameter);
+    argc_var->set_parameter_index(1);
     auto* args_reg = task.arena().create<Variable>("edx", 8);
     auto* out = task.arena().create<Variable>("out", 4);
 
@@ -2367,7 +3461,332 @@ void test_ast_code_node_ownership_rejects_duplicate_blocks() {
     duplicated->add_node(arena.create<aletheia::CodeNode>(first));
     ASSERT_TRUE(!aletheia::ast_has_unique_code_node_ownership(duplicated));
 
+    auto* break_block = arena.create<aletheia::BasicBlock>(176);
+    break_block->add_instruction(arena.create<aletheia::BreakInstr>());
+    auto* break_code = arena.create<aletheia::CodeNode>(break_block);
+    aletheia::AstNode* deep = break_code;
+    constexpr std::size_t deep_levels = 4096;
+    for (std::size_t index = 0; index < deep_levels; ++index) {
+        auto* sequence = arena.create<aletheia::SeqNode>();
+        sequence->add_node(deep);
+        deep = sequence;
+    }
+    ASSERT_TRUE(deep->does_end_with_break());
+    ASSERT_TRUE(deep->does_contain_break());
+    ASSERT_TRUE(!deep->does_end_with_continue());
+    ASSERT_TRUE(!deep->does_end_with_return());
+    std::vector<aletheia::AstNode*> deep_ends;
+    deep->get_end_nodes(deep_ends);
+    ASSERT_EQ(deep_ends.size(), 1U);
+    ASSERT_EQ(deep_ends[0], break_code);
+    std::vector<aletheia::CodeNode*> deep_interrupting;
+    deep->get_descendant_code_nodes_interrupting_ancestor_loop(
+        deep_interrupting);
+    ASSERT_EQ(deep_interrupting.size(), 1U);
+    ASSERT_EQ(deep_interrupting[0], break_code);
+    ASSERT_TRUE(aletheia::ast_has_unique_code_node_ownership(deep));
+    ASSERT_TRUE(aletheia::ast_contains_node(deep, break_code));
+    ASSERT_TRUE(aletheia::ast_contains_original_block(deep, break_block));
+    ASSERT_TRUE(!aletheia::ast_contains_original_block(deep, first));
+    std::vector<std::uint64_t> deep_block_ids;
+    ASSERT_TRUE(aletheia::collect_ast_original_block_ids(
+        deep, deep_block_ids));
+    ASSERT_EQ(deep_block_ids.size(), 1U);
+    ASSERT_EQ(deep_block_ids[0], 176U);
+    z3::context car_context;
+    std::unordered_map<
+        aletheia::TransitionBlock*,
+        logos::LogicCondition> no_reaching_conditions;
+    ASSERT_EQ(
+        aletheia::ConditionAwareRefinement::refine(
+            arena, car_context, deep, no_reaching_conditions),
+        deep);
+    DecompilerTask ast_simplification_task(0x5170);
+    auto deep_forest = std::make_unique<aletheia::AbstractSyntaxForest>();
+    deep_forest->set_root(deep);
+    ast_simplification_task.set_ast(std::move(deep_forest));
+    aletheia::AstExpressionSimplificationStage ast_simplification;
+    ast_simplification.execute(ast_simplification_task);
+    ASSERT_EQ(ast_simplification_task.ast()->root(), deep);
+
+    auto* cycle = arena.create<aletheia::SeqNode>();
+    cycle->add_node(cycle);
+    std::vector<aletheia::AstNode*> cycle_ends;
+    cycle->get_end_nodes(cycle_ends);
+    ASSERT_TRUE(cycle_ends.empty());
+    ASSERT_TRUE(!cycle->does_end_with_break());
+    ASSERT_TRUE(!cycle->does_contain_break());
+    ASSERT_TRUE(!aletheia::ast_has_unique_code_node_ownership(cycle));
+    ASSERT_TRUE(aletheia::ast_contains_node(cycle, cycle));
+    ASSERT_TRUE(!aletheia::ast_contains_node(cycle, break_code));
+    ASSERT_TRUE(!aletheia::ast_contains_original_block(cycle, break_block));
+    std::vector<std::uint64_t> cycle_block_ids{999U};
+    ASSERT_TRUE(!aletheia::collect_ast_original_block_ids(
+        cycle, cycle_block_ids));
+    ASSERT_EQ(cycle_block_ids.size(), 1U);
+    ASSERT_EQ(cycle_block_ids[0], 999U);
+    ASSERT_EQ(
+        aletheia::ConditionAwareRefinement::refine(
+            arena, car_context, cycle, no_reaching_conditions),
+        cycle);
+    auto cycle_forest = std::make_unique<aletheia::AbstractSyntaxForest>();
+    cycle_forest->set_root(cycle);
+    ast_simplification_task.set_ast(std::move(cycle_forest));
+    ast_simplification.execute(ast_simplification_task);
+    ASSERT_EQ(ast_simplification_task.ast()->root(), cycle);
+
     std::cout << "[+] test_ast_code_node_ownership_rejects_duplicate_blocks passed.\n";
+}
+
+void test_codegen_rejects_invalid_ast_structure() {
+    {
+        DecompilerTask task(0x5300);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(176);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        task.set_cfg(std::move(cfg));
+
+        auto forest = std::make_unique<AbstractSyntaxForest>();
+        auto* duplicated = task.arena().create<SeqNode>();
+        duplicated->add_node(task.arena().create<CodeNode>(block));
+        duplicated->add_node(task.arena().create<CodeNode>(block));
+        forest->set_root(duplicated);
+        task.set_ast(std::move(forest));
+
+        auto validation = validate_task_for_codegen(task);
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(
+            validation->find("duplicate CodeNode ownership")
+            != std::string::npos);
+
+        CodeVisitor visitor;
+        auto lines = visitor.generate_code(task);
+        ASSERT_EQ(lines.size(), 1U);
+        ASSERT_TRUE(
+            lines[0].find("rejected invalid IR")
+            != std::string::npos);
+        ASSERT_TRUE(visitor.has_unresolved_semantics());
+    }
+
+    {
+        DecompilerArena arena;
+        auto* forest = arena.create<AbstractSyntaxForest>();
+        auto* cycle = arena.create<SeqNode>();
+        cycle->add_node(cycle);
+        forest->set_root(cycle);
+
+        auto validation = validate_ast_for_codegen(forest);
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(
+            validation->find("AST structural cycle")
+            != std::string::npos);
+
+        CodeVisitor visitor;
+        auto lines = visitor.generate_code(forest);
+        ASSERT_EQ(lines.size(), 1U);
+        ASSERT_TRUE(
+            lines[0].find("rejected invalid IR")
+            != std::string::npos);
+        ASSERT_TRUE(visitor.has_unresolved_semantics());
+    }
+
+    {
+        DecompilerTask task(0x5310);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(177);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        auto* cycle = task.arena().create<Operation>(
+            OperationType::logical_not,
+            std::vector<Expression*>{
+                task.arena().create<Constant>(0, 1)},
+            1);
+        cycle->mutable_operands()[0] = cycle;
+        block->add_instruction(task.arena().create<Return>(
+            std::vector<Expression*>{cycle}));
+        task.set_cfg(std::move(cfg));
+
+        auto validation = validate_cfg_for_codegen(task.cfg());
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(
+            validation->find("CFG expression cycle")
+            != std::string::npos);
+
+        CodeVisitor visitor;
+        auto lines = visitor.generate_code(task);
+        ASSERT_EQ(lines.size(), 1U);
+        ASSERT_TRUE(
+            lines[0].find("rejected invalid IR")
+            != std::string::npos);
+        ASSERT_TRUE(visitor.has_unresolved_semantics());
+
+        CExpressionGenerator expression_generator({
+            .portable_c = true,
+        });
+        ASSERT_EQ(
+            expression_generator.generate(cycle),
+            "__aletheia_expr_cycle");
+        ASSERT_TRUE(
+            expression_generator.has_unresolved_semantics());
+    }
+
+    {
+        DecompilerTask task(0x5320);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(178);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        auto* invalid_parameter =
+            task.arena().create<Variable>("renamed_parameter", 4);
+        invalid_parameter->set_kind(VariableKind::Parameter);
+        invalid_parameter->set_parameter_index(1);
+        block->add_instruction(task.arena().create<Return>(
+            std::vector<Expression*>{invalid_parameter}));
+        task.set_cfg(std::move(cfg));
+        task.set_function_type(std::make_shared<const FunctionTypeDef>(
+            Integer::int32_t(),
+            std::vector<TypePtr>{Integer::int32_t()}));
+
+        auto validation = validate_cfg_for_codegen(task);
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(validation->find("outside declared parameter count 1")
+            != std::string::npos);
+
+        CodeVisitor visitor;
+        auto lines = visitor.generate_code(task);
+        ASSERT_EQ(lines.size(), 1U);
+        ASSERT_TRUE(lines[0].find("rejected invalid IR")
+            != std::string::npos);
+        ASSERT_TRUE(visitor.has_unresolved_semantics());
+    }
+
+    {
+        DecompilerTask task(0x5330);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(179);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        task.set_cfg(std::move(cfg));
+
+        auto* invalid_ast_variable =
+            task.arena().create<Variable>("local_with_index", 8);
+        invalid_ast_variable->set_parameter_index(0);
+        auto forest = std::make_unique<AbstractSyntaxForest>();
+        forest->set_root(
+            task.arena().create<ExprAstNode>(invalid_ast_variable));
+        task.set_ast(std::move(forest));
+
+        auto validation = validate_task_for_codegen(task);
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(validation->find("AST parameter metadata")
+            != std::string::npos);
+        ASSERT_TRUE(validation->find("non-parameter variable")
+            != std::string::npos);
+    }
+
+    {
+        DecompilerTask task(0x5340);
+        task.set_function_type(std::make_shared<const FunctionTypeDef>(
+            Integer::int32_t(),
+            std::vector<TypePtr>{Integer::int32_t()}));
+        task.set_parameter_register("x1", {
+            .name = "a2",
+            .index = 1,
+            .type = Integer::int32_t(),
+        });
+
+        auto validation = validate_cfg_for_codegen(task);
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(validation->find("parameter map metadata")
+            != std::string::npos);
+        ASSERT_TRUE(validation->find("outside declared parameter count 1")
+            != std::string::npos);
+    }
+
+    {
+        DecompilerTask task(0x5350);
+        auto cfg = std::make_unique<ControlFlowGraph>();
+        auto* block = task.arena().create<BasicBlock>(180);
+        cfg->set_entry_block(block);
+        cfg->add_block(block);
+        auto* deep_leaf = task.arena().create<Variable>("deep_leaf", 1);
+        Expression* deep_expression = deep_leaf;
+        for (std::size_t depth = 0;
+             depth < pipeline_detail::kMaxCodegenExpressionDepth + 32;
+             ++depth) {
+            deep_expression = task.arena().create<Operation>(
+                OperationType::logical_not,
+                std::vector<Expression*>{deep_expression},
+                1);
+        }
+        block->add_instruction(task.arena().create<Return>(
+            std::vector<Expression*>{deep_expression}));
+        task.set_cfg(std::move(cfg));
+
+        std::unordered_set<Variable*> deep_requirements;
+        deep_expression->collect_requirements(deep_requirements);
+        ASSERT_EQ(deep_requirements.size(), 1U);
+        ASSERT_TRUE(deep_requirements.contains(deep_leaf));
+
+        auto* replacement_leaf =
+            task.arena().create<Variable>("replacement_leaf", 1);
+        deep_expression->substitute(deep_leaf, replacement_leaf);
+        deep_requirements.clear();
+        deep_expression->collect_requirements(deep_requirements);
+        ASSERT_EQ(deep_requirements.size(), 1U);
+        ASSERT_TRUE(deep_requirements.contains(replacement_leaf));
+        ASSERT_TRUE(!deep_requirements.contains(deep_leaf));
+
+        const auto validation = validate_cfg_for_codegen(task);
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(validation->find("depth limit") != std::string::npos);
+
+        CodeVisitor visitor({.portable_c = true});
+        const auto lines = visitor.generate_code(task);
+        ASSERT_EQ(lines.size(), 1U);
+        ASSERT_TRUE(lines[0].find("rejected invalid IR")
+            != std::string::npos);
+        ASSERT_TRUE(visitor.has_unresolved_semantics());
+
+        CExpressionGenerator expression_generator({.portable_c = true});
+        ASSERT_EQ(
+            expression_generator.generate(deep_expression),
+            std::string("__aletheia_expr_depth_limit"));
+        ASSERT_TRUE(expression_generator.has_unresolved_semantics());
+    }
+
+    {
+        DecompilerArena arena;
+        auto* forest = arena.create<AbstractSyntaxForest>();
+        AstNode* deep_ast = arena.create<ExprAstNode>(
+            arena.create<Constant>(1, 1));
+        for (std::size_t depth = 0;
+             depth < pipeline_detail::kMaxCodegenAstDepth + 32;
+             ++depth) {
+            auto* sequence = arena.create<SeqNode>();
+            sequence->add_node(deep_ast);
+            deep_ast = sequence;
+        }
+        forest->set_root(deep_ast);
+
+        const auto validation = validate_ast_for_codegen(forest);
+        ASSERT_TRUE(validation.has_value());
+        ASSERT_TRUE(validation->find("AST complexity")
+            != std::string::npos);
+        ASSERT_TRUE(validation->find("depth limit")
+            != std::string::npos);
+
+        CodeVisitor visitor({.portable_c = true});
+        const auto lines = visitor.generate_code(forest);
+        ASSERT_EQ(lines.size(), 1U);
+        ASSERT_TRUE(lines[0].find("rejected invalid IR")
+            != std::string::npos);
+        ASSERT_TRUE(visitor.has_unresolved_semantics());
+    }
+
+    std::cout
+        << "[+] test_codegen_rejects_invalid_ast_structure passed.\n";
 }
 
 void test_loop_name_generator_for_counters() {
@@ -2555,6 +3974,34 @@ void test_instruction_length_handler() {
                         dynamic_cast<aletheia::Constant*>(operand) != nullptr);
         }
     }
+
+    aletheia::Expression* deep_expression = a;
+    constexpr std::size_t deep_levels = 4096;
+    for (std::size_t index = 0; index < deep_levels; ++index) {
+        deep_expression = arena.create<aletheia::Operation>(
+            aletheia::OperationType::negate,
+            std::vector<aletheia::Expression*>{deep_expression},
+            4);
+    }
+    auto* deep_block = arena.create<aletheia::BasicBlock>(177);
+    deep_block->add_instruction(arena.create<aletheia::Return>(
+        std::vector<aletheia::Expression*>{deep_expression}));
+    aletheia::AstNode* deep_ast =
+        arena.create<aletheia::CodeNode>(deep_block);
+    for (std::size_t index = 0; index < deep_levels; ++index) {
+        auto* wrapper = arena.create<aletheia::SeqNode>();
+        wrapper->add_node(deep_ast);
+        deep_ast = wrapper;
+    }
+    forest->set_root(deep_ast);
+    aletheia::InstructionLengthHandler::apply(forest, arena, bounds);
+    ASSERT_EQ(deep_block->instructions().size(), 1U);
+
+    auto* cycle = arena.create<aletheia::SeqNode>();
+    cycle->add_node(cycle);
+    forest->set_root(cycle);
+    aletheia::InstructionLengthHandler::apply(forest, arena, bounds);
+    ASSERT_EQ(forest->root(), cycle);
 
     std::cout << "[+] test_instruction_length_handler passed.\n";
 }
@@ -2794,6 +4241,74 @@ void test_cbr_cnf_subexpression_grouping() {
     ASSERT_TRUE(grouped_cond2->expr() == cond_c);
 
     std::cout << "[+] test_cbr_cnf_subexpression_grouping passed.\n";
+}
+
+void test_cbr_does_not_group_textually_equal_non_equivalent_clauses() {
+    z3::context ctx;
+    aletheia::DecompilerArena arena;
+
+    auto make_global_clause = [&](bool represents_address) {
+        auto* global = arena.create<aletheia::GlobalVariable>("g", 8);
+        global->set_represents_address(represents_address);
+        return arena.create<aletheia::Condition>(
+            aletheia::OperationType::eq,
+            global,
+            arena.create<aletheia::Constant>(0, 8),
+            1);
+    };
+    auto* value_clause = make_global_clause(false);
+    auto* address_clause = make_global_clause(true);
+    ASSERT_EQ(
+        expression_fingerprint_hash(value_clause),
+        expression_fingerprint_hash(address_clause));
+    ASSERT_TRUE(!expressions_structurally_equal(
+        value_clause, address_clause));
+
+    auto* left = arena.create<aletheia::Operation>(
+        aletheia::OperationType::logical_and,
+        std::vector<aletheia::Expression*>{
+            value_clause,
+            arena.create<aletheia::Condition>(
+                aletheia::OperationType::eq,
+                arena.create<aletheia::Variable>("x", 4),
+                arena.create<aletheia::Constant>(1, 4),
+                1),
+        },
+        1);
+    auto* right = arena.create<aletheia::Operation>(
+        aletheia::OperationType::logical_and,
+        std::vector<aletheia::Expression*>{
+            address_clause,
+            arena.create<aletheia::Condition>(
+                aletheia::OperationType::eq,
+                arena.create<aletheia::Variable>("y", 4),
+                arena.create<aletheia::Constant>(2, 4),
+                1),
+        },
+        1);
+
+    auto* first_body = arena.create<aletheia::BasicBlock>(144);
+    auto* second_body = arena.create<aletheia::BasicBlock>(145);
+    auto* sequence = arena.create<aletheia::SeqNode>();
+    sequence->add_node(arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(left),
+        arena.create<aletheia::CodeNode>(first_body)));
+    sequence->add_node(arena.create<aletheia::IfNode>(
+        arena.create<aletheia::ExprAstNode>(right),
+        arena.create<aletheia::CodeNode>(second_body)));
+
+    auto* refined = aletheia::ConditionBasedRefinement::refine(
+        arena,
+        ctx,
+        sequence,
+        std::unordered_map<
+            aletheia::TransitionBlock*, logos::LogicCondition>{});
+    auto* refined_sequence = dynamic_cast<aletheia::SeqNode*>(refined);
+    ASSERT_TRUE(refined_sequence != nullptr);
+    ASSERT_EQ(refined_sequence->nodes().size(), 2U);
+
+    std::cout
+        << "[+] test_cbr_does_not_group_textually_equal_non_equivalent_clauses passed.\n";
 }
 
 void test_car_initial_switch_constructor() {
@@ -3621,6 +5136,115 @@ void test_phi_function_fixer_stage() {
     std::cout << "[+] test_phi_function_fixer_stage passed.\n";
 }
 
+void test_dead_code_elimination_preserves_phi_origin_definitions() {
+    DecompilerTask task(0x5380);
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* entry = task.arena().create<BasicBlock>(34);
+    auto* left = task.arena().create<BasicBlock>(35);
+    auto* right = task.arena().create<BasicBlock>(36);
+    auto* join = task.arena().create<BasicBlock>(37);
+    cfg->set_entry_block(entry);
+    cfg->add_block(entry);
+    cfg->add_block(left);
+    cfg->add_block(right);
+    cfg->add_block(join);
+    task.set_cfg(std::move(cfg));
+
+    auto* e0 = task.arena().create<Edge>(entry, left, EdgeType::True);
+    auto* e1 = task.arena().create<Edge>(entry, right, EdgeType::False);
+    auto* e2 = task.arena().create<Edge>(left, join, EdgeType::Unconditional);
+    auto* e3 = task.arena().create<Edge>(right, join, EdgeType::Unconditional);
+    entry->add_successor(e0);
+    entry->add_successor(e1);
+    left->add_predecessor(e0);
+    right->add_predecessor(e1);
+    left->add_successor(e2);
+    right->add_successor(e3);
+    join->add_predecessor(e2);
+    join->add_predecessor(e3);
+
+    auto* x1 = task.arena().create<Variable>("x", 8);
+    x1->set_ssa_version(1);
+    auto* x2 = task.arena().create<Variable>("x", 8);
+    x2->set_ssa_version(2);
+    auto* x3 = task.arena().create<Variable>("x", 8);
+    x3->set_ssa_version(3);
+    left->add_instruction(task.arena().create<Assignment>(
+        x1, task.arena().create<Constant>(0x1111, 8)));
+    right->add_instruction(task.arena().create<Assignment>(
+        x2, task.arena().create<Constant>(0x2222, 8)));
+
+    // Model a repaired phi whose origin map is authoritative while its
+    // positional list has not been rebuilt.
+    auto* phi = task.arena().create<Phi>(
+        x3, task.arena().create<ListOperation>(std::vector<Expression*>{}, 8));
+    phi->update_phi_function({{left, x1}, {right, x2}});
+    join->add_instruction(phi);
+    join->add_instruction(task.arena().create<Return>(std::vector<Expression*>{x3}));
+
+    DeadCodeEliminationStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(left->instructions().size(), 1U);
+    ASSERT_EQ(right->instructions().size(), 1U);
+    ASSERT_TRUE(isa<Assignment>(left->instructions().front()));
+    ASSERT_TRUE(isa<Assignment>(right->instructions().front()));
+
+    std::cout << "[+] test_dead_code_elimination_preserves_phi_origin_definitions passed.\n";
+}
+
+void test_return_definition_sanity_does_not_truncate_usage_successor() {
+    aletheia::DecompilerTask task(0x2400);
+    auto& arena = task.arena();
+    auto cfg = std::make_unique<aletheia::ControlFlowGraph>();
+    auto* usage = arena.create<aletheia::BasicBlock>(0);
+    auto* detail = arena.create<aletheia::BasicBlock>(1);
+    cfg->set_entry_block(usage);
+    cfg->add_block(usage);
+    cfg->add_block(detail);
+    auto* edge = arena.create<aletheia::Edge>(
+        usage, detail, aletheia::EdgeType::Unconditional);
+    usage->add_successor(edge);
+    detail->add_predecessor(edge);
+
+    auto make_call = [&](std::string name, std::vector<aletheia::Expression*> arguments) {
+        auto* target = arena.create<aletheia::GlobalVariable>(std::move(name), 8);
+        return arena.create<aletheia::Call>(target, std::move(arguments), 4);
+    };
+    usage->add_instruction(arena.create<aletheia::Assignment>(
+        nullptr,
+        make_call("_strtol", {
+            arena.create<aletheia::Variable>("text", 8),
+            arena.create<aletheia::Variable>("end", 8),
+            arena.create<aletheia::Constant>(10, 4)})));
+    usage->add_instruction(arena.create<aletheia::Assignment>(
+        nullptr,
+        make_call("_fprintf", {
+            arena.create<aletheia::Variable>("stream", 8),
+            arena.create<aletheia::GlobalVariable>("\"Usage: %s [n]\\n\"", 8)})));
+    detail->add_instruction(arena.create<aletheia::Assignment>(
+        nullptr,
+        make_call("_fprintf", {
+            arena.create<aletheia::Variable>("stream", 8),
+            arena.create<aletheia::GlobalVariable>("\"details\\n\"", 8)})));
+    detail->add_instruction(arena.create<aletheia::Return>(
+        std::vector<aletheia::Expression*>{arena.create<aletheia::Constant>(1, 4)}));
+    task.set_cfg(std::move(cfg));
+
+    aletheia::ReturnDefinitionSanityStage stage;
+    stage.execute(task);
+    ASSERT_TRUE(!task.failed());
+    ASSERT_TRUE(std::none_of(
+        usage->instructions().begin(), usage->instructions().end(),
+        [](aletheia::Instruction* instruction) {
+            return aletheia::isa<aletheia::Return>(instruction);
+        }));
+    ASSERT_EQ(usage->successors().size(), 1U);
+    ASSERT_TRUE(aletheia::isa<aletheia::Return>(detail->instructions().back()));
+
+    std::cout << "[+] test_return_definition_sanity_does_not_truncate_usage_successor passed.\n";
+}
+
 void test_identity_elimination_stage() {
     DecompilerTask task(0x7000);
 
@@ -4261,6 +5885,54 @@ void test_common_subexpression_definition_generator_stage() {
     std::cout << "[+] test_common_subexpression_definition_generator_stage passed.\n";
 }
 
+void test_common_subexpression_rejects_matching_hash_width_collision() {
+    DecompilerTask task(0x7210);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* entry = task.arena().create<BasicBlock>(61);
+    auto* child = task.arena().create<BasicBlock>(62);
+    cfg->set_entry_block(entry);
+    cfg->add_block(entry);
+    cfg->add_block(child);
+    task.set_cfg(std::move(cfg));
+
+    auto* edge = task.arena().create<Edge>(
+        entry, child, EdgeType::Unconditional);
+    entry->add_successor(edge);
+    child->add_predecessor(edge);
+
+    const auto make_add = [&](std::size_t result_width) {
+        return task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{
+                task.arena().create<Variable>("x", 8),
+                task.arena().create<Variable>("y", 8),
+            },
+            result_width);
+    };
+
+    Operation* narrow = make_add(4);
+    Operation* wide = make_add(8);
+    ASSERT_EQ(
+        expression_fingerprint_hash(narrow),
+        expression_fingerprint_hash(wide));
+    entry->add_instruction(task.arena().create<Assignment>(
+        task.arena().create<Variable>("narrow", 4), narrow));
+    auto* wide_assignment = task.arena().create<Assignment>(
+        task.arena().create<Variable>("wide", 8), wide);
+    child->add_instruction(wide_assignment);
+
+    CommonSubexpressionEliminationStage stage;
+    stage.execute(task);
+
+    auto* retained = dyn_cast<Operation>(wide_assignment->value());
+    ASSERT_TRUE(retained != nullptr);
+    ASSERT_EQ(retained->size_bytes, 8U);
+
+    std::cout
+        << "[+] test_common_subexpression_rejects_matching_hash_width_collision passed.\n";
+}
+
 void test_expression_simplification_collapse_constants() {
     DecompilerTask task(0x7300);
 
@@ -4755,6 +6427,133 @@ void test_dead_component_pruner_stage() {
     std::cout << "[+] test_dead_component_pruner_stage passed.\n";
 }
 
+void test_dead_component_pruner_preserves_aliased_write_dependencies() {
+    DecompilerTask task(0x7840);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(751);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* input = task.arena().create<Variable>("input", 8);
+    auto* cse = task.arena().create<Variable>("cse", 8);
+    auto* observable = task.arena().create<Variable>("observable", 8);
+    observable->set_aliased(true);
+
+    auto* cse_definition = task.arena().create<Assignment>(
+        cse,
+        task.arena().create<Operation>(
+            OperationType::mul,
+            std::vector<Expression*>{
+                input,
+                task.arena().create<Constant>(2, 8)},
+            8));
+    auto* aliased_write = task.arena().create<Assignment>(
+        observable,
+        task.arena().create<Operation>(
+            OperationType::add,
+            std::vector<Expression*>{
+                cse,
+                task.arena().create<Constant>(1, 8)},
+            8));
+    auto* ret = task.arena().create<Return>(
+        std::vector<Expression*>{task.arena().create<Constant>(0, 4)});
+
+    bb->add_instruction(cse_definition);
+    bb->add_instruction(aliased_write);
+    bb->add_instruction(ret);
+
+    DeadComponentPrunerStage stage;
+    stage.execute(task);
+
+    const auto& insts = bb->instructions();
+    ASSERT_EQ(insts.size(), 3U);
+    ASSERT_TRUE(insts[0] == cse_definition);
+    ASSERT_TRUE(insts[1] == aliased_write);
+    ASSERT_TRUE(insts[2] == ret);
+
+    std::cout << "[+] test_dead_component_pruner_preserves_aliased_write_dependencies passed.\n";
+}
+
+void test_dead_component_pruner_coalesces_timespec_stack_fields() {
+    DecompilerTask task(0x7880);
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(76);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* seconds = task.arena().create<Variable>("arg_0", 8);
+    seconds->set_kind(VariableKind::StackLocal);
+    seconds->set_stack_offset(0);
+    auto* nanoseconds = task.arena().create<Variable>("arg_8", 8);
+    nanoseconds->set_kind(VariableKind::StackLocal);
+    nanoseconds->set_stack_offset(8);
+    auto* pointer = task.arena().create<Variable>("tmp_ptr", 8);
+    auto* address = task.arena().create<Operation>(
+        OperationType::address_of,
+        std::vector<Expression*>{seconds},
+        8);
+    auto* pointer_definition = task.arena().create<Assignment>(pointer, address);
+    bb->add_instruction(pointer_definition);
+
+    auto* target = task.arena().create<GlobalVariable>("_clock_gettime", 8, nullptr, false);
+    auto* call = task.arena().create<Call>(
+        target,
+        std::vector<Expression*>{task.arena().create<Constant>(6, 4), pointer},
+        4);
+    auto* call_result = task.arena().create<Variable>("call_result", 4);
+    bb->add_instruction(task.arena().create<Assignment>(call_result, call));
+
+    auto* forwarded_field = task.arena().create<Variable>("forwarded_field", 8);
+    bb->add_instruction(task.arena().create<Assignment>(
+        forwarded_field, seconds->copy(task.arena())));
+    auto* second_pointer = task.arena().create<Variable>("tmp_ptr_2", 8);
+    auto* second_address = task.arena().create<Operation>(
+        OperationType::address_of,
+        std::vector<Expression*>{forwarded_field},
+        8);
+    bb->add_instruction(task.arena().create<Assignment>(second_pointer, second_address));
+    auto* second_call = task.arena().create<Call>(
+        target->copy(task.arena()),
+        std::vector<Expression*>{task.arena().create<Constant>(6, 4), second_pointer},
+        4);
+    auto* second_result = task.arena().create<Variable>("call_result_2", 4);
+    bb->add_instruction(task.arena().create<Assignment>(second_result, second_call));
+
+    auto* sum = task.arena().create<Operation>(
+        OperationType::add,
+        std::vector<Expression*>{seconds->copy(task.arena()), nanoseconds},
+        8);
+    auto* ret = task.arena().create<Return>(std::vector<Expression*>{sum});
+    bb->add_instruction(ret);
+
+    DeadComponentPrunerStage stage;
+    stage.execute(task);
+
+    auto* rewritten_address = dyn_cast<Operation>(pointer_definition->value());
+    ASSERT_TRUE(rewritten_address != nullptr);
+    ASSERT_EQ(rewritten_address->type(), OperationType::address_of);
+    auto* aggregate = dyn_cast<Variable>(rewritten_address->operands()[0]);
+    ASSERT_TRUE(aggregate != nullptr);
+    ASSERT_EQ(aggregate->size_bytes, 16U);
+    auto* rewritten_second_base = dyn_cast<Variable>(second_address->operands()[0]);
+    ASSERT_TRUE(rewritten_second_base != nullptr);
+    ASSERT_EQ(rewritten_second_base->name(), aggregate->name());
+    ASSERT_EQ(rewritten_second_base->size_bytes, 16U);
+
+    bool saw_aggregate = false;
+    for (Variable* requirement : ret->requirements()) {
+        ASSERT_TRUE(requirement->name() != "arg_0");
+        ASSERT_TRUE(requirement->name() != "arg_8");
+        saw_aggregate = saw_aggregate || requirement->name() == "ts";
+    }
+    ASSERT_TRUE(saw_aggregate);
+
+    std::cout << "[+] test_dead_component_pruner_coalesces_timespec_stack_fields passed.\n";
+}
+
 void test_edge_pruner_stage() {
     DecompilerTask task(0x7c00);
 
@@ -4821,6 +6620,161 @@ void test_edge_pruner_stage() {
     ASSERT_EQ(b_value->name(), tmp_var->name());
 
     std::cout << "[+] test_edge_pruner_stage passed.\n";
+}
+
+void test_edge_pruner_does_not_hoist_aliased_reads_across_calls() {
+    DecompilerTask task(0x7c10);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(80);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* aggregate = task.arena().create<Variable>("aggregate", 16);
+    aggregate->set_aliased(true);
+    auto* before = task.arena().create<Variable>("before", 8);
+    auto* after = task.arena().create<Variable>("after", 8);
+    auto* call_result = task.arena().create<Variable>("call_result", 8);
+    auto* call_target = task.arena().create<GlobalVariable>("mutate", 8);
+
+    const auto make_high_read = [&]() -> Expression* {
+        return task.arena().create<Operation>(
+            OperationType::cast,
+            std::vector<Expression*>{
+                task.arena().create<Operation>(
+                    OperationType::shr_us,
+                    std::vector<Expression*>{
+                        aggregate->copy(task.arena()),
+                        task.arena().create<Constant>(64, 8)},
+                    16)},
+            8);
+    };
+
+    bb->add_instruction(task.arena().create<Assignment>(before, make_high_read()));
+    bb->add_instruction(task.arena().create<Assignment>(
+        call_result,
+        task.arena().create<Call>(
+            call_target,
+            std::vector<Expression*>{},
+            8)));
+    bb->add_instruction(task.arena().create<Assignment>(after, make_high_read()));
+    bb->add_instruction(task.arena().create<Return>(std::vector<Expression*>{after}));
+
+    EdgePrunerStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(bb->instructions().size(), 4U);
+    auto* before_assignment = dynamic_cast<Assignment*>(bb->instructions()[0]);
+    auto* after_assignment = dynamic_cast<Assignment*>(bb->instructions()[2]);
+    ASSERT_TRUE(before_assignment != nullptr);
+    ASSERT_TRUE(after_assignment != nullptr);
+    ASSERT_TRUE(dynamic_cast<Operation*>(before_assignment->value()) != nullptr);
+    ASSERT_TRUE(dynamic_cast<Operation*>(after_assignment->value()) != nullptr);
+
+    std::cout << "[+] test_edge_pruner_does_not_hoist_aliased_reads_across_calls passed.\n";
+}
+
+void test_edge_pruner_rejects_matching_hash_width_collision() {
+    DecompilerTask task(0x7c18);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(81);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    const auto make_expression = [&](std::size_t result_width) {
+        return task.arena().create<Operation>(
+            OperationType::mul,
+            std::vector<Expression*>{
+                task.arena().create<Operation>(
+                    OperationType::add,
+                    std::vector<Expression*>{
+                        task.arena().create<Variable>("x", 8),
+                        task.arena().create<Variable>("y", 8),
+                    },
+                    8),
+                task.arena().create<Variable>("z", 8),
+            },
+            result_width);
+    };
+
+    Operation* narrow = make_expression(4);
+    Operation* wide = make_expression(8);
+    ASSERT_EQ(
+        expression_fingerprint_hash(narrow),
+        expression_fingerprint_hash(wide));
+    auto* narrow_assignment = task.arena().create<Assignment>(
+        task.arena().create<Variable>("narrow", 4), narrow);
+    auto* wide_assignment = task.arena().create<Assignment>(
+        task.arena().create<Variable>("wide", 8), wide);
+    bb->add_instruction(narrow_assignment);
+    bb->add_instruction(wide_assignment);
+    bb->add_instruction(task.arena().create<Return>(
+        std::vector<Expression*>{
+            task.arena().create<Variable>("wide", 8)}));
+
+    EdgePrunerStage stage;
+    stage.execute(task);
+
+    // The common inner add may be hoisted, but the colliding outer expressions
+    // must remain distinct because their result widths differ.
+    ASSERT_EQ(bb->instructions().size(), 4U);
+    ASSERT_TRUE(dyn_cast<Operation>(narrow_assignment->value()) != nullptr);
+    ASSERT_TRUE(dyn_cast<Operation>(wide_assignment->value()) != nullptr);
+    ASSERT_EQ(wide_assignment->value()->size_bytes, 8U);
+
+    std::cout
+        << "[+] test_edge_pruner_rejects_matching_hash_width_collision passed.\n";
+}
+
+void test_redundant_assignment_elimination_uses_out_of_ssa_liveness() {
+    DecompilerTask task(0x7c20);
+
+    auto cfg = std::make_unique<ControlFlowGraph>();
+    auto* bb = task.arena().create<BasicBlock>(82);
+    cfg->set_entry_block(bb);
+    cfg->add_block(bb);
+    task.set_cfg(std::move(cfg));
+
+    auto* value = task.arena().create<Variable>("value", 8);
+    auto* undefined_source = task.arena().create<Variable>("undefined_source", 8);
+    auto* aliased = task.arena().create<Variable>("aliased", 8);
+    aliased->set_aliased(true);
+    auto* call_result = task.arena().create<Variable>("call_result", 8);
+    auto* call_target = task.arena().create<GlobalVariable>("side_effect", 8);
+
+    bb->add_instruction(task.arena().create<Assignment>(value, undefined_source));
+    bb->add_instruction(task.arena().create<Assignment>(
+        value, task.arena().create<Constant>(7, 8)));
+    bb->add_instruction(task.arena().create<Assignment>(
+        aliased, task.arena().create<Constant>(9, 8)));
+    bb->add_instruction(task.arena().create<Assignment>(
+        call_result,
+        task.arena().create<Call>(
+            call_target,
+            std::vector<Expression*>{
+                task.arena().create<Operation>(
+                    OperationType::address_of,
+                    std::vector<Expression*>{aliased},
+                    8)},
+            8)));
+    bb->add_instruction(task.arena().create<Return>(std::vector<Expression*>{value}));
+
+    RedundantAssignmentEliminationStage stage;
+    stage.execute(task);
+
+    ASSERT_EQ(bb->instructions().size(), 4U);
+    auto* first = dynamic_cast<Assignment*>(bb->instructions()[0]);
+    ASSERT_TRUE(first != nullptr);
+    ASSERT_TRUE(dynamic_cast<Constant*>(first->value()) != nullptr);
+    ASSERT_EQ(dynamic_cast<Constant*>(first->value())->value(), 7U);
+    ASSERT_TRUE(dynamic_cast<Assignment*>(bb->instructions()[1]) != nullptr);
+    ASSERT_TRUE(dynamic_cast<Call*>(
+        dynamic_cast<Assignment*>(bb->instructions()[2])->value()) != nullptr);
+
+    std::cout << "[+] test_redundant_assignment_elimination_uses_out_of_ssa_liveness passed.\n";
 }
 
 void test_bitfield_comparison_unrolling_stage() {
@@ -5318,8 +7272,11 @@ void test_e2e_diamond_if_else() {
     // Verify the pipeline produced *some* output beyond just the function shell.
     if (lines.size() < 3) dump_pseudocode("test_e2e_diamond_if_else", lines);
     ASSERT_TRUE(lines.size() >= 3);  // at least: signature, something, closing brace
-    // With structuring + fallback, we expect at least the function shell and some body content.
     ASSERT_TRUE(output_contains(lines, "diamond"));  // function name in output
+    ASSERT_TRUE(output_contains(lines, "if"));
+    ASSERT_TRUE(output_contains(lines, "else"));
+    ASSERT_TRUE(output_contains(lines, "1"));
+    ASSERT_TRUE(output_contains(lines, "2"));
 
     std::cout << "[+] test_e2e_diamond_if_else passed.\n";
 }
@@ -5907,10 +7864,7 @@ void test_e2e_dead_code_elimination() {
 // Expected: if / else if / else chain.
 // ---------------------------------------------------------------------------
 void test_e2e_if_else_chain() {
-    // Heap-allocate and intentionally leak to avoid arena destructor hang.
-    // TODO: investigate and fix the arena destructor hang for multi-block CFGs.
-    auto* taskp = new DecompilerTask(0xE900);
-    auto& task = *taskp;
+    DecompilerTask task(0xE900);
     auto& arena = task.arena();
 
     auto cfg = std::make_unique<ControlFlowGraph>();
@@ -5926,6 +7880,8 @@ void test_e2e_if_else_chain() {
 
     // entry: if (x < 0)
     auto* x = arena.create<Variable>("x", 4);
+    x->set_kind(VariableKind::Parameter);
+    x->set_parameter_index(0);
     entry->add_instruction(arena.create<Branch>(
         arena.create<Condition>(OperationType::lt, x,
             arena.create<Constant>(0, 4))));
@@ -5937,6 +7893,8 @@ void test_e2e_if_else_chain() {
 
     // check_zero: if (x == 0)
     auto* x2 = arena.create<Variable>("x", 4);
+    x2->set_kind(VariableKind::Parameter);
+    x2->set_parameter_index(0);
     check_zero->add_instruction(arena.create<Branch>(
         arena.create<Condition>(OperationType::eq, x2,
             arena.create<Constant>(0, 4))));
@@ -5965,35 +7923,30 @@ void test_e2e_if_else_chain() {
     task.set_function_type(std::make_shared<const FunctionTypeDef>(
         Integer::int32_t(),
         std::vector<TypePtr>{Integer::int32_t()}));
-
-    // Run pipeline WITHOUT structuring to avoid Z3 destructor hang at cleanup.
-    // This still tests SSA, propagation, simplification, DCE, and out-of-SSA.
-    {
-        DecompilerPipeline pipeline;
-        pipeline.add_stage(std::make_unique<SsaConstructor>());
-        pipeline.add_stage(std::make_unique<GraphExpressionFoldingStage>());
-        pipeline.add_stage(std::make_unique<ExpressionPropagationStage>());
-        pipeline.add_stage(std::make_unique<ExpressionSimplificationStage>());
-        pipeline.add_stage(std::make_unique<DeadCodeEliminationStage>());
-        pipeline.add_stage(std::make_unique<SsaDestructor>());
-        pipeline.run(task);
-    }
-    // Build flat AST from CFG blocks.
-    build_flat_ast(task);
+    run_e2e_pipeline(task);
+    ASSERT_TRUE(!task.failed());
+    ASSERT_TRUE(task.ast() != nullptr);
+    ASSERT_TRUE(task.ast()->root() != nullptr);
 
     CodeVisitor visitor;
     auto lines = visitor.generate_code(task);
 
     dump_pseudocode("test_e2e_if_else_chain", lines);
-    // At minimum the function name and some control flow or content must appear.
     ASSERT_TRUE(output_contains(lines, "classify"));
-    // Should have at least some branching or return content.
-    bool has_content = output_contains(lines, "if") ||
-                       output_contains(lines, "branch") ||
-                       output_contains(lines, "return") ||
-                       output_contains(lines, "<") ||
-                       output_contains(lines, "==");
-    ASSERT_TRUE(has_content);
+    std::size_t structured_if_count = 0;
+    for (const std::string& line : lines) {
+        if (line.find("if (") != std::string::npos) {
+            ++structured_if_count;
+        }
+    }
+    ASSERT_TRUE(structured_if_count >= 2U);
+    ASSERT_TRUE(!output_contains(lines, "goto bb_"));
+    ASSERT_TRUE(!output_contains(lines, "var_"));
+    ASSERT_TRUE(output_contains(lines, "if (a1 < 0)"));
+    ASSERT_TRUE(output_contains(lines, "if (a1 != 0)"));
+    ASSERT_TRUE(output_contains(lines, "return -1"));
+    ASSERT_TRUE(output_contains(lines, "return 0"));
+    ASSERT_TRUE(output_contains(lines, "return 1"));
 
     std::cout << "[+] test_e2e_if_else_chain passed." << std::endl;
 }
@@ -6018,8 +7971,11 @@ int main() {
     test_codegen_operator_precedence();
     test_codegen_compound_assignment_increment();
     test_codegen_constant_formatting();
+    test_codegen_parameter_display_respects_storage_kind();
     test_codegen_unknown_operation_placeholder();
     test_codegen_scalar_list_is_explicitly_unresolved();
+    test_portable_codegen_resolved_call_uses_declared_symbol_abi();
+    test_portable_codegen_distinguishes_global_address_and_lvalue();
     test_codegen_fallback_branch_marker();
     test_codegen_if_branch_swapping();
     test_codegen_return_type_reconciliation();
@@ -6031,6 +7987,7 @@ int main() {
     test_variable_name_generation_skips_globals();
     test_post_rename_cleanup_preserves_ast_condition_definition();
     test_ast_code_node_ownership_rejects_duplicate_blocks();
+    test_codegen_rejects_invalid_ast_structure();
     test_loop_name_generator_for_counters();
     test_loop_name_generator_while_counters();
     test_instruction_length_handler();
@@ -6038,6 +7995,7 @@ int main() {
     test_transition_cfg_switch_tags();
     test_cbr_complementary_conditions();
     test_cbr_cnf_subexpression_grouping();
+    test_cbr_does_not_group_textually_equal_non_equivalent_clauses();
     test_car_initial_switch_constructor();
     test_car_switch_extractor_and_missing_case_sequence();
     test_car_missing_case_finder_condition();
@@ -6054,6 +8012,8 @@ int main() {
     test_phi_lifting_edge_splitting();
     test_instruction_hierarchy();
     test_minimal_variable_renamer();
+    test_minimal_variable_renamer_separates_x0_pointer_and_integer_roles();
+    test_cfg_variable_naming_unifies_inconsistent_stack_metadata();
     test_graph_expression_folding_rewrites_store_address();
     test_graph_expression_folding_preserves_per_use_type();
     test_graph_expression_folding_rejects_identity_cycles();
@@ -6068,11 +8028,17 @@ int main() {
     test_remove_noreturn_boilerplate_stage();
     test_insert_missing_definitions_stage();
     test_phi_function_fixer_stage();
+    test_dead_code_elimination_preserves_phi_origin_definitions();
+    test_return_definition_sanity_does_not_truncate_usage_successor();
     test_identity_elimination_stage();
     test_expression_propagation_function_call_target_canonicalization();
     test_common_subexpression_existing_replacer_stage();
     test_common_subexpression_definition_generator_stage();
+    test_common_subexpression_rejects_matching_hash_width_collision();
     test_edge_pruner_stage();
+    test_edge_pruner_does_not_hoist_aliased_reads_across_calls();
+    test_edge_pruner_rejects_matching_hash_width_collision();
+    test_redundant_assignment_elimination_uses_out_of_ssa_liveness();
     test_bitfield_comparison_unrolling_stage();
     test_expression_simplification_collapse_constants();
     test_expression_simplification_trivial_arithmetic();
@@ -6082,6 +8048,8 @@ int main() {
     test_expression_simplification_linear_sub_chain();
     test_expression_simplification_preserves_phi_edge_selection();
     test_dead_component_pruner_stage();
+    test_dead_component_pruner_preserves_aliased_write_dependencies();
+    test_dead_component_pruner_coalesces_timespec_stack_fields();
     test_redundant_casts_elimination_stage();
     test_coherence_stage();
     test_type_propagation_stage();

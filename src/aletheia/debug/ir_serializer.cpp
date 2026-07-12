@@ -20,6 +20,8 @@ const char* operation_type_name(OperationType type) {
         case OperationType::mod_us:             return "mod_us";
         case OperationType::negate:             return "negate";
         case OperationType::power:              return "power";
+        case OperationType::popcount:           return "popcount";
+        case OperationType::lzcount:            return "lzcount";
         case OperationType::add_float:          return "add_float";
         case OperationType::sub_float:          return "sub_float";
         case OperationType::mul_float:          return "mul_float";
@@ -53,6 +55,7 @@ const char* operation_type_name(OperationType type) {
         case OperationType::address_of:         return "address_of";
         case OperationType::member_access:      return "member_access";
         case OperationType::cast:               return "cast";
+        case OperationType::bitcast:            return "bitcast";
         case OperationType::pointer:            return "pointer";
         case OperationType::low:                return "low";
         case OperationType::field:              return "field";
@@ -138,8 +141,12 @@ std::string ir_to_string(const Expression* expr,
 
         case NodeKind::Variable: {
             auto* v = cast<Variable>(expr);
-            return std::format("var:{}_{} {}",
-                               v->name(), v->ssa_version(), size_tag(v->size_bytes));
+            const std::string semantic_type = v->ir_type()
+                ? v->ir_type()->to_string() : "?";
+            return std::format("var:{}_{} {}{{{},{}@{}}}",
+                               v->name(), v->ssa_version(), size_tag(v->size_bytes),
+                               semantic_type, variable_kind_name(v->kind()),
+                               v->stack_offset());
         }
 
         case NodeKind::Call: {

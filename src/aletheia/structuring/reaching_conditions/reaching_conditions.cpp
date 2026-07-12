@@ -10,41 +10,6 @@ namespace aletheia {
 
 namespace {
 
-void collect_original_block_ids(AstNode* node, std::vector<std::uint64_t>& ids) {
-    if (!node) {
-        return;
-    }
-
-    if (BasicBlock* bb = node->get_original_block()) {
-        ids.push_back(static_cast<std::uint64_t>(bb->id()));
-    }
-
-    if (auto* seq = ast_dyn_cast<SeqNode>(node)) {
-        for (AstNode* child : seq->nodes()) {
-            collect_original_block_ids(child, ids);
-        }
-        return;
-    }
-    if (auto* if_node = ast_dyn_cast<IfNode>(node)) {
-        collect_original_block_ids(if_node->true_branch(), ids);
-        collect_original_block_ids(if_node->false_branch(), ids);
-        return;
-    }
-    if (auto* loop = ast_dyn_cast<LoopNode>(node)) {
-        collect_original_block_ids(loop->body(), ids);
-        return;
-    }
-    if (auto* sw = ast_dyn_cast<SwitchNode>(node)) {
-        for (CaseNode* case_node : sw->cases()) {
-            collect_original_block_ids(case_node->body(), ids);
-        }
-        return;
-    }
-    if (auto* case_node = ast_dyn_cast<CaseNode>(node)) {
-        collect_original_block_ids(case_node->body(), ids);
-    }
-}
-
 std::uint64_t transition_block_order_key(TransitionBlock* node) {
     if (!node || !node->ast_node()) {
         return std::numeric_limits<std::uint64_t>::max();
@@ -55,7 +20,7 @@ std::uint64_t transition_block_order_key(TransitionBlock* node) {
     }
 
     std::vector<std::uint64_t> ids;
-    collect_original_block_ids(node->ast_node(), ids);
+    collect_ast_original_block_ids(node->ast_node(), ids);
     if (!ids.empty()) {
         return *std::min_element(ids.begin(), ids.end());
     }
@@ -70,7 +35,7 @@ std::string transition_block_signature(TransitionBlock* node) {
     }
 
     std::vector<std::uint64_t> ids;
-    collect_original_block_ids(node->ast_node(), ids);
+    collect_ast_original_block_ids(node->ast_node(), ids);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
